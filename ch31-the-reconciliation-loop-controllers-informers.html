@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 31 — The reconciliation loop, controllers, informers</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part IV · Kubernetes &nbsp;·&nbsp; Chapter 31</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part IV · Kubernetes — Architecture &amp; Internals · Chapter 31</div>
+      <h1>The reconciliation loop, controllers, informers</h1>
+      <p class="tagline">Chapter 28 told you controllers reconcile; Chapter 29 warned that polling the API server melts it. This is the machinery that squares the two: watch, a local cache, a work queue, and an idempotent reconcile. Every built-in controller, every operator you'll write, and Argo CD all run this exact pattern — so learn it once, deeply.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~40 min read · kind</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain list + watch and why it beats polling — and what an informer's cache is for.</li>
+          <li>Trace an event from the API server through the informer, work queue, and reconcile function.</li>
+          <li>Say precisely why controllers are level-triggered even though they're driven by events, and why that self-heals.</li>
+          <li>Recognise the two classic controller failures: a controller that stopped reconciling, and one hot-looping without progress.</li>
+          <li>See why this one pattern underlies every operator (Chapter 32) and GitOps engine like Argo CD (Chapter 65).</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>How does a controller know when to act?</h2>
+    <p>You have the model: a controller compares desired state to actual state and closes the gap. But that leaves a mechanical hole. <em>When</em> does it run the comparison? The naive answer — "every second, list every pod and check" — is exactly the mistake Chapter 29 showed melting an API server: full LISTs are expensive, they serialize the world out of etcd, and doing that on a timer across dozens of controllers is a self-inflicted outage.</p>
+    <p>The opposite naive answer — "have the API server call me when something changes" — has its own trap. If the controller reacts only to the change <em>event</em> ("pod-42 was deleted"), then a missed event (the controller was restarting, the connection dropped) leaves it permanently wrong, because nothing re-fires an old event. That's the fragility of edge-triggered logic from Chapter 28.</p>
+    <p>So Kubernetes needs a machine that gets change notifications cheaply <em>and</em> stays correct when notifications are missed or duplicated. That machine is the trio you'll meet here: a <b>watch</b> (a cheap change stream), an <b>informer</b> (a local, always-current cache fed by that stream), and a <b>work queue</b> feeding an idempotent <b>reconcile</b> that always reads current state. It's the shared skeleton of every controller in the cluster, and once you can draw it, "why did the controller do that?" becomes answerable instead of magic.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>The resolution is a split: <b>events tell the controller <em>when</em> to look; the cache tells it <em>what is true</em>.</b> A change enqueues a reminder to reconcile object X — but reconcile then reads X's full current state and acts on that, ignoring what the event said changed. Miss an event and you're only late, never wrong. That single idea is the whole chapter.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: an assistant with a change feed and an in-tray</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Imagine a meticulous assistant whose job is to keep a set of orders in the right state. They don't re-read the entire master ledger every minute — that would be absurd. Instead they subscribe once to a <b>change feed</b> from the records office ("order 42 touched," "order 51 touched") and use it to keep a <b>personal photocopy of the ledger</b> up to date (the informer cache). The change feed is cheap; their copy is always current.</p>
+      <p>For every change that comes in, they don't act immediately. They drop a <b>sticky note</b> with just the order number into an <b>in-tray</b> (the work queue). The tray is smart: if order 42 changes five times before they get to it, there's still only <em>one</em> sticky for 42 — the notes deduplicate. And the sticky says only "look at 42," never "42 changed from X to Y."</p>
+      <p>They work the tray one sticky at a time. For each, they pull order 42's <em>latest</em> record from their photocopy, compare it to how it should be, and fix whatever's off. If a fix fails (the records office is busy), they put the sticky back — but at the bottom, and they wait a little longer each time before retrying (backoff), so a stubborn order doesn't starve the rest. Because they always read the current record, it doesn't matter if they missed a change or five piled up: the final state is what they act on.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In a controller</th></tr>
+      <tr><td>Subscribing to the change feed</td><td><b>Watch</b> — a streaming connection of changes from the API server</td></tr>
+      <tr><td>The personal photocopy, kept current</td><td>The <b>informer cache</b> (Indexer) — a local, indexed copy of objects</td></tr>
+      <tr><td>Dropping a sticky note with the order number</td><td>Enqueuing the object <b>key</b> (<code>namespace/name</code>)</td></tr>
+      <tr><td>Five changes → one sticky</td><td>The <b>work queue</b> deduplicates pending keys</td></tr>
+      <tr><td>"Look at 42," not "42 changed to X"</td><td>Level-triggered: the key is the trigger; reconcile reads state</td></tr>
+      <tr><td>Reading the latest record before acting</td><td>Reconcile reads current state from the cache (Lister)</td></tr>
+      <tr><td>Failed fix → back of tray, wait longer</td><td>Requeue with <b>rate-limited exponential backoff</b></td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>informer → work queue → reconcile</h2>
+    <p>Here is the skeleton shared by every controller. Read it left to right along the top (the informer keeping a cache), then down and right (the queue feeding the worker), and note the two feedback arrows from the worker — one to read state, one to act.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 380" role="img" aria-label="A controller: an informer lists and watches the API server to fill a cache, event handlers enqueue keys to a work queue, and a worker reconciles by reading the cache and acting on the API server">
+        <defs>
+          <marker id="c1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="c2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+          <marker id="c3" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--deep)"/></marker>
+          <marker id="c4" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" style="fill:var(--muted)"/></marker>
+        </defs>
+        <!-- top row: informer -->
+        <rect x="16" y="40" width="120" height="70" rx="10" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="76" y="70" text-anchor="middle" style="fill:var(--accent);font:700 12px sans-serif">API server</text>
+        <text x="76" y="88" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">source of truth</text>
+
+        <rect x="170" y="40" width="152" height="70" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="246" y="66" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">Reflector</text>
+        <text x="246" y="84" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">LIST then WATCH</text>
+        <text x="246" y="99" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">(resourceVersion)</text>
+
+        <rect x="356" y="40" width="172" height="70" rx="10" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="442" y="66" text-anchor="middle" style="fill:var(--accent);font:700 12px sans-serif">Informer cache</text>
+        <text x="442" y="84" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">DeltaFIFO → Indexer</text>
+        <text x="442" y="99" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">local, always current</text>
+
+        <line x1="136" y1="66" x2="168" y2="66" style="stroke:var(--accent);stroke-width:2" marker-end="url(#c1)"/>
+        <text x="152" y="34" text-anchor="middle" style="fill:var(--accent);font:600 9.5px sans-serif">list+watch</text>
+        <line x1="322" y1="75" x2="354" y2="75" style="stroke:var(--accent);stroke-width:2" marker-end="url(#c1)"/>
+        <text x="338" y="128" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">apply deltas</text>
+
+        <!-- handlers -->
+        <rect x="356" y="140" width="172" height="46" rx="9" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="442" y="160" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">event handlers</text>
+        <text x="442" y="176" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">Add / Update / Delete</text>
+        <line x1="442" y1="110" x2="442" y2="138" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#c4)"/>
+
+        <!-- workqueue -->
+        <rect x="356" y="214" width="172" height="56" rx="10" style="fill:var(--panel);stroke:var(--deep);stroke-width:1.5"/>
+        <text x="442" y="238" text-anchor="middle" style="fill:var(--deep);font:700 11.5px sans-serif">work queue</text>
+        <text x="442" y="256" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">dedupe · rate-limit · backoff</text>
+        <line x1="442" y1="186" x2="442" y2="212" style="stroke:var(--deep);stroke-width:2" marker-end="url(#c3)"/>
+        <text x="516" y="203" text-anchor="middle" style="fill:var(--deep);font:600 9.5px sans-serif">enqueue key</text>
+
+        <!-- worker -->
+        <rect x="566" y="214" width="138" height="56" rx="10" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="635" y="238" text-anchor="middle" style="fill:var(--accent2);font:700 11.5px sans-serif">worker</text>
+        <text x="635" y="256" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">Reconcile(key)</text>
+        <line x1="528" y1="242" x2="564" y2="242" style="stroke:var(--deep);stroke-width:2" marker-end="url(#c3)"/>
+
+        <!-- worker reads cache (level) -->
+        <path d="M635,214 L635,124 L530,124" fill="none" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#c2)"/>
+        <text x="600" y="118" text-anchor="middle" style="fill:var(--accent2);font:600 9.5px sans-serif">read current (Lister)</text>
+
+        <!-- worker acts on api server -->
+        <path d="M635,270 L635,344 L76,344 L76,112" fill="none" style="stroke:var(--accent);stroke-width:2" marker-end="url(#c1)"/>
+        <text x="330" y="360" text-anchor="middle" style="fill:var(--accent);font:600 10px sans-serif">act: create / update / delete</text>
+
+        <!-- requeue on error -->
+        <path d="M600,270 C560,300 470,300 442,272" fill="none" style="stroke:var(--muted);stroke-width:1.5;stroke-dasharray:5 4" marker-end="url(#c4)"/>
+        <text x="512" y="300" text-anchor="middle" style="fill:var(--muted);font:italic 9.5px sans-serif">error → requeue w/ backoff</text>
+      </svg>
+      <figcaption>Events flow down the middle (cache → handlers → queue → worker). But the worker's real inputs are the two side arrows: it <em>reads</em> current state from the cache and <em>acts</em> on the API server. The event only decided that it was time to look.</figcaption>
+    </figure>
+
+    <h2 id="internals"><span class="beat">Internal working</span>list/watch, the informer, the queue, the reconcile</h2>
+
+    <h4>1 · list + watch: a consistent stream, cheaply</h4>
+    <p>Two API primitives make this possible. A <b>LIST</b> returns all objects of a type <em>and</em> a <code>resourceVersion</code> — a monotonically increasing marker for "the state of the world as of here." A <b>WATCH</b> opens a long-lived streaming connection that delivers every change <em>since</em> a given resourceVersion: added, modified, deleted. So a controller lists once to get the full picture and a starting version, then watches from that version to receive a live delta stream — no polling, and the API server serves it from its own watch cache, cheaply, to thousands of watchers.</p>
+    <p>Watches aren't forever. Connections drop; the API server may send a <code>410 Gone</code> if your resourceVersion is too old to resume from (the change history it keeps is bounded). The client handles this by <b>relisting</b> to get a fresh resourceVersion and resuming the watch — which is also a correctness reset. Periodic <em>watch bookmarks</em> keep the client's resourceVersion current so relists stay rare.</p>
+
+    <h4>2 · The informer: a local cache you can read for free</h4>
+    <p>An <b>informer</b> wraps list/watch into a maintained local cache. Its parts:</p>
+    <ol class="steps">
+      <li><b>Reflector.</b> Runs the ListAndWatch loop against one resource type and pushes every change into a <b>DeltaFIFO</b> queue as a delta (Added/Updated/Deleted).</li>
+      <li><b>DeltaFIFO → Indexer.</b> The informer pops deltas in order and updates the <b>Indexer</b> — a thread-safe in-memory store keyed by <code>namespace/name</code>, optionally indexed by labels/fields for fast lookups. This Indexer <em>is</em> the cache; it always reflects the latest observed state.</li>
+      <li><b>Event handlers.</b> As it applies each delta, the informer calls your registered <code>OnAdd</code>/<code>OnUpdate</code>/<code>OnDelete</code> handlers. Note that well-written handlers do almost nothing except compute a key and enqueue it — they don't reconcile inline.</li>
+      <li><b>Resync.</b> Periodically the informer re-delivers everything in its cache through the handlers, even with no changes. That's a deliberate level-triggered safety net: it re-drives reconciliation so nothing sits un-reconciled forever.</li>
+    </ol>
+    <p>The "<b>Shared</b>" in SharedInformer matters at scale: one informer per resource type is shared by every controller in the process, so pods are listed and watched <em>once</em> and everyone reads the same cache — instead of each controller opening its own watch. This is the mechanized version of the Chapter 29 rule "use informers, not per-controller LISTs."</p>
+
+    <h4>3 · The work queue: debounce and backoff</h4>
+    <p>Handlers enqueue <em>keys</em>, not objects, into a rate-limited work queue with three properties that make controllers well-behaved:</p>
+    <ul>
+      <li><b>Deduplication.</b> A key already waiting isn't added twice. Ten rapid changes to one Deployment collapse into one reconcile — natural debouncing.</li>
+      <li><b>Rate limiting &amp; backoff.</b> On a failed reconcile you call <code>AddRateLimited(key)</code>, which re-adds it with exponential backoff (milliseconds, then seconds, capped). A persistently failing object retries forever but slowly, so it can't hammer the API server or starve other keys.</li>
+      <li><b>Delayed adds.</b> <code>AddAfter(key, 30s)</code> lets a reconcile ask to be re-run later — e.g. "check again in 30s" while waiting for something to settle.</li>
+    </ul>
+
+    <h4>4 · The reconcile: idempotent, level-triggered</h4>
+    <p>A worker goroutine pops a key and runs the reconcile. This is where you'd write your own logic; the shape is always:</p>
+    <div class="codewrap"><span class="lang">go</span><pre><code>func reconcile(key string) error {
+    obj, exists := lister.Get(key)   <span class="c">// read CURRENT state from the cache — not from the event</span>
+    if !exists {
+        return handleDeleted(key)     <span class="c">// object is gone; clean up if needed</span>
+    }
+    desired  := obj.Spec              <span class="c">// what should be</span>
+    actual   := observeWorld(obj)     <span class="c">// what is (children, external systems…)</span>
+    if !equal(desired, actual) {
+        return act(diff(desired, actual))  <span class="c">// idempotent create/update/delete</span>
+    }
+    return nil                        <span class="c">// success → queue.Forget(key)</span>
+}</code></pre></div>
+    <p>Three properties do all the work. It <b>reads current state</b> from the cache, so it's level-triggered — the key was just a nudge. It's <b>idempotent</b> — running it twice on the same state changes nothing the second time, so duplicate or replayed keys are harmless. And it returns an <b>error to requeue</b> or nil to forget, so transient failures retry with backoff and successes stop churning. Restart the controller and it relists, refills the cache, resyncs every key, and converges — the same restart-safety as every loop in this Part.</p>
+
+    <details class="recall"><summary>Think first: a controller misses a delete event for a pod while it was restarting. Does the pod's owner stay broken?</summary>
+      <div class="body">
+        <p>No. On restart the informer does a fresh LIST, so its cache reflects reality: the pod is simply absent. When the owner (say a ReplicaSet) is reconciled — either because the resync re-drives every key, or because the missing pod changed the observed count — the reconcile reads the current cache, counts the pods that actually exist, sees it's one short of desired, and creates a replacement. It never needed the delete event; it needed the current count, which it reads every time. This is the concrete reason level-triggered controllers tolerate missed events: the event was only a hint to look, and the LIST-backed cache is the source of "what is." An edge-triggered handler that decremented a counter on the delete event would now be permanently wrong.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, named</h2>
+    <ul>
+      <li><b>Watch / List</b> — the API primitives: full snapshot + resourceVersion (List), streaming deltas from a version (Watch). The foundation everything else sits on.</li>
+      <li><b>Reflector</b> — runs ListAndWatch for one type and feeds the DeltaFIFO.</li>
+      <li><b>Informer (SharedInformer)</b> — maintains the cache (Indexer) from the delta stream and fans out events to handlers; shared across controllers in a process.</li>
+      <li><b>Indexer / Lister</b> — the in-memory cache and the read API over it. Reconcile reads here, not from the API server, so reads are free and fast.</li>
+      <li><b>Work queue</b> — the deduplicating, rate-limited queue of keys between handlers and workers.</li>
+      <li><b>Reconciler</b> — your function: read current state, converge, return error-or-nil.</li>
+      <li><b>ownerReferences &amp; the garbage collector</b> — metadata linking children to a parent (a ReplicaSet owns its pods). A controller watches its children and maps each back to the owner's key to reconcile the owner; and when a parent is deleted, the GC controller deletes objects whose owner is gone (cascading delete).</li>
+      <li><b>controller-runtime / Manager</b> — the library (used by Kubebuilder/Operator SDK) that wires informers, queues, workers, and leader election together so you write only the reconcile. This is the bridge to operators in <a href="ch32-api-machinery-apply-path-admission-crds-and.html">Chapter 32</a>.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following "delete a ReplicaSet's pod" through the machine</h2>
+    <p>Chapter 28 showed this self-heals; now watch the actual parts move. You delete one pod owned by a ReplicaSet that wants 3:</p>
+    <ol class="steps">
+      <li>The API server records the deletion and bumps the global resourceVersion.</li>
+      <li>The ReplicaSet controller's <b>pod informer</b> receives the delete on its watch, removes the pod from its cache, and fires the <code>OnDelete</code> handler.</li>
+      <li>The handler reads the pod's <code>ownerReferences</code>, finds the owning ReplicaSet, and enqueues the <b>ReplicaSet's key</b> (not the pod's) — you reconcile the owner, because the owner is what has a desired count.</li>
+      <li>A worker pops the ReplicaSet key. Via the Lister it reads the ReplicaSet (desired: 3) and lists pods matching its selector <em>from the cache</em> (now: 2). Diff: +1.</li>
+      <li>The reconcile creates one Pod via the API server, with an ownerReference back to the ReplicaSet. Success → the key is forgotten.</li>
+      <li>That create is itself a change: the pod informer sees the new pod, the ReplicaSet is reconciled again, counts 3 = 3, and does nothing. Equilibrium.</li>
+    </ol>
+    <p>No step referenced the delete event's contents. The controller learned "something about this ReplicaSet's world changed," then read the current counts and acted. That's the pattern doing exactly what the analogy promised.</p>
+
+    <details class="recall"><summary>Think first: five controllers in one controller-manager all need to watch Pods. How many pod watches hit the API server?</summary>
+      <div class="body">
+        <p>One. That's what the <b>Shared</b> in SharedInformer buys you: a single informer per resource type lists and watches Pods once, keeps one cache, and every controller in that process reads from it and registers its own handlers. Without sharing, five controllers would open five watches and hold five copies of the same data — five times the API-server and memory cost for no benefit. This is the mechanical reason the controller-manager bundles dozens of controllers into one binary: they share informers. It's also why a rogue controller that opens its own per-object LISTs instead of using the shared cache stands out immediately as an API-server hog (the Chapter 29 incident).</p>
+      </div>
+    </details>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>kind create cluster --name ctrl
+kubectl create deployment web --image=nginx:1.27-alpine --replicas=3</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — watch the raw change stream</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p><code>kubectl get --watch</code> opens the very same watch stream that informers consume. In one terminal, start watching pods and print resourceVersions:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl get pods -l app=web --watch</code></pre></div>
+        <p>In another, delete a pod and see the stream emit the transitions live:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl delete pod $(kubectl get pod -l app=web -o name | head -1)</code></pre></div>
+        <div class="out"><span class="ol">Output (the --watch terminal)</span>web-xxxx-aaaaa   1/1   Running       ...
+web-xxxx-aaaaa   1/1   Terminating   ...
+web-xxxx-bbbbb   0/1   Pending       ...
+web-xxxx-bbbbb   0/1   ContainerCreating ...
+web-xxxx-bbbbb   1/1   Running       ...</code></div>
+        <p>You're seeing exactly what a controller's Reflector sees: a stream of deltas, not a snapshot. Add <code>-v=8</code> to any command and you'll spot the underlying request — <code>GET .../pods?watch=true&amp;resourceVersion=...</code> — a single long-lived HTTP connection, not repeated polling.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — see the controller reconcile via Events</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Controllers record their actions as Events on the object, which is the cleanest way to <em>watch</em> a reconcile without reading source. Look at the ReplicaSet:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl describe rs -l app=web | sed -n '/Events/,$p'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>Events:
+  Type    Reason            From                   Message
+  Normal  SuccessfulCreate  replicaset-controller  Created pod: web-xxxx-aaaaa
+  Normal  SuccessfulCreate  replicaset-controller  Created pod: web-xxxx-bbbbb
+  Normal  SuccessfulCreate  replicaset-controller  Created pod: web-xxxx-ccccc</code></div>
+        <p>The <code>From: replicaset-controller</code> is the reconcile speaking — each "Created pod" is one pass of the loop closing a gap. Now expose the ownership link the flow depended on:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl get pod -l app=web -o jsonpath='{.items[0].metadata.ownerReferences[0].kind}/{.items[0].metadata.ownerReferences[0].name}{"\n"}'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>ReplicaSet/web-xxxx</code></div>
+        <p>That <code>ownerReference</code> is how a pod event gets mapped back to the ReplicaSet key to enqueue — and how deleting the ReplicaSet later garbage-collects these pods.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — watch reconciliation from the controller's side</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>You've deleted a pod before; now connect it to the machinery. Delete a pod and immediately read the ReplicaSet's Events again — you'll see a <em>fourth</em> create appear, the reconcile reacting to the enqueued owner key:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl delete pod $(kubectl get pod -l app=web -o name | head -1)
+sleep 2
+kubectl describe rs -l app=web | grep SuccessfulCreate | tail -2</code></pre></div>
+        <div class="out"><span class="ol">Output</span>Normal  SuccessfulCreate  replicaset-controller  Created pod: web-xxxx-ddddd</code></div>
+        <p>Trace it against the flow: delete → pod informer fires OnDelete → handler enqueues the ReplicaSet key → worker reads desired (3) and cached pod count (2) → creates one → records the Event. The controller never handled a "pod deleted" case specially; it recounted and converged. That's self-healing you can now explain mechanically, not just observe.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — an object stuck Terminating</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Finalizers are how a controller says "let me clean up before this object is really deleted" — and they're a top cause of stuck deletions. Create an object with a finalizer nobody removes:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl create configmap demo-cm --from-literal=k=v
+kubectl patch configmap demo-cm --type=merge \
+  -p '{"metadata":{"finalizers":["example.com/needs-cleanup"]}}'
+kubectl delete configmap demo-cm --wait=false
+kubectl get configmap demo-cm</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME      DATA   AGE
+demo-cm   1      30s        <span class="c"># still here — delete "succeeded" but object remains</span></code></div>
+        <p>The delete didn't delete. Why is it stuck, and what's the safe fix versus the dangerous one? Reason first.</p>
+        <details class="recall"><summary>Reveal the diagnosis</summary>
+          <div class="body">
+            <p>The object now has a <code>deletionTimestamp</code> (it's marked for deletion) but a non-empty <code>finalizers</code> list, and the API server won't actually remove an object until its finalizers are all cleared. Normally a controller owns that finalizer: it sees the deletionTimestamp, does its cleanup (drain external resources, deregister DNS, etc.), then removes its finalizer, and the object disappears. Here no controller owns <code>example.com/needs-cleanup</code>, so it hangs forever in Terminating. Confirm:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl get configmap demo-cm -o jsonpath='{.metadata.deletionTimestamp} {.metadata.finalizers}{"\n"}'</code></pre></div>
+            <div class="out"><span class="ol">Output</span>2026-09-21T...Z [example.com/needs-cleanup]</code></div>
+            <p>The <b>right</b> fix in production is to make the owning controller healthy so it removes its finalizer after cleanup. The <b>blunt</b> fix, when the controller is gone for good and you accept skipping its cleanup, is to remove the finalizer by hand — <code>kubectl patch configmap demo-cm --type=merge -p '{"metadata":{"finalizers":null}}'</code> — after which it deletes instantly. Force-removing finalizers on real resources (namespaces stuck Terminating, PVs) can orphan external infrastructure, so it's a last resort, not a reflex. This exact "stuck Terminating" shape recurs with operators and namespaces throughout the book.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — a hot-looping reconcile</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>The opposite failure of "not reconciling" is "reconciling constantly without progress" — a hot loop. Reproduce the shape by pointing a Deployment at an unpullable image, then reason about how you'd detect a hot loop in general:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl set image deployment/web nginx=nginx:nope-not-real
+kubectl get events --sort-by=.lastTimestamp | tail -8</code></pre></div>
+        <div class="out"><span class="ol">Output</span>... BackOff        Back-off pulling image "nginx:nope-not-real"
+... Failed         Failed to pull image ...
+... FailedCreate/SuccessfulCreate (repeating) ...</code></div>
+        <p>The controllers keep retrying with backoff — that's healthy backoff, not a bug. But how would you tell a <em>pathological</em> hot loop (a controller burning CPU and API calls, making no progress) from normal backoff, and what usually causes it? Think, then reveal.</p>
+        <details class="recall"><summary>Reveal the approach</summary>
+          <div class="body">
+            <p>You look at the controller's own signals, not the app's. Controllers built on client-go/controller-runtime export work-queue metrics — <code>workqueue_depth</code> (keys waiting), <code>workqueue_adds_total</code>, <code>workqueue_retries_total</code>, and reconcile latency/error counters. A <b>healthy</b> controller under backoff shows a bounded queue and retries spaced out by exponential backoff. A <b>hot loop</b> shows retries climbing without bound, high adds_total with no drop in depth, and often 100% CPU on the controller — it's re-enqueuing faster than backoff intends.</p>
+            <p>The usual causes are self-inflicted: a reconcile that isn't <b>idempotent</b>, so every pass writes the object (a status update, a defaulted field) which fires the informer, which re-enqueues the same key — an infinite feedback loop the controller creates itself. Or <b>two controllers fighting the same field</b> (a manifest and the HPA both setting <code>replicas</code>), each undoing the other forever. Or returning an error on a permanent condition so it requeues endlessly at the backoff cap. The fixes: make reconcile idempotent and only write when something actually changed (compare before update); ensure exactly one owner per field; and treat permanent failures as terminal (record status, stop requeuing) rather than as retryable errors. This is precisely the failure mode you'll debug in operators (Chapter 32) and as "Argo CD stuck OutOfSync / reconcile error" in <a href="ch65-argo-cd.html">Chapter 65</a>. Clean up: <code>kubectl rollout undo deployment/web</code>, then <code>kind delete cluster --name ctrl</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · a controller stopped reconciling</div>
+      <p><b>Symptom:</b> you change desired state and nothing happens — no new pods, no events, the object just sits. <b>First cut:</b> is the controller running and is it the leader? For built-ins, check the controller-manager pod and its leader-election Lease; for an operator, its Deployment and logs. <b>Usual causes:</b> the controller crashed or lost leader election, its informer cache never synced (it's still doing the initial LIST, or the watch is wedged), or RBAC forbids it from watching the resource. <b>Confirm:</b> controller logs showing "caches synced" and no watch errors; <code>kubectl auth can-i --as</code> the controller's ServiceAccount. <b>Fix</b> is cause-specific, but "is the loop even turning, and is this the active replica?" is always the first question.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · hot loop / rising work-queue depth</div>
+      <p><b>Symptom:</b> a controller is at high CPU and the API server sees a flood of writes from it, but nothing converges. <b>First cut:</b> its <code>workqueue_depth</code> and <code>workqueue_retries_total</code> metrics, and diff two dumps of the target object to see if a field is flapping. <b>Usual causes:</b> a non-idempotent reconcile that writes every pass and re-triggers itself, two controllers fighting one field, or retrying a permanent error forever. <b>Fix:</b> only write on real change, one owner per field, make permanent failures terminal.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · object stuck Terminating</div>
+      <p><b>Symptom:</b> a delete "succeeds" but the object stays, phase Terminating, for a long time. <b>Cause:</b> a finalizer whose owning controller is down, missing, or erroring during cleanup. <b>Confirm:</b> read <code>deletionTimestamp</code> and <code>finalizers</code>, and check that controller's health/logs. <b>Fix:</b> restore the controller so it completes cleanup and removes its finalizer; only force-remove the finalizer when you've accepted skipping the cleanup and understand the orphaned resources.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Reconcile must be idempotent and quiet.</b> The single most important property of any controller you write or operate is that a reconcile with no real change makes no writes. Compare current to desired and only call the API when they differ; otherwise you create the feedback loop that becomes a hot loop and a self-DoS on the API server. Keep reconciles fast and non-blocking — never sleep or make long synchronous calls inside one; if you must wait, requeue with <code>AddAfter</code> and return.</p>
+    <p><b>Use informers; never poll.</b> This is the Chapter 29 lesson made concrete: read from the informer cache (Lister), share informers across controllers, and let watch deliver changes. A controller that does periodic full LISTs against the API server is the classic cause of control-plane overload at scale. Watch the work-queue and reconcile metrics as first-class SLOs for your controllers — queue depth, retry rate, reconcile error rate, reconcile duration.</p>
+    <p><b>One owner per field, and respect backoff.</b> Two controllers writing the same field will fight forever; decide ownership explicitly (server-side apply's field management helps). Let the rate limiter do its job — return errors for transient failures so they back off, and treat permanent failures as terminal (set a status condition, stop requeuing) rather than retrying at the cap indefinitely. Give HA controllers leader election so exactly one instance reconciles.</p>
+    <p><b>Mind cache staleness and finalizers.</b> The cache is eventually consistent — you may reconcile on data a few hundred milliseconds old, so writes can hit a <code>409 Conflict</code>; handle it by requeuing and re-reading, not by force-writing. And if you add a finalizer, you are promising a healthy controller will remove it — an operator that adds finalizers and then gets uninstalled leaves objects un-deletable. <b>Common mistakes:</b> non-idempotent reconciles, blocking reconciles, per-controller LISTs, fighting over a field, retrying permanent errors, and orphaned finalizers.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>This pattern is bigger than Kubernetes — it's a general recipe for a control system that survives failure, and you'll reach for it whenever you build something that must keep an external world in a desired state. The ingredients: a <b>change stream</b> (watch is change-data-capture, the same idea as a database's replication log or a Kafka topic — Chapter 84), a <b>local cache</b> so reads are cheap and you don't hammer the source of truth, a <b>debounced, backpressured work queue</b> so bursts collapse and failures back off instead of amplifying, and an <b>idempotent, level-triggered worker</b> so the system converges regardless of what it missed. Every Kubernetes operator (Chapter 32), cert-manager, external-dns, and the GitOps engines Argo CD and Flux (<a href="ch65-argo-cd.html">Chapter 65</a>) are this recipe pointed at a different desired state — a git repo, a certificate authority, a DNS provider. When you design your own sync engine or automation, copying this structure buys you self-healing, restart-safety, and graceful behaviour under load for free; rolling your own edge-triggered event handlers buys you subtle, permanent inconsistencies. It's also the deep reason Kubernetes is extensible at all: because <em>everything</em> is this loop over API objects, adding a new kind of object plus a controller that reconciles it makes your abstraction a first-class citizen of the platform (Chapter 32).</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What is an informer and why not just poll the API server?</summary>
+        <div class="a"><p>An informer keeps a local, always-current cache of a resource type by doing one LIST and then a streaming WATCH, and it fires event handlers as changes arrive. Controllers read from that cache instead of calling the API server, so reads are free and fast. Polling — repeatedly LISTing everything on a timer — is expensive: it serializes large result sets out of etcd and, done across many controllers, overloads the API server. Watch delivers only deltas over a single long-lived connection and is served cheaply from the API server's watch cache. So informers give you fresh data and low load at once.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through the path from an object changing to a controller acting.</summary>
+        <div class="a"><p>The change lands in the API server, which bumps a resourceVersion. The controller's informer, which is watching that resource, receives the delta on its watch stream, updates its local cache (the Indexer), and fires the matching event handler. The handler doesn't reconcile inline — it computes the object's key, <code>namespace/name</code> (or maps a child to its owner's key via ownerReferences), and enqueues that key into a rate-limited work queue that deduplicates, so rapid changes collapse into one item. A worker goroutine pops the key and runs reconcile: it reads the object's <em>current</em> state from the cache via a Lister, observes the actual world, and if they differ, makes idempotent API calls to converge. On success it forgets the key; on a transient error it requeues with exponential backoff. The important subtlety is that the event only decided <em>when</em> to reconcile — the reconcile reads current state and acts on that, which is what makes it level-triggered and tolerant of missed or duplicate events.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Controllers are driven by events but called level-triggered. Reconcile that.</summary>
+        <div class="a"><p>The events and the logic operate at different layers. Watch delivers edges — "this object changed" — purely as an efficiency mechanism so the controller doesn't poll; the event is a notification to <em>look</em>, and its payload is essentially ignored beyond identifying which object. The reconcile logic is level-triggered: it reads the object's full current state from the cache and computes desired-versus-actual from scratch every time, so it's a function of state, not of the transition. Three things make this resilient. First, the informer's cache is backed by a periodic relist and a resync that re-drives every key, so even if a watch event is missed, the current level is re-observed and reconciled. Second, reconcile is idempotent, so a duplicate or replayed key is a no-op. Third, the work queue deduplicates, so a burst of edges becomes one level-read. The upshot: edges optimise <em>when</em> work happens; levels determine <em>what</em> work happens. That's why you can drop events, restart the controller, or replay, and it still converges — and why edge-triggered handlers that mutate state per-event (incrementing a counter on each delete) are the classic way to introduce permanent drift.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>You change a Deployment and nothing happens. How do you tell if the controller is even running?</summary>
+        <div class="a"><p>I separate "did my change land" from "is the loop turning." First I confirm the write persisted — <code>kubectl get deploy -o yaml</code> shows my new spec and a bumped generation — so the API server accepted it. Then I check the controller. For a built-in, that's the kube-controller-manager pod: is it Running, and does its log show "caches synced" and no watch/authorization errors, and — in HA — is this the leader holding the leader-election Lease? For an operator, it's that operator's Deployment and logs. Common findings: the controller crashed or lost leadership so no instance is reconciling; its informer never finished the initial sync so it's not acting yet; or RBAC forbids it from watching the resource, which shows as watch errors in the log. I'd also check the object's Events and the controller's work-queue depth metric to see whether it enqueued the key at all. The mental model is the loop: is it running, is it the active replica, did it see the change, and did reconcile error — in that order.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>How does this pattern relate to operators and GitOps tools?</summary>
+        <div class="a"><p>They're the same machine pointed at different desired state. An operator (Chapter 32) is a custom controller for a Custom Resource: you define a new kind of object with its spec, then write a reconcile — using controller-runtime, which wires up the informer, work queue, workers, and leader election for you — that makes some real system match that spec. cert-manager reconciles Certificates against a CA; external-dns reconciles DNS records against a provider. GitOps engines like Argo CD (Chapter 65) do the same with the desired state living in a git repo: they watch the repo and the cluster, diff, and reconcile the cluster toward git, with the identical "OutOfSync detected → converge → retry with backoff" loop — which is why an Argo app "stuck OutOfSync" or "reconcile error" is debugged exactly like a stuck or hot-looping controller here. Learning this loop once means you understand every controller, every operator, and every reconcile-based delivery tool in the ecosystem.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>Controllers don't poll — they use list + watch to get a cheap, consistent change stream, and an informer turns that stream into a local, always-current cache (Reflector → DeltaFIFO → Indexer) plus event handlers. Handlers enqueue the object's key into a work queue that deduplicates and rate-limits with exponential backoff; a worker pops each key and runs an idempotent reconcile that reads current state from the cache, compares desired to actual, and acts through the API server, requeuing on error. The events only decide <em>when</em> to look; the cache decides <em>what is true</em> — so the loop is level-triggered and tolerant of missed or duplicate events, and it self-heals and survives restarts. The same skeleton powers every built-in controller, every operator, and Argo CD. Two failures dominate: a controller that stopped reconciling (crashed, not leader, cache not synced, RBAC) and one hot-looping (non-idempotent reconcile, two owners fighting a field, retrying a permanent error). And an object stuck Terminating is a finalizer whose controller isn't removing it.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>Controllers use list + watch, never polling: LIST gives a snapshot + resourceVersion, WATCH streams deltas from it.</li>
+      <li>An informer maintains a local cache (Indexer) from the watch stream and fires Add/Update/Delete handlers.</li>
+      <li>"Shared" informers list/watch each type once for all controllers in a process — the fix for API-server overload.</li>
+      <li>Handlers enqueue the object's key (<code>namespace/name</code>), not the object; the work queue deduplicates pending keys.</li>
+      <li>The work queue rate-limits and backs off, so a failing key retries slowly and can't starve others.</li>
+      <li>Reconcile reads current state from the cache and acts idempotently — the event only said "look now."</li>
+      <li>That split makes controllers level-triggered: missed or duplicate events only delay, never corrupt.</li>
+      <li>ownerReferences map children to owners (enqueue the owner's key) and drive cascading garbage collection.</li>
+      <li>Stopped reconciling = crashed / not leader / cache unsynced / RBAC; hot loop = non-idempotent or fighting a field.</li>
+      <li>Object stuck Terminating = a finalizer whose owning controller hasn't cleaned up and removed it.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch28-why-kubernetes-the-declarative-reconciled-model.html"><b>Ch 28</b> Reconciled model</a>
+      <a href="ch29-the-control-plane-api-server-etcd-scheduler.html"><b>Ch 29</b> Watch &amp; the API server</a>
+      <a href="ch30-the-node-kubelet-kube-proxy-runtime-cri.html"><b>Ch 30</b> The kubelet loop</a>
+      <a href="ch32-api-machinery-apply-path-admission-crds-and.html"><b>Ch 32</b> CRDs &amp; operators</a>
+      <a href="ch65-argo-cd.html"><b>Ch 65</b> Argo CD</a>
+      <a href="ch84-async-and-flow-control.html"><b>Ch 84</b> Async &amp; queues</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/architecture/controller/">Controllers</a>: the reconcile-loop concept from the source.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/reference/using-api/api-concepts/">API Concepts</a>: list and watch, resourceVersion, watch bookmarks, and 410 Gone.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/overview/working-with-objects/finalizers/">Finalizers</a> and <a href="https://kubernetes.io/docs/concepts/overview/working-with-objects/owners-dependents/">Owners and Dependents</a>: the "stuck Terminating" and garbage-collection mechanics.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/architecture/self-healing/">Self-Healing</a>: reconciliation recovering from drift, at the concept level.</li>
+      <li>Kubernetes community — <a href="https://github.com/kubernetes/sample-controller">sample-controller</a>: a minimal, readable controller using client-go informers and a work queue.</li>
+      <li>Kubernetes SIG API Machinery — <a href="https://github.com/kubernetes/client-go/tree/master/tools/cache">client-go tools/cache</a>: the Reflector, DeltaFIFO, Indexer, and SharedInformer implementations.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch30-the-node-kubelet-kube-proxy-runtime-cri.html"><span class="dir">← Prev</span><div class="ti">Ch 30 — The node: kubelet, kube-proxy, runtime, CRI</div></a>
+      <a class="nx" href="ch32-api-machinery-apply-path-admission-crds-and.html"><span class="dir">Next →</span><div class="ti">Ch 32 — API machinery: apply path, admission, CRDs and operators</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 31 of 121 · Part IV · Kubernetes — Architecture &amp; Internals. You now own the loop that runs the whole platform. Next: how to add your <em>own</em> objects and controllers — CRDs and operators.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">informer → queue → reconcile</a>
+    <a href="#internals">Watch, informer, queue</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">Self-heal, mechanically</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

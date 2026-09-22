@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 38 — Storage: volumes, PV, PVC, StorageClass, CSI</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part IV · Kubernetes &nbsp;·&nbsp; Chapter 38</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part IV · Kubernetes — Architecture &amp; Internals · Chapter 38</div>
+      <h1>Storage: volumes, PV, PVC, StorageClass, CSI</h1>
+      <p class="tagline">A container's filesystem dies with the container. That's fine for a stateless web server and a disaster for a database. Kubernetes storage is the machinery that gives a pod a disk that outlives it — and understanding the request/supply split, the CSI attach-then-mount dance, and access modes is the difference between "the PVC is stuck Pending, why?" being a five-minute fix or a two-hour outage.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~45 min read · kind + kubectl</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain why a PVC and a PV are separate objects, and what "binding" actually does.</li>
+          <li>Set up dynamic provisioning with a StorageClass and read the whole PVC → PV → CSI attach → mount path.</li>
+          <li>Choose the right access mode (RWO / RWX / ROX / RWOP) and explain why RWO is not "one pod."</li>
+          <li>Use <code>volumeClaimTemplates</code>, reclaim policy, and volume expansion correctly.</li>
+          <li>Diagnose a Pending PVC with no provisioner, an RWO scheduling conflict, and a stuck attach.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>Pods are cattle; some data is not</h2>
+    <p>A container's writable layer is scratch space. Kill the container — or let the kubelet restart it, or reschedule the pod to another node — and everything written inside is gone. That's exactly what you want for a stateless service: no state to lose, any replica is interchangeable, and you met that model in the workloads chapters. But a Postgres pod, a Kafka broker, a Prometheus server, an upload service — these <em>are</em> their data. Lose the disk and you've lost the service.</p>
+    <p>So a pod needs a disk that isn't tied to the container's life. And here's the tension that shapes the entire design: the person who <em>needs</em> storage (an app developer writing a pod spec) is not the person who <em>owns</em> storage (a platform team, or a cloud provider with EBS volumes and quotas). The developer shouldn't have to know the AWS volume ID or the NFS export path. The platform shouldn't have to hand-create a disk every time someone deploys.</p>
+    <p>Kubernetes solves this by splitting the world into a <b>request</b> and a <b>supply</b>, exactly like a resource request and a node. The developer writes a <b>PersistentVolumeClaim</b>: "I want 10Gi, read-write-once, of the <code>fast-ssd</code> class." Somewhere, a <b>PersistentVolume</b> — a real disk — either already exists or gets created on demand to satisfy that claim. The two are matched and <b>bound</b>, and from then on the pod just references the claim by name. Neither side needs to know the other's details. The machinery that turns "I want 10Gi" into an actual attached, mounted, formatted filesystem is the subject of this chapter, and most of it is the <b>CSI</b> — the Container Storage Interface, the plugin contract that lets any storage vendor teach Kubernetes how to make disks appear.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>Storage in Kubernetes is a claim (PVC, the request) matched to a volume (PV, the supply), decoupled by a StorageClass (the recipe for making supply on demand). The pod only ever names the claim. Everything hard — creating a cloud disk, attaching it to the right node, mounting it into the pod — happens below that line, driven by a CSI driver.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a self-storage facility</h2>
+    <p>Carry this picture through the chapter.</p>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>You need somewhere to keep your stuff, so you go to a self-storage facility. You don't build a unit — you fill in a <b>rental form</b>: "I need a 10&nbsp;m² climate-controlled unit." That form is the <b>PVC</b>. The actual concrete room with a roll-up door is the <b>PV</b>. The front desk matches your form to a free room and hands you the key — that matching is <b>binding</b>, and from then on your form and that specific room are married.</p>
+      <p>You picked "climate-controlled" from a menu of unit <b>types</b> — standard, climate-controlled, drive-up. That menu is the <b>StorageClass</b>. Pick a type and, if no matching room is free, the facility <b>builds one on the spot</b> to your spec — that's dynamic provisioning.</p>
+      <p>But renting the room isn't the same as being able to put things in it. First the facility has to <b>assign the unit to your building</b> (you can't use a unit that's in a different building across town) — that's the CSI <b>attach</b>. Then someone has to actually <b>roll the door open</b> so you can walk in — that's the CSI <b>mount</b>. Attach makes the volume reachable from your node; mount makes it usable inside your pod. Two distinct steps, and a failure at each looks completely different.</p>
+      <p>The rental agreement also says what happens when you leave: does the facility <b>demolish the room</b> (reclaim policy <code>Delete</code>) or <b>keep it and your stuff</b> for someone to collect (<code>Retain</code>)? And can two people share one unit at once? A standard unit is <b>one tenant at a time</b> (RWO); a shared workshop lets <b>many in together</b> (RWX).</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In Kubernetes</th></tr>
+      <tr><td>The rental form ("I need 10&nbsp;m²")</td><td>PersistentVolumeClaim (PVC) — the request</td></tr>
+      <tr><td>The physical room</td><td>PersistentVolume (PV) — the real disk</td></tr>
+      <tr><td>Front desk marries form to room</td><td>Binding — PVC ↔ PV, one-to-one</td></tr>
+      <tr><td>The menu of unit types</td><td>StorageClass — provisioner + parameters</td></tr>
+      <tr><td>Building a unit to spec on demand</td><td>Dynamic provisioning (CSI <code>CreateVolume</code>)</td></tr>
+      <tr><td>Assigning the unit to your building</td><td>Attach (CSI <code>ControllerPublishVolume</code>)</td></tr>
+      <tr><td>Rolling the door open</td><td>Mount (CSI <code>NodeStage</code> + <code>NodePublish</code>)</td></tr>
+      <tr><td>Demolish vs keep on move-out</td><td>Reclaim policy: <code>Delete</code> vs <code>Retain</code></td></tr>
+      <tr><td>One tenant vs shared workshop</td><td>Access mode: RWO vs RWX</td></tr>
+    </table>
+
+    <details class="recall"><summary>Think first: a pod is deleted and rescheduled to a different node. Its PVC is ReadWriteOnce. Does its data survive the move?</summary>
+      <div class="body">
+        <p>Yes — the data survives, and that's the entire point of a PV. The PVC stays bound to the same PV across the pod's death and rebirth; the new pod references the same claim and sees the same files. What ReadWriteOnce controls is not persistence but <em>concurrency</em>: the volume can be mounted read-write by pods on <b>one node at a time</b>. So the old pod's volume is detached from the old node and the new pod's volume is attached to the new node — a detach-then-attach handoff. If the old pod is slow to terminate (a stuck finalizer, a hung kubelet), that handoff stalls and the new pod sits in ContainerCreating with a "Multi-Attach" or "volume node affinity" error until the old attachment clears. Persistence is guaranteed; a <em>clean, fast handoff</em> is the thing that bites you.</p>
+      </div>
+    </details>
+
+    <h2 id="arch"><span class="beat">Architecture</span>Claim, volume, and the CSI plumbing</h2>
+    <p>The developer-facing part is two objects: a PVC and the PV it binds to. Below that line sits the CSI, split into a <b>controller</b> side (runs once per cluster, talks to the cloud API to create and attach volumes) and a <b>node</b> side (runs on every node as a DaemonSet, does the actual mounting). The diagram follows one claim from request to a mounted filesystem.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 468" role="img" aria-label="A PVC binds to a PV via a StorageClass; the CSI controller creates and attaches the volume; the CSI node plugin stages and publishes it into the pod.">
+        <defs>
+          <marker id="s1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="s2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+        </defs>
+        <!-- request band -->
+        <rect x="14" y="14" width="692" height="128" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="30" y="36" style="fill:var(--accent);font:700 12px sans-serif;letter-spacing:.05em">REQUEST ↔ SUPPLY (developer-facing)</text>
+        <rect x="34" y="52" width="150" height="72" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="109" y="82" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">Pod</text>
+        <text x="109" y="102" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">claimName: data</text>
+        <rect x="216" y="52" width="150" height="72" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="291" y="82" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">PVC "data"</text>
+        <text x="291" y="102" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">10Gi · RWO · fast</text>
+        <rect x="398" y="52" width="150" height="72" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="473" y="82" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">PV (bound)</text>
+        <text x="473" y="102" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">vol-0abc… 10Gi</text>
+        <rect x="562" y="52" width="128" height="72" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="626" y="78" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">StorageClass</text>
+        <text x="626" y="96" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">provisioner +</text>
+        <text x="626" y="110" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">parameters</text>
+        <line x1="186" y1="88" x2="214" y2="88" style="stroke:var(--accent);stroke-width:2" marker-end="url(#s1)"/>
+        <line x1="368" y1="88" x2="396" y2="88" style="stroke:var(--accent);stroke-width:2" marker-end="url(#s1)"/>
+        <text x="382" y="80" text-anchor="middle" style="fill:var(--accent);font:600 9.5px sans-serif">bind</text>
+        <line x1="550" y1="88" x2="560" y2="88" style="stroke:var(--line);stroke-width:1.5"/>
+        <!-- controller band -->
+        <rect x="14" y="156" width="692" height="128" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="30" y="178" style="fill:var(--accent2);font:700 12px sans-serif;letter-spacing:.05em">CSI CONTROLLER (once per cluster) — talks to the cloud API</text>
+        <rect x="34" y="196" width="200" height="72" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="134" y="224" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">external-provisioner</text>
+        <text x="134" y="244" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">CreateVolume → makes PV</text>
+        <rect x="260" y="196" width="200" height="72" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="360" y="224" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">external-attacher</text>
+        <text x="360" y="244" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">ControllerPublish → attach</text>
+        <rect x="486" y="196" width="204" height="72" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="588" y="224" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">external-resizer / snapshotter</text>
+        <text x="588" y="244" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">expand · snapshot</text>
+        <line x1="473" y1="124" x2="360" y2="194" style="stroke:var(--accent2);stroke-width:1.5" marker-end="url(#s2)"/>
+        <!-- node band -->
+        <rect x="14" y="298" width="692" height="156" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="30" y="320" style="fill:var(--accent2);font:700 12px sans-serif;letter-spacing:.05em">CSI NODE PLUGIN (DaemonSet, every node) — does the mounting</text>
+        <rect x="34" y="336" width="300" height="100" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="184" y="364" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">NodeStageVolume</text>
+        <text x="184" y="384" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">format if needed, mount to</text>
+        <text x="184" y="400" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">a global per-node staging dir</text>
+        <text x="184" y="420" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">(once per node)</text>
+        <rect x="352" y="336" width="338" height="100" rx="8" style="fill:var(--chip);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="521" y="364" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">NodePublishVolume</text>
+        <text x="521" y="384" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">bind-mount staging dir into the</text>
+        <text x="521" y="400" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">pod's volume path → container sees it</text>
+        <text x="521" y="420" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">(once per pod)</text>
+        <line x1="334" y1="386" x2="350" y2="386" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#s2)"/>
+        <line x1="134" y1="268" x2="134" y2="334" style="stroke:var(--accent2);stroke-width:1.5" marker-end="url(#s2)"/>
+      </svg>
+      <figcaption>Top: the PVC binds to a PV, decoupled by the StorageClass. Middle: the CSI controller creates the cloud volume and attaches it to the node. Bottom: the node plugin stages it once per node, then publishes it into each pod. Attach ≠ mount.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>Storage is where "the pod won't start" stops being a compute problem. A pod stuck in <code>ContainerCreating</code> for minutes is, four times out of five, a volume problem: the PVC never bound, the volume won't attach to this node, or the mount is hanging on a dead NFS server. Each has a different signature and a different fix, and they all look identical from <code>kubectl get pods</code>. The attach-vs-mount split you'll learn here is the map that turns that opaque wait into a diagnosis.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>The CSI attach-then-mount flow, step by step</h2>
+    <p>This is the sequence that turns "I want 10Gi" into a filesystem the container can write to. Watch which component does each step — controller (cluster-wide) versus node (per-machine) — because that's how you'll know where a failure lives.</p>
+    <ol class="steps">
+      <li><b>PVC created.</b> A developer applies a PVC naming a StorageClass (or the cluster default). Its status is <code>Pending</code> — no PV yet.</li>
+      <li><b>Provision (controller).</b> The <b>external-provisioner</b> sidecar sees the unbound PVC and calls the driver's <code>CreateVolume</code>. For a cloud driver this makes a real disk (an EBS volume, a GCE PD). A PV object is created describing it, and the PVC and PV are <b>bound</b> — status flips to <code>Bound</code>.</li>
+      <li><b>Schedule.</b> The pod referencing the PVC is scheduled to a node. With <code>volumeBindingMode: WaitForFirstConsumer</code>, provisioning is deferred until <em>now</em> so the volume is created in the same zone as the node — otherwise you can create a disk in zone A and a pod in zone B that can never reach it.</li>
+      <li><b>Attach (controller).</b> The <b>external-attacher</b> creates a <code>VolumeAttachment</code> object; the driver's <code>ControllerPublishVolume</code> attaches the volume to the chosen node (the cloud "attach this EBS volume to this instance" call). Some drivers, like node-local ones, skip this — attachment isn't universal.</li>
+      <li><b>Stage (node).</b> On the node, the kubelet asks the CSI <b>node plugin</b> to <code>NodeStageVolume</code>: format the volume if it's blank, then mount it to a <em>global</em> staging directory on the host — once per node, shared if several pods use the same volume.</li>
+      <li><b>Publish (node).</b> The node plugin runs <code>NodePublishVolume</code>: a bind-mount from the staging dir into this specific pod's volume path under the kubelet directory. Now the container's mount namespace can see the filesystem, and the container starts.</li>
+      <li><b>Teardown, in reverse.</b> Pod dies → <code>NodeUnpublish</code> → <code>NodeUnstage</code> → <code>ControllerUnpublish</code> (detach). If the PVC is deleted and the reclaim policy is <code>Delete</code>, <code>DeleteVolume</code> destroys the cloud disk; <code>Retain</code> keeps it for manual recovery.</li>
+    </ol>
+    <p>The single most useful thing in that list: <b>attach is a controller/cloud operation; mount is a node operation.</b> A pod stuck because the <code>VolumeAttachment</code> never succeeded is a cloud-API or IAM problem you debug from the controller. A pod stuck because <code>NodePublishVolume</code> hangs is a node problem — a dead NFS server, a filesystem that won't mount — you debug on the machine. Same symptom, opposite ends of the cluster.</p>
+
+    <div class="box keypoint"><div class="h">Access modes are about nodes, not pods</div>
+      <p><b>ReadWriteOnce (RWO)</b> means the volume is mounted read-write by pods on <em>one node</em> at a time — several pods on the same node can share it, which surprises people. <b>ReadWriteMany (RWX)</b> allows read-write from many nodes (needs a networked filesystem like NFS/CephFS; block volumes like EBS can't do it). <b>ReadOnlyMany (ROX)</b> is read-only from many nodes. <b>ReadWriteOncePod (RWOP)</b> is the strict one — exactly one pod, cluster-wide. The classic bug: assuming RWO means "one pod" and being baffled when two pods on the same node happily share it, or when a Deployment with RWO storage can't roll to a new node.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: you deploy a 3-replica Deployment, each replica mounting the <em>same</em> RWO PVC. Two pods run; one is stuck. Why — and would a StatefulSet fix it?</summary>
+      <div class="body">
+        <p>An RWO volume attaches to one node. Two of the replicas landed on the same node, so they share the mount fine; the third landed on a different node and can't attach the already-attached volume — it hangs. Sharing one PVC across replicas is the mistake. A Deployment gives every replica the <em>same</em> pod template, including the same <code>claimName</code>, so they all fight over one volume. A <b>StatefulSet</b> fixes it precisely because of <code>volumeClaimTemplates</code>: it stamps out a <em>separate</em> PVC per replica (<code>data-web-0</code>, <code>data-web-1</code>, …), so each pod gets its own volume and there's no contention. That's why databases run as StatefulSets — not for the stable network name alone, but because per-replica storage is baked into the object.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, named</h2>
+    <ul>
+      <li><b>Volume.</b> The generic "something mounted into a pod." Ephemeral kinds (<code>emptyDir</code>, <code>configMap</code>, <code>secret</code>, <code>downwardAPI</code>) live and die with the pod. Persistent ones are backed by a PV. This chapter is about the persistent kind.</li>
+      <li><b>PersistentVolume (PV).</b> A cluster-scoped object representing a real piece of storage — capacity, access modes, the CSI driver and volume handle, reclaim policy. Either pre-created by an admin (static) or created by a provisioner (dynamic).</li>
+      <li><b>PersistentVolumeClaim (PVC).</b> A namespaced request for storage — size, access modes, StorageClass. Pods reference the PVC, never the PV. One PVC binds to exactly one PV.</li>
+      <li><b>StorageClass.</b> The recipe for dynamic provisioning: which <code>provisioner</code> (CSI driver), what <code>parameters</code> (disk type, IOPS, encryption), the <code>reclaimPolicy</code>, <code>volumeBindingMode</code> (Immediate vs WaitForFirstConsumer), and <code>allowVolumeExpansion</code>. A cluster has a default class marked with an annotation.</li>
+      <li><b>CSI driver.</b> The vendor's implementation of the Container Storage Interface. A <b>controller</b> Deployment (with the external-provisioner/attacher/resizer/snapshotter sidecars) plus a <b>node</b> DaemonSet. Out-of-tree by design — the in-tree cloud volume plugins are gone, replaced by CSI.</li>
+      <li><b>VolumeAttachment.</b> A cluster object tracking "is this volume attached to this node." Watch it to debug attach failures directly.</li>
+      <li><b><code>volumeClaimTemplates</code>.</b> A StatefulSet field that creates one PVC per replica, giving each pod its own durable, stably-named volume that follows it across reschedules.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one PVC from Pending to written</h2>
+    <p>A developer applies a PVC (<code>5Gi</code>, RWO, class <code>fast</code>) and a pod that mounts it. Here's the whole life:</p>
+    <ol class="steps">
+      <li>PVC lands, status <code>Pending</code>. Because <code>fast</code> uses <code>WaitForFirstConsumer</code>, nothing provisions yet — the system waits to see where the pod will run.</li>
+      <li>The scheduler picks a node for the pod, factoring in the volume's topology so it won't strand the disk in the wrong zone.</li>
+      <li>The external-provisioner calls <code>CreateVolume</code>; a 5Gi cloud disk appears in the node's zone; a PV is created and bound to the PVC. Status → <code>Bound</code>.</li>
+      <li>The external-attacher attaches the disk to the node via a <code>VolumeAttachment</code>.</li>
+      <li>The node plugin stages the volume (formats to ext4/xfs if new, mounts to the global dir) and publishes it into the pod's path.</li>
+      <li>The container starts with the filesystem present and writes data. Kill the pod and the data stays on the PV; a new pod bound to the same PVC picks it up.</li>
+      <li>Delete the PVC: with reclaim <code>Delete</code>, the disk is destroyed; with <code>Retain</code>, the PV goes to <code>Released</code> and the disk waits for manual recovery.</li>
+    </ol>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>All local on <code>kind</code>, which ships the <b>local-path</b> provisioner and a default StorageClass named <code>standard</code>. It's a node-local CSI-style provisioner — perfect for seeing binding, mounting, and the access-mode gotchas without a cloud account. Use a two-node cluster so the RWO lab is real:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>cat &gt; kind-store.yaml &lt;&lt;'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+- role: worker
+EOF
+kind create cluster --name store --config kind-store.yaml
+kubectl get storageclass</code></pre></div>
+    <div class="out"><span class="ol">Output</span>NAME                 PROVISIONER             RECLAIMPOLICY   VOLUMEBINDINGMODE      ALLOWVOLUMEEXPANSION
+standard (default)   rancher.io/local-path   Delete          WaitForFirstConsumer   false</code></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — a dynamic PVC</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Create a PVC against the default class and watch it stay <code>Pending</code> — on purpose.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: data }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 1Gi } }
+EOF
+kubectl get pvc data</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME   STATUS    VOLUME   CAPACITY   ACCESS MODES   STORAGECLASS
+data   Pending                                        standard</code></div>
+        <p>Pending isn't broken here. The <code>standard</code> class uses <code>WaitForFirstConsumer</code>, so it won't provision a PV until a pod actually needs the claim. Confirm with the events:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl describe pvc data | tail -3</code></pre></div>
+        <div class="out"><span class="ol">Output</span>Normal  WaitForFirstConsumer  ...  waiting for first consumer to be created before binding</code></div>
+        <p>That message is the tell: the PVC is fine and deliberately waiting. Compare it in Lab 3 with a PVC that's Pending for a bad reason.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — mount it, and prove persistence</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Attach the claim to a pod, write a file, then destroy and recreate the pod. If the file comes back, you've proven the volume outlives the container.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: Pod
+metadata: { name: writer }
+spec:
+  containers:
+  - name: c
+    image: busybox:1.36
+    command: ["sh","-c","echo persisted-$(date +%s) &gt; /data/marker; sleep 3600"]
+    volumeMounts: [{ name: v, mountPath: /data }]
+  volumes:
+  - name: v
+    persistentVolumeClaim: { claimName: data }
+EOF
+kubectl wait --for=condition=Ready pod/writer --timeout=60s
+kubectl get pvc data          <span class="c"># now Bound — a PV was provisioned on demand</span>
+kubectl exec writer -- cat /data/marker</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME   STATUS   VOLUME                                     CAPACITY   ACCESS MODES
+data   Bound    pvc-6f2c...                                1Gi        RWO
+persisted-1727... </code></div>
+        <p>The PVC bound the moment the pod needed it — that's WaitForFirstConsumer doing its job. Now delete the pod and bring it back with a command that <em>reads</em> instead of writes:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl delete pod writer
+kubectl run reader --image=busybox:1.36 --overrides='{"spec":{"containers":[{"name":"c","image":"busybox:1.36","command":["cat","/data/marker"],"volumeMounts":[{"name":"v","mountPath":"/data"}]}],"volumes":[{"name":"v","persistentVolumeClaim":{"claimName":"data"}}]}}' --restart=Never -it</code></pre></div>
+        <div class="out"><span class="ol">Output</span>persisted-1727... </code></div>
+        <p>Same marker, different pod. The container's filesystem died twice; the PV didn't. You can even see where the bytes live — <code>docker exec store-worker ls /var/local-path-provisioner</code> shows the host directory backing the PV.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — a PVC that's Pending for a bad reason</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Lab 1's Pending was benign. This one isn't. Ask for a StorageClass that doesn't exist:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: broken }
+spec:
+  storageClassName: fast-ssd            <span class="c"># no such class in this cluster</span>
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 1Gi } }
+EOF
+kubectl get pvc broken</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME     STATUS    VOLUME   CAPACITY   ACCESS MODES   STORAGECLASS
+broken   Pending                                        fast-ssd</code></div>
+        <p>Same <code>Pending</code> as Lab 1 at a glance — but this one will wait forever, and no pod will fix it. Don't guess; read the events and figure out why before revealing.</p>
+        <details class="recall"><summary>Reveal the cause</summary>
+          <div class="body">
+            <p>There is no <code>fast-ssd</code> StorageClass, so no provisioner ever claims this PVC. The events say so directly:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl describe pvc broken | grep -A2 Events</code></pre></div>
+            <div class="out"><span class="ol">Output</span>Warning  ProvisioningFailed  ...  storageclass.storage.k8s.io "fast-ssd" not found</code></div>
+            <p>This is the number-one PVC failure in the wild, and it comes in three flavours: (1) the named StorageClass doesn't exist (typo, or a class that lives only in prod); (2) the class exists but its CSI driver isn't installed or its controller pod is crash-looping, so nobody answers <code>CreateVolume</code>; (3) no default class is set and the PVC named none, so nothing volunteers. The fix depends on which: create/rename the class, get the driver healthy, or set a default. The diagnostic reflex is always the same — <code>describe pvc</code> and read the event, because a Pending PVC never explains itself in <code>get</code>. Clean up: <code>kubectl delete pvc broken</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — expand a volume</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>The <code>data</code> PVC is 1Gi and filling up. Growing it should be a one-line edit. Try it:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl patch pvc data -p '{"spec":{"resources":{"requests":{"storage":"2Gi"}}}}'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>Error from server: persistentvolumeclaims "data" is forbidden: only dynamically
+provisioned pvc with allowVolumeExpansion=true can be resized</code></div>
+        <p>Rejected. The edit is legal syntax but forbidden. What property decides whether a volume may grow — and is it on the PVC or somewhere else? Work it out before revealing.</p>
+        <details class="recall"><summary>Reveal the cause and the mechanism</summary>
+          <div class="body">
+            <p>Expansion is gated by <code>allowVolumeExpansion: true</code> on the <b>StorageClass</b>, not the PVC — and kind's <code>standard</code> class ships with it <code>false</code> (you saw that in the setup output). The driver must also implement expansion (the external-resizer sidecar plus <code>NodeExpandVolume</code>). With a class that allows it, the flow is: edit the PVC's requested size upward, the resizer calls <code>ControllerExpandVolume</code> to grow the backing disk, and on next mount <code>NodeExpandVolume</code> grows the filesystem to fill it. Two hard rules: you can only grow, never shrink; and the class must have opted in <em>before</em> you need it. Prove the gate by making a class that allows expansion:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata: { name: expandable }
+provisioner: rancher.io/local-path
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+EOF
+<span class="c"># A PVC on 'expandable' will accept the same patch that 'data' rejected.</span></code></pre></div>
+            <p>(local-path itself doesn't implement resize, so the patch is <em>accepted</em> but the disk won't actually grow — which is its own lesson: the class opting in isn't enough, the driver has to do the work. On a real CSI driver like EBS, both are true and the volume grows online.)</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — RWO across two nodes</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>A team reports: "We scaled our app and the new pod is stuck in ContainerCreating, but the old one is fine." Reproduce it. The <code>data</code> PVC's PV is pinned to whichever node ran the writer pod. Force a second pod onto the <em>other</em> node and have it mount the same claim:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl get pv -o custom-columns=NAME:.metadata.name,NODE:'.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values[0]'
+<span class="c"># say the PV is pinned to 'store-worker'; pin a new pod to the control-plane node</span>
+OTHER=$(kubectl get nodes -o name | grep control-plane | cut -d/ -f2)
+kubectl apply -f - &lt;&lt;EOF
+apiVersion: v1
+kind: Pod
+metadata: { name: second }
+spec:
+  nodeName: ${OTHER}
+  containers:
+  - name: c
+    image: busybox:1.36
+    command: ["sh","-c","sleep 3600"]
+    volumeMounts: [{ name: v, mountPath: /data }]
+  volumes:
+  - name: v
+    persistentVolumeClaim: { claimName: data }
+EOF
+kubectl get pod second</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME     READY   STATUS              RESTARTS   AGE
+second   0/1     ContainerCreating   0          40s</code></div>
+        <p>It never goes Ready. From <code>get pods</code> this is indistinguishable from a slow image pull or a crashing app. The senior move: find out what the pod is actually waiting on, then explain to the team why "just add a replica" broke — and what they should have built instead.</p>
+        <details class="recall"><summary>Reveal the cause and the fix</summary>
+          <div class="body">
+            <p>The pod's events name it exactly:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl describe pod second | grep -A2 Events</code></pre></div>
+            <div class="out"><span class="ol">Output</span>Warning  FailedScheduling / FailedMount  ...  node(s) had volume node affinity conflict
+  <span class="c"># on a cloud block driver the equivalent is:</span>
+  <span class="c"># Multi-Attach error for volume "pvc-..." Volume is already exclusively attached to one node</span></code></div>
+            <p>An RWO volume lives on one node. local-path's PV carries a node-affinity to the node that provisioned it, so a pod pinned elsewhere can't use it — "volume node affinity conflict." On a cloud block store (EBS) the same single-node truth shows up as a <b>Multi-Attach error</b>: the volume is already attached to node A and can't attach to node B while node A holds it. Different words, identical cause: <b>RWO is one node at a time.</b></p>
+            <p>The fix depends on intent. If the pods genuinely need to <em>share</em> one filesystem, that's <b>ReadWriteMany</b>, which requires a networked filesystem (NFS, CephFS, EFS) — a block volume physically cannot do RWX. If instead each pod needs its <em>own</em> durable disk (the usual case for a scaled stateful app), you don't share a PVC at all — you run a <b>StatefulSet with <code>volumeClaimTemplates</code></b>, which gives every replica its own PVC. Sharing one RWO PVC across replicas of a Deployment is the actual bug. Clean up with <code>kind delete cluster --name store</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · the Pending PVC</div>
+      <p><b>Symptom:</b> a pod is stuck Pending/ContainerCreating; its PVC is <code>Pending</code>. <b>First cut:</b> <code>kubectl describe pvc &lt;name&gt;</code> and read the events. <b>Cause is usually:</b> the StorageClass doesn't exist or was mistyped; the CSI driver isn't installed or its controller is crash-looping so nobody answers <code>CreateVolume</code>; or no default class is set and the PVC named none. A benign look-alike is <code>WaitForFirstConsumer</code> — that Pending is correct and clears when a pod is scheduled, so read the event before you panic.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · RWO won't move nodes</div>
+      <p><b>Symptom:</b> a rolling update or a rescheduled pod hangs in ContainerCreating on a new node while the old pod's node still holds the volume. <b>First cut:</b> <code>kubectl describe pod</code> — look for "Multi-Attach error" or "volume node affinity conflict." <b>Confirm:</b> <code>kubectl get volumeattachment</code> to see the stale attachment. <b>Cause is usually:</b> RWO storage plus a workload that assumes multi-node access, or a slow detach because the old pod won't terminate. Fix by using RWX for genuine sharing, per-replica PVCs (StatefulSet) for per-pod state, or a <code>Recreate</code> rollout so the old pod releases before the new one attaches.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · stuck attach or hung mount</div>
+      <p><b>Symptom:</b> ContainerCreating for many minutes with no obvious rejection. <b>First cut:</b> is it stuck at <em>attach</em> or <em>mount</em>? Check <code>kubectl get volumeattachment</code> (attach) and the CSI node plugin logs on that node (mount). <b>Cause is usually:</b> an attach that never completes because of a cloud-API throttle, an IAM permission the driver lacks, or hitting the per-node attached-volume limit — versus a mount that hangs because a networked filesystem (NFS) is unreachable, which will freeze <code>NodePublishVolume</code> indefinitely. Attach is a cloud/controller problem; mount is a node problem. Knowing which end to open the laptop on is the whole game.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Reclaim policy is a data-loss lever, so treat it like one.</b> Dynamic PVs default to <code>Delete</code>: delete the PVC and the cloud disk — and everything on it — is destroyed. For anything you'd cry over, use <code>Retain</code> so a deleted PVC leaves the PV <code>Released</code> and the disk intact for recovery. The worst storage incidents aren't corruption; they're a <code>kubectl delete</code> on the wrong namespace wiping PVCs whose class was <code>Delete</code>. Back that up with real backups (volume snapshots via the CSI snapshotter), because reclaim policy is not a backup.</p>
+    <p><b>WaitForFirstConsumer is almost always what you want.</b> With <code>Immediate</code> binding, the volume is provisioned the instant the PVC is created — before anything knows which node the pod will run on — so in a multi-zone cluster you can strand a disk in zone A and a pod that can only run in zone B, and the pod never schedules. Delayed binding provisions after the scheduler has chosen a node, so topology lines up. If you see zonal scheduling failures with healthy storage, check the binding mode first.</p>
+    <p><b>Security lives in three places.</b> Filesystem ownership: a container running as non-root can't write a volume owned by root, so set <code>fsGroup</code> in the pod's securityContext to have the volume group-owned correctly. Encryption: enable it in the StorageClass <code>parameters</code> (most cloud drivers support encrypted-at-rest), because a detached, unencrypted volume is a data-exfil path. And access: a hostPath volume or an over-broad CSI mount can expose the node's filesystem to a pod — Pod Security Admission's restricted profile blocks hostPath for exactly this reason (<a href="ch39-security-rbac-admission-policy-securitycontext.html">Chapter 39</a>).</p>
+    <p><b>Performance is set by the class, not the pod.</b> IOPS and throughput are properties of the underlying disk type chosen in the StorageClass parameters — a pod can't ask for faster I/O than its volume's class provides. Under-provision the disk type and you get a database that's mysteriously slow under load with the CPU idle, because it's blocked on I/O the whole time. Match the class to the workload: gp3/io2 tiers for databases, cheaper tiers for logs and scratch. And remember node limits — each node can only attach so many volumes, which caps how many stateful pods land there.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>The request/supply split you see in PVC-and-PV is the same decoupling pattern that runs through the whole book: the consumer declares intent, a controller reconciles supply, and neither is coupled to the other's implementation. It's why a developer can write one pod spec that runs unchanged on kind (local-path), on EKS (EBS), and on-prem (Ceph) — the StorageClass is swapped, the pod isn't. That portability is a design goal you'll defend in interviews.</p>
+    <p>Storage is also where the stateless/stateful boundary gets real. Everything you learned about scaling freely in <a href="ch37-autoscaling-and-governance-hpa-vpa-cluster-autoscaler.html">Chapter 37</a> assumed disposable pods; the moment a pod owns a PV, it can't be freely multiplied or moved, and RWO turns "just add a replica" into a design decision. That pushes the industry pattern of keeping the compute tier stateless and concentrating durable state in a small number of carefully-run StatefulSets or, more often, in managed data services outside the cluster (<a href="ch86-the-data-layer-mysql-and-postgresql.html">Chapter 86</a>). When you reach EKS you'll see this collide with the CSI driver, IAM, and multi-AZ topology (<a href="ch57-eks-architecture.html">Chapter 57</a>) — where a volume's zone dictates a pod's zone, and DR planning (<a href="ch90-disaster-recovery.html">Chapter 90</a>) becomes a snapshot-and-restore story.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Open each one only after you've answered it in your head.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's the difference between a PV, a PVC, and a StorageClass?</summary>
+        <div class="a"><p>A PersistentVolume is the actual storage — a real disk, cluster-scoped. A PersistentVolumeClaim is a namespaced request for storage that a pod references by name. Binding marries one PVC to one PV. A StorageClass is the recipe for creating PVs on demand: it names the CSI provisioner and its parameters, so when a PVC asks for that class and no matching PV exists, one gets dynamically provisioned. The point of the split is decoupling — the developer writes a claim without knowing the disk's cloud ID or the driver, and the same pod spec is portable across clusters by swapping only the class.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through what happens from applying a PVC to a container writing to the volume.</summary>
+        <div class="a"><p>The PVC lands as Pending. With WaitForFirstConsumer nothing provisions until a pod that uses it is scheduled, so the volume ends up in the pod's zone. Once the pod is scheduled, the external-provisioner sidecar calls the CSI driver's <code>CreateVolume</code>, which makes the real disk; a PV object is created and bound to the PVC, so status flips to Bound. Then the external-attacher creates a VolumeAttachment and the driver's <code>ControllerPublishVolume</code> attaches the disk to the node — a cloud "attach volume to instance" call. On the node, the kubelet drives the node plugin: <code>NodeStageVolume</code> formats if needed and mounts the disk to a global staging directory once per node, and <code>NodePublishVolume</code> bind-mounts that into the specific pod's path. The container starts and writes. The key mental model I'd stress is that provision and attach are controller/cloud operations while stage and mount are node operations — so a stuck volume is diagnosed at opposite ends depending on which step failed.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>What exactly does ReadWriteOnce mean, and why does it trip people up?</summary>
+        <div class="a"><p>RWO means the volume can be mounted read-write by pods on <em>one node</em> at a time — not one pod. Several pods co-located on the same node can share an RWO volume perfectly well, which surprises people who read "Once" as "one pod." The flip side bites harder: a Deployment with RWO storage can't do a normal rolling update onto a new node, because the new pod tries to attach a volume still held by the old pod's node, and you get a Multi-Attach error or a node-affinity conflict. The strict single-pod mode is a separate access mode, ReadWriteOncePod. RWO is also physically tied to block storage — an EBS volume attaches to one instance — so you cannot get RWX from it no matter what you write in the manifest; RWX needs a networked filesystem like NFS or CephFS. When someone wants "shared storage for all my replicas," the right questions are: do they need one shared filesystem (RWX) or one disk per replica (StatefulSet volumeClaimTemplates)? Those are different answers and confusing them is the classic mistake.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A pod has been in ContainerCreating for eight minutes. How do you find out why?</summary>
+        <div class="a"><p>ContainerCreating is a catch-all, so I isolate the layer. First <code>kubectl describe pod</code> and read the events — that usually names it: "FailedMount," "Multi-Attach," "volume node affinity conflict," or an image-pull error, which immediately tells me storage versus image. If it's storage, I check the chain in order. Is the PVC Bound? If it's Pending, the problem is provisioning — <code>describe pvc</code> for a missing StorageClass or a dead CSI controller. If the PVC is Bound, the volume exists but isn't reaching the pod, so I check <code>kubectl get volumeattachment</code>: a missing or stuck attachment points at the controller and the cloud API (throttling, IAM, per-node attach limits). If it's attached but not mounted, I go to the node and read the CSI node-plugin logs, because a hung <code>NodePublishVolume</code> is usually a networked filesystem that's unreachable. The framework is: bound → attached → mounted, and I find the first arrow that didn't complete. That turns an opaque eight-minute wait into a specific fix.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>Why do databases run as StatefulSets instead of Deployments, from a storage angle?</summary>
+        <div class="a"><p>Because a Deployment gives every replica the same pod template, including the same volume claim, so all replicas would fight over one PVC — and with RWO that means all but the co-located ones can't even mount it. A StatefulSet has <code>volumeClaimTemplates</code>, which stamps out a distinct PVC per replica: <code>data-db-0</code>, <code>data-db-1</code>, and so on. Each pod gets its own durable disk that stays bound to that ordinal and follows the pod across reschedules, which is exactly what a database replica needs — its own data directory, stable across restarts. That per-replica storage, together with stable network identity and ordered rollout, is why stateful systems use StatefulSets. If I only remembered one storage reason, it's that volumeClaimTemplates give per-pod persistent volumes automatically, and a Deployment cannot.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>A container's filesystem is scratch; durable data needs a PersistentVolume. Kubernetes splits storage into a request (PVC) and a supply (PV), decoupled by a StorageClass that provisions PVs on demand via a CSI driver — so the pod only names the claim and the same spec is portable across clusters. The CSI flow is provision (CreateVolume → PV, bound), then attach (ControllerPublishVolume → VolumeAttachment, a controller/cloud step), then stage and publish (NodeStage + NodePublish, node steps that format and mount) — attach and mount are different operations at opposite ends of the cluster, which is how you localize a stuck volume. Access modes are about nodes: RWO is one node at a time (not one pod), RWX needs a networked filesystem, RWOP is the strict single-pod mode. WaitForFirstConsumer avoids stranding a disk in the wrong zone; reclaim <code>Delete</code> destroys data while <code>Retain</code> keeps it; expansion needs <code>allowVolumeExpansion</code> on the class and a driver that implements it, and only grows. StatefulSet <code>volumeClaimTemplates</code> give each replica its own PVC — the reason databases aren't Deployments.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>Container filesystems are ephemeral; a PV is a disk that outlives the pod.</li>
+      <li>PVC = request (namespaced), PV = supply (cluster-scoped); binding is one-to-one and the pod names only the PVC.</li>
+      <li>A StorageClass is the recipe for dynamic provisioning: provisioner, parameters, reclaim policy, binding mode, expansion.</li>
+      <li>CSI has two halves: a controller (provision, attach — talks to the cloud) and a node DaemonSet (stage, mount).</li>
+      <li>Attach ≠ mount: attach is a controller/cloud step, mount is a node step — debug them at opposite ends.</li>
+      <li>RWO is one <em>node</em> at a time, not one pod; RWX needs a networked filesystem; RWOP is strict single-pod.</li>
+      <li>WaitForFirstConsumer provisions after scheduling so the volume lands in the pod's zone.</li>
+      <li>Reclaim <code>Delete</code> destroys the disk with the PVC; use <code>Retain</code> for anything precious, plus real snapshots.</li>
+      <li>Volume expansion needs <code>allowVolumeExpansion</code> on the class and driver support, and can only grow.</li>
+      <li>StatefulSet <code>volumeClaimTemplates</code> give each replica its own PVC — why databases aren't Deployments.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch34-workloads-ii-statefulset-daemonset-job-cronjob.html"><b>Ch 34</b> StatefulSets &amp; volumeClaimTemplates</a>
+      <a href="ch24-container-filesystems-overlayfs-and-image-layers.html"><b>Ch 24</b> Container filesystems</a>
+      <a href="ch39-security-rbac-admission-policy-securitycontext.html"><b>Ch 39</b> fsGroup &amp; hostPath policy</a>
+      <a href="ch57-eks-architecture.html"><b>Ch 57</b> EBS CSI on EKS</a>
+      <a href="ch86-the-data-layer-mysql-and-postgresql.html"><b>Ch 86</b> Running databases</a>
+      <a href="ch90-disaster-recovery.html"><b>Ch 90</b> Snapshots &amp; DR</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/storage/persistent-volumes/">Persistent Volumes</a>: PV/PVC lifecycle, binding, access modes, reclaim policy, and expansion, from the source.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/storage/volumes/">Volumes</a>: the full volume taxonomy, ephemeral vs persistent, and CSI volume references.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/storage/storage-classes/">Storage Classes</a> and <a href="https://kubernetes.io/docs/concepts/storage/dynamic-provisioning/">Dynamic Provisioning</a>: provisioners, parameters, binding modes, and the default class.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/">StatefulSets</a>: <code>volumeClaimTemplates</code> and per-replica persistent storage.</li>
+      <li>Kubernetes CSI developer docs — <a href="https://kubernetes-csi.github.io/docs/">kubernetes-csi.github.io</a>: the CSI architecture and the external-provisioner/attacher/resizer/snapshotter sidecars.</li>
+      <li>Kubernetes CSI — <a href="https://kubernetes-csi.github.io/docs/sidecar-containers.html">Sidecar containers</a>: exactly which sidecar owns provision, attach, resize, and snapshot.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch37-autoscaling-and-governance-hpa-vpa-cluster-autoscaler.html"><span class="dir">← Prev</span><div class="ti">Ch 37 — Autoscaling and governance</div></a>
+      <a class="nx" href="ch39-security-rbac-admission-policy-securitycontext.html"><span class="dir">Next →</span><div class="ti">Ch 39 — Security: RBAC, admission policy, securityContext</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 38 of 121 · Part IV · Kubernetes — Architecture &amp; Internals. When a pod won't start, ask whether the volume is bound, attached, and mounted — in that order. The first arrow that didn't complete is your incident.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Claim, volume, CSI</a>
+    <a href="#internals">CSI attach &amp; mount</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">Following a PVC</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

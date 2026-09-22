@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 12 — L3: IP, CIDR, Subnetting, Routing &amp; NAT</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part II · Networking &nbsp;·&nbsp; Chapter 12</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part II · Networking from First Principles · Chapter 12</div>
+      <h1>L3 — IP, CIDR, subnetting, routing &amp; NAT</h1>
+      <p class="tagline">Layer 2 gets a frame across one wire. Layer 3 gets a packet across the planet, through networks that have never heard of each other. Every routing decision your host makes is one table lookup — and once you can read that table, "why can't this pod reach that database" stops being a mystery.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~42 min read · Linux lab (Docker + netns)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Read an IPv4 or IPv6 address and its CIDR prefix, and do subnet math in your head.</li>
+          <li>Explain longest-prefix match and predict which route a packet takes — then prove it with <code>ip route get</code>.</li>
+          <li>Tell the difference between SNAT, DNAT, and MASQUERADE, and say which one a container host is doing.</li>
+          <li>Build a network namespace that reaches the internet through NAT, and break it on purpose.</li>
+          <li>Diagnose a wrong route and spot overlapping CIDRs before they become a VPC-peering outage.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem L3 solves</h2>
+    <p>Layer 2 — Ethernet, MAC addresses, ARP, switches — is brilliant at one thing and useless at everything else. It gets a frame from one card to another <em>on the same physical segment</em>. A switch floods, learns MACs, and forwards. That works right up until the two machines aren't on the same segment, and then it collapses: MAC addresses are flat, there are trillions of them, and no switch on Earth can hold a table mapping every MAC to a port. You cannot build the internet out of switches.</p>
+    <p>So you need a second kind of address — one that carries <b>location</b>, not just identity. That's the IP address. A phone number tells you the country and the area before it tells you the subscriber; an IP address tells you the network before it tells you the host. Because addresses are structured that way, a router doesn't need to know where every machine is. It only needs to know which <em>direction</em> each block of addresses lies in. That single idea — hierarchical addressing plus direction-only forwarding — is what lets a packet cross a dozen networks that share nothing but a common protocol.</p>
+    <p>Layer 3 is the internet's contract: give me a 32-bit (IPv4) or 128-bit (IPv6) destination, and I'll make a best effort to move your packet one hop closer, over and over, until it arrives — or until its time runs out. No promises about order, delivery, or duplication. Those are someone else's job (that someone is TCP, in <a href="ch13-l4-tcp-deep-and-udp.html">Chapter 13</a>).</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>An IP packet is forwarded <b>hop by hop</b>, and every hop makes the same tiny decision independently: "given this destination, which of my routes matches, and where do I send it next?" No router holds the whole path. The path <em>emerges</em> from each router answering that one question. Get comfortable with that question and routing stops being magic.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a postal sorting network</h2>
+    <p>Here's the picture to carry through the chapter.</p>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Think of the global postal system. You drop a letter in a box addressed to <b>90210, Beverly Hills</b>. Your local post office does not know the street. It reads the postcode, decides "that's California, west coast — put it on the truck heading that way," and forwards it. The next sorting centre reads a longer chunk of the postcode and narrows it further. Only the <em>final</em> office, the one that actually owns 90210, knows the specific street and house.</p>
+      <p>Each office keeps a chart: "postcodes starting 9xxxx → west truck; 902xx → this regional hub; 90210 → our own delivery vans." When two entries could match, the office uses the <b>most specific</b> one. That chart is the <b>routing table</b>. The "most specific wins" rule is <b>longest-prefix match</b>. And the catch-all "anything I don't recognise → send to the big central hub" is your <b>default gateway</b>.</p>
+      <p>NAT is the mail room of an office building. Inside, everyone has a desk number (a private address) that means nothing to the outside world. Outgoing mail gets the building's single street address stamped on it, and the mail room keeps a ledger so replies land back on the right desk. That's exactly what your home router — and every container host — does.</p>
+    </div>
+    <p>Every term maps onto something concrete you'll type commands against:</p>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In Linux / L3</th></tr>
+      <tr><td>The postcode</td><td>The IP address (32-bit IPv4, 128-bit IPv6)</td></tr>
+      <tr><td>"Postcodes starting 902xx"</td><td>A CIDR prefix / subnet, e.g. <code>10.0.2.0/24</code></td></tr>
+      <tr><td>The sorting chart</td><td>The routing table (<code>ip route</code>)</td></tr>
+      <tr><td>"Most specific entry wins"</td><td>Longest-prefix match</td></tr>
+      <tr><td>"Anything I don't recognise → central hub"</td><td>The default route <code>0.0.0.0/0</code> via the gateway</td></tr>
+      <tr><td>The building mail room + its ledger</td><td>NAT + the connection-tracking table (<code>conntrack</code>)</td></tr>
+      <tr><td>The building's one street address</td><td>The public IP that MASQUERADE stamps on outgoing packets</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>How a host decides where a packet goes</h2>
+    <p>Before a single byte leaves your machine, the kernel answers two questions in order. First: <b>which route matches this destination?</b> That picks the outgoing interface and the next-hop gateway. Second (if the packet is being forwarded or NAT'd): <b>does any address need rewriting?</b> The figure traces one <code>curl</code> to <code>8.8.8.8</code> from a private host, through the routing decision, through a MASQUERADE rewrite, and out.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 486" role="img" aria-label="A packet from a private host: routing table longest-prefix match, then NAT source rewrite, out to the internet, and the reverse translation on the way back">
+        <defs>
+          <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="ag" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+          <marker id="ad" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--deep)"/></marker>
+        </defs>
+
+        <!-- host band -->
+        <rect x="18" y="16" width="684" height="86" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="34" y="37" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">PRIVATE HOST — 10.0.2.5/24</text>
+        <rect x="40" y="48" width="196" height="42" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="138" y="66" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">curl https://8.8.8.8</text>
+        <text x="138" y="82" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">app opens a socket</text>
+        <rect x="270" y="48" width="410" height="42" rx="6" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="285" y="65" style="fill:var(--muted);font:11px sans-serif">packet header</text>
+        <text x="285" y="82" style="fill:var(--ink);font:600 12.5px ui-monospace,monospace">src 10.0.2.5:44321   dst 8.8.8.8:443</text>
+
+        <!-- routing table -->
+        <rect x="18" y="122" width="684" height="132" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="34" y="143" style="fill:var(--accent);font:700 12px sans-serif;letter-spacing:.05em">1 · ROUTING TABLE — longest-prefix match</text>
+        <rect x="40" y="152" width="640" height="26" rx="5" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="52" y="169" style="fill:var(--ink);font:12px ui-monospace,monospace">10.0.2.0/24   dev eth0            (directly connected — no gateway)</text>
+        <rect x="40" y="182" width="640" height="26" rx="5" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="52" y="199" style="fill:var(--ink);font:12px ui-monospace,monospace">172.16.0.0/12 via 10.0.2.1  dev eth0   (a peered network)</text>
+        <rect x="40" y="212" width="640" height="30" rx="5" style="fill:color-mix(in srgb,var(--accent2) 16%,var(--panel));stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="52" y="231" style="fill:var(--ink);font:700 12px ui-monospace,monospace">0.0.0.0/0     via 10.0.2.1  dev eth0   ← 8.8.8.8 matches ONLY this (the default)</text>
+
+        <!-- NAT -->
+        <rect x="18" y="274" width="684" height="98" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="34" y="295" style="fill:var(--applied);font:700 12px sans-serif;letter-spacing:.05em">2 · POSTROUTING · MASQUERADE (source NAT)</text>
+        <rect x="40" y="306" width="300" height="52" rx="7" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="54" y="326" style="fill:var(--muted);font:11px sans-serif">before</text>
+        <text x="54" y="345" style="fill:var(--ink);font:600 12px ui-monospace,monospace">src 10.0.2.5:44321</text>
+        <rect x="380" y="306" width="300" height="52" rx="7" style="fill:color-mix(in srgb,var(--applied) 14%,var(--panel));stroke:var(--applied);stroke-width:1.5"/>
+        <text x="394" y="326" style="fill:var(--muted);font:11px sans-serif">after — src rewritten to the host's public IP</text>
+        <text x="394" y="345" style="fill:var(--ink);font:700 12px ui-monospace,monospace">src 203.0.113.9:44321</text>
+        <line x1="340" y1="332" x2="378" y2="332" style="stroke:var(--applied);stroke-width:2" marker-end="url(#ar)"/>
+
+        <!-- internet -->
+        <rect x="18" y="392" width="684" height="76" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="34" y="413" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">INTERNET</text>
+        <text x="360" y="440" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">8.8.8.8 replies to 203.0.113.9 — conntrack reverses the rewrite back to 10.0.2.5</text>
+
+        <!-- flow arrows -->
+        <line x1="138" y1="90" x2="138" y2="120" style="stroke:var(--accent);stroke-width:2" marker-end="url(#ar)"/>
+        <line x1="360" y1="242" x2="360" y2="272" style="stroke:var(--accent);stroke-width:2" marker-end="url(#ar)"/>
+        <line x1="360" y1="358" x2="360" y2="390" style="stroke:var(--accent);stroke-width:2" marker-end="url(#ar)"/>
+        <line x1="690" y1="430" x2="708" y2="430" style="stroke:none"/>
+        <path d="M700,392 L700,60 L686,60" style="fill:none;stroke:var(--accent2);stroke-width:2;stroke-dasharray:5 4" marker-end="url(#ag)"/>
+        <text x="706" y="240" text-anchor="middle" transform="rotate(90 706 240)" style="fill:var(--accent2);font:600 10.5px sans-serif">reply path (conntrack reverse)</text>
+      </svg>
+      <figcaption>Two decisions per outbound packet: match a route (longest-prefix wins), then rewrite the source (MASQUERADE). The reply is un-rewritten automatically because conntrack remembers the mapping.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>Every Kubernetes node is doing exactly this diagram, thousands of times a second. A pod at <code>10.244.3.7</code> talks to an external API; the node MASQUERADEs it to the node's IP; conntrack tracks the return. When you see "SNAT port exhaustion" or "conntrack table full" in an EKS incident (<a href="ch48-pod-to-internet-and-the-full-synthesis.html">Chapter 48</a>), it's this machinery running out of room. The pod networking you'll meet later is this chapter with more interfaces.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: your host has routes for <code>10.0.0.0/8</code>, <code>10.0.2.0/24</code>, and <code>0.0.0.0/0</code>. A packet is bound for <code>10.0.2.99</code>. Which route wins?</summary>
+      <div class="body">
+        <p><code>10.0.2.0/24</code>. All three routes technically "contain" <code>10.0.2.99</code> — the <code>/8</code> matches the first octet, the default matches everything — but longest-prefix match takes the entry with the most network bits set. <code>/24</code> is more specific than <code>/8</code>, and both beat the <code>/0</code> default. The prefix length is the tiebreaker, always. This is why adding a broad route rarely "steals" traffic from a narrower one, and why a stray <code>/32</code> host route can quietly hijack a single destination.</p>
+      </div>
+    </details>
+
+    <h2 id="model2"><span class="beat">Addressing &amp; CIDR</span>CIDR and subnet math you can do in your head</h2>
+    <p>An IPv4 address is 32 bits, written as four decimal octets: <code>10.0.2.5</code> is <code>00001010.00000000.00000010.00000101</code>. A CIDR prefix like <code>/24</code> says "the first 24 bits are the <b>network</b>; the remaining 8 are the <b>host</b>." Everything about subnetting falls out of that one split.</p>
+    <p>You do not need binary conversion tricks for the common cases. Memorise the powers of two and one rule — <b>hosts in a block = 2<sup>(32 − prefix)</sup>, minus 2 for the network and broadcast addresses</b> — and you can size any subnet on a whiteboard:</p>
+    <table class="t">
+      <tr><th>Prefix</th><th>Netmask</th><th>Total addresses</th><th>Usable hosts</th><th>Typical use</th></tr>
+      <tr><td><code>/8</code></td><td>255.0.0.0</td><td>16,777,216</td><td>16,777,214</td><td>A whole RFC 1918 range (<code>10.0.0.0/8</code>)</td></tr>
+      <tr><td><code>/16</code></td><td>255.255.0.0</td><td>65,536</td><td>65,534</td><td>A VPC or a large cluster pod CIDR</td></tr>
+      <tr><td><code>/24</code></td><td>255.255.255.0</td><td>256</td><td>254</td><td>A classic subnet / one AZ</td></tr>
+      <tr><td><code>/26</code></td><td>255.255.255.192</td><td>64</td><td>62</td><td>A small subnet, 4 per <code>/24</code></td></tr>
+      <tr><td><code>/28</code></td><td>255.255.255.240</td><td>16</td><td>14</td><td>A tiny subnet, e.g. a NAT-gateway subnet</td></tr>
+      <tr><td><code>/30</code></td><td>255.255.255.252</td><td>4</td><td>2</td><td>A point-to-point link</td></tr>
+      <tr><td><code>/32</code></td><td>255.255.255.255</td><td>1</td><td>1</td><td>A single host route / a loopback address</td></tr>
+    </table>
+    <p>The one trick worth knowing is the <b>block-size (magic-number) method</b> for the octet the prefix lands in. For a <code>/26</code>, the mask octet is <code>192</code>, so the block size is <code>256 − 192 = 64</code>. That means the <code>/26</code> subnets of <code>192.168.1.0</code> start at <code>.0</code>, <code>.64</code>, <code>.128</code>, <code>.192</code>. Given an address like <code>192.168.1.100/26</code>, the block it falls in is the largest multiple of 64 at or below 100 — that's <code>64</code> — so its network is <code>192.168.1.64</code>, its broadcast is <code>192.168.1.127</code>, and its usable hosts run <code>.65</code>–<code>.126</code>. No binary required.</p>
+    <div class="box keypoint"><div class="h">The private ranges, burned into memory</div>
+      <p>RFC 1918 reserves three blocks that never appear on the public internet: <code>10.0.0.0/8</code>, <code>172.16.0.0/12</code>, and <code>192.168.0.0/16</code>. Two others you'll meet constantly: <code>127.0.0.0/8</code> is loopback (<code>127.0.0.1</code> is just one address in it), and <code>169.254.0.0/16</code> is link-local (RFC 3927) — if a host shows a <code>169.254.x.x</code> address it failed to get DHCP, and on AWS <code>169.254.169.254</code> is the instance metadata endpoint. One more: RFC 6598 carves out <code>100.64.0.0/10</code> as "shared address space" for carrier-grade NAT, and EKS uses it for pods when you're short on VPC addresses.</p>
+    </div>
+    <p>IPv6 changes the numbers but not the ideas. Addresses are 128 bits, written as eight groups of hex — <code>2001:db8::1</code>, where <code>::</code> collapses one run of zero groups. The prefix still splits network from host: a <code>/64</code> is the standard subnet size (that leaves 64 bits for hosts, which is why IPv6 subnets are gigantic and scanning them is pointless). <code>fe80::/10</code> is link-local, <code>fc00::/7</code> is the private-ish "unique local" range, and <code>2000::/3</code> is currently the global unicast space. The headline difference: with 128 bits there's no address scarcity, so classic NAT mostly disappears — every host can have a globally routable address.</p>
+
+    <h2 id="route"><span class="beat">Internal working</span>The routing decision, step by step</h2>
+    <p>When the kernel has a packet to send, here is the exact sequence. This is the machinery under <code>ip route get</code>:</p>
+    <ol class="steps">
+      <li><b>Take the destination address</b> from the packet (or from <code>connect()</code>, before the first byte is sent).</li>
+      <li><b>Scan the routing table for every prefix that contains it.</b> The kernel stores routes in a trie (a "LPC-trie" / LPM structure) so this is fast even with hundreds of thousands of routes, but conceptually it's "which of my prefixes match?"</li>
+      <li><b>Pick the longest matching prefix.</b> <code>/32</code> beats <code>/24</code> beats <code>/8</code> beats the <code>/0</code> default. Prefix length is the primary key; metric breaks ties between equal-length routes.</li>
+      <li><b>Read the next hop from the winning route.</b> If the route says <code>dev eth0</code> with no gateway, the destination is <b>directly connected</b> — it's on the same L2 segment, so the kernel will ARP for the destination's own MAC. If the route says <code>via 10.0.2.1</code>, the destination is remote, so the kernel ARPs for the <em>gateway's</em> MAC and hands the frame there.</li>
+      <li><b>Choose the source address.</b> Unless the socket already bound one, the kernel picks the primary address of the chosen interface. This is why a multi-homed host can surprise you: the source IP is a consequence of the route, not the other way round.</li>
+      <li><b>Hand the frame to L2</b> with the right destination MAC, and out it goes. Every downstream router repeats steps 1–5 with its own table. TTL drops by one at each hop; hit zero and the packet is dropped with an ICMP "time exceeded" — that's how <code>traceroute</code> works.</li>
+    </ol>
+    <p>The mental shift that matters most: <b>routing is per-hop and stateless</b>. Your host doesn't know or care about the full path to <code>8.8.8.8</code>. It knows one thing — "not local, so send it to my gateway" — and trusts the gateway to know the next step. Nobody holds the whole route. That's why the internet scales, and why a single wrong entry on one router (a "route leak") can black-hole traffic for the world without any single machine "knowing" it's broken.</p>
+
+    <div class="box gotcha"><div class="h">The reverse-path trap</div>
+      <p>Forwarding works in <em>both</em> directions or not at all. A reply has to find its way back. Linux enforces this with <b>reverse-path filtering</b> (<code>rp_filter</code>): if a packet arrives on an interface the kernel wouldn't have used to <em>reach</em> its source, it's dropped as spoofed. This silently kills asymmetric-routing setups and some multi-NIC pod configurations. When traffic goes out fine but replies vanish, <code>rp_filter</code> and a missing return route are the first two suspects.</p>
+    </div>
+
+    <h2 id="components"><span class="beat">Components</span>NAT: SNAT, DNAT, and MASQUERADE</h2>
+    <p>NAT rewrites addresses in flight and remembers what it changed so replies can be un-rewritten. On Linux this lives in netfilter's <code>nat</code> table, and there are three variants you must be able to name apart:</p>
+    <ul>
+      <li><b>SNAT — source NAT.</b> Rewrites the <em>source</em> address of outgoing packets to a fixed IP you specify. Used when the host has a known, stable public address. Applied in the <code>POSTROUTING</code> chain: <code>-j SNAT --to-source 203.0.113.9</code>.</li>
+      <li><b>MASQUERADE.</b> SNAT's dynamic cousin — it rewrites the source to <em>whatever address the outgoing interface currently has</em>, looked up per packet. Slightly more expensive than SNAT, but it survives the interface's IP changing (DHCP, failover). This is what home routers, <code>docker0</code>, and Kubernetes nodes use. Also <code>POSTROUTING</code>.</li>
+      <li><b>DNAT — destination NAT.</b> Rewrites the <em>destination</em> of incoming packets, redirecting them to an internal host. This is port-forwarding and load-balancing: "traffic to my public IP:443 → actually send it to <code>10.0.2.20:8443</code>." Applied in <code>PREROUTING</code>. Kubernetes <code>NodePort</code> and <code>ClusterIP</code> services are DNAT under the hood.</li>
+    </ul>
+    <p>All three depend on one shared piece: <b>conntrack</b>, the connection-tracking table. When the first packet of a flow is rewritten, netfilter records the tuple mapping. Every later packet in that flow — and every reply — is matched against the table and translated the same way, without re-running the rules. That's why NAT can be stateful and fast, and it's also the resource that runs out: <code>nf_conntrack_max</code> caps how many flows a host can track. Blow past it and new connections are dropped with <code>nf_conntrack: table full</code> in <code>dmesg</code> while existing ones keep working — a maddening, partial outage.</p>
+
+    <details class="recall"><summary>Think first: why can't ten thousand private hosts behind one MASQUERADE address all open a connection to <code>8.8.8.8:443</code> at the same instant?</summary>
+      <div class="body">
+        <p>Because the reply has to be demultiplexed, and after rewriting, every one of those flows shares the same source IP (<code>203.0.113.9</code>) and same destination (<code>8.8.8.8:443</code>). The only thing left to tell them apart is the <b>source port</b>, and there are only ~28,000 usable ephemeral ports per source IP. NAT can hand out at most that many simultaneous flows to a single destination endpoint before it runs out of ports — this is <b>SNAT port exhaustion</b>. The fixes are more source IPs (a NAT-gateway pool), or not funnelling everything to one destination. You'll see this bite hard in busy EKS clusters talking to a single external API.</p>
+      </div>
+    </details>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one packet out and back</h2>
+    <p>Trace <code>curl https://8.8.8.8</code> from the private host in the figure. <b>Out:</b> the app opens a socket; the kernel routes <code>8.8.8.8</code>, finds only the default route matches, so it sends the frame to the gateway's MAC out <code>eth0</code> with source <code>10.0.2.5:44321</code>. On the NAT box, <code>POSTROUTING</code> MASQUERADE rewrites the source to <code>203.0.113.9:44321</code> and conntrack records <code>10.0.2.5:44321 ↔ 203.0.113.9:44321 ↔ 8.8.8.8:443</code>. The packet crosses the internet hop by hop, TTL ticking down. <b>Back:</b> <code>8.8.8.8</code> replies to <code>203.0.113.9:44321</code> — it never knew the private address existed. The NAT box matches the reply against conntrack, reverses the rewrite to <code>10.0.2.5:44321</code>, and delivers it. The app sees a clean conversation with <code>8.8.8.8</code> and has no idea NAT happened. That invisibility is the whole point — and also why NAT breaks protocols that embed their own address inside the payload (classic FTP, SIP), which need a helper to rewrite the payload too.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>These labs need a Linux box with <code>NET_ADMIN</code> so you can edit routes and NAT rules. On a Mac, use a privileged throwaway container — everything below runs inside it, and the network-namespace lab mirrors exactly what a container runtime does for you.</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># --privileged gives us iptables, ip netns, and route editing.</span>
+docker run --rm -it --privileged ubuntu:24.04 bash
+
+<span class="c"># Inside the container:</span>
+apt-get update &amp;&amp; apt-get install -y iproute2 iptables iputils-ping conntrack ipcalc</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — read your addresses and your routing table</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Two commands show almost everything about a host's L3 state. Learn to read them fluently.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>ip -brief addr        <span class="c"># addresses per interface, one line each</span>
+ip route              <span class="c"># the main routing table</span></code></pre></div>
+        <div class="out"><span class="ol">Output (example)</span>lo    UNKNOWN   127.0.0.1/8 ::1/128
+eth0  UP        172.17.0.2/16
+
+default via 172.17.0.1 dev eth0
+172.17.0.0/16 dev eth0 proto kernel scope link src 172.17.0.2</code></div>
+        <p>Read the routes bottom-up. The second line — <code>172.17.0.0/16 dev eth0 scope link</code> — is the directly-connected network: anything in <code>172.17.0.0/16</code> is reachable by ARP, no gateway. The first line is the <b>default route</b>: everything else goes to <code>172.17.0.1</code>. Two entries, and between them they cover the entire address space. Now watch the kernel actually make a decision:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>ip route get 8.8.8.8
+ip route get 172.17.0.9</code></pre></div>
+        <div class="out"><span class="ol">Output</span>8.8.8.8 via 172.17.0.1 dev eth0 src 172.17.0.2 uid 0
+172.17.0.9 dev eth0 src 172.17.0.2 uid 0</code></div>
+        <p><code>ip route get</code> is the single most useful routing command you own. It tells you the winning route, the chosen source IP, and the next hop — for a specific destination, no guessing. When someone says "why is this traffic leaving the wrong interface," this answers it in one line.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — subnet math, then verify it</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Do the math by hand first, then let the machine check you. Take <code>192.168.10.100/26</code>. Block size is <code>256 − 192 = 64</code>, so it's in the <code>.64</code> block: network <code>192.168.10.64</code>, broadcast <code>192.168.10.127</code>, hosts <code>.65</code>–<code>.126</code>. Confirm:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>ipcalc 192.168.10.100/26</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>Address:   192.168.10.100
+Netmask:   255.255.255.192 = 26
+Network:   192.168.10.64/26
+HostMin:   192.168.10.65
+HostMax:   192.168.10.126
+Broadcast: 192.168.10.127
+Hosts/Net: 62</code></div>
+        <p>Now the split you'll do for real — carving a <code>/24</code> into four <code>/26</code>s for four availability zones:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Where do the four /26 subnets of 10.20.0.0/24 begin?</span>
+for i in 0 64 128 192; do echo "10.20.0.$i/26"; done</code></pre></div>
+        <div class="out"><span class="ol">Output</span>10.20.0.0/26
+10.20.0.64/26
+10.20.0.128/26
+10.20.0.192/26</code></div>
+        <p>Block size 64, four blocks, no overlap, no gaps. This is the exact calculation you do when planning a VPC — and getting it wrong (say, sizing subnets too small) is a mistake you can't fix without rebuilding, because you can't renumber a running network cheaply.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — plant a wrong route and black-hole traffic</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Add a more-specific route pointing somewhere useless, then watch it win by longest-prefix match. Don't peek at the explanation until you've predicted the result.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Send anything in 8.8.8.0/24 to a next hop that goes nowhere.</span>
+ip route add 8.8.8.0/24 via 172.17.0.99
+ip route get 8.8.8.8
+ping -c1 -W1 8.8.8.8</code></pre></div>
+        <div class="out"><span class="ol">Output</span>8.8.8.8 via 172.17.0.99 dev eth0 src 172.17.0.2 uid 0
+PING 8.8.8.8 ...
+--- 8.8.8.8 ping statistics ---
+1 packets transmitted, 0 received, 100% packet loss</code></div>
+        <p>The default route still exists and still points at the real gateway — but it lost. Why does a working default no longer carry this traffic?</p>
+        <details class="recall"><summary>Reveal what happened</summary>
+          <div class="body">
+            <p><code>8.8.8.0/24</code> is a longer prefix than <code>0.0.0.0/0</code>, so for any address in that block the kernel picks it over the default — that's longest-prefix match doing exactly its job. The packet is now sent to <code>172.17.0.99</code>, which doesn't exist, so it ARPs into the void and the packet is dropped. The default route is untouched and irrelevant; specificity beat it. This is the single most common self-inflicted routing outage: someone adds a "temporary" specific route, forgets it, and a slice of traffic silently dies while everything else works. Clean up: <code>ip route del 8.8.8.0/24 via 172.17.0.99</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — which route is actually winning?</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Simulate the mess you'll meet in production: several overlapping routes, and traffic going somewhere unexpected. Set it up, then investigate as if you didn't build it.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>ip route add 10.0.0.0/8   via 172.17.0.1
+ip route add 10.5.0.0/16  via 172.17.0.50
+ip route add 10.5.6.0/24  via 172.17.0.60
+<span class="c"># A user reports 10.5.6.7 is unreachable. Where is its traffic going?</span>
+ip route get 10.5.6.7</code></pre></div>
+        <div class="out"><span class="ol">Output</span>10.5.6.7 via 172.17.0.60 dev eth0 src 172.17.0.2 uid 0</code></div>
+        <p>Three routes contain <code>10.5.6.7</code>. The <code>/24</code> wins — so the traffic is going to <code>172.17.0.60</code>, not the <code>/8</code> or <code>/16</code> next hops. If <code>172.17.0.60</code> is a decommissioned box, that's your outage, and no amount of staring at the broad <code>/8</code> route explains it. The lesson: never reason about routing from the top of the table — ask the kernel with <code>ip route get</code>, because it applies longest-prefix match for you. Then walk outward: is the winning next hop alive (<code>ping</code> it), and does the far side have a <b>return</b> route back to your source?</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — build NAT for an isolated namespace, then break it</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>This is what a CNI plugin does in miniature: give an isolated network namespace its own address, route it out through the host, and MASQUERADE it onto the host's IP. Build it end to end.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># 1) A namespace with no network of its own.</span>
+ip netns add lab
+<span class="c"># 2) A veth pair: one end in the host, one end inside the namespace.</span>
+ip link add veth-h type veth peer name veth-c
+ip link set veth-c netns lab
+<span class="c"># 3) Address both ends on a /30 point-to-point link.</span>
+ip addr add 10.99.0.1/30 dev veth-h &amp;&amp; ip link set veth-h up
+ip netns exec lab ip addr add 10.99.0.2/30 dev veth-c
+ip netns exec lab ip link set veth-c up &amp;&amp; ip netns exec lab ip link set lo up
+<span class="c"># 4) Inside the namespace, default route via the host end.</span>
+ip netns exec lab ip route add default via 10.99.0.1
+<span class="c"># 5) Turn the host into a router + MASQUERADE the namespace's range.</span>
+sysctl -w net.ipv4.ip_forward=1
+iptables -t nat -A POSTROUTING -s 10.99.0.0/30 -o eth0 -j MASQUERADE
+<span class="c"># 6) Prove it: the namespace reaches the outside world.</span>
+ip netns exec lab ping -c1 172.17.0.1</code></pre></div>
+        <div class="out"><span class="ol">Output</span>64 bytes from 172.17.0.1: icmp_seq=1 ttl=64 time=0.09 ms</code></div>
+        <p>The namespace has no route to <code>172.17.0.0/16</code> and no public presence, yet the ping works — because the host forwards it and MASQUERADE stamps the host's address on the way out. Watch the translation live:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>conntrack -L 2&gt;/dev/null | grep 10.99.0.2</code></pre></div>
+        <p>Now the senior part. Delete the MASQUERADE rule and the ping stops — but <em>the packet still leaves the host</em>. Explain precisely why the reply never comes back, before opening the answer.</p>
+        <details class="recall"><summary>Reveal the failure mode</summary>
+          <div class="body">
+            <div class="codewrap"><span class="lang">bash</span><pre><code>iptables -t nat -D POSTROUTING -s 10.99.0.0/30 -o eth0 -j MASQUERADE
+ip netns exec lab ping -c1 -W1 172.17.0.1   <span class="c"># now fails</span></code></pre></div>
+            <p>Without MASQUERADE, the ping leaves the host still carrying source <code>10.99.0.2</code> — an address that only exists inside your host. The gateway (or the outside world) has no route back to <code>10.99.0.0/30</code>, so the reply is dropped somewhere upstream and nothing returns. The request went out fine; the <b>return path</b> is what's broken. This is the exact shape of a real incident where a node's SNAT/MASQUERADE rule gets flushed (a bad firewall reload, an <code>iptables-restore</code> that clobbered the <code>nat</code> table) and suddenly pods can send but never receive — outbound "works," everything times out. The tell is that <code>tcpdump</code> on the node shows packets egressing with a private source. Re-add the rule and it heals. Tear down when done: <code>ip netns del lab</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <p>Four patterns cover most L3 pain you'll be paged for.</p>
+    <div class="box realworld"><div class="h">Incident pattern · overlapping CIDRs after a VPC peering</div>
+      <p><b>Symptom:</b> two networks are peered, but hosts in one can't reach half the hosts in the other, or reach the <em>wrong</em> host. <b>First cut:</b> compare the two CIDR blocks. <b>Confirm:</b> if both networks use <code>10.0.0.0/16</code>, an address like <code>10.0.1.5</code> exists on both sides and the routing table can't tell them apart — longest-prefix match sends it locally, never across the peer. <b>Cause is usually:</b> nobody planned address space centrally, so two teams both chose <code>10.0.0.0/16</code>. There's no clean fix after the fact; you re-IP one side or insert NAT. This is why address planning is a design decision, not an afterthought — a preview of <a href="ch50-vpc-foundations-cidr-subnets-route-tables-igw.html">Chapter 50</a>.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · the stale specific route</div>
+      <p><b>Symptom:</b> one destination (or one subnet) is unreachable while everything else is fine. <b>First cut:</b> <code>ip route get &lt;dst&gt;</code>. <b>Confirm:</b> the winning route points at a next hop that's dead or wrong. <b>Cause is usually:</b> a leftover static route from a migration, a VPN client that installed routes and didn't clean up, or a route-injecting daemon that crashed mid-update. The default route looks healthy and misleads you; only <code>ip route get</code> reveals the more-specific entry stealing the traffic.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · conntrack table full</div>
+      <p><b>Symptom:</b> new connections fail intermittently under load; existing ones are fine. <b>First cut:</b> <code>dmesg | grep conntrack</code> and <code>sysctl net.netfilter.nf_conntrack_count net.netfilter.nf_conntrack_max</code>. <b>Confirm:</b> count is pinned at max. <b>Cause is usually:</b> a NAT host (or Kubernetes node) tracking more flows than <code>nf_conntrack_max</code> allows — often a traffic spike, a scan, or short-lived connections churning faster than they expire. Raise the limit and tune timeouts, but also ask why there are so many flows.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · SNAT port exhaustion</div>
+      <p><b>Symptom:</b> outbound connections to one external endpoint start failing when concurrency climbs past ~28k, while the same host reaches other endpoints fine. <b>First cut:</b> count established flows to that <code>dst:port</code>. <b>Cause is usually:</b> too many clients funnelled through one NAT source IP to one destination, running out of source ports for that 4-tuple. Fixes are a larger NAT source-IP pool or spreading the destination — never "restart it."</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Address planning is the decision you can't undo.</b> Pick your VPC and pod CIDRs with room to grow, and make sure they don't overlap with anything you might ever peer, VPN to, or acquire. A <code>/16</code> that felt enormous holds 65k addresses — a large EKS cluster with prefix delegation can eat that. Renumbering a live network is one of the most expensive operations in infrastructure, so the cheap move is to plan generously on day one.</p>
+    <p><b>Security lives partly at L3.</b> Reverse-path filtering blocks source-address spoofing. Route tables and firewall rules decide who can reach what before any application code runs. But remember NAT is <em>not</em> a security control — it hides addresses, it doesn't authorise anything; a DNAT rule is exactly how you deliberately expose an internal service, so a wrong one exposes it by accident. Real segmentation is firewall/security-group policy (<a href="ch51-vpc-security-security-groups-vs-nacls.html">Chapter 51</a>) and NetworkPolicy (<a href="ch47-networkpolicy-deep.html">Chapter 47</a>), not the presence of NAT.</p>
+    <p><b>Performance</b> at L3 is mostly about not making the kernel work harder than it must. Every MASQUERADE'd flow costs a conntrack entry and a per-packet lookup; huge fan-out through one NAT node is a bottleneck and a failure domain. Prefer routable addresses (native VPC routing, IPv6) over NAT where you can, so packets skip the rewrite entirely. And keep routing tables sane — a host with tens of thousands of injected routes spends measurable CPU on lookups and updates.</p>
+    <p><b>Common mistakes:</b> sizing subnets too small and running out of addresses mid-quarter; treating NAT as a firewall; adding a specific route to "fix" something and forgetting it; forgetting the return route so traffic is one-way; and assuming two clouds with the same <code>10.0.0.0/8</code> can be joined without pain. Each is a route you now know how to avoid.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>L3 sets the shape of every cloud network you'll ever design. A VPC <em>is</em> a CIDR block; subnets are its longest-prefix carve-up, usually one per availability zone; route tables and an internet/NAT gateway decide who talks to the outside world. The "public subnet vs private subnet" distinction that governs security in AWS is nothing more than "which route table applies — one with a route to the internet gateway, or one that only reaches a NAT gateway." When you design multi-region or hybrid connectivity, the first question is always the same: <em>do the address spaces overlap?</em> Because if they do, no amount of peering, transit gateway, or VPN saves you. Kubernetes stacks its own address planes on top — a pod CIDR and a service CIDR, both of which must avoid colliding with the node network — and the pod-to-internet path in <a href="ch48-pod-to-internet-and-the-full-synthesis.html">Chapter 48</a> is this chapter's MASQUERADE diagram scaled to a cluster.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What is longest-prefix match?</summary>
+        <div class="a"><p>When a destination address matches more than one route, the router picks the route with the longest network prefix — the most specific one. A <code>/32</code> beats a <code>/24</code> beats a <code>/8</code> beats the <code>/0</code> default. It's how a single default route can coexist with specific routes without conflict: specifics win for their own addresses, the default catches everything else.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>How many usable hosts are in a <code>/26</code>, and where do its subnets fall inside a <code>/24</code>?</summary>
+        <div class="a"><p>A <code>/26</code> leaves 6 host bits, so 2<sup>6</sup> = 64 total addresses, minus the network and broadcast addresses = 62 usable hosts. The mask octet is 192, so the block size is 256 − 192 = 64, which means the four <code>/26</code> subnets of any <code>/24</code> start at <code>.0</code>, <code>.64</code>, <code>.128</code>, and <code>.192</code>. So <code>10.0.0.0/24</code> splits into <code>10.0.0.0/26</code>, <code>10.0.0.64/26</code>, <code>10.0.0.128/26</code>, <code>10.0.0.192/26</code> — four subnets of 62 hosts each, which is the classic "one subnet per AZ" layout. The trick I lean on is the block-size method: find the mask octet, subtract from 256, and the boundaries are multiples of that.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Walk me through what MASQUERADE does and how the reply gets back.</summary>
+        <div class="a"><p>MASQUERADE is source NAT where the new source is the outgoing interface's current address, looked up per packet, so it survives IP changes. On the first packet of a flow, netfilter's <code>POSTROUTING</code> chain rewrites the source IP (and, if needed, the source port to keep the tuple unique) and records the mapping in the conntrack table — original tuple, translated tuple, destination. Every subsequent packet in that flow is matched against conntrack and translated identically without re-evaluating rules. The reply arrives addressed to the translated source; conntrack matches it, reverses the translation to the original private address and port, and the internal host sees a normal conversation. The costs to remember: each flow consumes a conntrack entry, capped by <code>nf_conntrack_max</code>, and you can only have about 28k simultaneous flows per source-IP-to-single-destination because you run out of source ports — that's SNAT port exhaustion. It also breaks protocols that carry addresses in their payload, which need a conntrack helper.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A user says one specific service IP is unreachable, but the rest of the internet works. How do you diagnose it?</summary>
+        <div class="a"><p>I start with the routing decision for that exact address: <code>ip route get &lt;dst&gt;</code>. That tells me the winning route, the source IP the kernel will use, and the next hop — applying longest-prefix match for me, which is the whole point, because a broad default route can look healthy while a more-specific stale route steals this one destination. If the winning next hop is wrong or dead, I've found it. If the route looks right, I check the next hop is alive (ping the gateway), then check the far end has a return route back to my source — one-way reachability almost always means a missing or asymmetric return route, or reverse-path filtering dropping the reply. Only after that do I look at firewalls and the application. The discipline is: decision first, forward path, return path, then policy.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>Two teams both built VPCs using <code>10.0.0.0/16</code> and now need them connected. What do you tell them?</summary>
+        <div class="a"><p>That it can't be done cleanly, and this is why address planning is a design decision. With identical CIDRs, an address like <code>10.0.1.5</code> exists on both sides; a router can't decide "local or remote" because longest-prefix match will always resolve it locally, so peering simply won't carry that traffic. The honest options are to re-IP one side onto a non-overlapping block (painful but correct), or to put NAT at the boundary so each side sees the other through translated address space (a workaround that adds a stateful choke point and breaks anything that embeds addresses). The real lesson is upstream: allocate non-overlapping ranges from a central plan before anyone builds, leaving room for growth, VPNs, and acquisitions. Renumbering a live network is one of the most expensive things you can be asked to do.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>L3 moves packets across networks using structured addresses that carry location. A CIDR prefix splits an address into network and host bits; subnet math is just powers of two plus the block-size trick. Routing is per-hop and stateless: each router runs longest-prefix match against its table, picks the most specific route, and forwards one hop — nobody holds the whole path. The default route <code>0.0.0.0/0</code> catches everything unmatched. NAT rewrites addresses and uses conntrack to reverse the change for replies: SNAT to a fixed IP, MASQUERADE to the interface's current IP, DNAT to redirect inbound. <code>ip route get</code> answers "where does this go?" definitively, and most L3 incidents are a wrong specific route, an overlapping CIDR, a missing return path, or a NAT resource running out.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>IP addresses carry location, not just identity — that hierarchy is what lets routing scale.</li>
+      <li>Routing is per-hop and stateless: every router independently runs longest-prefix match. No one holds the full path.</li>
+      <li>Longest-prefix match: the most specific route wins. <code>/32</code> &gt; <code>/24</code> &gt; <code>/8</code> &gt; the <code>/0</code> default.</li>
+      <li>Usable hosts = 2<sup>(32−prefix)</sup> − 2; block size = 256 − mask octet gives you subnet boundaries in your head.</li>
+      <li>Memorise the private ranges: <code>10.0.0.0/8</code>, <code>172.16.0.0/12</code>, <code>192.168.0.0/16</code>; plus loopback <code>127/8</code> and link-local <code>169.254/16</code>.</li>
+      <li>A route with <code>dev</code> and no gateway is directly connected (ARP the host); <code>via</code> means remote (ARP the gateway).</li>
+      <li>SNAT rewrites source to a fixed IP; MASQUERADE to the interface's current IP; DNAT rewrites destination for inbound.</li>
+      <li>NAT is stateful via conntrack — and both conntrack entries and source ports are finite, so NAT hosts run out under load.</li>
+      <li><code>ip route get &lt;dst&gt;</code> is the definitive "where does this packet go" tool — always ask the kernel, don't eyeball the table.</li>
+      <li>Overlapping CIDRs can't be peered cleanly; plan non-overlapping address space up front, because renumbering later is brutal.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on and toward:</span>
+      <a href="ch11-l2-ethernet-mac-arp-switching.html"><b>Ch 11</b> L2, ARP &amp; switching</a>
+      <a href="ch13-l4-tcp-deep-and-udp.html"><b>Ch 13</b> TCP &amp; UDP</a>
+      <a href="ch48-pod-to-internet-and-the-full-synthesis.html"><b>Ch 48</b> Pod to internet</a>
+      <a href="ch50-vpc-foundations-cidr-subnets-route-tables-igw.html"><b>Ch 50</b> VPC foundations</a>
+      <a href="ch51-vpc-security-security-groups-vs-nacls.html"><b>Ch 51</b> VPC security</a>
+      <a href="ch105-network-runbooks.html"><b>Ch 105</b> Network runbooks</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc791">RFC 791: Internet Protocol (IPv4)</a>. The original spec: header format, addressing, fragmentation, TTL.</li>
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc8200">RFC 8200: Internet Protocol, Version 6 (IPv6)</a>. The current IPv6 base specification.</li>
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc1918">RFC 1918: Address Allocation for Private Internets</a> and <a href="https://www.rfc-editor.org/rfc/rfc4632">RFC 4632: CIDR</a>.</li>
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc6598">RFC 6598: IANA-Reserved IPv4 Prefix for Shared Address Space</a> (the <code>100.64.0.0/10</code> block used by carrier-grade NAT and EKS).</li>
+      <li>IANA — <a href="https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml">IPv4 Special-Purpose Address Registry</a>. The authoritative list of reserved blocks.</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man8/ip-route.8.html">ip-route(8)</a> and <a href="https://man7.org/linux/man-pages/man8/ip.8.html">ip(8)</a>: the routing and address tooling.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch11-l2-ethernet-mac-arp-switching.html"><span class="dir">← Prev</span><div class="ti">Ch 11 — L2: Ethernet, MAC, ARP, switching</div></a>
+      <a class="nx" href="ch13-l4-tcp-deep-and-udp.html"><span class="dir">Next →</span><div class="ti">Ch 13 — L4: TCP deep, and UDP</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 12 of 121 · Part II · Networking from First Principles. Do the subnet math by hand until it's boring; ask the kernel with <code>ip route get</code> when it's real.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Routing a packet</a>
+    <a href="#model2">CIDR &amp; subnet math</a>
+    <a href="#route">The routing decision</a>
+    <a href="#components">SNAT, DNAT, MASQUERADE</a>
+    <a href="#flow">One packet, out and back</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

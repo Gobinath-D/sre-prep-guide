@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 51 — VPC security: Security Groups vs NACLs</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part VI · AWS &amp; EKS &nbsp;·&nbsp; Chapter 51</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part VI · AWS &amp; EKS for SREs · Chapter 51</div>
+      <h1>VPC security — Security Groups vs NACLs</h1>
+      <p class="tagline">Two firewalls guard every packet in a VPC, and they disagree about almost everything: one remembers you, the other doesn't; one only says yes, the other can say no in writing. Mix up which is which and you'll spend an afternoon debugging a reply that got silently dropped on its way home.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~32 min read · AWS CLI / LocalStack</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain precisely what a Security Group and a NACL each attach to, and the stateful-vs-stateless difference that drives every gotcha in this chapter.</li>
+          <li>Trace one packet through both layers on the way in, and both layers again — differently — on the way out.</li>
+          <li>Predict, before testing, why a stateless NACL can block a reply even when the matching request sailed straight through.</li>
+          <li>Tell a "connection refused" apart from a "connection timed out" and know which layer each one points at.</li>
+          <li>Redesign a flat, everything-open Security Group into a least-privilege chain that references other Security Groups instead of IP ranges.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem VPC security groups solve</h2>
+    <p><a href="ch50-vpc-foundations-cidr-subnets-route-tables-igw.html">Chapter 50</a> got you a subnet with a path to the internet. Notice what it didn't get you: any control over <em>who</em> uses that path. Route tables answer "can a packet physically get there." They say nothing about "should this packet be allowed to." Wire up a public subnet with nothing else and every port on every instance in it is fair game to anyone who can route to it.</p>
+    <p>So AWS gives you two independent filters, and it's worth asking why two instead of one. A <b>Security Group</b> answers "who may talk to <em>this specific network interface</em>" — fine-grained, per-resource, and it follows the resource around. A <b>network ACL</b> answers "what may cross the boundary of <em>this entire subnet</em>" — coarse, blunt, and it doesn't care what's inside. One gives you precision; the other gives you a blast door you can slam on a whole subnet regardless of what any individual instance's rules say. Together they're defense in depth: a mistake in one is supposed to be caught by the other.</p>
+    <p>The trouble is that "two firewalls" sounds redundant until you learn they behave nothing alike, and production incidents live exactly in that gap.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>A Security Group is stateful and can only allow. A network ACL is stateless and can allow <em>or</em> explicitly deny, evaluated in a strict numbered order. Everything unusual in this chapter — the asymmetric NACL block, the "which layer do I even check" question — falls out of that one paragraph. Memorize it before anything else here.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a personal bodyguard and a lobby checkpoint</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>A <b>Security Group is a personal bodyguard</b> assigned to one specific person (your network interface). When a visitor arrives, the bodyguard checks a short list of who's allowed in — and here's the important part — <b>remembers</b> that visitor. When your host later sends a reply out to that same visitor, the bodyguard waves it through without checking anything, because they remember letting the visitor in a moment ago. The bodyguard only ever says "yes, I recognize this" or silently ignores everyone else; there's no "no" on the list, just an absence of "yes."</p>
+      <p>A <b>network ACL is the building's lobby checkpoint</b>, and it works completely differently. It checks <em>every single person</em> crossing the lobby doors — on the way in <em>and</em> on the way out — against a numbered list of rules, top to bottom, first match wins. And it has no memory at all: it doesn't know or care that it waved someone in five minutes ago. If a rule doesn't explicitly permit someone leaving, they don't leave — even if they were let in by rule #1 a moment earlier. That's why the checkpoint needs separate, explicit rules for people coming in and people going out, and why forgetting the "going out" rule traps your own visitors inside.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>Security Group</th><th>Network ACL</th></tr>
+      <tr><td>What it's assigned to</td><td>One network interface (ENI)</td><td>An entire subnet</td></tr>
+      <tr><td>Memory</td><td>Stateful — remembers the request, auto-allows the reply</td><td>Stateless — no memory; in and out are separately evaluated</td></tr>
+      <tr><td>What it can say</td><td>Allow only (no explicit deny)</td><td>Allow <em>and</em> explicit deny</td></tr>
+      <tr><td>How rules combine</td><td>All matching rules are OR'd together</td><td>Ordered by rule number, first match wins</td></tr>
+      <tr><td>Default posture</td><td>Default SG allows all outbound, and inbound from itself</td><td>Default NACL allows everything; a custom one starts by denying everything</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>One packet, two gates, in both directions</h2>
+    <p>Every packet entering a subnet crosses the NACL first, at the subnet boundary, then the Security Group, right at the destination's network interface. On the way back out, it's the reverse order — but which layer actually has to <em>check</em> anything is where the two mechanisms stop looking alike.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 840 420" role="img" aria-label="A packet crossing the subnet's stateless NACL, then the destination's stateful Security Group, then reaching the ENI; the reply is auto-allowed by the Security Group but must separately clear the NACL's outbound rules">
+        <defs>
+          <marker id="s1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+          <marker id="s2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--deep)"/></marker>
+        </defs>
+        <rect x="16" y="168" width="118" height="64" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="75" y="194" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">CLIENT</text>
+        <text x="75" y="212" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">203.0.113.9</text>
+        <line x1="134" y1="192" x2="176" y2="192" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#s1)"/>
+
+        <rect x="180" y="30" width="210" height="360" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="196" y="52" style="fill:var(--muted);font:700 10.5px sans-serif;letter-spacing:.04em">SUBNET · NETWORK ACL</text>
+        <rect x="196" y="62" width="178" height="102" rx="7" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.4"/>
+        <text x="285" y="82" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">Inbound rules</text>
+        <text x="285" y="100" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">100 ALLOW 443 tcp · 0.0.0.0/0</text>
+        <text x="285" y="116" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">110 ALLOW 1024-65535 tcp</text>
+        <text x="285" y="132" text-anchor="middle" style="fill:var(--deep);font:9.5px sans-serif">* DENY all (implicit, last)</text>
+        <text x="285" y="150" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">ascending order · first match wins</text>
+        <rect x="196" y="200" width="178" height="102" rx="7" style="fill:var(--panel);stroke:var(--deep);stroke-width:1.4"/>
+        <text x="285" y="220" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">Outbound rules</text>
+        <text x="285" y="238" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">100 ALLOW 1024-65535 tcp</text>
+        <text x="285" y="254" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">→ 0.0.0.0/0 (the reply's port)</text>
+        <text x="285" y="270" text-anchor="middle" style="fill:var(--deep);font:9.5px sans-serif">* DENY all (implicit, last)</text>
+        <text x="285" y="288" text-anchor="middle" style="fill:var(--deep);font:600 9px sans-serif">evaluated separately — no memory of the request</text>
+        <text x="285" y="368" text-anchor="middle" style="fill:var(--muted);font:600 10px sans-serif">STATELESS</text>
+
+        <line x1="390" y1="192" x2="432" y2="192" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#s1)"/>
+        <text x="411" y="180" text-anchor="middle" style="fill:var(--accent2);font:9px sans-serif">passed</text>
+
+        <rect x="436" y="60" width="210" height="300" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="452" y="82" style="fill:var(--muted);font:700 10.5px sans-serif;letter-spacing:.04em">ENI · SECURITY GROUP</text>
+        <rect x="452" y="92" width="178" height="86" rx="7" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.4"/>
+        <text x="541" y="112" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">Inbound rules (allow-only)</text>
+        <text x="541" y="130" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">ALLOW 443 tcp from sg-alb</text>
+        <text x="541" y="146" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">(no matching rule = silently dropped)</text>
+        <rect x="452" y="194" width="178" height="70" rx="7" style="fill:var(--chip);stroke:var(--accent2);stroke-width:1.4;stroke-dasharray:5 4"/>
+        <text x="541" y="216" text-anchor="middle" style="fill:var(--accent2);font:600 11px sans-serif">connection tracked here</text>
+        <text x="541" y="234" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">reply auto-allowed — no outbound rule needed</text>
+        <text x="541" y="330" text-anchor="middle" style="fill:var(--muted);font:600 10px sans-serif">STATEFUL</text>
+
+        <line x1="646" y1="192" x2="688" y2="192" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#s1)"/>
+        <rect x="692" y="162" width="132" height="60" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="758" y="186" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">EC2 (ENI)</text>
+        <text x="758" y="204" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">app listening :443</text>
+
+        <line x1="692" y1="222" x2="646" y2="264" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#s1)"/>
+        <text x="720" y="248" text-anchor="middle" style="fill:var(--accent2);font:600 9px sans-serif">① SG: already tracked → auto-allow</text>
+        <line x1="452" y1="264" x2="396" y2="240" style="stroke:var(--deep);stroke-width:2" marker-end="url(#s2)"/>
+        <text x="410" y="300" text-anchor="middle" style="fill:var(--deep);font:600 9px sans-serif">② NACL: must match an</text>
+        <text x="410" y="313" text-anchor="middle" style="fill:var(--deep);font:600 9px sans-serif">explicit OUTBOUND allow</text>
+        <line x1="196" y1="240" x2="134" y2="220" style="stroke:var(--deep);stroke-width:2" marker-end="url(#s2)"/>
+      </svg>
+      <figcaption>Inbound: NACL, then Security Group, then the ENI. The reply: the Security Group remembers and auto-allows it, but the NACL doesn't — it needs its own explicit outbound rule or the reply dies right there.</figcaption>
+    </figure>
+
+    <p>Read the two boxes in the figure like rulebooks with different grammar. A Security Group's rules are all <b>allow</b> statements, and AWS evaluates them as a set: if <em>any</em> rule matches, the traffic is allowed; if none match, it's dropped by default — there's no explicit "deny" statement to write, and none is needed. A NACL's rules are numbered, each one either <code>ALLOW</code> or <code>DENY</code>, and AWS walks them in ascending order and stops at the <b>first</b> match — a low-numbered <code>DENY</code> will shadow a higher-numbered <code>ALLOW</code> for the same traffic, and every NACL ends with an implicit <code>*</code> rule that denies anything nothing else matched.</p>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>Security Groups don't filter everything, even when they're locked down tight. AWS explicitly carves out a handful of exceptions that always get through regardless of your rules: DNS, DHCP, the EC2 and ECS metadata endpoints, Windows license activation, and the Amazon Time Sync service. That's a real, documented fact worth knowing before you assume a restrictive Security Group has fully sealed an instance off — its metadata endpoint is reachable from that instance no matter what you write, which is exactly the door <a href="ch54-iam-and-sts.html">Chapter 54</a>'s IMDSv2 material and <a href="ch55-irsa-and-eks-pod-identity.html">Chapter 55</a>'s IRSA material both care about.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>Why the reply is the hard part</h2>
+    <p>Follow one TCP connection all the way through, because the asymmetry only shows up if you track both directions separately.</p>
+    <ol class="steps">
+      <li><b>Request arrives at the subnet boundary.</b> The NACL's <em>inbound</em> rule list is checked, in ascending rule-number order. Say rule 100 allows TCP 443 from <code>0.0.0.0/0</code> — match, allowed, stop checking further rules.</li>
+      <li><b>Request arrives at the destination ENI.</b> The Security Group's inbound rules are checked, all together. One of them allows 443 from the ALB's Security Group — match, allowed. The Security Group also opens a <b>connection-tracking entry</b>: it now remembers this 5-tuple (protocol, source IP/port, destination IP/port) as an established flow.</li>
+      <li><b>The application sends its reply.</b> The reply is outbound from the ENI's point of view. The Security Group checks its tracking table, finds this flow already established, and <b>allows it automatically</b> — it never even consults the outbound rule list for a tracked reply.</li>
+      <li><b>The reply reaches the subnet boundary, outbound.</b> The NACL has no memory of step 1 at all — it's a completely separate evaluation. It walks its <em>outbound</em> rule list from the top. If there's no rule allowing the reply's source port range (the original client's ephemeral port, typically somewhere in 1024–65535 depending on the client OS) out to the client's address, the implicit final <code>DENY</code> catches it and the reply is dropped, silently, at the subnet edge.</li>
+      <li><b>From the client's point of view,</b> the connection just hangs and eventually times out — indistinguishable, without server-side visibility, from the request never having arrived at all.</li>
+    </ol>
+    <p>That's the entire asymmetric-NACL trap in one sequence: the Security Group's statefulness means you almost never think about outbound rules for reply traffic, which trains you to forget that a NACL needs that same reply traffic spelled out explicitly, twice — once as an inbound allow for the original request, once as an outbound allow for the response.</p>
+
+    <details class="recall"><summary>Think first: your Security Group allows inbound 443 from anywhere, and your NACL allows inbound 443 too. Is that enough to guarantee the connection completes?</summary>
+      <div class="body">
+        <p>No — you've only covered the request leg. TCP's handshake and the HTTP response both need <em>outbound</em> traffic to leave the subnet, and the Security Group will handle that automatically because it's stateful. The NACL will not. Unless the NACL's outbound rule list separately allows the ephemeral port range the client is using, every reply gets silently dropped at the subnet boundary and the client just sees a hang. Two "inbound 443 allowed" rules, one on each layer, is a classic half-finished setup — it feels complete because the request gets through, and the failure only shows up on the way back.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, and what each one owns</h2>
+    <ul>
+      <li><b>Security Group.</b> Owns per-resource, stateful, allow-only filtering. Attached to one or more ENIs (an instance can have several Security Groups; a Security Group can be attached to many ENIs). A brand-new custom Security Group starts with no inbound rules and one default outbound rule allowing everything.</li>
+      <li><b>Security Group rule.</b> Owns a single allow condition: protocol, port range, and a source (or destination) that can be a CIDR block <em>or another Security Group's ID</em>. Referencing a Security Group as the source is the feature that makes least-privilege chains maintainable — the rule tracks the group, not a list of IPs that changes every time you scale.</li>
+      <li><b>Network ACL.</b> Owns subnet-wide, stateless, ordered allow/deny filtering. Every subnet has exactly one NACL — the default one if you never attach a custom one — and one NACL can be associated with several subnets.</li>
+      <li><b>NACL rule.</b> Owns a numbered evaluation position, a protocol/port/CIDR match, and an explicit <code>ALLOW</code> or <code>DENY</code> action, separately for inbound and outbound. Numbers are just evaluation order — leaving gaps (100, 110, 120) is standard practice so you can slot a new rule in later without renumbering everything.</li>
+      <li><b>The implicit <code>*</code> rule.</b> Every NACL — default or custom — ends with an unremovable, highest-numbered rule that denies anything nothing above it matched. You can't delete it; you can only make sure your own rules catch what you actually want allowed before evaluation ever reaches it.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one HTTPS request through both layers, both ways</h2>
+    <p>A client at <code>203.0.113.9</code> opens a connection to an EC2 instance at <code>10.0.0.15:443</code>, sitting in a subnet with a custom NACL and a locked-down Security Group. The SYN packet hits the subnet boundary first: the NACL's inbound rule 100 (<code>ALLOW 443 tcp from 0.0.0.0/0</code>) matches, so it proceeds. It reaches the instance's ENI: the Security Group's inbound rule (<code>ALLOW 443 from sg-alb</code>, say, or a CIDR) matches, so the OS delivers the SYN to the listening process, and the Security Group opens a tracking entry for this flow. The SYN-ACK leaves the instance: the Security Group sees the tracked flow and auto-allows it outbound with no rule lookup. It hits the subnet boundary outbound: the NACL's outbound rule 100 (<code>ALLOW 1024-65535 tcp to 0.0.0.0/0</code>) — written specifically to cover ephemeral-port replies — matches, and the SYN-ACK reaches the client. The rest of the TCP handshake and every subsequent packet in both directions repeats exactly this pattern: Security Group remembers and waves it through; NACL re-checks from scratch, every single time, in both directions.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>Security Groups and NACLs cost nothing to create or hold — you only ever pay for the resources they're attached to. Every lab below still notes a <b>no-cost local alternative</b> for consistency: <a href="https://www.localstack.aws/">LocalStack</a> emulates the full Security Group and NACL create/describe/authorize API in its free Community edition, since these are core EC2 calls. Set up once:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>export AWS_REGION=us-east-1
+VPC_ID=vpc-0123abcd            <span class="c"># reuse the VPC from Chapter 50, or any VPC you own</span>
+SUBNET_ID=subnet-0aaa1111
+
+<span class="c"># No-cost local alt: LocalStack Community handles SGs and NACLs fully.</span>
+<span class="c"># docker run --rm -d -p 4566:4566 localstack/localstack</span>
+<span class="c"># add --endpoint-url http://localhost:4566 to every aws ec2 command below.</span></code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — a locked-down Security Group</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Create a Security Group that allows HTTPS in from anywhere and nothing else, and inspect the default outbound rule you didn't have to write.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>SG_ID=$(aws ec2 create-security-group --group-name web-sg --description "web tier" \
+  --vpc-id $VPC_ID --query 'GroupId' --output text)
+
+aws ec2 authorize-security-group-ingress --group-id $SG_ID \
+  --protocol tcp --port 443 --cidr 0.0.0.0/0
+
+aws ec2 describe-security-groups --group-ids $SG_ID \
+  --query 'SecurityGroups[].{in:IpPermissions,out:IpPermissionsEgress}'</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>[{
+  "in":  [{ "IpProtocol": "tcp", "FromPort": 443, "ToPort": 443, "IpRanges": [{"CidrIp": "0.0.0.0/0"}] }],
+  "out": [{ "IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}] }]
+}]</code></div>
+        <p>You wrote one inbound rule. The outbound rule — allow all protocols, all ports, anywhere — was there the moment the group was created; it's the Security Group default, and most teams never touch it for a plain web tier since the statefulness of inbound replies is what actually matters for serving traffic. You'll tighten this in Lab 5.</p>
+        <p class="small"><b>No-cost local alt:</b> identical commands against LocalStack with <code>--endpoint-url http://localhost:4566</code> — real group IDs, real rule JSON, $0.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — build a NACL and watch rule order decide the outcome</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Create a custom NACL, add rules deliberately out of the order you'd naturally write them, and read how AWS actually evaluates them.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>NACL_ID=$(aws ec2 create-network-acl --vpc-id $VPC_ID --query 'NetworkAcl.NetworkAclId' --output text)
+
+<span class="c"># Rule 90: deny this one bad actor's /32, checked BEFORE the broad allow.</span>
+aws ec2 create-network-acl-entry --network-acl-id $NACL_ID --rule-number 90 \
+  --protocol tcp --port-range From=443,To=443 --cidr-block 198.51.100.66/32 \
+  --rule-action deny --ingress
+
+<span class="c"># Rule 100: allow everyone else on 443.</span>
+aws ec2 create-network-acl-entry --network-acl-id $NACL_ID --rule-number 100 \
+  --protocol tcp --port-range From=443,To=443 --cidr-block 0.0.0.0/0 \
+  --rule-action allow --ingress
+
+aws ec2 describe-network-acls --network-acl-ids $NACL_ID \
+  --query 'NetworkAcls[].Entries[?Egress==`false`].{num:RuleNumber,action:RuleAction,cidr:CidrBlock}'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>[
+  { "num": 90,  "action": "deny",  "cidr": "198.51.100.66/32" },
+  { "num": 100, "action": "allow", "cidr": "0.0.0.0/0" },
+  { "num": 32767, "action": "deny", "cidr": "0.0.0.0/0" }
+]</code></div>
+        <p>Rule 32767 is the implicit catch-all — you didn't create it and can't remove it. Trace two source IPs by hand: <code>198.51.100.66</code> hits rule 90 first (lower number wins) and is denied, never reaching rule 100's allow. Any other IP skips rule 90 (no match), matches rule 100, and is allowed — evaluation stops there and never reaches 32767. Order, not intent, decides.</p>
+        <p class="small"><b>No-cost local alt:</b> same commands against LocalStack, or work the two traces on paper — the algorithm is just "walk the numbers up, stop at first match."</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — the NACL that only lets requests in, never answers out</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Associate the NACL from Lab 2 with a subnet holding a web server, curl it from outside, and watch it hang. The Security Group is wide open. Investigate before revealing.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>aws ec2 associate-network-acl --network-acl-id $NACL_ID --subnet-id $SUBNET_ID
+
+curl -m 5 https://10.0.0.15
+<span class="c"># curl: (28) Connection timed out after 5001 milliseconds</span>
+
+<span class="c"># Check the full rule set, both directions, on the instance's own NACL:</span>
+aws ec2 describe-network-acls --network-acl-ids $NACL_ID \
+  --query 'NetworkAcls[].Entries[].{num:RuleNumber,egress:Egress,action:RuleAction,port:PortRange}'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>[
+  { "num": 90,  "egress": false, "action": "deny",  "port": {"From":443,"To":443} },
+  { "num": 100, "egress": false, "action": "allow", "port": {"From":443,"To":443} },
+  { "num": 32767, "egress": false, "action": "deny", "port": null },
+  { "num": 32767, "egress": true,  "action": "deny", "port": null }
+]</code></div>
+        <p>Every rule you created has <code>egress: false</code> — inbound only. There's exactly one outbound rule in the whole list, and it's the implicit deny-all. Before opening the answer: given everything you now know about statefulness, why does a fully-open Security Group not save you here?</p>
+        <details class="recall"><summary>Reveal the cause</summary>
+          <div class="body">
+            <p><b>There is no outbound allow rule at all, on the one layer that actually needs one written out.</b> The Security Group's statefulness means its own outbound rules were never in question — the reply is auto-allowed there regardless. But the NACL evaluates outbound completely separately, with zero memory of the inbound request it just let through, and this NACL has no outbound rule except the implicit deny-all at 32767. Every reply — the SYN-ACK, every response byte — gets silently dropped the instant it tries to leave the subnet.</p>
+            <p>The fix is an explicit outbound rule allowing the reply's port range back to the client: <code>create-network-acl-entry --rule-number 100 --protocol tcp --port-range From=1024,To=65535 --cidr-block 0.0.0.0/0 --rule-action allow --egress</code>. Note the range: the reply leaves from the server's port 443 but arrives addressed to whatever <em>ephemeral</em> port the client picked for the request, so the outbound rule has to permit that broad range, not just 443. This exact gap is the single most common NACL production incident.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — refused vs timed out</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Two tickets land the same afternoon. Ticket A: <code>curl</code> to one instance returns instantly with "connection refused." Ticket B: <code>curl</code> to another instance just hangs until it times out. Before running anything, decide which layer you'd check first for each — then confirm.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Ticket A:</span>
+curl -m 5 http://10.0.1.20:8080
+<span class="c"># curl: (7) Failed to connect to 10.0.1.20 port 8080: Connection refused</span>
+
+<span class="c"># Ticket B:</span>
+curl -m 5 http://10.0.1.21:8080
+<span class="c"># curl: (28) Connection timed out after 5001 milliseconds</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>refused → the packet reached the host; something answered "nobody's listening"
+timeout → the packet was dropped somewhere and got no answer at all</code></div>
+        <p>Work out what each signature rules out before you open the diagnosis below.</p>
+        <details class="recall"><summary>Reveal the diagnostic logic</summary>
+          <div class="body">
+            <p><b>"Connection refused" means the packet already cleared both the NACL and the Security Group.</b> A refusal is an active TCP RST sent by the destination host's own network stack, and a host can only send an RST for a packet it actually received. If nothing crossed the network filters, there'd be silence, not a RST. So for Ticket A, skip straight past both firewall layers — the real cause is that nothing is listening on port 8080 on that host (wrong port, app crashed, app bound to <code>127.0.0.1</code> instead of <code>0.0.0.0</code>). Checking Security Groups here wastes time.</p>
+            <p><b>"Timed out" means something dropped the packet silently, and a silent drop is exactly what both a NACL <code>DENY</code> and a Security Group with no matching allow rule produce</b> — from outside, they're indistinguishable without server-side tooling. For Ticket B, that's where you start: <code>describe-network-acls</code> for the subnet, then <code>describe-security-groups</code> for the instance's ENI, checking both directions on each. The signature doesn't tell you which of the two layers is the blocker, but it tells you immediately that it <em>is</em> one of them, and that the app itself is very likely fine.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — from one flat Security Group to a least-privilege chain</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>You inherit a three-tier app — web, app, database — all sharing <em>one</em> Security Group that allows every port from <code>0.0.0.0/0</code>, because it was fastest to ship. Redesign it into least privilege, tier by tier, before opening the answer.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>aws ec2 describe-security-groups --group-ids sg-flat \
+  --query 'SecurityGroups[].IpPermissions[].{proto:IpProtocol,port:FromPort,src:IpRanges[0].CidrIp}'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>[{ "proto": "-1", "port": null, "src": "0.0.0.0/0" }]     <span class="c"># everything, from anywhere, into every tier</span></code></div>
+        <details class="recall"><summary>Reveal the redesign</summary>
+          <div class="body">
+            <p>Create one Security Group per tier and chain them by <em>reference</em>, not by CIDR: <code>web-sg</code> allows 443 from <code>0.0.0.0/0</code> (it's the only tier that should ever face the internet); <code>app-sg</code> allows its application port only <code>--source-group web-sg</code>; <code>db-sg</code> allows 5432 only <code>--source-group app-sg</code>. Nothing in the app or database tier accepts a CIDR block at all anymore.</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>aws ec2 authorize-security-group-ingress --group-id $APP_SG \
+  --protocol tcp --port 8080 --source-group $WEB_SG
+aws ec2 authorize-security-group-ingress --group-id $DB_SG \
+  --protocol tcp --port 5432 --source-group $APP_SG</code></pre></div>
+            <p>The reason this matters beyond "fewer open ports": a group reference tracks membership automatically. When the app tier autoscales and launches ten new instances, every one of them either has <code>app-sg</code> attached or it doesn't — there's no IP allow-list to edit, no CIDR to widen, no stale entry left behind when an instance terminates. A CIDR-based rule has to be maintained by hand as the fleet changes shape; a group-reference rule maintains itself. That's the actual staff-level upgrade here — not just "tighter rules" but rules that stay correct without anyone remembering to update them.</p>
+          </div>
+        </details>
+        <p class="small"><b>No-cost local alt:</b> the same three <code>authorize-security-group-ingress --source-group</code> calls against LocalStack demonstrate the chain exactly; no live traffic needed to see the API accept a group ID as a source.</p>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · Security Group vs NACL confusion</div>
+      <p><b>Symptom:</b> a connection is silently dropped and the on-call engineer starts editing Security Group rules that were never the problem. <b>First cut:</b> check both layers, in both directions, before changing either — <code>describe-security-groups</code> and <code>describe-network-acls</code> side by side. <b>Usual cause:</b> tunnel vision on the per-resource layer (Security Groups feel more familiar) while the actual block is a subnet-wide NACL rule nobody remembered existed.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · asymmetric NACL blocking the return leg</div>
+      <p><b>Symptom:</b> requests appear to arrive (server-side logs show the connection) but clients report timeouts and never see a response. <b>First cut:</b> check the NACL's <em>outbound</em> rules specifically for the ephemeral port range — not just whether inbound looks fine. <b>Usual cause:</b> an inbound-only rule set, exactly as built in Lab 3, that lets requests in and then drops every reply at the subnet boundary.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · "it worked yesterday," NACL edition</div>
+      <p><b>Symptom:</b> traffic that was fine for months suddenly starts failing, with no application deploy anywhere near the timeline. <b>First cut:</b> diff the NACL's rule list, sorted by number, against its last known-good state. <b>Usual cause:</b> someone inserted a new rule at a lower number than an existing allow — often a well-intentioned, narrowly-scoped deny — and first-match-wins means it now shadows a rule that used to fire first.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Reach for Security Groups first.</b> AWS's own guidance is direct about this: in most cases, Security Groups alone meet your needs, and NACLs are the additional layer you add for defense in depth — a hard, subnet-wide backstop, not your primary control. Trying to run fine-grained, per-service policy through NACLs fights the tool; NACLs are coarse on purpose.</p>
+    <p><b>Never open 22 or 3389 to <code>0.0.0.0/0</code>.</b> This is AWS's own explicit best-practice warning, not a house style opinion: authorize only the specific address ranges that legitimately need SSH or RDP. The same discipline applies to any administrative port. Prefer referencing a bastion's or a bastion Security Group's ID over a CIDR wherever the source is another one of your own resources.</p>
+    <p><b>Know what Security Groups never filter.</b> DNS, DHCP, the instance metadata endpoint, ECS task metadata, Windows activation, and Amazon Time Sync all bypass Security Group rules entirely, by design. That's not a loophole to patch — it's documented behavior — but it means "my Security Group is locked down" is never the same claim as "this instance can't reach the metadata service," which matters directly for the IMDSv2 and IRSA material two chapters over.</p>
+    <p><b>Common mistakes:</b> writing a NACL inbound allow and assuming the reply is covered; putting a narrow deny at a lower rule number than the allow it was meant to sit beside, without checking existing numbers first; referencing a Security Group as a source and then wondering why a same-named group in a different VPC doesn't work (group references are scoped to a VPC, with a separate cross-VPC feature required otherwise); and leaving the default Security Group — which allows all outbound and inbound from itself — attached to production resources nobody meant to expose that way.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>This chapter is the literal enforcement layer underneath every "zero trust microsegmentation" slide you'll sit through. A least-privilege Security Group chain — each tier only accepting traffic from the specific group in front of it — is the same idea as a Kubernetes <code>NetworkPolicy</code> restricting pod-to-pod traffic (<a href="ch47-networkpolicy-deep.html">Chapter 47</a>), just enforced one layer down, on the ENI instead of the pod. On EKS with the VPC CNI, pods share their node's Security Groups by default, which is precisely why NetworkPolicy exists as the pod-granular tool, and why AWS also offers <em>security groups for pods</em> as a heavier, per-pod alternative when compliance genuinely requires it (<a href="ch58-vpc-cni-the-deep-one.html">Chapter 58</a>). And the stateful-vs-stateless distinction here is worth carrying forward: it's the same reasoning that shows up anywhere you design a system with a fast, "remembers you" cache in front of a strict, "checks everything again" audit layer.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's the core difference between a Security Group and a network ACL?</summary>
+        <div class="a"><p>Scope, memory, and vocabulary. A Security Group attaches to a network interface and is stateful — it remembers a connection and auto-allows the reply — and it can only allow, never explicitly deny. A network ACL attaches to a whole subnet and is stateless — every packet, in either direction, is checked fresh against a numbered rule list with no memory of anything before it — and it can both allow and explicitly deny, evaluated in ascending order with first match winning. In practice: Security Groups do most of your day-to-day access control; NACLs are the coarse, subnet-wide backstop.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through why a NACL can block a reply even though the request got through fine.</summary>
+        <div class="a"><p>It comes down to statefulness. When a request arrives, the NACL checks its inbound rules and the Security Group checks its inbound rules — if both allow it, the Security Group additionally opens a tracking entry for that connection. When the server replies, the Security Group consults that tracking entry and auto-allows the outbound traffic without even looking at its outbound rule list; that's what stateful means. The NACL does no such tracking. It evaluates the reply's outbound leg completely fresh, as if it had never seen the inbound request, against its own separate outbound rule list. If that list doesn't have a rule allowing the reply's traffic — typically the ephemeral port range the client is using — the implicit deny-all at the end catches it and the reply is dropped silently at the subnet boundary. The client just sees a hang. The fix is always the same: NACLs need explicit, mirrored rules for both directions, because unlike a Security Group they never infer one direction from the other.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Why does AWS give you two separate mechanisms instead of one better one?</summary>
+        <div class="a"><p>They solve different-shaped problems, and collapsing them into one tool would make both worse at what they're currently good at. A Security Group needs to be attached to a resource and travel with it — when you scale a fleet, every new instance should inherit its tier's rules automatically, and stateful tracking is exactly what makes "allow the reply" require zero extra rules as your traffic patterns get more complex. That precision is expensive to apply at scale, though: writing per-resource state for every flow crossing a whole subnet's worth of traffic doesn't fit a blunt, subnet-wide instrument. A NACL solves the opposite problem — "I need a hard, auditable, impossible-to-accidentally-bypass block at a boundary regardless of what any individual resource's rules say" — and stateless, ordered, allow-or-deny evaluation is the right tool for that: predictable, doesn't depend on connection state that could be manipulated, and enforceable uniformly across everything in the subnet. Defense in depth isn't a slogan here; a misconfigured Security Group on one instance is still caught by a correct NACL at the subnet edge, and vice versa. Two tools, two different jobs, not one job done twice.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A client reports "connection refused" hitting your service. Where do you look first, and why not at the Security Group?</summary>
+        <div class="a"><p>"Connection refused" is a signal I take literally: it means a TCP RST came back, and a host can only send a RST in response to a packet it actually received on that port. That already tells me the packet cleared both the NACL and the Security Group — a network-level block produces silence, a timeout, never an active refusal. So I don't start with either firewall layer; I start on the host itself. Most likely nothing is listening on the port the client hit — wrong port number, the app crashed, or it's bound to <code>127.0.0.1</code> instead of all interfaces so it never accepts a connection from outside the loopback address. I'd confirm with <code>ss -tlnp</code> or the equivalent on the instance before touching a single Security Group rule, because the evidence already rules the network filters out.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>How does Security Group referencing scale better than CIDR-based rules?</summary>
+        <div class="a"><p>A CIDR-based rule encodes a snapshot of IP addresses that's only correct until your fleet changes shape — every autoscale event, every instance replacement, potentially requires someone to update an allow-list, and in practice nobody keeps that current, so teams over-widen the CIDR "just in case" and privilege creeps outward over time. A Security Group reference encodes membership instead of addresses: <code>--source-group app-sg</code> means "anything currently wearing this group," and that set updates itself the instant an instance attaches or detaches the group, with zero rule edits. It's the same shift as moving from a hardcoded server list to a service registry — the access-control question becomes "is this identity in the right group" instead of "is this the right IP today," and the former stays correct under change while the latter quietly rots.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>Security Groups and NACLs both filter traffic, and that's nearly the only thing they have in common. A Security Group attaches to a network interface, is stateful, and can only allow — matching rules are OR'd together, and a tracked connection's reply is auto-allowed with no outbound rule needed. A NACL attaches to a subnet, is stateless, and evaluates numbered rules in ascending order with first match winning, ending in an implicit deny-all you can't remove; it re-checks every packet in both directions with zero memory between them, which is exactly why an inbound-only NACL rule set traps replies at the subnet boundary. "Connection refused" means the packet cleared both layers and nothing was listening; "timed out" means something dropped it silently, and either layer is a suspect. Security Groups are your primary tool; NACLs are the coarse backstop. And referencing a Security Group as a rule's source, instead of a CIDR block, is what makes least privilege survive a fleet that keeps changing shape.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>Security Groups attach to ENIs and are stateful; NACLs attach to subnets and are stateless.</li>
+      <li>Security Groups can only allow (rules OR'd together); NACLs can allow or explicitly deny, evaluated in ascending order, first match wins.</li>
+      <li>A tracked connection's reply is auto-allowed by the Security Group — no outbound rule needed there.</li>
+      <li>A NACL re-checks every packet fresh in both directions, so it needs explicit, separate inbound and outbound rules for the same flow.</li>
+      <li>Every NACL ends in an implicit, unremovable deny-all at the highest rule number.</li>
+      <li>"Connection refused" = packet reached the host, nothing listening; "timed out" = dropped somewhere, check both firewall layers.</li>
+      <li>Security Groups don't filter DNS, DHCP, instance metadata, ECS task metadata, Windows activation, or Amazon Time Sync — by design.</li>
+      <li>Never open SSH or RDP to <code>0.0.0.0/0</code> — AWS's own best-practice guidance says so directly.</li>
+      <li>Reference a Security Group as a rule's source instead of a CIDR wherever the source is one of your own resources — it self-updates as the fleet changes.</li>
+      <li>Reach for Security Groups first; treat NACLs as the subnet-wide defense-in-depth backstop, not your primary control.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch50-vpc-foundations-cidr-subnets-route-tables-igw.html"><b>Ch 50</b> VPC foundations</a>
+      <a href="ch14-ports-sockets-ephemeral-ports-connection-lifecycle.html"><b>Ch 14</b> Ports &amp; ephemeral ports</a>
+      <a href="ch47-networkpolicy-deep.html"><b>Ch 47</b> NetworkPolicy deep</a>
+      <a href="ch52-load-balancing-alb-nlb-target-groups-health.html"><b>Ch 52</b> Load balancing</a>
+      <a href="ch58-vpc-cni-the-deep-one.html"><b>Ch 58</b> VPC CNI &amp; SGs for pods</a>
+      <a href="ch60-end-to-end-synthesis-internet-to-alb.html"><b>Ch 60</b> Internet → ALB → Pod</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/vpc/latest/userguide/vpc-security-groups.html">Control traffic to your AWS resources using security groups</a>: statefulness, defaults, the documented metadata/DNS/DHCP exceptions.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/vpc/latest/userguide/security-group-rules.html">Security group rules</a>: rule fields, referencing a security group as a source, quotas.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/vpc/latest/userguide/vpc-network-acls.html">Control subnet traffic with network access control lists</a>: statelessness, rule numbering, the implicit deny-all.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/vpc/latest/userguide/default-security-group.html">Default security groups for your VPCs</a>: what a brand-new VPC's default group actually allows.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/vpc/latest/userguide/infrastructure-security.html">Infrastructure security in Amazon VPC</a>: the direct security-group-vs-NACL comparison and the SSH/RDP best-practice warning.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch50-vpc-foundations-cidr-subnets-route-tables-igw.html"><span class="dir">← Prev</span><div class="ti">Ch 50 — VPC foundations: CIDR, subnets, route tables, IGW</div></a>
+      <a class="nx" href="ch52-load-balancing-alb-nlb-target-groups-health.html"><span class="dir">Next →</span><div class="ti">Ch 52 — Load balancing: ALB, NLB, target groups, health</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 51 of 121 · Part VI · AWS &amp; EKS for SREs. You can now tell, before testing, whether a packet gets through both gates in both directions. Next: what's actually listening on the other side.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Two gates, both ways</a>
+    <a href="#internals">Why the reply is hard</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">One request, both layers</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

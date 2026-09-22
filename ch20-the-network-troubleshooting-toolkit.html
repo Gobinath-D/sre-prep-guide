@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 20 — The network troubleshooting toolkit</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part II · Networking &nbsp;·&nbsp; Chapter 20</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part II · Networking from First Principles · Chapter 20</div>
+      <h1>The network troubleshooting toolkit</h1>
+      <p class="tagline">At 3 a.m. nobody has time to "explore." You need to know, cold, which one command answers the question in front of you — and how to tell a refused connection from a timeout from a reset. This chapter turns ten tools into reflexes and a decision tree.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~45 min read · Linux lab (Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Map each tool — <code>ip</code>, <code>ss</code>, <code>dig</code>, <code>ping</code>, <code>traceroute</code>, <code>mtr</code>, <code>nc</code>, <code>curl</code>, <code>tcpdump</code>, <code>conntrack</code> — to the one question it answers.</li>
+          <li>Tell "connection refused" from "timeout" from "reset" from "DNS failure" instantly, and know what each implies.</li>
+          <li>Bisect any network problem by layer instead of guessing, using a repeatable decision tree.</li>
+          <li>Read a <code>tcpdump</code> capture and a <code>ss</code> state table well enough to name the fault.</li>
+          <li>Debug under pressure without making the incident worse.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem: "the network is broken" is not a diagnosis</h2>
+    <p>A ticket says "app can't reach the database." That sentence spans seven layers and a dozen possible faults: a bad DNS record, a wrong route, a missing security-group rule, a crashed service, a full conntrack table, an expired cert. If you start poking at random you'll waste the first twenty minutes — the expensive minutes — on the wrong layer. The <a href="ch19-capstone-trace-curl-https-example-com.html">previous chapter</a> showed that a request is a strict sequence of stages; this chapter gives you the instruments to check each stage and a tree that tells you which to check first.</p>
+    <p>The core skill isn't knowing many tools — it's knowing which single tool answers the exact question you have <em>right now</em>, so you can confirm or eliminate a layer in one command and move on. A senior SRE debugging a network problem looks slow and calm because they're not searching; they're running a decision tree they've internalised. That tree is the deliverable of this chapter.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>Every tool here answers <em>one</em> question. <code>dig</code>: does the name resolve, and to what? <code>ping</code>: is the host reachable at L3? <code>ss</code>: what's listening and what state are connections in? <code>nc</code>: is that port open? <code>tcpdump</code>: what's actually on the wire? Learn the question, not just the flags, and the right tool picks itself.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a doctor's instruments</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>A good doctor doesn't run every test on every patient. They work from symptom to instrument: fever? thermometer. Chest complaint? stethoscope, then maybe an X-ray. Each instrument answers one narrow question, and they're ordered from cheap-and-broad to expensive-and-specific. You don't start with an MRI.</p>
+      <p>Network debugging is the same triage. The symptom ("can't connect") points you to the first cheap instrument (<code>dig</code>, then <code>nc</code>), and only if those don't localise it do you reach for the expensive, detailed one (<code>tcpdump</code>, the packet-level MRI that shows everything but takes time to read). The mistake juniors make is starting with tcpdump on everything — like ordering a full-body scan for a headache. Start broad, narrow down, and let each answer tell you which instrument to pick up next.</p>
+    </div>
+    <table class="t">
+      <tr><th>The question you have</th><th>The instrument</th><th>Layer</th></tr>
+      <tr><td>What are my interfaces and IPs?</td><td><code>ip addr</code> / <code>ip -br a</code></td><td>L2/L3</td></tr>
+      <tr><td>How would a packet to X leave this box?</td><td><code>ip route get X</code></td><td>L3</td></tr>
+      <tr><td>Do I have the next hop's MAC?</td><td><code>ip neigh</code></td><td>L2</td></tr>
+      <tr><td>Does the name resolve, and to what?</td><td><code>dig</code></td><td>DNS</td></tr>
+      <tr><td>Is the host reachable at all?</td><td><code>ping</code></td><td>L3</td></tr>
+      <tr><td>Where along the path does it break?</td><td><code>traceroute</code> / <code>mtr</code></td><td>L3</td></tr>
+      <tr><td>Is that TCP/UDP port open?</td><td><code>nc -vz</code></td><td>L4</td></tr>
+      <tr><td>What's listening, and what state are my connections in?</td><td><code>ss</code></td><td>L4</td></tr>
+      <tr><td>Does the actual request work, and how fast per stage?</td><td><code>curl -v</code> / <code>-w</code></td><td>L7</td></tr>
+      <tr><td>What is <em>really</em> on the wire?</td><td><code>tcpdump</code></td><td>all</td></tr>
+      <tr><td>What connections does the kernel track? Is the table full?</td><td><code>conntrack</code></td><td>L3/L4</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>The decision tree</h2>
+    <p>Here's the tree. A failed or slow request enters at the top; each diamond is one cheap command; each leaf is a class of fault with the tool that confirms it. Memorise the shape — under pressure you walk it top to bottom.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 760 540" role="img" aria-label="Decision tree for network failures: does DNS resolve, does the port connect, refused vs timeout vs reset, then HTTP-layer checks">
+        <defs>
+          <marker id="tk" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--muted)"/></marker>
+        </defs>
+        <!-- start -->
+        <rect x="300" y="14" width="160" height="34" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.6"/>
+        <text x="380" y="36" text-anchor="middle" style="fill:var(--ink);font:700 13px sans-serif">request fails / slow</text>
+        <!-- Q1 DNS -->
+        <path d="M380,66 L470,104 L380,142 L290,104 Z" style="fill:var(--chip);stroke:var(--applied);stroke-width:1.6"/>
+        <text x="380" y="100" text-anchor="middle" style="fill:var(--ink);font:700 11.5px sans-serif">dig NAME</text>
+        <text x="380" y="116" text-anchor="middle" style="fill:var(--ink);font:700 11.5px sans-serif">resolves?</text>
+        <line x1="380" y1="48" x2="380" y2="66" style="stroke:var(--muted);stroke-width:1.6" marker-end="url(#tk)"/>
+        <!-- DNS leaf -->
+        <rect x="516" y="86" width="230" height="52" rx="8" style="fill:var(--panel);stroke:var(--applied)"/>
+        <text x="631" y="106" text-anchor="middle" style="fill:var(--applied);font:700 11px sans-serif">NO → DNS FAULT</text>
+        <text x="631" y="123" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">NXDOMAIN · SERVFAIL · timeout</text>
+        <line x1="470" y1="104" x2="516" y2="108" style="stroke:var(--muted);stroke-width:1.6" marker-end="url(#tk)"/>
+        <text x="486" y="98" style="fill:var(--muted);font:10px sans-serif">no</text>
+        <!-- Q2 connect -->
+        <path d="M380,166 L480,210 L380,254 L280,210 Z" style="fill:var(--chip);stroke:var(--accent2);stroke-width:1.6"/>
+        <text x="380" y="205" text-anchor="middle" style="fill:var(--ink);font:700 11.5px sans-serif">nc -vz host port</text>
+        <text x="380" y="221" text-anchor="middle" style="fill:var(--ink);font:700 11.5px sans-serif">connects?</text>
+        <line x1="380" y1="142" x2="380" y2="166" style="stroke:var(--muted);stroke-width:1.6" marker-end="url(#tk)"/>
+        <text x="388" y="158" style="fill:var(--muted);font:10px sans-serif">yes</text>
+        <!-- three failure leaves -->
+        <rect x="20" y="286" width="220" height="70" rx="8" style="fill:var(--panel);stroke:var(--deep)"/>
+        <text x="130" y="306" text-anchor="middle" style="fill:var(--deep);font:700 11px sans-serif">REFUSED (instant RST)</text>
+        <text x="130" y="323" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">nothing listening · wrong port</text>
+        <text x="130" y="338" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">crashed → ss -tlnp on server</text>
+        <rect x="270" y="286" width="220" height="70" rx="8" style="fill:var(--panel);stroke:var(--deep)"/>
+        <text x="380" y="306" text-anchor="middle" style="fill:var(--deep);font:700 11px sans-serif">TIMEOUT (silent hang)</text>
+        <text x="380" y="323" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">firewall/SG drop · bad route</text>
+        <text x="380" y="338" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">host down → mtr, traceroute</text>
+        <rect x="520" y="286" width="220" height="70" rx="8" style="fill:var(--panel);stroke:var(--deep)"/>
+        <text x="630" y="306" text-anchor="middle" style="fill:var(--deep);font:700 11px sans-serif">RESET mid-stream</text>
+        <text x="630" y="323" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">app crash · LB idle timeout</text>
+        <text x="630" y="338" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">OOM → server logs, tcpdump</text>
+        <line x1="330" y1="240" x2="150" y2="286" style="stroke:var(--muted);stroke-width:1.4" marker-end="url(#tk)"/>
+        <line x1="380" y1="254" x2="380" y2="286" style="stroke:var(--muted);stroke-width:1.4" marker-end="url(#tk)"/>
+        <line x1="430" y1="240" x2="610" y2="286" style="stroke:var(--muted);stroke-width:1.4" marker-end="url(#tk)"/>
+        <text x="250" y="268" style="fill:var(--muted);font:10px sans-serif">refused</text>
+        <text x="360" y="276" style="fill:var(--muted);font:10px sans-serif">hang</text>
+        <text x="505" y="268" style="fill:var(--muted);font:10px sans-serif">reset</text>
+        <!-- yes-connect path down to L7 -->
+        <rect x="270" y="396" width="220" height="40" rx="8" style="fill:var(--chip);stroke:var(--accent2);stroke-width:1.6"/>
+        <text x="380" y="415" text-anchor="middle" style="fill:var(--ink);font:700 11px sans-serif">connects OK → curl -v</text>
+        <text x="380" y="430" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">now it's L7</text>
+        <line x1="480" y1="210" x2="490" y2="210" style="stroke:var(--muted);stroke-width:1.4"/>
+        <line x1="490" y1="210" x2="490" y2="416" style="stroke:var(--muted);stroke-width:1.4"/>
+        <line x1="490" y1="416" x2="490" y2="416" style="stroke:var(--muted);stroke-width:1.4"/>
+        <line x1="490" y1="416" x2="490" y2="416" style="stroke:var(--muted);stroke-width:1.4" marker-end="url(#tk)"/>
+        <path d="M490,210 L490,416 L492,416" style="fill:none;stroke:var(--muted);stroke-width:1.4" marker-end="url(#tk)"/>
+        <text x="498" y="300" style="fill:var(--accent2);font:10px sans-serif">yes</text>
+        <!-- L7 leaves -->
+        <rect x="270" y="470" width="220" height="52" rx="8" style="fill:var(--panel);stroke:var(--violet)"/>
+        <text x="380" y="490" text-anchor="middle" style="fill:var(--violet);font:700 11px sans-serif">L7 fault</text>
+        <text x="380" y="507" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">4xx/5xx · TLS · slow ttfb (curl -w)</text>
+        <line x1="380" y1="436" x2="380" y2="470" style="stroke:var(--muted);stroke-width:1.4" marker-end="url(#tk)"/>
+      </svg>
+      <figcaption>Top-down: does it resolve, does it connect, and if it connects how did it fail — refused, timed out, or reset. Each answer eliminates a layer. The three red leaves are the distinctions everyone confuses.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>The three red boxes — refused, timeout, reset — feel identical to a user ("it doesn't work") and are three completely different root causes. Refused means something answered and said "no" (nothing on that port). Timeout means <em>nothing answered at all</em> (a drop). Reset means it worked and then something killed it mid-flight. Confusing them sends you to the wrong team. Getting them right in the first minute is the difference between a 10-minute incident and a 2-hour one.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>The bisection method, and what each signal means</h2>
+    <p>The method is layer bisection: check the middle-cheap things first, and let each result cut the search space in half. Here's the disciplined order for "can't reach X."</p>
+    <ol class="steps">
+      <li><b>Resolve it.</b> <code>dig X</code>. If it returns <code>NXDOMAIN</code>, the name doesn't exist (typo, wrong domain, record deleted). <code>SERVFAIL</code> means the resolver tried and failed (broken delegation, DNSSEC problem). A hang means the resolver itself is unreachable. If DNS is wrong, stop — nothing downstream matters.</li>
+      <li><b>Reach the host.</b> <code>ping X</code> tells you L3 reachability, but treat a failed ping carefully: many hosts and clouds block ICMP, so "ping fails" is not "host down." It's a hint, not a verdict.</li>
+      <li><b>Reach the port.</b> <code>nc -vz X PORT</code>. This is the decisive one, and its <em>manner</em> of failing is the diagnosis. <b>Succeeded</b> → L4 is fine, move to L7. <b>Connection refused</b> (instant) → the SYN reached a live host that returned a RST because nothing listens on that port. <b>Timed out</b> (hangs) → the SYN got no answer at all: a firewall/security-group drop, a black-holed route, or a dead host.</li>
+      <li><b>If refused, look at the server.</b> The service isn't listening where you think. <code>ss -tlnp</code> on the server shows exactly what's bound to which port and which process owns it. Often it's bound to <code>127.0.0.1</code> instead of <code>0.0.0.0</code>, so it works locally and refuses from outside.</li>
+      <li><b>If timed out, find where it dies.</b> <code>mtr X</code> (or <code>traceroute</code>) shows per-hop loss over time; the hop where replies stop is where the drop is — often the last hop before the destination (its firewall) or a specific segment losing packets.</li>
+      <li><b>If it connects but the app fails, go to L7.</b> <code>curl -v</code> shows how far the request got and whether it's a TLS problem or an HTTP status; <code>curl -w</code> attributes the latency (Chapter 19). A <code>4xx</code>/<code>5xx</code> is the app's problem, not the network's.</li>
+      <li><b>When nothing adds up, watch the wire.</b> <code>tcpdump</code> is the ground truth: it shows whether packets actually leave, arrive, and with what flags. If curl says "timeout" but tcpdump shows a SYN leaving and a RST coming back, curl was lying to you about "timeout" — it was refused. tcpdump settles every argument.</li>
+    </ol>
+    <div class="box keypoint"><div class="h">Refused vs timeout vs reset — the one distinction to never get wrong</div>
+      <p><b>Refused</b> = a RST came back immediately. A host is up; nothing is listening on that port (or a firewall is actively rejecting). <b>Timeout</b> = silence. The packet was dropped on the floor — firewall <code>DROP</code>, wrong route, or host truly down. <b>Reset mid-stream</b> = the connection established and moved data, then a RST arrived — the app crashed, was OOM-killed, or a load balancer/idle-timeout tore down a connection it considered stale. Same three letters to a user; three different on-call responses.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: <code>curl</code> to a service hangs for 30 seconds then fails, but the same service answers when you curl <code>localhost</code> on the box it runs on. What's your first command and why?</summary>
+      <div class="body">
+        <p>The hang (not an instant refuse) says the SYN is getting no reply from outside, yet it works locally — so the process is up and listening, but not reachable from where you are. My first command is <code>ss -tlnp</code> on the server: I bet it's bound to <code>127.0.0.1</code> (or a specific interface) instead of <code>0.0.0.0</code>, so it accepts local connections and silently ignores remote ones. If <code>ss</code> shows <code>0.0.0.0:PORT</code>, then it's a firewall/security-group drop between us and I switch to <code>mtr</code>/<code>tcpdump</code> to find where the SYN dies. The "works locally, hangs remotely" pattern is almost always a bind address or a firewall — and <code>ss</code> distinguishes them in one line.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The tools, grouped by layer</h2>
+    <ul>
+      <li><b>Addressing &amp; routing (L2/L3):</b> <code>ip addr</code> (interfaces/IPs), <code>ip route get</code> (which route a packet takes), <code>ip neigh</code> (the ARP cache). The <code>ip</code> command replaced the deprecated <code>ifconfig</code>/<code>route</code>/<code>arp</code> — use <code>ip</code>.</li>
+      <li><b>Reachability (L3):</b> <code>ping</code> (is it up at L3, and round-trip time), <code>traceroute</code> (the hop-by-hop path), <code>mtr</code> (traceroute + ping continuously, the best tool for intermittent loss because it shows loss <em>per hop over time</em>).</li>
+      <li><b>Ports &amp; connections (L4):</b> <code>ss</code> (sockets: what's listening, connection states, replaces <code>netstat</code>), <code>nc</code> (open a raw TCP/UDP connection to test a port), <code>conntrack</code> (the kernel's connection table and its counters, from <a href="ch18-the-linux-network-stack-internals.html">Chapter 18</a>).</li>
+      <li><b>Names (DNS):</b> <code>dig</code> (query any record from any server, see the full answer and timing — far more precise than <code>nslookup</code>).</li>
+      <li><b>Application (L7):</b> <code>curl</code> (make the real request, see every stage with <code>-v</code>, time each stage with <code>-w</code>).</li>
+      <li><b>Ground truth (all layers):</b> <code>tcpdump</code> (capture and decode actual packets; the final arbiter when tools disagree).</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Walking one symptom through the tree</h2>
+    <p>Symptom: "the checkout service can't reach payments." I run <code>dig payments.internal</code> — it returns an IP, so DNS is fine, cut that branch. <code>nc -vz payments.internal 8443</code> — it hangs and times out, not an instant refuse, so the SYN is being dropped, not rejected. That rules out "service crashed" (which would refuse) and points at a firewall or policy. <code>mtr payments.internal</code> shows loss starting at the last hop, consistent with the destination's firewall dropping us. I check the security group / NetworkPolicy for port 8443 from the checkout subnet — and there's the missing rule. Total time: three commands, because each answer eliminated a layer instead of me guessing. That's the whole method.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>Everything runs in one container; give it the capture capabilities:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>docker run --rm -it --cap-add=NET_ADMIN --cap-add=NET_RAW ubuntu:24.04 bash
+apt-get update &amp;&amp; apt-get install -y iproute2 dnsutils netcat-openbsd tcpdump curl mtr-tiny iputils-ping conntrack</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — see what's listening and what's connected</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Start a listener, then use <code>ss</code> to answer the two questions it's for: what's bound, and what states are connections in.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>python3 -m http.server 8080 --bind 127.0.0.1 &amp;
+ss -tlnp                        <span class="c"># t=tcp l=listening n=numeric p=process</span>
+curl -s http://127.0.0.1:8080 -o /dev/null
+ss -tan | head                  <span class="c"># a=all: see the connection states</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>State  Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+LISTEN 0      5          127.0.0.1:8080      0.0.0.0:*    users:(("python3",pid=9,fd=3))
+
+State     Recv-Q Send-Q Local Address:Port Peer Address:Port
+LISTEN    0      5          127.0.0.1:8080      0.0.0.0:*
+TIME-WAIT 0      0          127.0.0.1:8080    127.0.0.1:43402</code></div>
+        <p>Two lessons in one output. The <code>LISTEN</code> line shows the server is bound to <code>127.0.0.1</code> — <em>local only</em>, the exact misconfiguration that makes a service refuse remote connections. And the <code>TIME-WAIT</code> after the curl is the closing side holding the socket briefly (Chapter 14); thousands of these is a sign of connection churn. <code>ss</code> answers "what's listening?" and "what state are connections in?" — nothing else does both this fast.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — refused vs timeout, felt directly</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Use <code>nc</code> to hit an open port and a closed one, and feel the difference the whole tree hinges on.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>nc -vz 127.0.0.1 8080     <span class="c"># open — something is listening</span>
+nc -vz 127.0.0.1 9090     <span class="c"># closed — nothing listening here</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>Connection to 127.0.0.1 8080 port [tcp/http-alt] succeeded!
+nc: connect to 127.0.0.1 port 9090 (tcp) failed: Connection refused</code></div>
+        <p>The closed port returns <b>Connection refused instantly</b> — a RST, because the host is up and simply has nothing on 9090. Now contrast a <em>timeout</em>: a firewalled or non-existent host doesn't send a RST, it sends nothing, so <code>nc</code> hangs until it gives up:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>nc -vz -w3 10.255.255.1 9090   <span class="c"># unroutable/black-holed — hangs ~3s then times out</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>nc: connect to 10.255.255.1 port 9090 (tcp) timed out: Operation now in progress</code></div>
+        <p>Refused = instant RST from a live host (wrong port, crashed service). Timeout = silence (firewall/route/host). This one sensory difference — instant error vs. hang — is the single most useful reflex in network debugging.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Understand — read a capture, and query DNS precisely</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p><code>tcpdump</code> is ground truth. Capture your own loopback traffic while curling, and learn to read the flags:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>tcpdump -n -i lo port 8080 &amp;
+curl -s http://127.0.0.1:8080 -o /dev/null; sleep 1; kill %2 2&gt;/dev/null</code></pre></div>
+        <div class="out"><span class="ol">Output (representative)</span>IP 127.0.0.1.43410 &gt; 127.0.0.1.8080: Flags [S], seq 12345          <span class="c"># SYN</span>
+IP 127.0.0.1.8080 &gt; 127.0.0.1.43410: Flags [S.], seq 99, ack 12346 <span class="c"># SYN,ACK</span>
+IP 127.0.0.1.43410 &gt; 127.0.0.1.8080: Flags [.], ack 100            <span class="c"># ACK</span>
+IP 127.0.0.1.43410 &gt; 127.0.0.1.8080: Flags [P.], length 78         <span class="c"># the GET</span>
+IP 127.0.0.1.8080 &gt; 127.0.0.1.43410: Flags [F.], ...               <span class="c"># FIN</span></code></div>
+        <p><code>[S]</code>=SYN, <code>[S.]</code>=SYN-ACK, <code>[.]</code>=bare ACK, <code>[P.]</code>=data (push), <code>[F.]</code>=FIN, <code>[R]</code>=RST. Seeing a <code>[R]</code> where you expected <code>[S.]</code> is a refused connection on the wire. Now <code>dig</code>, which answers DNS questions precisely — note you can ask a <em>specific</em> server with <code>@</code>:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>dig +short example.com A            <span class="c"># just the answer</span>
+dig @1.1.1.1 example.com            <span class="c"># ask a specific resolver, see the full response</span>
+dig +trace example.com              <span class="c"># follow the delegation from the root down</span></code></pre></div>
+        <div class="out"><span class="ol">Output (representative — dig example.com)</span>;; ANSWER SECTION:
+example.com.  6  IN  A  104.20.23.154
+;; Query time: 12 msec
+;; SERVER: 127.0.0.53#53(127.0.0.53)
+;; status: NOERROR</code></div>
+        <p>Read the <code>status</code> line: <code>NOERROR</code> with an answer is healthy; <code>NXDOMAIN</code> means the name doesn't exist; <code>SERVFAIL</code> means the resolver failed. The <code>SERVER</code> line tells you <em>which</em> resolver answered — vital when you suspect one bad resolver in a pool. <code>dig</code> is far more precise than <code>nslookup</code>; use it.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Break — a symptom, and you pick the tool</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Here's a scenario. A teammate says: "our app logs <code>connection refused</code> talking to the cache at <code>cache.svc:6379</code>, but the cache pods are Running and healthy." You have shell on the app pod. Before revealing, decide: what do you run, in what order, and what does each result mean?</p>
+        <details class="recall"><summary>Reveal — the sequence and the reasoning</summary>
+          <div class="body">
+            <p><b>"Refused," not "timeout," is the biggest clue</b> — a RST came back, so a host is reachable and up; it's the <em>port</em> that's wrong, not the network. So I skip DNS-hang and firewall theories for a moment and check what's actually listening.</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>dig +short cache.svc                 <span class="c"># 1. does the name point where I expect?</span>
+nc -vz cache.svc 6379                <span class="c"># 2. confirm: instant refuse or hang?</span>
+<span class="c"># If DNS returns a Service IP and nc refuses instantly, the pods aren't</span>
+<span class="c"># actually serving 6379 where the Service sends traffic. Check endpoints:</span>
+ss -tlnp | grep 6379                 <span class="c"># on a cache pod: is redis bound to 0.0.0.0:6379?</span></code></pre></div>
+            <p>The usual answer: the cache is bound to <code>127.0.0.1:6379</code> inside its own pod, or listening on a different port than the Service targets, so the connection reaches the pod and gets refused because nothing listens on that address/port from outside. "Running and healthy" only means the process is up — not that it's listening where clients connect. <code>ss</code> on the target settles it. If instead <code>nc</code> had <em>timed out</em>, I'd pivot entirely to NetworkPolicy/security-group and <code>mtr</code>. The manner of failure chose the whole investigation.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — intermittent packet loss under pressure</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>The hardest network problems are intermittent — 2% of requests time out, no pattern, and it comes and goes. A single <code>ping</code> or <code>traceroute</code> "looks fine" because the loss is rare. How do you catch a fault that only shows up 2% of the time, and prove where it is?</p>
+        <details class="recall"><summary>Reveal an approach</summary>
+          <div class="body">
+            <p><code>mtr</code> is built for exactly this — it runs traceroute <em>continuously</em> and shows loss percentage per hop over hundreds of probes, so a 2% drop becomes visible where a one-shot traceroute misses it:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>mtr -rwc 500 payments.internal   <span class="c"># report mode, wide, 500 cycles</span></code></pre></div>
+            <div class="out"><span class="ol">Output (representative)</span>HOST: app-pod         Loss%  Snt   Last  Avg  Best  Wrst
+  1. gateway            0.0%   500   0.4   0.5  0.3   1.1
+  2. spine-sw-3         0.0%   500   0.8   0.9  0.6   2.0
+  3. edge-fw            2.2%   500   1.1   1.3  0.9   9.8   <span class="c"># loss starts here</span>
+  4. payments.internal  2.2%   500   1.2   1.4  1.0  10.1</code></div>
+            <p>Loss that <em>starts</em> at a hop and continues to the destination points at that hop (here <code>edge-fw</code>) or its uplink. One caveat that trips people up: loss shown at a middle hop but <em>not</em> at the destination is usually harmless — routers de-prioritise replying to the traceroute probes themselves (ICMP TTL-exceeded), so they under-report. Only loss that persists to the final hop is real. To corroborate, run <code>tcpdump</code> at both ends simultaneously and diff: packets that leave the sender but never arrive prove drops in between. For the conntrack angle from <a href="ch18-the-linux-network-stack-internals.html">Chapter 18</a>, check <code>conntrack -S</code> for rising <code>drop</code>/<code>insert_failed</code> counters — a full table causes exactly this "random 2% loss under load." The senior move is choosing the tool that <em>accumulates</em> evidence (mtr over 500 probes, conntrack counters) rather than the one-shot tool that hides rare faults.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · refused</div>
+      <p><b>Symptom:</b> instant "connection refused." <b>First cut:</b> <code>nc -vz host port</code> confirms the instant RST. <b>Confirm:</b> <code>ss -tlnp</code> on the target — nothing bound there, or bound to <code>127.0.0.1</code>. <b>Cause is usually:</b> service not started, crashed, wrong port, or listening on localhost only. It is <em>not</em> a firewall — a firewall drops, it doesn't refuse.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · timeout</div>
+      <p><b>Symptom:</b> connection hangs, then times out. <b>First cut:</b> <code>nc -vz -w3</code> confirms silence. <b>Confirm:</b> <code>mtr</code>/<code>traceroute</code> to see where packets die; <code>tcpdump</code> to see SYNs leave with no reply. <b>Cause is usually:</b> a firewall/security-group/NetworkPolicy dropping the packet, a bad route, or a host that's genuinely down. This is the one people mis-file as "server down" when it's a policy.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · reset mid-stream</div>
+      <p><b>Symptom:</b> requests succeed sometimes, or succeed then die partway with "connection reset by peer." <b>First cut:</b> <code>tcpdump</code> to catch the <code>[R]</code> and see who sent it. <b>Confirm:</b> correlate the RST timing with server logs. <b>Cause is usually:</b> the server crashed/OOM'd mid-request, a load balancer's idle timeout closed a pooled connection the client thought was alive, or a keep-alive mismatch — the client reuses a connection the server already closed.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · DNS</div>
+      <p><b>Symptom:</b> "name or service not known," or intermittent slowness on <em>first</em> request. <b>First cut:</b> <code>dig NAME</code> and read the <code>status</code>. <b>Confirm:</b> <code>NXDOMAIN</code> (record gone/typo), <code>SERVFAIL</code> (broken delegation/DNSSEC), or a hang (resolver unreachable); compare against <code>@</code>a known-good resolver. <b>Cause is usually:</b> a deleted or mis-propagated record, one unhealthy resolver in the pool, or a too-low TTL hammering a slow resolver.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Debug without making it worse.</b> <code>tcpdump</code> on a busy host can itself add load and, unfiltered, can fill a disk fast — always scope it with a filter (<code>host X and port Y</code>), a packet count (<code>-c 1000</code>), or a size-limited ring buffer (<code>-C 100 -W 5</code>), and prefer writing to a file (<code>-w</code>) over decoding live. Capturing packets means capturing <em>data</em>, so treat captures as sensitive — they can contain tokens, PII, and anything not encrypted; store and share them carefully, and prefer capturing metadata over payloads.</p>
+    <p><b>Know what needs privilege.</b> Raw packet capture and most <code>ip</code> mutations need <code>CAP_NET_RAW</code>/<code>CAP_NET_ADMIN</code>; read-only tools like <code>ss</code>, <code>dig</code>, and <code>ip … show</code> mostly don't. In a locked-down container you may have <code>curl</code> and <code>ss</code> but not <code>tcpdump</code> — plan your triage around what's actually installed, and bake a minimal toolkit (<code>ss</code>, <code>dig</code>, <code>curl</code>, <code>nc</code>) into your debug images. A distroless production image may have <em>none</em> of these, which is why ephemeral debug containers exist (<a href="ch40-kubernetes-troubleshooting-methodology.html">Chapter 40</a>).</p>
+    <p><b>Common mistakes:</b> concluding "host down" from a failed <code>ping</code> when ICMP is simply blocked; starting with <code>tcpdump</code> before the cheap tools have narrowed the layer; using deprecated <code>ifconfig</code>/<code>netstat</code>/<code>nslookup</code> and getting subtly different or incomplete output; and — the classic — not distinguishing refused from timeout, so the whole investigation goes to the wrong layer.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>These same questions, asked continuously instead of during an incident, become <b>observability</b>. A blackbox probe that runs <code>curl</code> against your endpoints every 30 seconds and records the per-stage timing is Lab 5 of Chapter 19 turned into a monitor — that's the Prometheus blackbox exporter (<a href="ch77-alerting-and-on-call-health.html">Chapter 77</a>). Synthetic checks that do a DNS lookup, a TCP connect, and a TLS handshake from multiple locations are these tools on a schedule, alerting when a stage regresses before users notice. When you design a service's health model, you're deciding which of these signals to watch and where to run them from. And the whole layered-bisection discipline is the network-specific case of the universal troubleshooting framework in <a href="ch103-the-universal-troubleshooting-framework.html">Chapter 103</a>: form a hypothesis, run the one command that confirms or kills it, repeat.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's the difference between "connection refused" and "connection timed out"?</summary>
+        <div class="a"><p>Refused is instant: the SYN reached a live host and got a RST back because nothing is listening on that port — so the service is down, on the wrong port, or bound to localhost. Timed out is silence: the SYN got no reply at all, so the packet was dropped — a firewall or security group, a bad route, or a genuinely dead host. Refused means something said "no"; timeout means nothing answered. They feel the same to a user and point at completely different causes, so distinguishing them is the first thing I do.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Give me your process for "app can't reach the database."</summary>
+        <div class="a"><p>I bisect by layer, cheap tools first. Resolve the name with <code>dig</code> — if it's NXDOMAIN or the wrong IP, that's it. Then test the port with <code>nc -vz host 5432</code>, and the manner of failure drives everything: if it connects, L4 is fine and I go to the app; if it refuses instantly, the DB isn't listening where I'm connecting, so I check <code>ss -tlnp</code> on the DB host for the bind address and port; if it times out, the packet is being dropped, so I check the firewall/security-group/NetworkPolicy and use <code>mtr</code> to see where the path dies. If it connects but the app still fails, I use <code>curl</code> or the DB client with verbose output to see the L7 error, which might be auth or TLS, not networking. If tools disagree, <code>tcpdump</code> on both ends is ground truth — it shows whether packets actually leave and arrive. The point is each command eliminates a layer, so I converge in three or four steps instead of guessing.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Ping to a server fails. Is the server down? How do you really tell?</summary>
+        <div class="a"><p>No — a failed ping is a weak signal, because ICMP is frequently blocked by firewalls, security groups, and cloud networks while TCP still works fine. So "ping fails" is a hint, not a verdict. To actually tell whether the server is usable, I test the port I care about with <code>nc -vz host port</code> or <code>curl</code> — a successful TCP connect proves the host is up and reachable at L4 regardless of ICMP. If TCP also fails, then I escalate: <code>mtr</code> to see whether packets reach the host's network at all, and <code>tcpdump</code> to see whether my SYNs leave and whether anything comes back. I'd also flip it around — if the app is serving traffic to others, the "down" is really "unreachable from here," which points at a path or policy between us, not the server. Relying on ping alone is a classic way to declare the wrong thing broken.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>2% of requests to a service intermittently time out. Everything "looks fine." Find it.</summary>
+        <div class="a"><p>Intermittent, low-rate loss hides from one-shot tools, so I use ones that accumulate evidence. <code>mtr -rwc 500</code> runs hundreds of probes and shows loss per hop over time; loss that <em>starts</em> at a hop and persists to the destination localises the bad segment — with the caveat that loss at a middle hop that doesn't reach the destination is usually just routers de-prioritising ICMP, so I only trust loss that continues to the final hop. I'd corroborate with simultaneous <code>tcpdump</code> at both ends and diff which packets left but never arrived. On a Linux node under load I'd also check <code>conntrack -S</code> for rising drops and compare <code>nf_conntrack_count</code> to max, because a full conntrack table produces exactly this random-2%-under-load symptom. And I'd look at whether the loss correlates with a specific backend, AZ, or the moments of highest connection churn. The theme is measuring over many samples, because the fault is rare by definition.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>When do you reach for tcpdump versus everything else?</summary>
+        <div class="a"><p>Last, not first — after the cheap tools have narrowed the layer, or when tools disagree and I need ground truth. tcpdump shows exactly what's on the wire: whether packets leave, arrive, and with which flags, so it settles arguments like "curl says timeout but is it really being refused?" — if I see a RST come back, it was refused, and curl was summarising. But it's the expensive instrument: it needs privilege, adds load on a busy host, and captures potentially sensitive data, so I always scope it with a filter, a packet count or a ring buffer, and write to a file rather than decode live. I use it to confirm a hypothesis I already have — "I expect to see SYNs with no reply" — not to go fishing. Starting every investigation with an unfiltered tcpdump is the junior move; reaching for it precisely, third or fourth, is the senior one.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>Network debugging is layered bisection with the right instrument at each layer. Each tool answers one question: <code>dig</code> (does the name resolve, and from which server?), <code>ping</code> (is it up at L3 — but ICMP may be blocked), <code>traceroute</code>/<code>mtr</code> (where does the path lose packets, especially over time), <code>nc</code> (is the port open?), <code>ss</code> (what's listening and what state are connections in?), <code>curl</code> (does the real request work, and how fast per stage?), <code>conntrack</code> (what's tracked, is the table full?), and <code>tcpdump</code> (what's truly on the wire — the final arbiter). The distinctions that matter most: <b>refused</b> is an instant RST (nothing listening), <b>timeout</b> is silence (a drop), <b>reset mid-stream</b> is a live connection killed (crash/idle-timeout), and a <b>DNS</b> failure stops everything before it starts. Start with the cheap, broad tools; reach for tcpdump last; and never confuse refused with timeout.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>Every tool answers one question — learn the question, and the tool picks itself.</li>
+      <li>Bisect by layer: resolve (dig) → reach the port (nc) → app (curl); each answer cuts the search in half.</li>
+      <li>Refused = instant RST = nothing listening / wrong port / bound to localhost — check <code>ss -tlnp</code>.</li>
+      <li>Timeout = silence = a dropped packet = firewall / security group / bad route — check <code>mtr</code>, policy.</li>
+      <li>Reset mid-stream = a live connection killed = crash, OOM, or LB idle timeout — check logs + tcpdump.</li>
+      <li>A failed <code>ping</code> is a hint, not a verdict — ICMP is often blocked; test the real port instead.</li>
+      <li><code>ss</code> replaced <code>netstat</code>, <code>ip</code> replaced <code>ifconfig</code>/<code>route</code>/<code>arp</code>, <code>dig</code> beats <code>nslookup</code> — use the modern ones.</li>
+      <li><code>mtr</code> beats a one-shot traceroute for intermittent loss because it measures per hop over time.</li>
+      <li>Read <code>dig</code>'s <code>status</code> line: NOERROR, NXDOMAIN, SERVFAIL — and the SERVER line tells you which resolver answered.</li>
+      <li>tcpdump is ground truth but expensive: reach for it last, always filtered, and treat captures as sensitive.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds toward:</span>
+      <a href="ch15-dns-end-to-end.html"><b>Ch 15</b> DNS</a>
+      <a href="ch18-the-linux-network-stack-internals.html"><b>Ch 18</b> conntrack &amp; the stack</a>
+      <a href="ch19-capstone-trace-curl-https-example-com.html"><b>Ch 19</b> The full trace</a>
+      <a href="ch40-kubernetes-troubleshooting-methodology.html"><b>Ch 40</b> K8s troubleshooting</a>
+      <a href="ch103-the-universal-troubleshooting-framework.html"><b>Ch 103</b> The universal framework</a>
+      <a href="ch105-network-runbooks.html"><b>Ch 105</b> Network runbooks</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man8/ss.8.html">ss(8)</a>, <a href="https://man7.org/linux/man-pages/man8/ip.8.html">ip(8)</a>, and <a href="https://man7.org/linux/man-pages/man8/tcpdump.8.html">tcpdump(8)</a>.</li>
+      <li>The Tcpdump/libpcap project — <a href="https://www.tcpdump.org/manpages/pcap-filter.7.html">pcap-filter(7)</a>: the capture-filter language you scope captures with.</li>
+      <li>ISC — <a href="https://bind9.readthedocs.io/en/latest/manpages.html">dig manual (BIND 9 documentation)</a> for reading DNS answers and status codes.</li>
+      <li>The curl project — <a href="https://everything.curl.dev/">Everything curl</a> and the <a href="https://curl.se/docs/manpage.html">curl(1) manual</a> (verbose mode and <code>-w</code> timing).</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man8/conntrack.8.html">conntrack(8)</a> and <a href="https://man7.org/linux/man-pages/man8/traceroute.8.html">traceroute(8)</a>.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch19-capstone-trace-curl-https-example-com.html"><span class="dir">← Prev</span><div class="ti">Ch 19 — Capstone trace: curl https://example.com</div></a>
+      <a class="nx" href="ch21-what-a-container-really-is.html"><span class="dir">Next →</span><div class="ti">Ch 21 — What a container really is</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 20 of 121 · Part II · Networking from First Principles. The tools are muscle memory; the decision tree is the skill.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">The decision tree</a>
+    <a href="#internals">Bisection method</a>
+    <a href="#components">Tools by layer</a>
+    <a href="#flow">Walking one symptom</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

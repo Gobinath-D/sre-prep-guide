@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 58 — VPC CNI: the deep one</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part VI · AWS &amp; EKS &nbsp;·&nbsp; Chapter 58</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part VI · AWS &amp; EKS for SREs · Chapter 58</div>
+      <h1>VPC CNI: the deep one</h1>
+      <p class="tagline">On EKS a pod's IP isn't a made-up overlay address — it's a real, routable VPC IP, handed out by the Amazon VPC CNI. That single design choice makes pods first-class citizens of your network and also makes them run out of addresses. This is the chapter where Part V's packet knowledge and Part VI's AWS knowledge fuse into one line you can trace end to end.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~55 min read · AWS CLI + a node shell (kind for contrast)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain why every EKS pod gets a real VPC IP, and what that buys and costs you.</li>
+          <li>Compute a node's max pods in both secondary-IP mode and prefix-delegation mode, from the instance type.</li>
+          <li>Describe the warm-IP pool and why <code>ipamd</code> pre-allocates addresses.</li>
+          <li>Trace a packet from a pod's network namespace all the way to a VPC route table and Security Group.</li>
+          <li>Diagnose "failed to assign an IP address" — telling node exhaustion apart from subnet exhaustion — and fix it with prefix delegation or more address space.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>Pods need IPs, and AWS gives them real ones</h2>
+    <p>Back in <a href="ch41-the-kubernetes-network-model-and-cni.html">Chapter 41</a> you learned the Kubernetes rule: every pod gets its own IP, and every pod can reach every other pod without NAT. A CNI plugin makes that true. Most CNIs build an <b>overlay</b> — they invent a private pod network (say <code>10.244.0.0/16</code>) that lives on top of the real network and tunnel pod traffic between nodes. The pod IPs are fictional as far as the underlying network is concerned; the VPC never sees them.</p>
+    <p>The Amazon VPC CNI takes the opposite approach, and it's the thing that makes EKS networking unusual. It gives each pod a <b>real private IP from your VPC subnet</b> — the same address space your EC2 instances, RDS databases, and load balancers use. There's no overlay and no tunnel. A pod at <code>10.0.1.23</code> is, to the VPC, indistinguishable from any other network interface at <code>10.0.1.23</code>.</p>
+    <p>That buys you a lot. A pod can talk straight to an RDS instance with no gateway in between. An Application Load Balancer can send traffic directly to a pod's IP. VPC Flow Logs, Security Groups, and route tables all apply to pod traffic because it <em>is</em> VPC traffic. You get one flat, observable network instead of a network-inside-a-network.</p>
+    <p>It also costs you something real, and this is the half that becomes your incident: <b>pods consume actual VPC IP addresses</b>, and VPCs have a finite supply. Subnets are sized in CIDR blocks; a <code>/24</code> has 251 usable addresses, and every pod eats one. Pack the cluster densely enough, or size the subnets carelessly enough, and you hit a wall that overlay users never see — pods stuck in <code>ContainerCreating</code> with the message <code>failed to assign an IP address to container</code>. This chapter is how that IP gets assigned, how the supply is managed, and what to do when it runs dry.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>The VPC CNI trades address abundance for network simplicity. Overlays give you effectively unlimited pod IPs but a second network to reason about; the VPC CNI gives you one flat network where pods are real VPC endpoints — at the price of planning your address space as carefully as you plan compute. Almost every hard EKS networking problem is a consequence of that trade.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: real phone extensions, not internal codes</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Imagine an office building where the phone company owns a block of real, dialable extensions — say <code>555-0100</code> through <code>555-0355</code> for one floor (that's your <b>subnet CIDR</b>). Every desk, printer, and contractor phone gets a genuine extension from that block, not a made-up internal code. That's the VPC CNI: pods get real numbers anyone in the building — or the phone company's records — can see and route to.</p>
+      <p>The <b>office manager</b> (the CNI's <code>ipamd</code> daemon) doesn't call the phone company each time a contractor arrives; that call is slow. Instead the manager keeps a small stash of pre-activated spare extensions in a drawer (the <b>warm-IP pool</b>) so a new contractor gets a working phone in seconds. Each wall panel on the floor (an <b>ENI</b>) has a fixed number of jacks; fill a panel and the manager installs another, up to the building's wiring limit (the instance type's max ENIs).</p>
+      <p>Two ways to run dry. A single floor's panels fill up — no more jacks on this floor even though the desk is empty (<b>node IP exhaustion</b>: the instance hit its ENI/IP limit). Or the phone company's whole block for the floor is used up — no numbers left to hand anyone (<b>subnet exhaustion</b>). <b>Prefix delegation</b> is the manager negotiating extensions in blocks of 16 at a time instead of one at a time: one jack now backs sixteen phones, so panels fill far more slowly and the manager rarely calls the phone company.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In the VPC CNI</th></tr>
+      <tr><td>The phone company's number block for the floor</td><td>The <b>subnet CIDR</b> (e.g. <code>10.0.1.0/24</code>)</td></tr>
+      <tr><td>A real dialable extension per phone</td><td>A routable <b>VPC IP per pod</b></td></tr>
+      <tr><td>The office manager</td><td><code>ipamd</code> — the IP-management daemon in <code>aws-node</code></td></tr>
+      <tr><td>The drawer of pre-activated spares</td><td>The <b>warm-IP pool</b> (WARM_ENI/IP targets)</td></tr>
+      <tr><td>A wall panel with a fixed number of jacks</td><td>An <b>ENI</b> with a fixed max IPs (by instance type)</td></tr>
+      <tr><td>Installing another panel</td><td>Attaching another <b>ENI</b>, up to the instance limit</td></tr>
+      <tr><td>Negotiating extensions 16 at a time</td><td><b>Prefix delegation</b> — a <code>/28</code> (16 IPs) per slot</td></tr>
+      <tr><td>Floor panels full / block used up</td><td>Node IP exhaustion / subnet exhaustion</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>Stitching a pod to the VPC</h2>
+    <p>Here is the whole line, from a process inside a pod to a destination out in the VPC. Follow it once slowly; every EKS networking incident lives somewhere on this path. The pod's <code>eth0</code> is one end of a <b>veth pair</b>; the other end sits in the host network namespace, where per-ENI policy routing sends the packet out the right elastic network interface. The pod's IP is a <em>secondary IP</em> (or an IP from a delegated prefix) on that ENI. From the ENI, normal VPC routing takes over — the subnet route table decides local-VPC versus internet — and a Security Group is enforced right at the ENI.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 548" role="img" aria-label="A packet's path from a pod network namespace through a veth pair, host policy routing, an ENI with secondary IPs or prefixes, a Security Group, then the VPC subnet route table to local or internet destinations">
+        <defs>
+          <marker id="v1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="v2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+          <marker id="vm" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" style="fill:var(--muted)"/></marker>
+        </defs>
+        <!-- NODE outer -->
+        <rect x="12" y="34" width="696" height="306" rx="12" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+        <text x="28" y="55" style="fill:var(--ink);font:700 12px sans-serif;letter-spacing:.03em">EC2 NODE — in your VPC subnet 10.0.1.0/24</text>
+        <!-- pod netns -->
+        <rect x="28" y="70" width="176" height="120" rx="10" style="fill:var(--chip);stroke:var(--violet);stroke-width:1.5"/>
+        <text x="116" y="90" text-anchor="middle" style="fill:var(--violet);font:700 11.5px sans-serif">pod A · netns</text>
+        <rect x="52" y="104" width="128" height="40" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="116" y="122" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">eth0</text>
+        <text x="116" y="137" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">10.0.1.23</text>
+        <text x="116" y="170" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">a real VPC IP —</text>
+        <text x="116" y="183" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">no overlay, no tunnel</text>
+        <!-- veth -->
+        <line x1="204" y1="124" x2="256" y2="124" style="stroke:var(--accent);stroke-width:2" marker-end="url(#v1)"/>
+        <text x="230" y="116" text-anchor="middle" style="fill:var(--accent);font:600 9px sans-serif">veth</text>
+        <text x="230" y="139" text-anchor="middle" style="fill:var(--muted);font:8.5px sans-serif">pair</text>
+        <!-- host netns -->
+        <rect x="256" y="70" width="196" height="120" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="354" y="90" text-anchor="middle" style="fill:var(--ink);font:700 11px sans-serif">host netns</text>
+        <text x="354" y="110" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">veth peer (vethXXXX)</text>
+        <text x="354" y="128" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">policy routing:</text>
+        <text x="354" y="143" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">ip rule per pod → per-ENI table</text>
+        <text x="354" y="167" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">return traffic pinned to the</text>
+        <text x="354" y="180" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">ENI the pod IP belongs to</text>
+        <!-- ipamd -->
+        <rect x="470" y="66" width="222" height="40" rx="8" style="fill:var(--panel);stroke:var(--accent2)"/>
+        <text x="581" y="84" text-anchor="middle" style="fill:var(--accent2);font:600 11px sans-serif">aws-node / ipamd</text>
+        <text x="581" y="98" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">warm pool · attaches ENIs · calls EC2 API</text>
+        <!-- SG dashed -->
+        <rect x="464" y="116" width="234" height="120" rx="10" style="fill:none;stroke:var(--deep);stroke-width:1.4;stroke-dasharray:6 4"/>
+        <text x="581" y="132" text-anchor="middle" style="fill:var(--deep);font:700 9.5px sans-serif;letter-spacing:.03em">SECURITY GROUP — enforced at the ENI</text>
+        <!-- eni0 -->
+        <rect x="478" y="142" width="204" height="42" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="580" y="159" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">eni-0 (primary) · node IP .5</text>
+        <text x="580" y="174" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">secondary IPs: .23 .24 .25 …</text>
+        <!-- eni1 -->
+        <rect x="478" y="190" width="204" height="40" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="580" y="206" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">eni-1 · /28 prefix</text>
+        <text x="580" y="220" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">.96–.111 (16 IPs in one slot)</text>
+        <!-- host -> eni -->
+        <line x1="452" y1="150" x2="476" y2="160" style="stroke:var(--accent);stroke-width:2" marker-end="url(#v1)"/>
+        <text x="360" y="205" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">.23 is a secondary IP on eni-0 →</text>
+        <!-- ipamd manages -->
+        <line x1="581" y1="106" x2="581" y2="140" style="stroke:var(--accent2);stroke-width:1.5;stroke-dasharray:3 3" marker-end="url(#v2)"/>
+        <text x="300" y="258" style="fill:var(--muted);font:9.5px sans-serif">egress to internet is SNAT'd to the node's primary IP unless AWS_VPC_K8S_CNI_EXTERNALSNAT=true</text>
+        <!-- node bottom arrow -->
+        <line x1="580" y1="230" x2="580" y2="300" style="stroke:var(--accent);stroke-width:2" marker-end="url(#v1)"/>
+        <text x="588" y="270" style="fill:var(--accent);font:600 9px sans-serif">out the ENI</text>
+        <text x="352" y="300" text-anchor="middle" style="fill:var(--ink);font:600 10px sans-serif">the ENI is a normal VPC network interface — the VPC takes over from here</text>
+        <!-- boundary -->
+        <line x1="12" y1="356" x2="708" y2="356" style="stroke:var(--deep);stroke-width:1.2;stroke-dasharray:7 5"/>
+        <text x="360" y="351" text-anchor="middle" style="fill:var(--deep);font:700 10px sans-serif;letter-spacing:.03em">NODE ↑ · VPC ↓</text>
+        <!-- route table -->
+        <rect x="220" y="372" width="280" height="72" rx="10" style="fill:var(--chip);stroke:var(--accent)"/>
+        <text x="360" y="392" text-anchor="middle" style="fill:var(--accent);font:700 11px sans-serif">subnet route table</text>
+        <text x="360" y="411" text-anchor="middle" style="fill:var(--ink);font:600 10px sans-serif">10.0.0.0/16 → local</text>
+        <text x="360" y="428" text-anchor="middle" style="fill:var(--ink);font:600 10px sans-serif">0.0.0.0/0 → nat-gateway</text>
+        <line x1="560" y1="340" x2="470" y2="371" style="stroke:var(--accent);stroke-width:2" marker-end="url(#v1)"/>
+        <!-- destinations -->
+        <rect x="40" y="474" width="300" height="56" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="190" y="497" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">local VPC (same route)</text>
+        <text x="190" y="514" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">other pod · RDS · ALB — direct, no NAT</text>
+        <rect x="380" y="474" width="300" height="56" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="530" y="497" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">0.0.0.0/0 → NAT GW → IGW</text>
+        <text x="530" y="514" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">the internet (egress, SNAT'd)</text>
+        <line x1="300" y1="444" x2="220" y2="472" style="stroke:var(--muted);stroke-width:1.6" marker-end="url(#vm)"/>
+        <line x1="430" y1="444" x2="510" y2="472" style="stroke:var(--muted);stroke-width:1.6" marker-end="url(#vm)"/>
+      </svg>
+      <figcaption>One unbroken line: pod <code>eth0</code> → veth pair → host policy routing → an ENI (where the pod IP lives as a secondary IP or inside a delegated prefix) → the Security Group at that ENI → the subnet route table → local VPC or the internet. No overlay anywhere. This diagram is <a href="ch42-pod-networking-internals-pod-to-pod.html">Chapter 42</a>'s veth story wired into <a href="ch50-vpc-foundations-cidr-subnets-route-tables-igw.html">Chapter 50</a>'s VPC.</figcaption>
+    </figure>
+
+    <p>The other picture you need is the one that decides how many pods a node can hold. Each ENI has a fixed number of IP <em>slots</em> set by the instance type. In the default mode, each slot holds one IP. In prefix mode, each slot holds a <code>/28</code> — sixteen IPs. Same ENIs, same slot count, sixteen times the pods:</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 250" role="img" aria-label="One ENI with nine usable slots: in secondary-IP mode each slot is one IP for nine pods; in prefix mode each slot is a /28 of sixteen IPs for a hundred and forty-four pods">
+        <text x="360" y="20" text-anchor="middle" style="fill:var(--muted);font:700 11px sans-serif;letter-spacing:.05em">SAME ENI, SAME 9 USABLE SLOTS — TWO MODES (example: c5.large, 10 IPs/ENI)</text>
+        <!-- left: secondary -->
+        <text x="180" y="46" text-anchor="middle" style="fill:var(--accent);font:700 11px sans-serif">Secondary-IP mode</text>
+        <rect x="40" y="58" width="280" height="120" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="180" y="76" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">1 slot = 1 IP</text>
+        <g>
+          <rect x="56" y="86" width="26" height="26" rx="4" style="fill:var(--panel);stroke:var(--accent)"/>
+          <rect x="86" y="86" width="26" height="26" rx="4" style="fill:var(--panel);stroke:var(--accent)"/>
+          <rect x="116" y="86" width="26" height="26" rx="4" style="fill:var(--panel);stroke:var(--accent)"/>
+          <rect x="146" y="86" width="26" height="26" rx="4" style="fill:var(--panel);stroke:var(--accent)"/>
+          <rect x="176" y="86" width="26" height="26" rx="4" style="fill:var(--panel);stroke:var(--accent)"/>
+          <rect x="206" y="86" width="26" height="26" rx="4" style="fill:var(--panel);stroke:var(--accent)"/>
+          <rect x="236" y="86" width="26" height="26" rx="4" style="fill:var(--panel);stroke:var(--accent)"/>
+          <rect x="266" y="86" width="26" height="26" rx="4" style="fill:var(--panel);stroke:var(--accent)"/>
+          <rect x="56" y="118" width="26" height="26" rx="4" style="fill:var(--panel);stroke:var(--accent)"/>
+        </g>
+        <text x="180" y="164" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">9 slots × 1 = 9 pod IPs / ENI</text>
+        <!-- right: prefix -->
+        <text x="540" y="46" text-anchor="middle" style="fill:var(--accent2);font:700 11px sans-serif">Prefix-delegation mode</text>
+        <rect x="400" y="58" width="280" height="120" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="540" y="76" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">1 slot = /28 = 16 IPs</text>
+        <g>
+          <rect x="416" y="86" width="26" height="26" rx="4" style="fill:var(--panel);stroke:var(--accent2)"/><text x="429" y="103" text-anchor="middle" style="fill:var(--accent2);font:8px sans-serif">16</text>
+          <rect x="446" y="86" width="26" height="26" rx="4" style="fill:var(--panel);stroke:var(--accent2)"/><text x="459" y="103" text-anchor="middle" style="fill:var(--accent2);font:8px sans-serif">16</text>
+          <rect x="476" y="86" width="26" height="26" rx="4" style="fill:var(--panel);stroke:var(--accent2)"/><text x="489" y="103" text-anchor="middle" style="fill:var(--accent2);font:8px sans-serif">16</text>
+          <rect x="506" y="86" width="26" height="26" rx="4" style="fill:var(--panel);stroke:var(--accent2)"/><text x="519" y="103" text-anchor="middle" style="fill:var(--accent2);font:8px sans-serif">16</text>
+          <rect x="536" y="86" width="26" height="26" rx="4" style="fill:var(--panel);stroke:var(--accent2)"/><text x="549" y="103" text-anchor="middle" style="fill:var(--accent2);font:8px sans-serif">16</text>
+          <rect x="566" y="86" width="26" height="26" rx="4" style="fill:var(--panel);stroke:var(--accent2)"/><text x="579" y="103" text-anchor="middle" style="fill:var(--accent2);font:8px sans-serif">16</text>
+          <rect x="596" y="86" width="26" height="26" rx="4" style="fill:var(--panel);stroke:var(--accent2)"/><text x="609" y="103" text-anchor="middle" style="fill:var(--accent2);font:8px sans-serif">16</text>
+          <rect x="626" y="86" width="26" height="26" rx="4" style="fill:var(--panel);stroke:var(--accent2)"/><text x="639" y="103" text-anchor="middle" style="fill:var(--accent2);font:8px sans-serif">16</text>
+          <rect x="416" y="118" width="26" height="26" rx="4" style="fill:var(--panel);stroke:var(--accent2)"/><text x="429" y="135" text-anchor="middle" style="fill:var(--accent2);font:8px sans-serif">16</text>
+        </g>
+        <text x="540" y="164" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">9 slots × 16 = 144 pod IPs / ENI</text>
+        <text x="360" y="206" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">max pods (secondary) = (ENIs × (IPs/ENI − 1)) + 2 &nbsp;·&nbsp; (prefix) = (ENIs × (IPs/ENI − 1) × 16) + 2</text>
+        <text x="360" y="228" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">the +2 covers host-network pods (aws-node, kube-proxy) that don't draw from the pool</text>
+      </svg>
+      <figcaption>Prefix delegation doesn't add ENIs or slots — it makes each slot hold a <code>/28</code> instead of a single address, multiplying pod density by up to 16× and cutting EC2 API calls, at the cost of needing contiguous <code>/28</code> blocks free in the subnet.</figcaption>
+    </figure>
+
+    <h2 id="internals"><span class="beat">Internal working</span>ENIs, the warm pool, prefixes, and where the IPs run out</h2>
+
+    <h4>1 · ENIs and secondary IPs — the base model</h4>
+    <p>The CNI runs on every node as the <code>aws-node</code> DaemonSet. Inside it is <b><code>ipamd</code></b> (the IP-address-management daemon) and, dropped onto the host, the CNI binary at <code>/opt/cni/bin/aws-cni</code>. When a node boots, <code>ipamd</code> attaches a primary elastic network interface and asks EC2 for a batch of <b>secondary IP addresses</b> on it. Each ENI's first IP is the interface's own primary address (used by the node); the rest are the pool <code>ipamd</code> hands to pods.</p>
+    <p>Every instance type caps two numbers: how many ENIs it can attach, and how many IPs each ENI can hold. An <code>m5.large</code> allows 3 ENIs of 10 IPs each; a <code>t3.medium</code> allows 3 ENIs of 6 IPs. From those two numbers you get the node's pod ceiling in the default mode:</p>
+    <div class="codewrap"><span class="lang">text</span><pre><code>max pods = (ENIs × (IPs_per_ENI − 1)) + 2
+
+m5.large:   (3 × (10 − 1)) + 2 = 29 pods
+t3.medium:  (3 × ( 6 − 1)) + 2 = 17 pods
+t3.small:   (3 × ( 4 − 1)) + 2 = 11 pods</code></pre></div>
+    <p>The <code>− 1</code> is the ENI's own primary IP, which pods don't use. The <code>+ 2</code> is for the two pods that run in the host's network namespace — <code>aws-node</code> and <code>kube-proxy</code> — and therefore don't draw an IP from the pool. That's the whole formula, and it explains a surprise every EKS beginner hits: a <code>t3.small</code> node with 2 vCPU and plenty of RAM refuses to schedule an 18th pod, not because it's out of CPU but because it's out of IPs.</p>
+
+    <h4>2 · The warm-IP pool — why <code>ipamd</code> hoards addresses</h4>
+    <p>Calling the EC2 API to assign an IP takes real time — hundreds of milliseconds, and attaching a whole new ENI can take up to ten seconds. If <code>ipamd</code> did that on the critical path of every pod start, pod launches would stall. So it keeps a <b>warm pool</b>: spare, already-assigned IPs sitting ready. When a pod lands, the CNI takes one from the pool instantly; in the background, <code>ipamd</code> tops the pool back up. Three environment variables tune the trade between fast launches and wasted addresses:</p>
+    <ul>
+      <li><b><code>WARM_ENI_TARGET</code></b> (default 1) — keep one entire spare ENI's worth of IPs ready. Fast, but on a big instance that can reserve dozens of IPs a node isn't using.</li>
+      <li><b><code>WARM_IP_TARGET</code></b> — keep exactly this many spare IPs, regardless of ENI boundaries. Tighter on addresses.</li>
+      <li><b><code>MINIMUM_IP_TARGET</code></b> — the floor of total IPs to hold, sized to your typical pods-per-node so a node comes up pre-warmed.</li>
+    </ul>
+    <p>The default (<code>WARM_ENI_TARGET=1</code>) favours launch speed and can waste IPs — exactly the wrong default when your subnets are tight. Setting <code>WARM_IP_TARGET</code> and <code>MINIMUM_IP_TARGET</code> together is the classic knob for conserving a scarce address space, at the cost of occasionally waiting on an EC2 call.</p>
+
+    <h4>3 · Prefix delegation — 16 IPs per slot</h4>
+    <p>Prefix delegation (VPC CNI 1.9.0 and later, enabled with <code>ENABLE_PREFIX_DELEGATION=true</code>) changes what fills an ENI slot. Instead of assigning individual secondary IPs, <code>ipamd</code> assigns <code>/28</code> IPv4 <b>prefixes</b> — a contiguous block of 16 addresses — and hands pod IPs out of those blocks. The instance's ENI and slot limits don't change, but each usable slot now backs 16 pods instead of 1. On a <code>c5.large</code>, whose ENI holds 10 IPs, a single ENI with no secondary IPs can carry up to 9 prefixes — 144 pod addresses from one ENI:</p>
+    <div class="codewrap"><span class="lang">text</span><pre><code>max pods (prefix) = (ENIs × (IPs_per_ENI − 1) × 16) + 2
+
+c5.large, 1 ENI:  (1 × 9 × 16) + 2 = 146   →  capped in practice to 110
+m5.large, 3 ENIs: (3 × 9 × 16) + 2 = 434   →  capped in practice to 110 (or 250)</code></pre></div>
+    <p>Kubernetes itself recommends no more than 110 pods per node, so AWS's <code>max-pods-calculator.sh</code> caps the result (110 for smaller instances, up to 250 for large ones) rather than letting a single node try to run 400+ pods. Two operational facts matter. First, you must tell the kubelet the higher number explicitly — set <code>--max-pods</code> and <code>--use-max-pods=false</code> in the node's bootstrap, or the node keeps the old secondary-IP ceiling. Second, prefixes need <b>contiguous</b> <code>/28</code> blocks; on a fragmented subnet, EC2 can refuse the allocation (more on that in the failure section). The payoff: far higher density, and far fewer EC2 API calls — attaching a prefix takes under a second versus up to ten for a new ENI. The default <code>WARM_PREFIX_TARGET=1</code> keeps one spare prefix ready, which can leave up to 15 unused IPs per node — a fine trade unless addresses are precious.</p>
+    <div class="box gotcha"><div class="h">You can't quietly downgrade out of prefix mode</div>
+      <p>Once prefix delegation is enabled and prefixes are attached to ENIs, you cannot downgrade the VPC CNI below 1.9.0 without deleting and recreating every node. And AWS recommends you don't do a rolling <em>enable</em> either: create fresh node groups with prefix mode on, drain the old ones, and delete them — because a node carrying both individual secondary IPs and prefixes reports inconsistent capacity, which confuses scheduling. Treat turning on prefix delegation as a node-group replacement, not an in-place toggle.</p>
+    </div>
+
+    <h4>4 · Where the IPs actually run out</h4>
+    <p>There are two distinct exhaustion points, and mixing them up sends you fixing the wrong thing:</p>
+    <ol class="steps">
+      <li><b>Node-level exhaustion.</b> A node has hit its ENI/IP ceiling — every slot is used. A new pod scheduled there can't get an IP, so the CNI's <code>ADD</code> fails and the pod hangs in <code>ContainerCreating</code> with <code>failed to assign an IP address to container</code>. This usually means <code>max-pods</code> was set higher than the node's real IP capacity, so the scheduler placed more pods than the node could address. The fix is aligning <code>max-pods</code> to capacity, or prefix delegation for more room.</li>
+      <li><b>Subnet-level exhaustion.</b> The subnet's CIDR is used up — no free addresses left in the whole block. Now <code>ipamd</code> asks EC2 for more IPs and EC2 refuses with <code>InsufficientFreeAddressesInSubnet</code>. Every node in that subnet is affected, not just one. The fix is more address space: a bigger subnet, additional subnets, or the CNI's <b>custom networking</b> feature, which places pods on a separate secondary VPC CIDR (commonly the <code>100.64.0.0/10</code> carrier-grade NAT range) so pods stop competing with nodes and load balancers for the primary subnet's addresses.</li>
+    </ol>
+    <p>Prefix delegation helps the first problem enormously (each node needs far fewer discrete allocations) and helps the second indirectly (fewer, larger allocations fragment the subnet less) — but if you've genuinely run the subnet dry, only more address space fixes it.</p>
+
+    <h4>5 · The datapath, packet by packet</h4>
+    <p>Now trace an outbound packet using the big diagram. A process in pod A (<code>10.0.1.23</code>) sends to another pod or to RDS. The packet leaves the pod's <code>eth0</code>, crosses the veth pair into the host network namespace, and hits the host's routing. Because the pod's IP is a secondary IP on a specific ENI, the CNI has installed an <code>ip rule</code> that steers this pod's traffic to that ENI's own route table — this is <b>source-based policy routing</b>, and it's what guarantees a pod's replies leave by the same ENI its address belongs to. The packet exits that ENI as ordinary VPC traffic. The ENI's <b>Security Group</b> is evaluated here (Security Groups are stateful and act at the interface — <a href="ch51-vpc-security-security-groups-vs-nacls.html">Chapter 51</a>). Then the subnet's <b>route table</b> decides: destination inside the VPC CIDR goes <code>local</code> and reaches the target directly; <code>0.0.0.0/0</code> goes to the NAT gateway and out. For internet egress the CNI source-NATs the pod IP to the node's primary IP by default, so return traffic comes back to the node (set <code>AWS_VPC_K8S_CNI_EXTERNALSNAT=true</code> to disable that when you have your own return path — the subject of <a href="ch48-pod-to-internet-and-the-full-synthesis.html">Chapter 48</a>).</p>
+
+    <details class="recall"><summary>Think first: your pods can reach an RDS database in the same VPC, but an app team swears their pod IPs are "random" and keep changing. Are the pod IPs real, and why do they change?</summary>
+      <div class="body">
+        <p>They're entirely real VPC addresses — that's precisely why the pod can hit RDS with no gateway in between; the database sees a normal in-VPC client. They "change" because pods are ephemeral: every new pod gets a fresh IP from the node's warm pool, and when the pod dies the IP goes back. That's not randomness, it's the pod lifecycle. The lesson is the same one as everywhere in Kubernetes — never pin anything to a pod IP; use a Service (stable ClusterIP) or DNS name. The pod IP being real matters for <em>reachability and security groups and flow logs</em>, not for addressing a workload. If the RDS side wants to allow-list the cluster, allow-list the node/pod Security Group or the subnet CIDR, never individual pod IPs.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, named</h2>
+    <ul>
+      <li><b><code>aws-node</code> DaemonSet</b> — one pod per node, host-networked. Contains the init container that lays down the CNI binary and config, the <code>ipamd</code> daemon, and (in recent versions) the network-policy agent. Owns: all IP management on the node.</li>
+      <li><b><code>ipamd</code></b> — the long-running daemon that attaches ENIs, requests secondary IPs or prefixes from EC2, keeps the warm pool, and answers the CNI binary over a local gRPC socket. Owns: the node's IP supply. Its log lives at <code>/var/log/aws-routed-eni/ipamd.log</code>.</li>
+      <li><b>The CNI binary</b> (<code>aws-cni</code>) — invoked by the kubelet on pod create/delete. Asks <code>ipamd</code> for an IP, then wires the veth pair, addresses, and policy-routing rules. Owns: the per-pod plumbing. Its log is <code>plugin.log</code> in the same directory.</li>
+      <li><b>ENIs and their IPs/prefixes</b> — the actual VPC interfaces and the addresses attached to them. Owns: being real, routable network endpoints.</li>
+      <li><b>The <code>ENIConfig</code> CRD</b> — used by custom networking to map an availability zone to a specific subnet and Security Group, so pods get IPs from a secondary CIDR. Owns: the "pods on a different subnet than nodes" story.</li>
+      <li><b>Security Groups</b> — applied at the ENI by default (all pods on a node share the node's SG). With <b>security groups for pods</b> (branch ENIs on supported Nitro instances), specific pods can get their own SG via a <code>SecurityGroupPolicy</code>. Owns: L3/L4 filtering of pod traffic.</li>
+      <li><b><code>eni-max-pods.txt</code></b> — AWS's published table of ENI and IP limits per instance type, the source of every max-pods number. Owns: the ground truth for capacity math.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one pod as it gets an IP</h2>
+    <p>A pod is scheduled to a node. Here's how it goes from "assigned" to "has a working VPC IP":</p>
+    <ol class="steps">
+      <li>The kubelet runs the pod sandbox and calls the CNI <code>ADD</code> for the new pod (the <code>RunPodSandbox</code> step from <a href="ch30-the-node-kubelet-kube-proxy-runtime-cri.html">Chapter 30</a>).</li>
+      <li>The <code>aws-cni</code> binary asks <code>ipamd</code> over its local socket for a free IP.</li>
+      <li><code>ipamd</code> takes one from the warm pool and returns it instantly. If the pool is below target, it asynchronously asks EC2 for more IPs, or attaches a new ENI/prefix — off the critical path.</li>
+      <li>The CNI creates the veth pair, moves one end into the pod's netns as <code>eth0</code>, assigns the IP, and installs the host-side <code>ip rule</code> and route so the pod's traffic uses the correct ENI.</li>
+      <li>The pod now has a real VPC address and can send and receive immediately; its Security Group is the ENI's SG.</li>
+      <li>If no IP is available (node or subnet exhausted), the <code>ADD</code> fails, the sandbox never completes, and the pod sits in <code>ContainerCreating</code> — the failure this whole chapter prepares you to read.</li>
+    </ol>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>These labs read real ENI and IP state, which only exists on EKS — so the AWS path is primary, with a <b>local kind alternative</b> noted for the parts that are conceptual rather than AWS-specific. Assume a cluster and a node instance ID handy (<code>aws eks ... </code> / <code>kubectl get nodes -o wide</code>).</p>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — see the real ENIs and IPs on a node</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Prove to yourself that pod IPs are VPC IPs living on ENIs. First from Kubernetes, then from EC2's own view of the same node.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl get pods -A -o wide | awk '{print $1,$2,$7}' | head   <span class="c"># pod IPs = VPC IPs</span>
+INSTANCE=$(kubectl get node NODE -o jsonpath='{.spec.providerID}' | awk -F/ '{print $NF}')
+aws ec2 describe-network-interfaces \
+  --filters Name=attachment.instance-id,Values=$INSTANCE \
+  --query 'NetworkInterfaces[].{eni:NetworkInterfaceId,primary:PrivateIpAddress,secondary:PrivateIpAddresses[].PrivateIpAddress,prefixes:Ipv4Prefixes[].Ipv4Prefix}'</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>[
+  { "eni": "eni-0a1b...", "primary": "10.0.1.5",
+    "secondary": ["10.0.1.5","10.0.1.23","10.0.1.24","10.0.1.25"],
+    "prefixes": [] },
+  { "eni": "eni-0c2d...", "primary": "10.0.1.40",
+    "secondary": ["10.0.1.40"], "prefixes": ["10.0.1.96/28"] }
+]</code></div>
+        <p>Every pod IP from the first command appears as a secondary IP (or inside a <code>/28</code> prefix) on one of these ENIs. That's the entire model in one screen: pods are addresses on real interfaces. <b>Local alternative:</b> on kind, <code>kubectl get pods -A -o wide</code> shows IPs like <code>10.244.0.x</code> — a made-up overlay range. Try to find them with any cloud API and you can't, because they don't exist outside the node. Holding those two outputs side by side is the fastest way to feel the difference between an overlay and the VPC CNI.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — do the prefix-delegation math</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>The capacity numbers come straight from the instance type. AWS ships a script that reads the same <code>eni-max-pods.txt</code> table and applies both formulas — run it for one instance both ways and read the difference.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># From the amazon-vpc-cni-k8s repo (runs locally; needs awscli + bash):</span>
+curl -sO https://raw.githubusercontent.com/awslabs/amazon-eks-ami/master/templates/al2/runtime/max-pods-calculator.sh
+chmod +x max-pods-calculator.sh
+./max-pods-calculator.sh --instance-type m5.large --cni-version 1.19.0
+./max-pods-calculator.sh --instance-type m5.large --cni-version 1.19.0 --cni-prefix-delegation-enabled</code></pre></div>
+        <div class="out"><span class="ol">Output</span>29
+110</code></div>
+        <p>Same instance: 29 pods in the default secondary-IP mode, 110 with prefix delegation (the raw formula gives 434, capped to the recommended 110). Confirm by hand from the table — <code>m5.large</code> is 3 ENIs × 10 IPs: <code>(3 × 9) + 2 = 29</code>, and <code>(3 × 9 × 16) + 2 = 434</code> before the cap. <b>Local alternative:</b> this lab is pure arithmetic against a published table, so it runs anywhere — you don't need a cluster at all, only the instance type you plan to use. Do this <em>before</em> choosing node sizes: a fleet of tiny instances can starve for IPs long before it starves for CPU.</p>
+      </div>
+    </div>
+
+    <details class="recall"><summary>Think first: a team runs 50 small services on <code>t3.small</code> nodes and keeps seeing pods Pending or stuck ContainerCreating even though CPU and memory dashboards look half-empty. What's the likely ceiling?</summary>
+      <div class="body">
+        <p>IP address capacity, almost certainly. A <code>t3.small</code> caps at <code>(3 × (4−1)) + 2 = 11</code> pods in the default mode — a tiny number that has nothing to do with CPU or memory. With 50 services plus their sidecars and system pods, they'll hit that per-node ceiling constantly, so pods either stay Pending (scheduler can't find a node under its max-pods) or land and fail the CNI <code>ADD</code>. The half-empty CPU/memory graphs are the tell: they're bottlenecked on addresses, not compute. Two fixes: turn on prefix delegation to lift the per-node ceiling roughly 10× (a <code>t3.small</code> goes from 11 toward the 110 cap), or move to fewer, larger nodes so each node's ENI/IP budget covers more pods. This is the single most common "my nodes look empty but nothing schedules" cause on EKS.</p>
+      </div>
+    </details>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — drive a node out of IPs and read the failure</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Reproduce node IP exhaustion deliberately. On a single small node (say a <code>t3.small</code>, ceiling 11), scale a deployment past what its IPs can cover and watch the CNI fail the extras.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl create deployment fill --image=nginx:1.27-alpine
+kubectl scale deployment fill --replicas=25    <span class="c"># more than the node can address</span>
+kubectl get pods -l app=fill -o wide | grep -c Running
+kubectl get pods -l app=fill | grep ContainerCreating | head -1</code></pre></div>
+        <div class="out"><span class="ol">Output</span>9
+fill-7c9d5-xy12   0/1   ContainerCreating   0   40s</code></div>
+        <p>Some pods run; the rest wedge in <code>ContainerCreating</code>. Before revealing: where does the CNI record <em>why</em> it couldn't place them, and which of the two exhaustion types is this?</p>
+        <details class="recall"><summary>Reveal the diagnosis</summary>
+          <div class="body">
+            <p>The reason is on the pod as an Event, and the detail is in the CNI's plugin log on the node:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl describe pod fill-7c9d5-xy12 | sed -n '/Events/,$p'
+<span class="c"># On the node (via a debug pod or SSM):</span>
+sudo tail -n 20 /var/log/aws-routed-eni/ipamd.log</code></pre></div>
+            <div class="out"><span class="ol">Output</span>Warning  FailedCreatePodSandBox  ... failed to assign an IP address to container
+ipamd.log: "DataStore has no available IP/Prefix addresses"</code></div>
+            <p>This is <b>node-level</b> exhaustion: the instance hit its ENI/IP ceiling, <code>ipamd</code>'s datastore is empty, and the CNI <code>ADD</code> failed. The subnet still has plenty of free IPs — only <em>this node</em> ran out of slots. The fix isn't more subnet space; it's more IP capacity per node (prefix delegation) or fewer pods per node (bigger instances, or a correct <code>max-pods</code>). Clean up: <code>kubectl delete deployment fill</code>. <b>Local alternative:</b> kind can't reproduce ENI exhaustion, but the shape — pod stuck ContainerCreating, reason in <code>kubectl describe</code> Events — is identical to the Chapter 30 sandbox failures, so the diagnostic reflex transfers directly.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — subnet exhaustion, the cluster-wide version</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Now the nastier one: pods across <em>many</em> nodes start failing to get IPs at once, and new nodes come up but can't address their pods either. Investigate before assuming it's the same as Lab 3.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>SUBNET=subnet-0abc123
+aws ec2 describe-subnets --subnet-ids $SUBNET \
+  --query 'Subnets[].{cidr:CidrBlock,free:AvailableIpAddressCount}'
+kubectl logs -n kube-system ds/aws-node -c aws-node | grep -i insufficient | tail</code></pre></div>
+        <div class="out"><span class="ol">Output</span>[ { "cidr": "10.0.1.0/24", "free": 0 } ]
+ipamd: "failed to allocate IP address: InsufficientFreeAddressesInSubnet"</code></div>
+        <p>The signal is unmistakable: <code>AvailableIpAddressCount</code> is <b>0</b> and <code>ipamd</code> is getting <code>InsufficientFreeAddressesInSubnet</code> from EC2. This is <b>subnet-level</b> exhaustion — the whole <code>/24</code> is spent, so it hits every node in that subnet, and adding nodes makes it worse (each new node also wants IPs from the same dry subnet). The fix is address space, not node sizing: add subnets, use a larger CIDR, or enable <b>custom networking</b> so pods draw from a secondary VPC CIDR like <code>100.64.0.0/10</code>. If instead you saw plenty of free subnet IPs but a single node failing, you'd be back in Lab 3's node-level case — which is exactly why you check the subnet's free count <em>first</em>. <b>Local alternative:</b> conceptual only on kind; the transferable skill is "one node failing vs every node failing" as the branch between node and subnet exhaustion.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — will this cluster fit, and how do you turn on prefixes safely?</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>You're asked to run 4,000 pods on EKS. Each AZ has one <code>/24</code> pod subnet (251 usable). Nodes are <code>m5.large</code>. Work out whether it fits and design the rollout — <em>before</em> reading the answer.</p>
+        <details class="recall"><summary>Reveal the capacity plan</summary>
+          <div class="body">
+            <p><b>Does it fit?</b> Three <code>/24</code>s give ~753 pod IPs total — nowhere near 4,000. Address space, not compute, is the binding constraint, so the plan is about IPs first. <b>Step one, more space:</b> enable <b>custom networking</b> and put pods on a secondary CIDR (a <code>100.64.0.0/10</code> block gives millions of addresses) so pods stop competing with nodes and load balancers for the primary subnets. <b>Step two, density:</b> turn on <b>prefix delegation</b> so each node addresses far more pods with fewer, larger allocations — 4,000 pods at ~110/node is ~37 nodes, and prefix mode keeps each node's allocations contiguous and cheap. <b>Step three, roll it out safely:</b> because you can't toggle prefixes in place, create <em>new</em> node groups with <code>ENABLE_PREFIX_DELEGATION=true</code>, <code>--max-pods</code> set to the prefix number, and <code>--use-max-pods=false</code>; protect workloads with PodDisruptionBudgets; then cordon and drain the old node groups and delete them. <b>Step four, conserve:</b> set <code>WARM_PREFIX_TARGET=1</code> (or <code>WARM_IP_TARGET</code> if even one spare prefix is too wasteful) and reserve subnet CIDR space so <code>/28</code> prefixes stay contiguous. The senior instinct here is to treat the VPC address plan as a capacity-planning exercise on par with CPU and memory — because on the VPC CNI it is.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · pods stuck ContainerCreating, "failed to assign an IP address"</div>
+      <p><b>Symptom:</b> new pods sit in <code>ContainerCreating</code>; <code>kubectl describe pod</code> shows <code>FailedCreatePodSandBox … failed to assign an IP address to container</code>. <b>First cut:</b> is it one node or many? Check that node's IP usage against its ceiling, and the subnet's <code>AvailableIpAddressCount</code>. <b>Usual cause:</b> node-level — <code>max-pods</code> set above the node's real IP capacity, so the scheduler over-packed it. <b>Confirm:</b> <code>/var/log/aws-routed-eni/ipamd.log</code> saying the datastore has no addresses. <b>Fix:</b> align <code>max-pods</code> to capacity or enable prefix delegation; don't just add nodes if the cause is per-node.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · subnet exhaustion — InsufficientFreeAddressesInSubnet</div>
+      <p><b>Symptom:</b> pods fail to get IPs across many nodes at once, and new nodes don't help. <b>First cut:</b> <code>aws ec2 describe-subnets</code> — is <code>AvailableIpAddressCount</code> at or near 0? <b>Confirm:</b> <code>aws-node</code> logs showing <code>InsufficientFreeAddressesInSubnet</code>. <b>Cause:</b> the pod subnet's CIDR is spent — often because pods, nodes, and load balancers all draw from the same small subnets. <b>Fix:</b> add subnets or a larger CIDR, and adopt custom networking to move pods onto a secondary CIDR (e.g. <code>100.64.0.0/10</code>). Adding nodes without adding addresses makes it worse.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · prefix attach fails — InsufficientCidrBlocks</div>
+      <p><b>Symptom:</b> after enabling prefix delegation, some nodes still can't get IPs and the CNI log shows <code>InsufficientCidrBlocks: There are not enough free cidr blocks in the specified subnet to satisfy the request</code>. <b>Cause:</b> the subnet is <em>fragmented</em> — plenty of scattered free IPs, but no contiguous <code>/28</code> block to hand out as a prefix. <b>Confirm:</b> the subnet has free addresses yet prefix allocation fails. <b>Fix:</b> use VPC subnet CIDR reservations to set aside contiguous space for prefixes, or dedicate a fresh subnet to prefix-mode nodes. This is the failure mode unique to prefix delegation, and it's about contiguity, not raw free count.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Plan the address space before the cluster, not after.</b> The VPC CNI turns IP planning into capacity planning. Size pod subnets for the pod count you'll grow into, keep pods on their own subnets (ideally a large secondary CIDR via custom networking) so they don't fight nodes and load balancers for addresses, and reserve contiguous space if you'll use prefixes. Retrofitting address space onto a running cluster is far more painful than getting it right up front — you often end up rebuilding node groups.</p>
+    <p><b>Default to prefix delegation for density, and set <code>max-pods</code> to match.</b> For most clusters prefix delegation is the right default: higher pod density, fewer EC2 API calls, faster launches. Just remember it's a node-group replacement, not a toggle, and that the kubelet needs the explicit <code>--max-pods</code> and <code>--use-max-pods=false</code> or it keeps the old ceiling. Tune <code>WARM_PREFIX_TARGET</code>/<code>WARM_IP_TARGET</code> to trade launch speed against wasted addresses in tight subnets.</p>
+    <p><b>Know your Security Group model.</b> By default every pod on a node shares the node's Security Group, so pod-to-pod filtering isn't SG-based — that's what NetworkPolicy is for (<a href="ch47-networkpolicy-deep.html">Chapter 47</a>). When compliance genuinely needs per-pod Security Groups, the CNI's security-groups-for-pods feature assigns a branch ENI per pod on supported Nitro instances via a <code>SecurityGroupPolicy</code> — powerful, but it consumes branch-ENI capacity and adds complexity, so use it where you must, not everywhere.</p>
+    <p><b>Watch the right signals and avoid the classic mistakes.</b> Alert on per-node IP utilisation and per-subnet <code>AvailableIpAddressCount</code> — both lead the ContainerCreating symptom by minutes. Keep the CNI add-on current (managed add-on, upgraded one minor version at a time). <b>Common mistakes:</b> setting <code>max-pods</code> above real IP capacity; running everything in a couple of small shared subnets; leaving <code>WARM_ENI_TARGET=1</code> on tiny subnets and wondering where the IPs went; treating prefix delegation as an in-place toggle; and allow-listing individual pod IPs on a database instead of a Security Group or subnet.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>The VPC CNI is a clean case study in a recurring design decision: <b>flat native addressing versus an overlay</b>. Giving every pod a real, routable address buys you a single observable network, direct integration with the rest of the platform (databases, load balancers, flow logs, security groups), and no tunnelling overhead on the datapath — at the cost of coupling your workload scale to a finite, carefully-planned address space. Overlays make the opposite trade: effectively unlimited pod IPs and freedom from VPC address planning, but a second network to operate and debug, plus encapsulation cost. Neither is universally right; the choice depends on whether you value network transparency and integration (native) or address abundance and decoupling (overlay). The warm-IP pool is another portable pattern — <b>amortising a slow, rate-limited backend (the EC2 API) behind a local cache</b> — the same shape as a connection pool or a DNS cache, where you pre-provision to keep a slow dependency off the request's critical path and accept some waste for latency. And the whole chapter is a reminder that at scale, <b>the address space is a capacity dimension</b> as real as CPU and memory: systems that treat IPs as infinite eventually meet a wall, and the ones that plan for it — subnet sizing, secondary CIDRs, prefix density — scale smoothly. That planning connects directly to <a href="ch48-pod-to-internet-and-the-full-synthesis.html">Chapter 48</a>'s egress story and to <a href="ch60-end-to-end-synthesis-internet-to-alb.html">Chapter 60</a>, where these pod IPs become the direct targets of a load balancer.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What makes the Amazon VPC CNI different from a typical overlay CNI?</summary>
+        <div class="a"><p>It gives every pod a real, routable IP from the VPC subnet instead of a made-up overlay address, with no tunnel. Pods are first-class VPC endpoints: they can reach RDS directly, a load balancer can target a pod IP, and Security Groups, route tables, and flow logs all apply to pod traffic because it's ordinary VPC traffic. The trade is that pods consume real VPC addresses, so you have to plan your subnet address space for pod scale — which is why "failed to assign an IP" is an EKS-specific class of incident overlay users never hit.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>How does a node decide how many pods it can run, and how does prefix delegation change it?</summary>
+        <div class="a"><p>Each instance type caps two numbers: how many ENIs it can attach and how many IPs each ENI holds. In the default secondary-IP mode, one IP per slot, so max pods is (ENIs × (IPs-per-ENI − 1)) + 2 — the minus one is each ENI's own primary IP, the plus two is the host-networked <code>aws-node</code> and <code>kube-proxy</code> pods that don't draw from the pool. An <code>m5.large</code> is 3 ENIs of 10 IPs, so (3 × 9) + 2 = 29 pods, regardless of how much CPU it has. Prefix delegation, enabled with <code>ENABLE_PREFIX_DELEGATION=true</code> on CNI 1.9+, changes what fills a slot: instead of one IP it assigns a /28 prefix of 16 addresses, so the same slots back up to 16× the pods — the formula becomes (ENIs × (IPs-per-ENI − 1) × 16) + 2, capped in practice to around 110 to match Kubernetes' recommended pods-per-node. You have to set the kubelet's <code>--max-pods</code> explicitly and it's a node-group replacement rather than an in-place toggle. The reason it exists is both density and fewer EC2 API calls, since attaching a prefix is one fast call that covers 16 addresses.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>What is the warm-IP pool, and how would you tune it on a cluster with scarce subnet space?</summary>
+        <div class="a"><p>The warm pool is <code>ipamd</code>'s stash of pre-allocated IPs kept ready so pod launches don't wait on the EC2 API — assigning an IP is hundreds of milliseconds and attaching a new ENI can be up to ten seconds, and you don't want that on every pod start. By default <code>WARM_ENI_TARGET=1</code> keeps a whole spare ENI's worth of IPs warm, which is fast but wasteful: on a large instance that reserves dozens of addresses the node isn't using. On a cluster where subnet space is scarce, I'd stop reserving by ENI and reserve by IP instead: set <code>WARM_IP_TARGET</code> to a small number of spare IPs and <code>MINIMUM_IP_TARGET</code> to roughly the pods a node normally runs, so nodes come up pre-warmed but don't hoard. That trades a little launch latency for a lot of reclaimed addresses. In prefix mode the analogous knob is <code>WARM_PREFIX_TARGET</code>, default 1, which keeps one spare /28 — up to 15 unused IPs per node — so if even that's too much I'd switch to <code>WARM_IP_TARGET</code> below 16 to avoid holding a whole extra prefix. The general principle: the warm pool is a latency-versus-utilisation dial, and tight subnets push you toward utilisation.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>Pods across the cluster suddenly can't get IPs. Walk me through isolating it.</summary>
+        <div class="a"><p>First question: one node or many? I'd look at whether the failing pods are concentrated on a node or spread across the cluster, because that splits the two exhaustion types. If it's one node, it's node-level: that instance hit its ENI/IP ceiling, usually because <code>max-pods</code> was set higher than its real IP capacity — I'd confirm in that node's <code>ipamd.log</code> ("no available IP addresses") and fix by aligning max-pods or enabling prefix delegation. If it's cluster-wide and new nodes don't help, it's subnet-level: I'd run <code>aws ec2 describe-subnets</code> and look at <code>AvailableIpAddressCount</code> — if it's near zero, the CIDR is spent and <code>aws-node</code> logs will show <code>InsufficientFreeAddressesInSubnet</code>. That's fixed with address space: more subnets, a bigger CIDR, or custom networking onto a secondary <code>100.64.0.0/10</code> range. There's a third, prefix-specific variant: if prefix mode is on and I see <code>InsufficientCidrBlocks</code> despite free IPs, the subnet is fragmented and can't produce a contiguous /28 — fixed with subnet CIDR reservations. So the decision tree is: scope it to node vs subnet first, check the subnet's free count, then read the exact CNI error, and only then choose between max-pods, address space, or contiguity as the fix.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>How do Security Groups apply to pods under the VPC CNI?</summary>
+        <div class="a"><p>By default, all pods on a node share the node's ENI Security Groups, because pod IPs are secondary IPs on those node ENIs. So SGs give you node-level filtering, not pod-level — for pod-to-pod policy you use Kubernetes NetworkPolicy, which the CNI's network-policy agent can enforce. When you genuinely need per-pod Security Groups — say, one workload must have database access that its neighbours don't — you enable security groups for pods, where the CNI assigns the pod a branch ENI (via a trunk ENI) on supported Nitro instance types and applies a Security Group from a <code>SecurityGroupPolicy</code> to that pod specifically. It's the right tool for compliance boundaries, but branch ENIs are a limited resource and add complexity, so I'd reserve it for the pods that actually need distinct SGs rather than turning it on cluster-wide. Either way, the fact that pod traffic is real VPC traffic is what makes SGs relevant to pods at all — that's the through-line of the whole chapter.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>The Amazon VPC CNI gives each pod a real, routable VPC IP — no overlay — which makes pods first-class VPC endpoints (direct RDS access, load-balancer targeting, Security Groups, flow logs) and makes them consume finite VPC addresses. Each instance type caps ENIs and IPs-per-ENI; default max pods is (ENIs × (IPs-per-ENI − 1)) + 2, so small nodes starve for IPs long before CPU. <code>ipamd</code> in the <code>aws-node</code> DaemonSet keeps a warm pool of pre-allocated IPs (tuned by WARM_ENI/WARM_IP/MINIMUM_IP targets) so launches don't wait on EC2. Prefix delegation (CNI 1.9+, <code>ENABLE_PREFIX_DELEGATION=true</code>) makes each slot a /28 of 16 IPs, multiplying density up to 16× and cutting API calls, capped around 110 pods/node, requiring explicit <code>--max-pods</code> and a node-group replacement. The datapath is pod <code>eth0</code> → veth → host policy routing → ENI (where the pod IP lives) → Security Group → subnet route table → local VPC or NAT-to-internet. Two exhaustion points: node-level ("failed to assign an IP", one node, fix with max-pods/prefixes) and subnet-level (<code>InsufficientFreeAddressesInSubnet</code>, cluster-wide, fix with address space/custom networking); prefix mode adds a contiguity failure (<code>InsufficientCidrBlocks</code>). Plan address space like you plan compute.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>VPC CNI gives every pod a real routable VPC IP — no overlay, no tunnel; pods are first-class VPC endpoints.</li>
+      <li>The upside is integration and observability; the cost is that pods consume finite VPC addresses.</li>
+      <li>Default max pods = (ENIs × (IPs-per-ENI − 1)) + 2 — small instances hit an IP ceiling before a CPU one.</li>
+      <li><code>ipamd</code> (in <code>aws-node</code>) keeps a warm pool of IPs so pod launches don't wait on the EC2 API.</li>
+      <li>WARM_ENI_TARGET (default 1) trades launch speed for wasted IPs; WARM_IP_TARGET/MINIMUM_IP_TARGET conserve.</li>
+      <li>Prefix delegation makes each slot a /28 (16 IPs): up to ~16× density, capped ~110/node, needs explicit max-pods.</li>
+      <li>Enabling prefixes is a node-group replacement, not a toggle; you can't downgrade the CNI below 1.9 afterward.</li>
+      <li>Datapath: pod eth0 → veth → host policy routing → ENI → Security Group → subnet route table → VPC/internet.</li>
+      <li>Node exhaustion ("failed to assign an IP", one node) ≠ subnet exhaustion (InsufficientFreeAddressesInSubnet, cluster-wide).</li>
+      <li>Plan subnets/CIDRs for pod scale up front; use custom networking (100.64/10) to give pods their own space.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch42-pod-networking-internals-pod-to-pod.html"><b>Ch 42</b> Pod-to-pod &amp; veth</a>
+      <a href="ch50-vpc-foundations-cidr-subnets-route-tables-igw.html"><b>Ch 50</b> VPC foundations</a>
+      <a href="ch51-vpc-security-security-groups-vs-nacls.html"><b>Ch 51</b> Security Groups</a>
+      <a href="ch48-pod-to-internet-and-the-full-synthesis.html"><b>Ch 48</b> Pod-to-internet</a>
+      <a href="ch57-eks-architecture.html"><b>Ch 57</b> EKS architecture</a>
+      <a href="ch60-end-to-end-synthesis-internet-to-alb.html"><b>Ch 60</b> End-to-end on EKS</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>GitHub — <a href="https://github.com/aws/amazon-vpc-cni-k8s">aws/amazon-vpc-cni-k8s</a>: the CNI source, the full list of <code>WARM_*</code>/<code>ENABLE_*</code> environment variables, and <code>eni-max-pods.txt</code>.</li>
+      <li>Amazon EKS User Guide — <a href="https://docs.aws.amazon.com/eks/latest/userguide/managing-vpc-cni.html">Assign IPs to Pods with the Amazon VPC CNI</a>: what the add-on does and how it's versioned.</li>
+      <li>Amazon EKS User Guide — <a href="https://docs.aws.amazon.com/eks/latest/userguide/cni-increase-ip-addresses.html">Assign more IP addresses with prefixes</a>: the prefix-delegation feature and its constraints.</li>
+      <li>Amazon EKS Best Practices Guide — <a href="https://docs.aws.amazon.com/eks/latest/best-practices/prefix-mode-linux.html">Prefix Mode for Linux</a>: the density math, warm-target tuning, and subnet-fragmentation guidance.</li>
+      <li>Amazon EKS User Guide — <a href="https://docs.aws.amazon.com/eks/latest/userguide/cni-custom-network.html">CNI custom networking</a>: placing pods on a secondary VPC CIDR to relieve subnet exhaustion.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/network-plugins/">Network plugins (CNI)</a>: the CNI contract the VPC CNI implements.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch57-eks-architecture.html"><span class="dir">← Prev</span><div class="ti">Ch 57 — EKS architecture</div></a>
+      <a class="nx" href="ch59-aws-integrations.html"><span class="dir">Next →</span><div class="ti">Ch 59 — AWS integrations</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 58 of 121 · Part VI · AWS &amp; EKS for SREs. You can now trace a pod's IP from its network namespace to a VPC route table — and predict where it runs out. Next: how in-cluster controllers reach out to the AWS APIs that provision load balancers, DNS, storage, and nodes.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Pod stitched to the VPC</a>
+    <a href="#internals">ENIs, warm pool, prefixes</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">One pod gets an IP</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

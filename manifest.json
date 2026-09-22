@@ -1,0 +1,816 @@
+{
+  "parts": [
+    {
+      "n": "I",
+      "title": "Linux & Operating-System Foundations",
+      "from": 1,
+      "to": 9
+    },
+    {
+      "n": "II",
+      "title": "Networking from First Principles",
+      "from": 10,
+      "to": 20
+    },
+    {
+      "n": "III",
+      "title": "Containers & Container Internals",
+      "from": 21,
+      "to": 27
+    },
+    {
+      "n": "IV",
+      "title": "Kubernetes — Architecture & Internals",
+      "from": 28,
+      "to": 40
+    },
+    {
+      "n": "V",
+      "title": "Kubernetes Networking at Packet Level",
+      "from": 41,
+      "to": 48
+    },
+    {
+      "n": "VI",
+      "title": "AWS & EKS for SREs",
+      "from": 49,
+      "to": 60
+    },
+    {
+      "n": "VII",
+      "title": "Platform Engineering — Packaging, IaC, GitOps, Mesh, Access",
+      "from": 61,
+      "to": 73
+    },
+    {
+      "n": "VIII",
+      "title": "Observability",
+      "from": 74,
+      "to": 80
+    },
+    {
+      "n": "IX",
+      "title": "Distributed Systems, Data & Reliability",
+      "from": 81,
+      "to": 92
+    },
+    {
+      "n": "X",
+      "title": "System Design",
+      "from": 93,
+      "to": 102
+    },
+    {
+      "n": "XI",
+      "title": "SRE Problem-Solving & Production Troubleshooting",
+      "from": 103,
+      "to": 108
+    },
+    {
+      "n": "XII",
+      "title": "Interview Mastery & Mock Interviews",
+      "from": 109,
+      "to": 114
+    },
+    {
+      "n": "XIII",
+      "title": "Capstone",
+      "from": 115,
+      "to": 116
+    },
+    {
+      "n": "XIV",
+      "title": "Interview Coding & SRE Career",
+      "from": 117,
+      "to": 121
+    }
+  ],
+  "chapters": [
+    {
+      "n": 1,
+      "slug": "ch01-kernel-and-system-calls",
+      "title": "The kernel, user space, and system calls",
+      "part": "I"
+    },
+    {
+      "n": 2,
+      "slug": "ch02-processes-threads-scheduling-signals",
+      "title": "Processes, threads, scheduling, signals",
+      "part": "I"
+    },
+    {
+      "n": 3,
+      "slug": "ch03-memory-virtual-memory-page-cache-swap-oom",
+      "title": "Memory: virtual memory, page cache, swap, OOM",
+      "part": "I"
+    },
+    {
+      "n": 4,
+      "slug": "ch04-filesystems-inodes-file-descriptors-disk-i-o",
+      "title": "Filesystems, inodes, file descriptors, disk I/O",
+      "part": "I"
+    },
+    {
+      "n": 5,
+      "slug": "ch05-users-groups-permissions-capabilities",
+      "title": "Users, groups, permissions, capabilities",
+      "part": "I"
+    },
+    {
+      "n": 6,
+      "slug": "ch06-systemd-journald-cron-service-lifecycle",
+      "title": "systemd, journald, cron, service lifecycle",
+      "part": "I"
+    },
+    {
+      "n": 7,
+      "slug": "ch07-the-sre-linux-toolkit-as-a-diagnostic",
+      "title": "The SRE Linux toolkit as a diagnostic system",
+      "part": "I"
+    },
+    {
+      "n": 8,
+      "slug": "ch08-bash-and-shell-scripting-for-automation",
+      "title": "Bash and shell scripting for automation",
+      "part": "I"
+    },
+    {
+      "n": 9,
+      "slug": "ch09-python-for-sre-automation",
+      "title": "Python for SRE automation",
+      "part": "I"
+    },
+    {
+      "n": 10,
+      "slug": "ch10-osi-vs-tcp-ip-encapsulation-the-layered",
+      "title": "OSI vs TCP/IP, encapsulation, the layered model",
+      "part": "II"
+    },
+    {
+      "n": 11,
+      "slug": "ch11-l2-ethernet-mac-arp-switching",
+      "title": "L2 — Ethernet, MAC, ARP, switching",
+      "part": "II"
+    },
+    {
+      "n": 12,
+      "slug": "ch12-l3-ip-cidr-subnetting-routing-nat",
+      "title": "L3 — IP, CIDR, subnetting, routing, NAT",
+      "part": "II"
+    },
+    {
+      "n": 13,
+      "slug": "ch13-l4-tcp-deep-and-udp",
+      "title": "L4 — TCP deep, and UDP",
+      "part": "II"
+    },
+    {
+      "n": 14,
+      "slug": "ch14-ports-sockets-ephemeral-ports-connection-lifecycle",
+      "title": "Ports, sockets, ephemeral ports, connection lifecycle",
+      "part": "II"
+    },
+    {
+      "n": 15,
+      "slug": "ch15-dns-end-to-end",
+      "title": "DNS, end to end",
+      "part": "II"
+    },
+    {
+      "n": 16,
+      "slug": "ch16-http-http-2-http-3-and-grpc",
+      "title": "HTTP, HTTP/2, HTTP/3, and gRPC",
+      "part": "II"
+    },
+    {
+      "n": 17,
+      "slug": "ch17-tls-and-pki",
+      "title": "TLS and PKI",
+      "part": "II"
+    },
+    {
+      "n": 18,
+      "slug": "ch18-the-linux-network-stack-internals",
+      "title": "The Linux network stack internals",
+      "part": "II"
+    },
+    {
+      "n": 19,
+      "slug": "ch19-capstone-trace-curl-https-example-com",
+      "title": "Capstone trace — curl https example.com",
+      "part": "II"
+    },
+    {
+      "n": 20,
+      "slug": "ch20-the-network-troubleshooting-toolkit",
+      "title": "The network troubleshooting toolkit",
+      "part": "II"
+    },
+    {
+      "n": 21,
+      "slug": "ch21-what-a-container-really-is",
+      "title": "What a container really is",
+      "part": "III"
+    },
+    {
+      "n": 22,
+      "slug": "ch22-linux-namespaces",
+      "title": "Linux namespaces",
+      "part": "III"
+    },
+    {
+      "n": 23,
+      "slug": "ch23-cgroups-v2-cpu-memory-io-limits",
+      "title": "cgroups v2 — CPU, memory, IO limits",
+      "part": "III"
+    },
+    {
+      "n": 24,
+      "slug": "ch24-container-filesystems-overlayfs-and-image-layers",
+      "title": "Container filesystems — overlayfs and image layers",
+      "part": "III"
+    },
+    {
+      "n": 25,
+      "slug": "ch25-container-networking",
+      "title": "Container networking",
+      "part": "III"
+    },
+    {
+      "n": 26,
+      "slug": "ch26-docker-containerd-runc-and-the-oci-model",
+      "title": "Docker, containerd, runc, and the OCI model",
+      "part": "III"
+    },
+    {
+      "n": 27,
+      "slug": "ch27-container-security-and-process-to-container-to",
+      "title": "Container security and Process to Container to Pod to VM",
+      "part": "III"
+    },
+    {
+      "n": 28,
+      "slug": "ch28-why-kubernetes-the-declarative-reconciled-model",
+      "title": "Why Kubernetes — the declarative reconciled model",
+      "part": "IV"
+    },
+    {
+      "n": 29,
+      "slug": "ch29-the-control-plane-api-server-etcd-scheduler",
+      "title": "The control plane — API server, etcd, scheduler, controller manager",
+      "part": "IV"
+    },
+    {
+      "n": 30,
+      "slug": "ch30-the-node-kubelet-kube-proxy-runtime-cri",
+      "title": "The node — kubelet, kube-proxy, runtime, CRI",
+      "part": "IV"
+    },
+    {
+      "n": 31,
+      "slug": "ch31-the-reconciliation-loop-controllers-informers",
+      "title": "The reconciliation loop, controllers, informers",
+      "part": "IV"
+    },
+    {
+      "n": 32,
+      "slug": "ch32-api-machinery-apply-path-admission-crds-and",
+      "title": "API machinery — apply path, admission, CRDs and operators",
+      "part": "IV"
+    },
+    {
+      "n": 33,
+      "slug": "ch33-workloads-i-pod-replicaset-deployment",
+      "title": "Workloads I — Pod, ReplicaSet, Deployment",
+      "part": "IV"
+    },
+    {
+      "n": 34,
+      "slug": "ch34-workloads-ii-statefulset-daemonset-job-cronjob",
+      "title": "Workloads II — StatefulSet, DaemonSet, Job, CronJob",
+      "part": "IV"
+    },
+    {
+      "n": 35,
+      "slug": "ch35-config-and-identity-configmap-secret-serviceaccount-namespace",
+      "title": "Config and identity — ConfigMap, Secret, ServiceAccount, Namespace",
+      "part": "IV"
+    },
+    {
+      "n": 36,
+      "slug": "ch36-scheduling-deep",
+      "title": "Scheduling deep",
+      "part": "IV"
+    },
+    {
+      "n": 37,
+      "slug": "ch37-autoscaling-and-governance-hpa-vpa-cluster-autoscaler",
+      "title": "Autoscaling and governance — HPA, VPA, Cluster Autoscaler, Karpenter",
+      "part": "IV"
+    },
+    {
+      "n": 38,
+      "slug": "ch38-storage-volumes-pv-pvc-storageclass-csi",
+      "title": "Storage — volumes, PV, PVC, StorageClass, CSI",
+      "part": "IV"
+    },
+    {
+      "n": 39,
+      "slug": "ch39-security-rbac-admission-policy-securitycontext",
+      "title": "Security — RBAC, admission policy, securityContext",
+      "part": "IV"
+    },
+    {
+      "n": 40,
+      "slug": "ch40-kubernetes-troubleshooting-methodology",
+      "title": "Kubernetes troubleshooting methodology",
+      "part": "IV"
+    },
+    {
+      "n": 41,
+      "slug": "ch41-the-kubernetes-network-model-and-cni",
+      "title": "The Kubernetes network model and CNI",
+      "part": "V"
+    },
+    {
+      "n": 42,
+      "slug": "ch42-pod-networking-internals-pod-to-pod",
+      "title": "Pod networking internals — Pod to Pod",
+      "part": "V"
+    },
+    {
+      "n": 43,
+      "slug": "ch43-services-and-the-datapath-pod-to-service",
+      "title": "Services and the datapath — Pod to Service",
+      "part": "V"
+    },
+    {
+      "n": 44,
+      "slug": "ch44-nodeport-loadbalancer-internet-to-pod",
+      "title": "NodePort, LoadBalancer — Internet to Pod",
+      "part": "V"
+    },
+    {
+      "n": 45,
+      "slug": "ch45-coredns-and-service-discovery",
+      "title": "CoreDNS and service discovery",
+      "part": "V"
+    },
+    {
+      "n": 46,
+      "slug": "ch46-ingress-and-the-gateway-api",
+      "title": "Ingress and the Gateway API",
+      "part": "V"
+    },
+    {
+      "n": 47,
+      "slug": "ch47-networkpolicy-deep",
+      "title": "NetworkPolicy deep",
+      "part": "V"
+    },
+    {
+      "n": 48,
+      "slug": "ch48-pod-to-internet-and-the-full-synthesis",
+      "title": "Pod to Internet and the full synthesis",
+      "part": "V"
+    },
+    {
+      "n": 49,
+      "slug": "ch49-the-aws-mental-model-regions-azs-failure",
+      "title": "The AWS mental model — regions, AZs, failure domains",
+      "part": "VI"
+    },
+    {
+      "n": 50,
+      "slug": "ch50-vpc-foundations-cidr-subnets-route-tables-igw",
+      "title": "VPC foundations — CIDR, subnets, route tables, IGW, NAT GW",
+      "part": "VI"
+    },
+    {
+      "n": 51,
+      "slug": "ch51-vpc-security-security-groups-vs-nacls",
+      "title": "VPC security — Security Groups vs NACLs",
+      "part": "VI"
+    },
+    {
+      "n": 52,
+      "slug": "ch52-load-balancing-alb-nlb-target-groups-health",
+      "title": "Load balancing — ALB, NLB, target groups, health checks",
+      "part": "VI"
+    },
+    {
+      "n": 53,
+      "slug": "ch53-route-53-dns-and-routing-policies",
+      "title": "Route 53 — DNS and routing policies",
+      "part": "VI"
+    },
+    {
+      "n": 54,
+      "slug": "ch54-iam-and-sts",
+      "title": "IAM and STS",
+      "part": "VI"
+    },
+    {
+      "n": 55,
+      "slug": "ch55-irsa-and-eks-pod-identity",
+      "title": "IRSA and EKS Pod Identity",
+      "part": "VI"
+    },
+    {
+      "n": 56,
+      "slug": "ch56-compute-and-data-services-for-sres",
+      "title": "Compute and data services for SREs",
+      "part": "VI"
+    },
+    {
+      "n": 57,
+      "slug": "ch57-eks-architecture",
+      "title": "EKS architecture",
+      "part": "VI"
+    },
+    {
+      "n": 58,
+      "slug": "ch58-vpc-cni-the-deep-one",
+      "title": "VPC CNI — the deep one",
+      "part": "VI"
+    },
+    {
+      "n": 59,
+      "slug": "ch59-aws-integrations",
+      "title": "AWS integrations",
+      "part": "VI"
+    },
+    {
+      "n": 60,
+      "slug": "ch60-end-to-end-synthesis-internet-to-alb",
+      "title": "End-to-end synthesis — Internet to ALB to Service to Pod",
+      "part": "VI"
+    },
+    {
+      "n": 61,
+      "slug": "ch61-helm",
+      "title": "Helm",
+      "part": "VII"
+    },
+    {
+      "n": 62,
+      "slug": "ch62-terraform-i-model-resources-state-the-dependency",
+      "title": "Terraform I — model, resources, state, the dependency graph",
+      "part": "VII"
+    },
+    {
+      "n": 63,
+      "slug": "ch63-terraform-ii-modules-state-at-scale-drift",
+      "title": "Terraform II — modules, state at scale, drift",
+      "part": "VII"
+    },
+    {
+      "n": 64,
+      "slug": "ch64-gitops-principles",
+      "title": "GitOps principles",
+      "part": "VII"
+    },
+    {
+      "n": 65,
+      "slug": "ch65-argo-cd",
+      "title": "Argo CD",
+      "part": "VII"
+    },
+    {
+      "n": 66,
+      "slug": "ch66-service-mesh-foundations",
+      "title": "Service-mesh foundations",
+      "part": "VII"
+    },
+    {
+      "n": 67,
+      "slug": "ch67-envoy-and-istiod-internals",
+      "title": "Envoy and Istiod internals",
+      "part": "VII"
+    },
+    {
+      "n": 68,
+      "slug": "ch68-istio-traffic-management",
+      "title": "Istio traffic management",
+      "part": "VII"
+    },
+    {
+      "n": 69,
+      "slug": "ch69-istio-security",
+      "title": "Istio security",
+      "part": "VII"
+    },
+    {
+      "n": 70,
+      "slug": "ch70-istio-resilience-and-onboarding-a-new-service",
+      "title": "Istio resilience and onboarding a new service",
+      "part": "VII"
+    },
+    {
+      "n": 71,
+      "slug": "ch71-istio-troubleshooting-the-deep-one",
+      "title": "Istio troubleshooting — the deep one",
+      "part": "VII"
+    },
+    {
+      "n": 72,
+      "slug": "ch72-teleport-and-identity-based-access",
+      "title": "Teleport and identity-based access",
+      "part": "VII"
+    },
+    {
+      "n": 73,
+      "slug": "ch73-ci-cd-and-progressive-delivery",
+      "title": "CI/CD and progressive delivery",
+      "part": "VII"
+    },
+    {
+      "n": 74,
+      "slug": "ch74-observability-foundations",
+      "title": "Observability foundations",
+      "part": "VIII"
+    },
+    {
+      "n": 75,
+      "slug": "ch75-prometheus",
+      "title": "Prometheus",
+      "part": "VIII"
+    },
+    {
+      "n": 76,
+      "slug": "ch76-grafana-and-dashboard-design",
+      "title": "Grafana and dashboard design",
+      "part": "VIII"
+    },
+    {
+      "n": 77,
+      "slug": "ch77-alerting-and-on-call-health",
+      "title": "Alerting and on-call health",
+      "part": "VIII"
+    },
+    {
+      "n": 78,
+      "slug": "ch78-logging",
+      "title": "Logging",
+      "part": "VIII"
+    },
+    {
+      "n": 79,
+      "slug": "ch79-distributed-tracing-and-opentelemetry",
+      "title": "Distributed tracing and OpenTelemetry",
+      "part": "VIII"
+    },
+    {
+      "n": 80,
+      "slug": "ch80-sli-slo-sla-and-error-budgets",
+      "title": "SLI, SLO, SLA and error budgets",
+      "part": "VIII"
+    },
+    {
+      "n": 81,
+      "slug": "ch81-distributed-systems-fundamentals",
+      "title": "Distributed-systems fundamentals",
+      "part": "IX"
+    },
+    {
+      "n": 82,
+      "slug": "ch82-consistency-replication-partitioning",
+      "title": "Consistency, replication, partitioning",
+      "part": "IX"
+    },
+    {
+      "n": 83,
+      "slug": "ch83-coordination-leader-election-consensus-locks-clocks",
+      "title": "Coordination — leader election, consensus, locks, clocks",
+      "part": "IX"
+    },
+    {
+      "n": 84,
+      "slug": "ch84-async-and-flow-control",
+      "title": "Async and flow control",
+      "part": "IX"
+    },
+    {
+      "n": 85,
+      "slug": "ch85-caching",
+      "title": "Caching",
+      "part": "IX"
+    },
+    {
+      "n": 86,
+      "slug": "ch86-the-data-layer-mysql-and-postgresql",
+      "title": "The data layer — MySQL and PostgreSQL",
+      "part": "IX"
+    },
+    {
+      "n": 87,
+      "slug": "ch87-redis-and-in-memory-data",
+      "title": "Redis and in-memory data",
+      "part": "IX"
+    },
+    {
+      "n": 88,
+      "slug": "ch88-reliability-engineering",
+      "title": "Reliability engineering",
+      "part": "IX"
+    },
+    {
+      "n": 89,
+      "slug": "ch89-capacity-planning-and-performance",
+      "title": "Capacity planning and performance",
+      "part": "IX"
+    },
+    {
+      "n": 90,
+      "slug": "ch90-disaster-recovery",
+      "title": "Disaster recovery",
+      "part": "IX"
+    },
+    {
+      "n": 91,
+      "slug": "ch91-chaos-engineering",
+      "title": "Chaos engineering",
+      "part": "IX"
+    },
+    {
+      "n": 92,
+      "slug": "ch92-incident-management-postmortems-and-the-sre-operating",
+      "title": "Incident management, postmortems and the SRE operating model",
+      "part": "IX"
+    },
+    {
+      "n": 93,
+      "slug": "ch93-the-system-design-method",
+      "title": "The system-design method",
+      "part": "X"
+    },
+    {
+      "n": 94,
+      "slug": "ch94-building-blocks",
+      "title": "Building blocks",
+      "part": "X"
+    },
+    {
+      "n": 95,
+      "slug": "ch95-scaling-patterns",
+      "title": "Scaling patterns",
+      "part": "X"
+    },
+    {
+      "n": 96,
+      "slug": "ch96-project-url-shortener",
+      "title": "Project — URL shortener",
+      "part": "X"
+    },
+    {
+      "n": 97,
+      "slug": "ch97-project-distributed-rate-limiter",
+      "title": "Project — Distributed rate limiter",
+      "part": "X"
+    },
+    {
+      "n": 98,
+      "slug": "ch98-project-distributed-job-and-queue-processing",
+      "title": "Project — Distributed job and queue processing",
+      "part": "X"
+    },
+    {
+      "n": 99,
+      "slug": "ch99-project-notification-system",
+      "title": "Project — Notification system",
+      "part": "X"
+    },
+    {
+      "n": 100,
+      "slug": "ch100-project-metrics-and-monitoring-platform",
+      "title": "Project — Metrics and monitoring platform",
+      "part": "X"
+    },
+    {
+      "n": 101,
+      "slug": "ch101-project-ci-cd-and-kubernetes-deployment-platform",
+      "title": "Project — CI/CD and Kubernetes deployment platform",
+      "part": "X"
+    },
+    {
+      "n": 102,
+      "slug": "ch102-project-highly-available-multi-region-saas",
+      "title": "Project — Highly available multi-region SaaS",
+      "part": "X"
+    },
+    {
+      "n": 103,
+      "slug": "ch103-the-universal-troubleshooting-framework",
+      "title": "The universal troubleshooting framework",
+      "part": "XI"
+    },
+    {
+      "n": 104,
+      "slug": "ch104-compute-and-memory-runbooks",
+      "title": "Compute and memory runbooks",
+      "part": "XI"
+    },
+    {
+      "n": 105,
+      "slug": "ch105-network-runbooks",
+      "title": "Network runbooks",
+      "part": "XI"
+    },
+    {
+      "n": 106,
+      "slug": "ch106-http-status-code-runbooks",
+      "title": "HTTP status-code runbooks",
+      "part": "XI"
+    },
+    {
+      "n": 107,
+      "slug": "ch107-kubernetes-runbooks",
+      "title": "Kubernetes runbooks",
+      "part": "XI"
+    },
+    {
+      "n": 108,
+      "slug": "ch108-platform-and-distributed-runbooks",
+      "title": "Platform and distributed runbooks",
+      "part": "XI"
+    },
+    {
+      "n": 109,
+      "slug": "ch109-interview-strategy-how-levels-are-scored",
+      "title": "Interview strategy — how levels are scored",
+      "part": "XII"
+    },
+    {
+      "n": 110,
+      "slug": "ch110-topic-interview-banks",
+      "title": "Topic interview banks",
+      "part": "XII"
+    },
+    {
+      "n": 111,
+      "slug": "ch111-distributed-systems-and-system-design-interviews",
+      "title": "Distributed-systems and system-design interviews",
+      "part": "XII"
+    },
+    {
+      "n": 112,
+      "slug": "ch112-production-troubleshooting-and-incident-interviews",
+      "title": "Production-troubleshooting and incident interviews",
+      "part": "XII"
+    },
+    {
+      "n": 113,
+      "slug": "ch113-behavioral-and-leadership-for-lead-and-staff",
+      "title": "Behavioral and leadership for lead and staff",
+      "part": "XII"
+    },
+    {
+      "n": 114,
+      "slug": "ch114-mock-interview-mode",
+      "title": "Mock-interview mode",
+      "part": "XII"
+    },
+    {
+      "n": 115,
+      "slug": "ch115-the-capstone-platform",
+      "title": "The capstone platform",
+      "part": "XIII"
+    },
+    {
+      "n": 116,
+      "slug": "ch116-the-incident-gauntlet",
+      "title": "The incident gauntlet",
+      "part": "XIII"
+    },
+    {
+      "n": 117,
+      "slug": "ch117-coding-algorithms-and-data-structures-for-sre",
+      "title": "Coding, algorithms and data structures for SRE interviews",
+      "part": "XIV"
+    },
+    {
+      "n": 118,
+      "slug": "ch118-timed-scripting-and-log-wrangling-sre-coding",
+      "title": "Timed scripting and log-wrangling — SRE coding",
+      "part": "XIV"
+    },
+    {
+      "n": 119,
+      "slug": "ch119-the-sre-interview-process-and-levels",
+      "title": "The SRE interview process and levels",
+      "part": "XIV"
+    },
+    {
+      "n": 120,
+      "slug": "ch120-resume-portfolio-and-salary-negotiation",
+      "title": "Resume, portfolio and salary negotiation",
+      "part": "XIV"
+    },
+    {
+      "n": 121,
+      "slug": "ch121-go-for-sre-optional-language-track",
+      "title": "Go for SRE — optional language track",
+      "part": "XIV"
+    }
+  ]
+}

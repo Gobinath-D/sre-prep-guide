@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 46 — Ingress and the Gateway API</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part V · K8s networking &nbsp;·&nbsp; Chapter 46</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part V · Kubernetes Networking at Packet Level · Chapter 46</div>
+      <h1>Ingress and the Gateway API</h1>
+      <p class="tagline">A NodePort gets a packet into the cluster. It has no idea what to do with a Host header, a URL path, or a certificate. Something has to read the request itself and decide where it actually goes — that's an Ingress controller, and the Gateway API is the rewrite that fixes the parts of Ingress that never quite worked cleanly.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~50 min read · kind + ingress-nginx lab</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain what an Ingress object actually configures, and who — not what — turns it into working routing.</li>
+          <li>Route two different paths and two different hosts to two different backends, and add TLS to one.</li>
+          <li>Say precisely what GatewayClass, Gateway, and HTTPRoute each own, and why that split exists.</li>
+          <li>Explain what cert-manager automates, including the HTTP-01 chicken-and-egg problem it has to solve.</li>
+          <li>Diagnose a 404 versus a 503 from an ingress, and tell a routing mistake from a backend mistake.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>NodePort gets you in the door; it can't read the request</h2>
+    <p><a href="ch44-nodeport-loadbalancer-internet-to-pod.html">Chapter 44</a> got a packet from the internet to a node and, from there, to a pod. But that mechanism is deliberately dumb — it matches a port number and forwards. It has no idea that <code>shop.example.com/api/cart</code> and <code>shop.example.com/checkout</code> should go to two completely different backends, or that <code>images.example.com</code> is a different app entirely from <code>shop.example.com</code>, even though both might arrive at the exact same external IP and the exact same port, 443.</p>
+    <p>Reading that kind of detail — the Host header, the URL path, the TLS handshake's SNI — means terminating the connection and actually looking at the HTTP request. That's layer 7, and it needs a real piece of software in the path: an <b>Ingress controller</b>. You describe the routing you want declaratively, as a Kubernetes object, and the controller's job is to turn that description into a running reverse proxy that does exactly what you asked. <b>Ingress</b> was the first API for this description, and it shipped with real limitations. The <b>Gateway API</b> is the newer, more expressive API meant to replace it — not a competing product, a successor.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>Neither Ingress nor the Gateway API routes a single packet by itself. Both are just declarative descriptions. A controller — ingress-nginx, Envoy-based, a cloud's own implementation — has to be running, watching those objects, and reconfiguring a real proxy. No controller, no routing, no matter how correct your YAML is.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: one shared reception desk in a multi-tenant building</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Picture an office building with one shared reception desk serving many tenant companies. Visitors arrive with an address that includes the company name and sometimes a specific department. The receptionist reads that, matches it against a set of instructions, and points the visitor to the right floor. That receptionist, doing real work on every arrival, is the <b>Ingress controller</b>. The instructions taped to the desk are the <b>Ingress</b> object.</p>
+      <p>The trouble with early building conventions was that <em>any tenant could tape up their own instruction slip</em>, in whatever format they liked, with no shared numbering for which slip takes priority when two overlap. Two companies' notes conflict, and which one the receptionist actually follows depends on which specific receptionist is on shift — different buildings' staff resolve ambiguity differently. That's Ingress: one shared object, annotation-driven extensions bolted on per vendor, and priority between overlapping rules left to each controller's own judgment.</p>
+      <p>The Gateway API is the building switching to a proper front-desk system with clear job separation. <b>Building management</b> configures the desk itself once — which doors it watches, which ports, which credentials it checks visitors against (TLS). That's the <b>Gateway</b>. Each <b>tenant company</b> then gets their own clearly-scoped page in the ledger — "anyone asking for us, on this path, goes to our floor" — that only affects their own routing and can't silently clobber another tenant's page. That's an <b>HTTPRoute</b>. And the whole desk-configuration format itself — what a valid entry even looks like — is set once by whoever manufactures front-desk systems for this kind of building. That's the <b>GatewayClass</b>.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In Kubernetes</th></tr>
+      <tr><td>The receptionist actually directing visitors</td><td>The <b>Ingress controller</b> or Gateway API implementation</td></tr>
+      <tr><td>One shared instruction slip, any tenant can add to it</td><td>An <b>Ingress</b> object (<code>networking.k8s.io/v1</code>)</td></tr>
+      <tr><td>Building management configuring the desk itself</td><td>A <b>Gateway</b> — listeners, ports, TLS, owned by the platform team</td></tr>
+      <tr><td>A tenant's own clearly-scoped ledger page</td><td>An <b>HTTPRoute</b> — host/path rules, owned by the app team</td></tr>
+      <tr><td>The desk-system manufacturer's spec</td><td>A <b>GatewayClass</b> — which controller implements this Gateway</td></tr>
+      <tr><td>Checking a visitor's ID badge at the door</td><td>TLS termination and certificate selection by SNI</td></tr>
+      <tr><td>The badge office that reprints expiring badges automatically</td><td><b>cert-manager</b> — automated certificate issuance and renewal</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>L7 routing to backends</h2>
+    <p>An Ingress controller is, physically, just another workload: a Deployment of proxy pods, sitting behind a Service that's exposed to the outside world exactly the way Chapter 44 described — usually <code>type: LoadBalancer</code> or a NodePort behind your own load balancer. External traffic reaches those proxy pods first, before it ever reaches your application.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 400" role="img" aria-label="A client request enters an Ingress controller pod exposed via a LoadBalancer Service, terminates TLS, matches a host and path rule, and is forwarded directly to a backend pod IP, bypassing kube-proxy">
+        <defs>
+          <marker id="i-ar" markerWidth="10" markerHeight="10" refX="7.5" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" style="fill:var(--accent)"/></marker>
+          <marker id="i-ar2" markerWidth="10" markerHeight="10" refX="7.5" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" style="fill:var(--accent2)"/></marker>
+        </defs>
+        <text x="360" y="18" text-anchor="middle" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">CLIENT → INGRESS CONTROLLER → BACKEND POD (L7)</text>
+
+        <rect x="14" y="40" width="108" height="64" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="68" y="64" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">client</text>
+        <text x="68" y="82" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">shop.example.com/api/cart</text>
+        <line x1="122" y1="72" x2="146" y2="72" style="stroke:var(--accent);stroke-width:2" marker-end="url(#i-ar)"/>
+
+        <rect x="148" y="34" width="118" height="76" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="207" y="56" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">LB / NodePort</text>
+        <text x="207" y="72" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">Ch 44 mechanism</text>
+        <text x="207" y="88" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">reads only the port</text>
+        <line x1="266" y1="72" x2="292" y2="72" style="stroke:var(--accent);stroke-width:2" marker-end="url(#i-ar)"/>
+
+        <!-- controller box -->
+        <rect x="294" y="20" width="230" height="220" rx="11" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="409" y="42" text-anchor="middle" style="fill:var(--accent);font:700 11.5px sans-serif;letter-spacing:.03em">INGRESS CONTROLLER POD</text>
+        <rect x="310" y="52" width="198" height="42" rx="7" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="409" y="77" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">TLS termination (SNI)</text>
+        <rect x="310" y="102" width="198" height="42" rx="7" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="409" y="127" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">match host + path rule</text>
+        <rect x="310" y="152" width="198" height="42" rx="7" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="409" y="177" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">pick a backend pod IP</text>
+        <text x="409" y="212" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">config compiled from watched</text>
+        <text x="409" y="227" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">Ingress/HTTPRoute + EndpointSlices</text>
+
+        <line x1="524" y1="173" x2="552" y2="173" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#i-ar2)"/>
+        <rect x="554" y="140" width="152" height="66" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="630" y="164" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">backend pod</text>
+        <text x="630" y="182" text-anchor="middle" style="fill:var(--accent2);font:9.5px sans-serif">reached directly by IP</text>
+        <text x="546" y="128" text-anchor="middle" style="fill:var(--deep);font:9px sans-serif">kube-proxy skipped</text>
+
+        <!-- watched objects note -->
+        <rect x="294" y="256" width="412" height="120" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="310" y="278" style="fill:var(--ink);font:11px sans-serif"><tspan style="fill:var(--accent);font-weight:700">Ingress rule</tspan> — host: shop.example.com, path: /api/* → Service tg-api</text>
+        <text x="310" y="298" style="fill:var(--ink);font:11px sans-serif"><tspan style="fill:var(--accent2);font-weight:700">EndpointSlice for tg-api</tspan> — the ready pod IPs behind that Service right now</text>
+        <text x="310" y="318" style="fill:var(--ink);font:11px sans-serif">The controller watches both. When either changes, it recompiles its own dataplane</text>
+        <text x="310" y="336" style="fill:var(--ink);font:11px sans-serif">config (an nginx.conf reload, or a dynamic update with no reload) and keeps serving.</text>
+        <text x="310" y="358" style="fill:var(--muted);font:10px sans-serif">Most L7 controllers talk straight to pod IPs — they do their own load balancing, not kube-proxy's.</text>
+      </svg>
+      <figcaption>The Ingress controller is the only thing in this path that reads the request. It terminates TLS, matches host and path against the rules it's watching, and forwards straight to a backend pod IP — usually skipping the ClusterIP/kube-proxy hop entirely.</figcaption>
+    </figure>
+
+    <p>The controller does its own load balancing across backend pods because it already has to track EndpointSlices to know where to send traffic — routing through the backend's ClusterIP and paying kube-proxy's DNAT a second time would add a hop for no benefit. This is worth remembering: an Ingress controller behaves like the <code>ip</code>-target-type load balancer from <a href="ch52-load-balancing-alb-nlb-target-groups-health.html">Chapter 52</a>, not like a plain Service client.</p>
+
+    <details class="recall"><summary>Think first: two separate Ingress objects, created by two different teams, both define a rule for the exact same host and path, pointing at different backends. What happens?</summary>
+      <div class="body">
+        <p>It's implementation-defined, and that's the actual problem, not a quirk of one controller. The core Ingress API has no formal precedence rule for resolving conflicts <em>across separate objects</em> — the docs acknowledge that behaviour can differ between controllers, and in practice most controllers pick one deterministically (often by creation time, or alphabetically) but won't warn you about the conflict. You end up with routing that "happens to work" today and can flip to the other team's backend after a controller upgrade, a Helm chart change, or simply re-applying manifests in a different order. This exact ambiguity is one of the concrete reasons the Gateway API defines an explicit, conformance-tested matching precedence instead of leaving it to each vendor.</p>
+      </div>
+    </details>
+
+    <h2 id="internals"><span class="beat">Internal working</span>From YAML to a working reverse proxy</h2>
+    <ol class="steps">
+      <li><b>You deploy an Ingress controller</b> — a Deployment of proxy pods (ingress-nginx wraps nginx; others wrap Envoy or their own engine) plus a Service exposing it externally, using the exact NodePort/LoadBalancer mechanism from Chapter 44. Nothing routes yet; the controller is just running.</li>
+      <li><b>The controller watches the API server</b> for Ingress objects matching its <code>IngressClass</code> (or, historically, the legacy <code>kubernetes.io/ingress.class</code> annotation — deprecated in favour of the dedicated <code>IngressClass</code> resource and <code>spec.ingressClassName</code>), and for the EndpointSlices of every Service those Ingress objects reference. This is the same watch-and-reconcile pattern as every controller in this book.</li>
+      <li><b>It compiles what it sees into real dataplane configuration.</b> ingress-nginx literally generates an <code>nginx.conf</code> and triggers a reload (or, for endpoint-only changes, patches upstreams dynamically without a full reload); Envoy-based controllers push configuration over xDS with no reload at all. Either way, the Ingress object you wrote is now a live, running proxy configuration.</li>
+      <li><b>A request arrives and TLS terminates first, if configured.</b> The controller picks which certificate to present based on the TLS handshake's SNI — the hostname the client asked for before any HTTP headers are even visible — which is why the <code>tls.hosts</code> list on an Ingress and the actual Host header need to agree.</li>
+      <li><b>The controller matches rules in order of specificity, not declaration order.</b> A <code>pathType: Exact</code> match beats a <code>Prefix</code> match; a longer prefix beats a shorter one. This ordering is well-defined <em>within one Ingress object</em>; it's the cross-object case from the recall above that's genuinely ambiguous.</li>
+      <li><b>The matched rule points at a Service, but the controller resolves that straight to pod IPs</b> via the Service's EndpointSlices, and load-balances across them itself — it does not send the request to the Service's ClusterIP and let kube-proxy handle it a second time.</li>
+    </ol>
+    <div class="box keypoint"><div class="h">The Gateway API's actual fix</div>
+      <p>Gateway API doesn't just rename Ingress's fields. It splits one object into three with different owners (<code>GatewayClass</code>, <code>Gateway</code>, <code>HTTPRoute</code>), it standardises rich matching (headers, methods, query parameters, weighted traffic splitting) that Ingress only ever offered through vendor-specific annotations, and — the part this chapter's recall exposed — it defines a strict, conformance-tested precedence order for overlapping matches: exact path matches beat prefix matches, longer prefixes beat shorter ones, and further ties are broken deterministically by rule and object age rather than by whichever controller you happen to run. The goal is the same routing behaviour on every conformant implementation, which Ingress never fully delivered.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: an app team wants to add a new path rule to a Gateway that the platform team owns. Under the Gateway API's role split, whose object do they edit?</summary>
+      <div class="body">
+        <p>Their own <code>HTTPRoute</code> — never the <code>Gateway</code> itself. The app team creates or edits an <code>HTTPRoute</code> in their own namespace with a <code>parentRefs</code> field pointing at the platform team's <code>Gateway</code>, and lists their own hostnames, paths, and backend Services in it. The platform team's <code>Gateway</code> object — its listeners, ports, and TLS configuration — never needs to change for this. That's the entire point of the split: an app team can add, change, or break their own routing without ever touching, or needing permission to touch, the shared front-desk configuration. Contrast that with a shared Ingress object, where adding a rule sometimes means editing the exact same object another team already has rules in.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces and what each owns</h2>
+    <ul>
+      <li><b>Ingress</b> (<code>networking.k8s.io/v1</code>) — host/path rules pointing at backend Services, plus a <code>tls</code> block referencing a Secret. Owns intent; does nothing on its own.</li>
+      <li><b>IngressClass</b> — names which controller should implement a given Ingress, replacing the old class annotation. A cluster can run multiple controllers side by side, each claiming its own class.</li>
+      <li><b>The Ingress controller</b> — the actual proxy plus its control loop. Owns turning Ingress objects and EndpointSlices into live routing, TLS termination, and (via annotations, since the core API has no field for it) most of the extra behaviour real production traffic needs — rewrites, rate limiting, auth.</li>
+      <li><b>cert-manager's <code>Certificate</code>, <code>Issuer</code>/<code>ClusterIssuer</code></b> — declare "I want a valid cert for this host, issued by this authority, kept in this Secret," and cert-manager's controllers own requesting, validating, and renewing it automatically, writing the result into the Secret the Ingress already references.</li>
+      <li><b><code>GatewayClass</code></b> (Gateway API, cluster-scoped) — names which controller implements Gateways of this class, the same role <code>IngressClass</code> plays.</li>
+      <li><b><code>Gateway</code></b> — the shared, infrastructure-owned listener configuration: ports, protocols, hostnames, TLS. Typically owned by a platform team.</li>
+      <li><b><code>HTTPRoute</code></b> (and its siblings <code>GRPCRoute</code>, <code>TCPRoute</code>, <code>TLSRoute</code> for non-HTTP traffic) — the app-team-owned routing rules: matches on path, header, method, or query, weighted <code>backendRefs</code> for traffic splitting, referencing a parent <code>Gateway</code>.</li>
+      <li><b><code>ReferenceGrant</code></b> — the explicit permission slip that lets an <code>HTTPRoute</code> in one namespace point at a Service in another; without it, cross-namespace backend references are refused, closing a gap Ingress never guarded.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one HTTPS request end to end</h2>
+    <p>A browser resolves <code>shop.example.com</code> to the Ingress controller's external IP — via Route 53 or whatever DNS you run (<a href="ch53-route-53-dns-and-routing-policies.html">Chapter 53</a>) — and connects on 443. The TLS handshake's SNI says <code>shop.example.com</code>; the controller picks the certificate cert-manager provisioned for that host and terminates TLS. It reads the now-decrypted request: <code>GET /api/cart</code>, Host <code>shop.example.com</code>. Among the Ingress rules it's watching, one matches this exact host with path prefix <code>/api</code>, pointing at Service <code>tg-api</code>. The controller resolves that Service's current EndpointSlice, picks one of the ready pod IPs, and forwards the request there directly — no ClusterIP, no kube-proxy DNAT for this hop. The pod answers; the controller streams the response back over the same TLS connection it terminated. If that pod had zero ready endpoints, the controller would have nothing to forward to and would answer with its own 503 — the same "no healthy backend" shape you've already seen at the Service layer in Chapter 43, one layer up.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>kind ships an officially documented way to run <a href="https://kind.sigs.k8s.io/docs/user/ingress/">ingress-nginx</a> with real host-port access, which is what these labs use. Create the cluster with the ports it needs mapped out to your laptop:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>kind create cluster --name ing --config - &lt;&lt;'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  kubeadmConfigPatches:
+  - |
+    kind: InitConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        node-labels: "ingress-ready=true"
+  extraPortMappings:
+  - containerPort: 80
+    hostPort: 80
+  - containerPort: 443
+    hostPort: 443
+EOF
+
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+kubectl wait --namespace ingress-nginx --for=condition=ready pod \
+  --selector=app.kubernetes.io/component=controller --timeout=120s</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — route two paths to two backends</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Deploy two tiny apps and one Ingress that splits traffic between them by path.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>for name in a b; do
+  kubectl create deployment echo-$name --image=hashicorp/http-echo -- /http-echo -listen=:8080 -text="echo-$name"
+  kubectl expose deployment echo-$name --port=8080
+done
+
+kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: split, annotations: { nginx.ingress.kubernetes.io/rewrite-target: /} }
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - { path: /a, pathType: Prefix, backend: { service: { name: echo-a, port: { number: 8080 } } } }
+          - { path: /b, pathType: Prefix, backend: { service: { name: echo-b, port: { number: 8080 } } } }
+EOF
+kubectl wait --for=condition=ready pod -l app.kubernetes.io/component=controller -n ingress-nginx --timeout=60s
+curl -s http://localhost/a
+curl -s http://localhost/b</code></pre></div>
+        <div class="out"><span class="ol">Output</span>echo-a
+echo-b</code></div>
+        <p>One controller, one external port, two completely different backends selected purely by URL path. Nothing about ClusterIPs or NodePorts changed — this whole split happened inside the controller's own L7 logic.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — route by host, and read the compiled config</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Add host-based routing, then look at what the controller actually generated from your YAML — the same nginx.conf the analogy's receptionist would be reading off.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: by-host }
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: a.local
+      http: { paths: [{ path: /, pathType: Prefix, backend: { service: { name: echo-a, port: { number: 8080 } } } }] }
+    - host: b.local
+      http: { paths: [{ path: /, pathType: Prefix, backend: { service: { name: echo-b, port: { number: 8080 } } } }] }
+EOF
+curl -s -H 'Host: a.local' http://localhost/
+curl -s -H 'Host: b.local' http://localhost/
+
+CTRL_POD=$(kubectl -n ingress-nginx get pods -l app.kubernetes.io/component=controller -o jsonpath='{.items[0].metadata.name}')
+kubectl -n ingress-nginx exec "$CTRL_POD" -- grep -A2 'server_name a.local' /etc/nginx/nginx.conf</code></pre></div>
+        <div class="out"><span class="ol">Output</span>echo-a
+echo-b
+server_name a.local ;
+listen 80  ;
+listen 443  ssl http2 ;</code></div>
+        <p>The same request, the same port, the same IP — routed entirely by the <code>Host</code> header, and the exact <code>server_name</code> block sitting in the controller's real config is right there for you to read. Ingress is a description; this is the thing that actually decides.</p>
+        <p>Now add real TLS, entirely locally — no ACME issuer needed to prove the mechanism. Generate a self-signed certificate for <code>a.local</code>, store it as the Secret type Ingress expects, and reference it:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>openssl req -x509 -nodes -days 30 -newkey rsa:2048 \
+  -keyout a-local.key -out a-local.crt -subj "/CN=a.local" &gt;/dev/null 2&gt;&amp;1
+kubectl create secret tls a-local-tls --cert=a-local.crt --key=a-local.key
+
+kubectl patch ingress by-host --type=merge -p '{"spec":{"tls":[{"hosts":["a.local"],"secretName":"a-local-tls"}]}}'
+curl -vk --resolve a.local:443:127.0.0.1 https://a.local/ 2&gt;&amp;1 | grep -E 'subject|HTTP/'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>* subject: CN=a.local
+&lt; HTTP/2 200</code></div>
+        <p>That's a genuinely working TLS listener — the certificate presented now actually matches the host, sourced from a Secret the controller picked up with no reload command from you. This is the working baseline the next lab is about to quietly break.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — a TLS secret that doesn't exist</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Working TLS, one small change away from broken: point the same Ingress at a Secret name that doesn't exist — a typo any templating mistake could produce — and see exactly what happens to the connection. Not an outright failure, which is what makes this mistake easy to miss.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl patch ingress by-host --type=merge -p '{"spec":{"tls":[{"hosts":["a.local"],"secretName":"a-local-tls-typo"}]}}'
+curl -vk --resolve a.local:443:127.0.0.1 https://a.local/ 2&gt;&amp;1 | grep -E 'subject|SSL certificate|HTTP/'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>* SSL certificate problem: self-signed certificate
+* subject: CN=Kubernetes Ingress Controller Fake Certificate
+&lt; HTTP/2 200</code></div>
+        <p>The connection succeeds, the app answers <code>200</code> — but the certificate presented is the controller's own built-in placeholder, not anything for <code>a.local</code>. A real browser would show a hard certificate warning; a strict client (most API clients, by default) would refuse the connection outright with a certificate verification error, not a helpful message about a missing Secret. Before revealing: why does the controller serve a fake cert instead of just failing the whole route?</p>
+        <details class="recall"><summary>Reveal the reasoning</summary>
+          <div class="body">
+            <p>Because failing the TLS handshake entirely would take down every other host this same controller serves on the same port — TLS termination happens before the controller even knows which Ingress rule a request is headed for, so it has to present <em>some</em> certificate the instant a client connects. When the referenced Secret is missing, ingress-nginx falls back to a built-in self-signed default certificate for that listener rather than refusing the connection. The failure is real, it's just silent and one layer removed from where you're looking: <code>kubectl describe ingress by-host</code> and the controller's own logs will show a warning about the missing Secret, but <code>curl</code> without <code>-k</code>, or any TLS-verifying client, will simply report a certificate error with no obvious link back to a typo'd <code>secretName</code>. Fix it: create the actual Secret cert-manager or you would normally provision, matching the name exactly.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — 404 from an ingress that looks completely correct</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>A very common real ticket: "the Ingress is applied, the pods are healthy, but I get a 404." Reproduce it by simply forgetting the Host header a host-based rule requires.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>curl -s -o /dev/null -w '%{http_code}\n' http://localhost/       <span class="c"># no Host header override at all</span>
+kubectl get pods -l app=echo-a                                    <span class="c"># definitely running</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>404
+NAME                       READY   STATUS
+echo-a-5d9c7f6b8d-x2z9k    1/1     Running</code></div>
+        <p>The pod is healthy, the Ingress exists, and you still get a 404. Work out why a perfectly healthy backend produces a 404 with no backend ever involved, before opening the answer.</p>
+        <details class="recall"><summary>Reveal the cause</summary>
+          <div class="body">
+            <p>Every rule in <code>by-host</code> requires a specific <code>Host</code> header — <code>a.local</code> or <code>b.local</code> — and a plain <code>curl http://localhost/</code> sends <code>Host: localhost</code>, which matches neither. With no matching host, the controller never reaches a backend at all; it answers from its own built-in <b>default backend</b>, whose entire job is to return 404 for anything nothing else claims. This is the single most common "my Ingress doesn't work" report, and the fix is never in the backend — it's confirming the client is actually sending the Host (or SNI, for HTTPS) the rule expects. The general triage: a 404 from an ingress means <em>no rule matched the request at all</em>; a 503 (Lab 3's territory, one layer deeper) means a rule matched but the backend had nothing healthy to serve it. Those are two different bugs in two different places, and the status code tells you which one you're looking at before you touch a single pod.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — translate this Ingress into Gateway API objects</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>Design the Gateway API equivalent of Lab 2's host-based routing, split correctly across the role boundary this chapter described, before opening the answer.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.1.0/standard-install.yaml
+kubectl get crd | grep gateway.networking.k8s.io</code></pre></div>
+        <details class="recall"><summary>Reveal the object split and how to verify it without a full controller installed</summary>
+          <div class="body">
+            <p>The platform team's object — one <code>Gateway</code>, naming the shared listeners:</p>
+            <div class="codewrap"><span class="lang">yaml</span><pre><code>apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: shop-gw }
+spec:
+  gatewayClassName: example-controller     <span class="c"># whichever implementation you run</span>
+  listeners:
+    - { name: http, protocol: HTTP, port: 80 }</code></pre></div>
+            <p>Each app team's object — an <code>HTTPRoute</code> that only touches their own routing:</p>
+            <div class="codewrap"><span class="lang">yaml</span><pre><code>apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: echo-a-route }
+spec:
+  parentRefs: [{ name: shop-gw }]
+  hostnames: ["a.local"]
+  rules:
+    - backendRefs: [{ name: echo-a, port: 8080 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: echo-b-route }
+spec:
+  parentRefs: [{ name: shop-gw }]
+  hostnames: ["b.local"]
+  rules:
+    - backendRefs: [{ name: echo-b, port: 8080 }]</code></pre></div>
+            <p>Neither <code>HTTPRoute</code> mentions the other, and neither had to touch <code>shop-gw</code> to exist — exactly the isolation the analogy promised. Without an actual Gateway API controller running (installing one — Envoy Gateway, Istio, a cloud-managed implementation — is a real, separate undertaking beyond CRDs alone), these objects won't route live traffic. But Gateway API's richer status subresource lets you verify the <em>configuration</em> is well-formed even with no controller attached, which Ingress never offered:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl apply -f gateway.yaml -f route-a.yaml -f route-b.yaml
+kubectl describe httproute echo-a-route | sed -n '/Status:/,$p'</code></pre></div>
+            <div class="out"><span class="ol">Output</span>Status:
+  Parents:
+    Conditions:
+      Type:    ResolvedRefs
+      Status:  Unknown
+      Reason:  Pending   <span class="c"># no controller has claimed this GatewayClass yet</span></code></div>
+            <p>That <code>Pending</code> status is itself the lesson: Gateway API objects report their own resolution state as a first-class field, so "is my routing config even valid and attached to something" is a <code>kubectl describe</code> away instead of a guess from behaviour — a real, structural improvement over Ingress that this chapter's earlier labs had no equivalent for.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · 404 from the ingress, backend perfectly healthy</div>
+      <p><b>Symptom:</b> a 404 comes back before any backend is ever touched; pods are Running and Ready. <b>First cut:</b> does the request's Host header (or TLS SNI) actually match a rule? <b>Confirm:</b> check what the client is actually sending versus what the Ingress/HTTPRoute rules expect — a missing <code>ingressClassName</code>, a wrong <code>IngressClass</code>, or simply no rule for this host all land here too. <b>Cause is usually:</b> a routing mismatch, not an application problem — the default backend is answering, not your app.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · 503 from the ingress, Ingress rule clearly correct</div>
+      <p><b>Symptom:</b> a rule matches, but the response is 503 from the controller itself. <b>First cut:</b> <code>kubectl get endpointslices -l kubernetes.io/service-name=&lt;backend&gt;</code> — is it empty? <b>Confirm:</b> same root cause as a bare Service with no endpoints (Chapter 43), one layer removed — the controller resolved the rule correctly and simply had nothing to forward to. <b>Cause is usually:</b> a failing readiness probe, a selector mismatch, or a scale-to-zero Deployment behind the referenced Service.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · TLS works for the wrong reason, and nobody notices</div>
+      <p><b>Symptom:</b> HTTPS "works" (connections succeed) but strict clients fail with certificate errors, or a security scan flags a self-signed certificate on a production hostname. <b>First cut:</b> check the certificate actually presented — <code>openssl s_client -connect host:443 -servername host</code> and read the subject. <b>Confirm:</b> it's the controller's built-in fallback certificate, not the one you expected. <b>Cause is usually:</b> a <code>secretName</code> typo, a Secret in the wrong namespace, or a cert-manager <code>Challenge</code> that never completed — check <code>kubectl get certificate,challenge -A</code> before assuming the Ingress config is wrong.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Automate certificates, and understand the chicken-and-egg problem in HTTP-01.</b> cert-manager's HTTP-01 challenge proves you control a domain by having Let's Encrypt (or another ACME issuer) fetch a token at a specific path over the real, public internet — which means the domain has to already be publicly reachable on port 80 before you can get a cert for it on 443. A domain that isn't live yet, or one gated by a NetworkPolicy or a firewall that blocks that path, will leave the resulting <code>Challenge</code> stuck pending indefinitely. DNS-01 validation (proving control via a DNS TXT record instead) sidesteps this and is the right choice for internal-only hosts or anything not yet publicly reachable — at the cost of needing your DNS provider's API credentials configured in the Issuer.</p>
+    <p><b>Decide your annotation dependency up front.</b> Nearly everything beyond basic host/path routing on Ingress — rate limiting, rewrites, auth, canary weights — is a controller-specific annotation, not a portable field. That's fine as long as you accept you're coupled to that controller; migrating to a different one, or to Gateway API, means translating every annotation by hand. Gateway API pulls the genuinely common cases (traffic splitting, header matching) into the portable core specifically to shrink this exposure.</p>
+    <p><b>Watch the controller's own health, not just your app's.</b> The Ingress controller is now a single, shared point every external request passes through — size it, and its own dataplane reload behaviour, for your real traffic. A controller that reloads its full config on every Ingress or Endpoint change can visibly hiccup during a busy rollout; prefer implementations (or configurations) that patch dynamically instead. <b>Common mistakes:</b> assuming the Ingress object itself does the routing; forgetting that TLS SNI has to match what the Host header will say; debugging a 503 by checking the Ingress instead of the backend's endpoints; and running two controllers claiming the same <code>IngressClass</code> with overlapping rules and being surprised by which one wins.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>This is the layer where "how does traffic get to my service" stops being purely a networking question and starts being an organisational one — the Gateway API's role split between <code>Gateway</code> (platform-owned) and <code>HTTPRoute</code> (app-owned) is a direct answer to the multi-tenant ownership problem that plagued shared Ingress objects, and it's the same shape you'll reach for anywhere many teams share one edge. On AWS, this whole chapter has a parallel implementation path: the AWS Load Balancer Controller can drive an <code>Ingress</code> straight into an ALB with L7 rules (<a href="ch60-end-to-end-synthesis-internet-to-alb.html">Chapter 60</a>), or increasingly a Gateway API implementation targeting the same ALB — same concepts, different dataplane. And the controller-reads-objects-and-programs-a-dataplane pattern here is identical in shape to a service mesh's control plane pushing configuration to Envoy sidecars (<a href="ch67-envoy-and-istiod-internals.html">Chapter 67</a>) — Ingress and Gateway API are, in effect, a mesh's edge-only special case, which is exactly why some meshes implement Gateway API directly instead of inventing their own ingress format.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What does an Ingress object actually do?</summary>
+        <div class="a"><p>By itself, nothing — it's a declarative description of host/path routing and TLS termination rules. An Ingress controller, a real running proxy watching the API server, turns that description into live routing by compiling it into its own dataplane configuration. The controller also resolves backends straight to pod IPs via EndpointSlices rather than going through the backend Service's ClusterIP, so it's doing its own load balancing, not deferring to kube-proxy.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Why did the Gateway API replace Ingress, specifically?</summary>
+        <div class="a"><p>Ingress has three real limitations the Gateway API targets directly. First, it's a single object shared by everyone who wants to route into a cluster, with no ownership boundary — any team can add rules to it, and there's no formal precedence for conflicting rules across separate Ingress objects, which different controllers resolve differently. Second, almost anything beyond basic host/path matching — rewrites, rate limiting, weighted traffic splitting, header matching — has to be expressed as controller-specific annotations rather than portable fields, which locks you to one controller's syntax. Third, Ingress has a thin status subresource, so there's little built-in way to see whether a rule is actually valid or attached to anything. Gateway API answers all three: it splits one object into <code>GatewayClass</code>/<code>Gateway</code>/<code>HTTPRoute</code> with different owners and RBAC boundaries, standardises richer matching and traffic splitting in the portable core API, defines a strict conformance-tested precedence order for overlapping matches, and gives every object a rich status subresource reporting its own resolution state.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Walk through exactly what cert-manager automates, and where it can get stuck.</summary>
+        <div class="a"><p>You declare a <code>Certificate</code> naming a host, an <code>Issuer</code> or <code>ClusterIssuer</code>, and a target Secret. cert-manager's controller creates a <code>CertificateRequest</code>, and for an ACME issuer like Let's Encrypt, that spawns an <code>Order</code> and one or more <code>Challenge</code> resources — one per domain being validated. For an HTTP-01 challenge, cert-manager temporarily serves a token at a well-known path on that host and the ACME server fetches it over the real internet to prove domain control; once validated, it issues the certificate and cert-manager writes it into the target Secret, which your Ingress or Gateway already references, so it picks it up with no further action. The stuck case is structural: HTTP-01 validation requires the domain to already be publicly reachable on port 80 at the moment of the challenge, so a domain that isn't live yet, or one behind a NetworkPolicy or firewall blocking that specific path, leaves the Challenge pending forever with no certificate ever issued. DNS-01, which proves control via a TXT record instead of a live HTTP fetch, avoids that dependency entirely and is the right choice for internal or not-yet-public hosts, at the cost of needing DNS provider API access configured into the Issuer.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>Users report your site is down; you check and get a 503 directly from the ingress. Walk me through the triage.</summary>
+        <div class="a"><p>A 503 from the ingress itself, as opposed to a 404, tells me a rule matched — so routing configuration isn't the problem, and I don't need to touch the Ingress or HTTPRoute at all. What it means is the controller resolved the rule to a backend Service and found nothing healthy to send the request to. So my next command is checking that Service's EndpointSlices, exactly as I would for a bare Service returning connection errors: are they empty, and if so, why — a failing readiness probe, a label selector that stopped matching after a deploy, or a Deployment that got scaled to zero. If the endpoints do exist and look healthy, I'd widen the check to whether the controller itself can actually reach the pod network — a NetworkPolicy change or a CNI issue on the controller's own node could produce the same symptom from the other direction. Throughout, I'm treating the 503 as a strong signal pointing one layer past the ingress config, not a reason to start editing routing rules.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>How does this whole chapter relate to a service mesh's ingress gateway?</summary>
+        <div class="a"><p>They're the same idea at a different scope. A mesh's ingress gateway is itself frequently just an Envoy proxy exposed the Chapter 44 way, configured by a control plane that watches routing objects and pushes configuration to it — the identical watch-compile-serve loop an Ingress controller runs, and increasingly the exact same Gateway API objects, since several service meshes implement Gateway API directly as their ingress configuration surface rather than inventing a separate one. The difference is scope and what happens after the edge: a plain Ingress controller's job ends once it's picked a backend pod, while a mesh's ingress gateway is the front door into a system where every hop afterward also gets mTLS, retries, and traffic policy from the same control plane. Understanding Ingress cold makes a mesh's ingress gateway look like a special case rather than a new concept.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>A NodePort or LoadBalancer gets a packet to a node; it takes a real proxy reading the actual request — an Ingress controller — to route by Host header, URL path, or TLS SNI. Ingress (<code>networking.k8s.io/v1</code>) describes that routing declaratively; the controller watching it compiles the description into a live reverse proxy and resolves backends straight to pod IPs via EndpointSlices, skipping kube-proxy. Ingress's real limits — one shared object with no cross-object precedence rule, annotation-dependent extensions, thin status reporting — are what the Gateway API fixes by splitting the config into <code>GatewayClass</code> (which controller), <code>Gateway</code> (platform-owned listeners/TLS), and <code>HTTPRoute</code> (app-owned routing rules), with a formal, conformance-tested matching precedence and a rich status subresource. cert-manager automates certificate issuance through <code>Certificate</code>/<code>Issuer</code> objects and ACME challenges, but HTTP-01 validation needs the domain already publicly reachable — DNS-01 is the fix for anything that isn't. A 404 from the ingress means no rule matched; a 503 means a rule matched but the backend had nothing healthy — different bugs, different places to look.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>An Ingress object is a description; an Ingress controller — a real running proxy — is what actually routes anything.</li>
+      <li>The controller watches Ingress/HTTPRoute objects and EndpointSlices, and compiles both into live dataplane config.</li>
+      <li>Backends are resolved straight to pod IPs via EndpointSlices — the controller does its own load balancing, bypassing kube-proxy.</li>
+      <li>Ingress has no formal cross-object precedence rule for overlapping host/path matches — behaviour is controller-defined.</li>
+      <li>Gateway API splits config by owner: <code>GatewayClass</code> (which controller), <code>Gateway</code> (platform), <code>HTTPRoute</code> (app team).</li>
+      <li>Gateway API defines a strict, conformance-tested match precedence and gives objects a rich status subresource.</li>
+      <li>TLS terminates before routing decisions are made — a missing/wrong Secret falls back to the controller's own fake cert, not an error.</li>
+      <li>404 from an ingress = no rule matched (check Host/SNI); 503 = a rule matched but the backend had no ready endpoints.</li>
+      <li>HTTP-01 cert validation needs the domain already publicly reachable; DNS-01 doesn't — use it for internal/not-yet-live hosts.</li>
+      <li>Almost everything beyond basic host/path matching on Ingress is a controller-specific annotation, not a portable field.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch43-services-and-the-datapath-pod-to-service.html"><b>Ch 43</b> Services &amp; the datapath</a>
+      <a href="ch44-nodeport-loadbalancer-internet-to-pod.html"><b>Ch 44</b> NodePort &amp; LoadBalancer</a>
+      <a href="ch17-tls-and-pki.html"><b>Ch 17</b> TLS &amp; PKI</a>
+      <a href="ch47-networkpolicy-deep.html"><b>Ch 47</b> NetworkPolicy</a>
+      <a href="ch60-end-to-end-synthesis-internet-to-alb.html"><b>Ch 60</b> Internet → ALB → Pod</a>
+      <a href="ch67-envoy-and-istiod-internals.html"><b>Ch 67</b> Envoy &amp; Istiod</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/services-networking/ingress/">Ingress</a>: rules, pathType, TLS, and IngressClass.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/services-networking/ingress-controllers/">Ingress Controllers</a>: the note that Ingress requires a controller to function at all.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/services-networking/gateway/">Gateway API</a>: how it relates to and extends beyond Ingress.</li>
+      <li>Gateway API project — <a href="https://gateway-api.sigs.k8s.io/">gateway-api.sigs.k8s.io</a>: the full spec, including <code>GatewayClass</code>/<code>Gateway</code>/<code>HTTPRoute</code> and formal match precedence.</li>
+      <li>cert-manager — <a href="https://cert-manager.io/docs/">cert-manager documentation</a>: Issuers, Certificates, and the ACME HTTP-01/DNS-01 solver mechanics.</li>
+      <li>kind — <a href="https://kind.sigs.k8s.io/docs/user/ingress/">Ingress</a>: the official kind configuration this chapter's labs are built on.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch45-coredns-and-service-discovery.html"><span class="dir">← Prev</span><div class="ti">Ch 45 — CoreDNS and service discovery</div></a>
+      <a class="nx" href="ch47-networkpolicy-deep.html"><span class="dir">Next →</span><div class="ti">Ch 47 — NetworkPolicy deep</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 46 of 121 · Part V · Kubernetes Networking at Packet Level. Traffic can now find its way in by name and path. Next: deciding what it's allowed to reach once it's inside.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">L7 routing to backends</a>
+    <a href="#internals">YAML to reverse proxy</a>
+    <a href="#components">The components</a>
+    <a href="#flow">Following a request</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

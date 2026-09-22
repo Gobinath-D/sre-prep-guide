@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 17 — TLS and PKI</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part II · Networking &nbsp;·&nbsp; Chapter 17</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part II · Networking from First Principles · Chapter 17</div>
+      <h1>TLS and PKI</h1>
+      <p class="tagline">The padlock in the browser is two separate promises: nobody can read this, and you're really talking to who you think. One is a handshake; the other is a chain of signatures back to someone your machine already trusts. Get either wrong and the whole site goes dark at 3&nbsp;a.m.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~40 min read · openssl lab (Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Walk through the TLS 1.3 handshake message by message, and say exactly how it differs from TLS 1.2.</li>
+          <li>Read an X.509 certificate with <code>openssl x509 -text</code> and explain every field that matters.</li>
+          <li>Verify a certificate chain by hand and spot a missing intermediate before it takes production down.</li>
+          <li>Explain the CA trust model, SNI, ALPN, session resumption, and mutual TLS to an interviewer without hand-waving.</li>
+          <li>Diagnose the three outages that cause most TLS incidents: expired cert, incomplete chain, SNI mismatch.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem TLS solves</h2>
+    <p>A packet leaving your laptop crosses a dozen machines you don't own — your router, your ISP, a few backbone carriers, the cloud provider's edge — before it reaches the server. Every one of those hops can read what you sent and, worse, change it. In <a href="ch13-l4-tcp-deep-and-udp.html">Chapter 13</a> we watched a TCP stream go by in plaintext; anyone on the path sees your session cookie, your password, the lot. That's the first problem: <b>confidentiality and integrity</b>. You need the bytes scrambled so the middle can't read them, and stamped so the middle can't tamper with them undetected.</p>
+    <p>There's a second problem that's easy to miss. Say you encrypt everything perfectly — but you encrypted it to an attacker who intercepted the connection and is happily relaying to the real bank. Encryption alone bought you nothing. So you also need <b>authentication</b>: proof that the server on the other end is genuinely <code>shop.example.com</code> and not someone in the middle. That proof can't come from the server just claiming it — anyone can claim anything. It has to come from a third party your machine already trusts.</p>
+    <p><b>TLS</b> (Transport Layer Security, the protocol formerly called SSL) handles the first problem. <b>PKI</b> (Public Key Infrastructure) — certificates, certificate authorities, and the trust store baked into your OS and browser — handles the second. They're separate ideas that always ship together, and confusing them is the root of half the TLS confusion you'll meet. This chapter keeps them separate on purpose.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>TLS gives you a private, tamper-evident channel. PKI answers a different question: <em>who is on the other end of that channel, and why should I believe it?</em> The handshake sets up the encryption; the certificate chain establishes the identity. An outage in the first is rare. An outage in the second — an expired cert, a broken chain — is a weekly event across the industry.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a passport and a sealed pouch</h2>
+    <p>Two everyday systems map cleanly onto TLS and PKI, and keeping them apart in your head is the whole game.</p>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Picture meeting a courier who claims to work for your bank. Before you hand over anything, you ask for ID. They show a <b>passport</b>. You don't personally know this person, but you trust the <b>government that issued the passport</b> — and the passport carries that government's seal, which is hard to forge. You check the seal, check it hasn't expired, check the photo matches, and check the name is the bank's. Only then do you trust them. That whole check is <b>PKI</b>: the courier's passport is the <b>certificate</b>, the issuing government is the <b>certificate authority</b>, and the reason you trust that government at all is that its seal is on a short list you were handed long ago — your <b>trust store</b>.</p>
+      <p>Now that you trust the courier, you don't shout your message across the street. You both agree on a private code, seal the message in a <b>diplomatic pouch</b> only the two of you can open, and exchange pouches. Anyone who grabs a pouch in transit sees sealed nonsense and can't alter it without breaking the seal. That's <b>TLS</b>: the handshake is agreeing on the code, and the encrypted records are the sealed pouches.</p>
+      <p>The subtle part: agreeing on the private code happens <em>in public</em>, where eavesdroppers are watching — yet they still can't derive the code. That trick is a <b>key exchange</b>, and TLS 1.3 makes it mandatory that the code can't be recovered later even if the server's long-term key is stolen. That property is <b>forward secrecy</b>, and it's why 1.3 threw out half of what 1.2 allowed.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In TLS / PKI</th></tr>
+      <tr><td>The courier's passport</td><td>The server's X.509 <b>certificate</b> (its public key + identity, signed)</td></tr>
+      <tr><td>The issuing government</td><td>The <b>Certificate Authority</b> (CA) that signed the certificate</td></tr>
+      <tr><td>The government seal on the passport</td><td>The CA's digital <b>signature</b> over the certificate</td></tr>
+      <tr><td>The short list of governments you trust</td><td>The <b>root store</b> / trust anchors on your OS or browser</td></tr>
+      <tr><td>Checking name, seal, expiry</td><td>Certificate <b>validation</b>: hostname (SAN), signature chain, validity dates</td></tr>
+      <tr><td>Agreeing a private code in public</td><td>The <b>key exchange</b> (ECDHE) inside the handshake</td></tr>
+      <tr><td>The sealed diplomatic pouch</td><td>An encrypted TLS <b>record</b> (AEAD-protected application data)</td></tr>
+      <tr><td>Telling the courier which office you came for</td><td><b>SNI</b> — the server name you send so a shared host picks the right cert</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>The TLS 1.3 handshake, in one picture</h2>
+    <p>TLS runs on top of a normal TCP connection (<a href="ch14-ports-sockets-ephemeral-ports-connection-lifecycle.html">Chapter 14</a>): first the three-way handshake gives you a byte stream, then the TLS handshake runs over that stream before any HTTP flows. The whole point of TLS 1.3's design was to make that second handshake cost <b>one round trip</b> and to encrypt almost all of it. Here's the message flow.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 440" role="img" aria-label="The TLS 1.3 handshake: ClientHello, ServerHello, encrypted server flight, client Finished, then application data, in one round trip">
+        <defs>
+          <marker id="c2s" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="s2c" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+          <marker id="dd" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" style="fill:var(--violet)"/></marker>
+        </defs>
+        <!-- lanes -->
+        <rect x="40" y="16" width="180" height="34" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="130" y="38" text-anchor="middle" style="fill:var(--ink);font:700 14px sans-serif">CLIENT (curl)</text>
+        <rect x="500" y="16" width="180" height="34" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="590" y="38" text-anchor="middle" style="fill:var(--ink);font:700 14px sans-serif">SERVER (nginx)</text>
+        <line x1="130" y1="50" x2="130" y2="410" style="stroke:var(--line);stroke-width:2"/>
+        <line x1="590" y1="50" x2="590" y2="410" style="stroke:var(--line);stroke-width:2"/>
+        <!-- 1: ClientHello -->
+        <line x1="130" y1="78" x2="588" y2="92" style="stroke:var(--accent);stroke-width:2" marker-end="url(#c2s)"/>
+        <text x="140" y="72" style="fill:var(--accent);font:600 12.5px sans-serif">ClientHello</text>
+        <text x="140" y="88" style="fill:var(--muted);font:11px sans-serif">key_share · versions · SNI · ALPN</text>
+        <!-- encryption boundary -->
+        <line x1="40" y1="110" x2="680" y2="110" style="stroke:var(--deep);stroke-width:1.3;stroke-dasharray:6 5"/>
+        <text x="360" y="105" text-anchor="middle" style="fill:var(--deep);font:700 10.5px sans-serif;letter-spacing:.04em">↓ EVERYTHING BELOW IS ENCRYPTED (handshake keys derived from key_share) ↓</text>
+        <!-- 2: ServerHello + flight -->
+        <line x1="588" y1="130" x2="132" y2="144" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#s2c)"/>
+        <text x="360" y="126" text-anchor="end" style="fill:var(--accent2);font:600 12.5px sans-serif">ServerHello (key_share)</text>
+        <line x1="588" y1="170" x2="132" y2="170" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#s2c)"/>
+        <text x="580" y="164" text-anchor="end" style="fill:var(--accent2);font:600 12px sans-serif">EncryptedExtensions · Certificate</text>
+        <line x1="588" y1="196" x2="132" y2="196" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#s2c)"/>
+        <text x="580" y="190" text-anchor="end" style="fill:var(--accent2);font:600 12px sans-serif">CertificateVerify · Finished</text>
+        <text x="150" y="214" style="fill:var(--muted);font:11px sans-serif">client validates chain against its trust store</text>
+        <!-- 3: client Finished -->
+        <line x1="130" y1="246" x2="588" y2="246" style="stroke:var(--accent);stroke-width:2" marker-end="url(#c2s)"/>
+        <text x="140" y="240" style="fill:var(--accent);font:600 12px sans-serif">Finished &nbsp;(+ [Certificate] if mTLS)</text>
+        <!-- app data -->
+        <line x1="130" y1="288" x2="588" y2="288" style="stroke:var(--violet);stroke-width:2.5" marker-end="url(#dd)"/>
+        <text x="140" y="282" style="fill:var(--violet);font:700 12px sans-serif">Application data — HTTP GET (1-RTT)</text>
+        <line x1="588" y1="316" x2="132" y2="316" style="stroke:var(--violet);stroke-width:2.5" marker-end="url(#dd)"/>
+        <text x="580" y="310" text-anchor="end" style="fill:var(--violet);font:700 12px sans-serif">Application data — HTTP response</text>
+        <!-- RTT bracket -->
+        <line x1="20" y1="78" x2="20" y2="288" style="stroke:var(--muted);stroke-width:1"/>
+        <line x1="20" y1="78" x2="28" y2="78" style="stroke:var(--muted);stroke-width:1"/>
+        <line x1="20" y1="288" x2="28" y2="288" style="stroke:var(--muted);stroke-width:1"/>
+        <text x="16" y="188" text-anchor="middle" transform="rotate(-90 16 188)" style="fill:var(--muted);font:700 11px sans-serif;letter-spacing:.06em">1 ROUND TRIP</text>
+        <!-- footnote line -->
+        <line x1="40" y1="360" x2="680" y2="360" style="stroke:var(--line);stroke-width:1"/>
+        <text x="360" y="382" text-anchor="middle" style="fill:var(--muted);font:12px sans-serif">In TLS 1.2 the same result takes two round trips, and the certificate is sent in the clear.</text>
+        <text x="360" y="400" text-anchor="middle" style="fill:var(--muted);font:12px sans-serif">The TCP handshake (SYN/SYN-ACK/ACK) already happened before ClientHello — it isn't shown here.</text>
+      </svg>
+      <figcaption>TLS 1.3: the client offers its key material in the very first message, so the server can reply with everything at once. One round trip, and the certificate is encrypted.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>That "one round trip" is latency you pay on every new connection, and it's why connection reuse and session resumption matter so much at scale. But the reason TLS wakes you up isn't the handshake — it's the certificate. Certs expire. Chains break when a server forgets to send an intermediate. A load balancer picks the wrong cert because SNI didn't match. Every one of those is a total outage for the affected hostname, and every one is invisible until the exact second it isn't. The rest of this chapter is about seeing them coming.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>What actually happens, step by step</h2>
+    <p>Let's walk the TLS 1.3 handshake as the machines see it, then contrast 1.2 so the differences stick.</p>
+    <ol class="steps">
+      <li><b>ClientHello.</b> The client sends, in the clear, a random nonce, the TLS versions it supports (<code>supported_versions</code>, which is how 1.3 is negotiated), a list of cipher suites, and — critically — one or more <b>key_share</b> entries: ephemeral public keys for a Diffie-Hellman exchange (usually X25519 or a NIST P-curve). It also sends the <b>SNI</b> extension (which hostname it wants) and <b>ALPN</b> (which application protocol, e.g. <code>h2</code> or <code>http/1.1</code>). Guessing the key_share up front is the trick that saves a round trip.</li>
+      <li><b>ServerHello.</b> The server picks a cipher suite and its own <b>key_share</b>, and sends them back in the clear. That's enough: both sides now combine their private half with the other's public key_share to derive the same shared secret. From this point on, every handshake message is <b>encrypted</b> with keys derived from that secret.</li>
+      <li><b>Server flight (encrypted).</b> Immediately after ServerHello the server sends <b>EncryptedExtensions</b> (including the agreed ALPN), then its <b>Certificate</b> (the leaf plus any intermediates), then <b>CertificateVerify</b> — a signature over the handshake transcript made with the private key that matches the certificate's public key. That signature is the proof the server actually holds the key in the cert, not just a copy of someone else's cert. Then <b>Finished</b>, a MAC over the whole transcript that proves nothing was tampered with.</li>
+      <li><b>Client validates.</b> The client builds a chain from the leaf up to a trust anchor in its store, checks each signature, checks validity dates, checks that the hostname it wanted is in the certificate's <b>Subject Alternative Name</b>, and verifies <code>CertificateVerify</code> and <code>Finished</code>. If any check fails, the connection aborts here — before a single byte of your request is sent.</li>
+      <li><b>Client Finished.</b> The client sends its own <code>Finished</code>. In mutual TLS it also sends its <code>Certificate</code> and <code>CertificateVerify</code> here, because the server asked for them with a <code>CertificateRequest</code>. The handshake is now complete.</li>
+      <li><b>Application data.</b> The client sends the HTTP request in the same flight as its Finished — that's the 1-RTT: request goes out one round trip after ClientHello. The server replies with application data protected by the negotiated AEAD cipher (AES-GCM or ChaCha20-Poly1305), which encrypts and authenticates in one step.</li>
+    </ol>
+    <p>Now TLS 1.2, so you can see what changed. In 1.2 the ClientHello does <em>not</em> carry a key_share, so the server has to reply with ServerHello, then its Certificate <b>in the clear</b>, then a ServerKeyExchange with its DH parameters, then ServerHelloDone — and only <em>then</em> can the client send ClientKeyExchange and finish. That's a second round trip, and the certificate is visible to anyone watching. TLS 1.2 also allowed static RSA key exchange (no forward secrecy), CBC-mode ciphers (a decade of padding-oracle bugs), compression (CRIME), and renegotiation. TLS 1.3 removed all of them: ephemeral key exchange is mandatory, only AEAD ciphers remain, and the handshake is encrypted after ServerHello.</p>
+    <div class="box keypoint"><div class="h">Forward secrecy, in one sentence</div>
+      <p>Because the DH keys in <code>key_share</code> are <em>ephemeral</em> — thrown away after the handshake — an attacker who records your encrypted traffic today and steals the server's private key next year still can't decrypt what they recorded. The session keys never touched the long-term key and no longer exist. TLS 1.2 with static RSA had no such protection: steal the key, decrypt everything ever recorded. This is why 1.3 made ephemeral exchange non-negotiable.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: why can the eavesdropper watch both key_share messages go by and still not compute the session key?</summary>
+      <div class="body">
+        <p>Because each side only ever transmits its <em>public</em> DH value. The shared secret is derived by combining <em>your</em> private value with the <em>other side's</em> public value — and the private values never leave either machine. Recovering the secret from the two public values is the discrete-logarithm problem, which is computationally infeasible for the curves TLS uses. The eavesdropper sees two public keys and can do nothing useful with them. That's the entire magic of Diffie-Hellman, and it's why a key exchange can happen safely in full view.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, named</h2>
+    <p>You'll say these words constantly on the job, so let's pin down exactly what each one owns.</p>
+    <ul>
+      <li><b>The certificate (X.509, RFC 5280).</b> A signed document binding a <em>public key</em> to an <em>identity</em>. The fields that matter in an incident: <b>Subject</b> and <b>Subject Alternative Name</b> (the hostnames it's valid for — the SAN, not the old CN, is what's checked), <b>Issuer</b> (who signed it), <b>Validity</b> (Not Before / Not After), and the <b>public key</b> itself.</li>
+      <li><b>The chain.</b> A server almost never has a certificate signed directly by a root. It has a <b>leaf</b>, signed by an <b>intermediate</b> CA, signed (maybe through more intermediates) by a <b>root</b>. The server must send the leaf <em>and every intermediate</em>. It must <em>not</em> send the root — the client already has it.</li>
+      <li><b>The trust store.</b> The set of root certificates your OS, browser, or language runtime trusts implicitly. On Linux it's usually under <code>/etc/ssl/certs</code>. This is the list of "governments" from the analogy. A cert validates only if the chain ends at one of these roots.</li>
+      <li><b>The private key.</b> The secret half of the leaf's key pair. It never leaves the server and is never in the certificate. If it leaks, the cert must be revoked and reissued — this is the worst day in PKI.</li>
+      <li><b>SNI (Server Name Indication, RFC 6066).</b> The hostname the client puts in the ClientHello so a server hosting many sites on one IP knows which certificate to present. Without it, a shared host can't pick the right cert.</li>
+      <li><b>ALPN (RFC 7301).</b> How client and server agree on the application protocol <em>inside</em> the handshake — <code>h2</code> for HTTP/2, <code>http/1.1</code> otherwise. It's why HTTP/2 needs no extra round trip to negotiate.</li>
+      <li><b>Session resumption.</b> After a full handshake the server can issue a <b>NewSessionTicket</b>. On the next connection the client presents it as a <b>pre-shared key (PSK)</b> and skips the certificate exchange — cheaper, and the basis of 0-RTT early data (with its own replay caveats).</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one HTTPS connection</h2>
+    <p>Put it together for <code>curl https://shop.example.com</code>. TCP connects to port 443. curl sends a ClientHello with <code>server_name=shop.example.com</code>, ALPN offering <code>h2,http/1.1</code>, and an X25519 key_share. The load balancer uses the SNI to select the <code>shop.example.com</code> certificate, replies with its ServerHello and key_share, and — now encrypted — sends the leaf and intermediate certificates, a CertificateVerify signature, and Finished. curl builds the chain to a root in <code>/etc/ssl/certs</code>, checks the dates, confirms <code>shop.example.com</code> is in the SAN, and sends its Finished plus the HTTP/2 request. From here it's just <a href="ch16-http-http-2-http-3-and-grpc.html">HTTP</a> inside encrypted records. Every failure mode in the labs below is one of those steps saying no.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>You don't need a real website to learn this — you'll build your own CA, sign your own chain, and run a TLS server on loopback. That makes every failure reproducible. Start a throwaway container with OpenSSL:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># OpenSSL 3.x ships in the base image; this is a clean, disposable box.</span>
+docker run --rm -it ubuntu:24.04 bash
+apt-get update &amp;&amp; apt-get install -y openssl curl</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — mint a real certificate chain</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Make a root CA, an intermediate, and a leaf for <code>shop.example.com</code> — the exact three-tier shape every public cert uses.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Root CA (self-signed, long-lived)</span>
+openssl req -x509 -newkey rsa:2048 -nodes -keyout root.key -out root.crt -days 3650 \
+  -subj "/O=Acme Root CA/CN=Acme Root CA X1" -sha256
+
+<span class="c"># Intermediate: make a request, sign it with the root, mark it a CA</span>
+openssl req -newkey rsa:2048 -nodes -keyout int.key -out int.csr -subj "/O=Acme/CN=Acme Intermediate CA G2"
+openssl x509 -req -in int.csr -CA root.crt -CAkey root.key -CAcreateserial -out int.crt -days 1825 \
+  -extfile &lt;(printf "basicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign") -sha256
+
+<span class="c"># Leaf: signed by the intermediate, with a SAN (this is what browsers check)</span>
+openssl req -newkey rsa:2048 -nodes -keyout leaf.key -out leaf.csr -subj "/O=Acme/CN=shop.example.com"
+openssl x509 -req -in leaf.csr -CA int.crt -CAkey int.key -CAcreateserial -out leaf.crt -days 90 \
+  -extfile &lt;(printf "subjectAltName=DNS:shop.example.com,DNS:www.shop.example.com\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth") -sha256</code></pre></div>
+        <p>You now have the same structure as any production site: a 90-day leaf (the length Let's Encrypt issues), a longer-lived intermediate, and a 10-year root. Note that the leaf carries <code>extendedKeyUsage=serverAuth</code> and a SAN — modern clients reject a cert with no SAN outright, no matter what the CN says.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — read the certificate</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p><code>openssl x509 -text</code> decodes the whole certificate into readable fields. This is the single most useful TLS command you'll learn.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>openssl x509 -in leaf.crt -noout -text | head -25</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>Certificate:
+    Data:
+        Version: 3 (0x2)
+        Signature Algorithm: sha256WithRSAEncryption
+        Issuer: O = Acme, CN = Acme Intermediate CA G2
+        Validity
+            Not Before: Sep 21 11:08:07 2026 GMT
+            Not After : Dec 20 11:08:07 2026 GMT
+        Subject: O = Acme, CN = shop.example.com
+        Subject Public Key Info:
+            Public Key Algorithm: rsaEncryption
+                Public-Key: (2048 bit)</code></div>
+        <p>Read it top to bottom: <b>Issuer</b> is the intermediate (so the chain goes up to it, not the root), <b>Validity</b> is a 90-day window, <b>Subject</b> is the site. Now the extensions that actually get checked at connection time:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>openssl x509 -in leaf.crt -noout -ext subjectAltName,extendedKeyUsage</code></pre></div>
+        <div class="out"><span class="ol">Output</span>X509v3 Subject Alternative Name:
+    DNS:shop.example.com, DNS:www.shop.example.com
+X509v3 Extended Key Usage:
+    TLS Web Server Authentication</code></div>
+        <p>The SAN is the list of hostnames the cert is valid for. If a client asks for a name that isn't in this list, validation fails — that's the SNI/hostname-mismatch class of incident. Against a real site you'd run the same decode over the wire:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Pull the live cert from any HTTPS endpoint and inspect its SAN + dates:</span>
+openssl s_client -connect example.com:443 -servername example.com &lt;/dev/null 2&gt;/dev/null \
+  | openssl x509 -noout -subject -dates -ext subjectAltName</code></pre></div>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Understand — do a live TLS 1.3 handshake</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Run your own server on loopback and connect to it, so you see a full handshake with no internet involved.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Server presents leaf + intermediate; -www makes it answer a simple GET</span>
+cat leaf.crt int.crt &gt; fullchain.crt
+openssl s_server -accept 4443 -cert leaf.crt -key leaf.key -cert_chain int.crt -www -tls1_3 &amp;
+
+<span class="c"># Client, trusting our root, asking for the right name:</span>
+echo Q | openssl s_client -connect 127.0.0.1:4443 -servername shop.example.com -CAfile root.crt</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>depth=2 O = Acme Root CA, CN = Acme Root CA X1
+verify return:1
+depth=1 O = Acme, CN = Acme Intermediate CA G2
+verify return:1
+depth=0 O = Acme, CN = shop.example.com
+verify return:1
+New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
+Verify return code: 0 (ok)</code></div>
+        <p>Read it bottom-up: <code>Verify return code: 0 (ok)</code> is the whole point — the chain validated. Above it, <code>depth=2 → 1 → 0</code> is OpenSSL walking the chain from the root down to the leaf, checking each signature. <code>TLSv1.3</code> and <code>TLS_AES_256_GCM_SHA384</code> tell you the version and AEAD cipher negotiated. When someone says "is TLS working?", this output is the answer.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Break — serve an incomplete chain</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>The most common TLS misconfiguration in the world: the server sends the leaf but forgets the intermediate. Reproduce it by starting the server with <em>only</em> the leaf.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>openssl s_server -accept 4444 -cert leaf.crt -key leaf.key -www -tls1_3 &amp;   <span class="c"># no -cert_chain!</span>
+echo Q | openssl s_client -connect 127.0.0.1:4444 -servername shop.example.com -CAfile root.crt 2&gt;/dev/null \
+  | grep -E "Verify|subject=|issuer="</code></pre></div>
+        <div class="out"><span class="ol">Output</span>subject=O = Acme, CN = shop.example.com
+issuer=O = Acme, CN = Acme Intermediate CA G2
+Verify return code: 21 (unable to verify the first certificate)</code></div>
+        <p>The client has the root and the leaf, but nothing links them — the intermediate is missing, so the chain has a hole. Here's the cruel part: <b>this often works in your browser and fails in curl, monitoring, and mobile apps.</b> Why? Think about what a browser has that a bare client doesn't, before you open the answer.</p>
+        <details class="recall"><summary>Reveal — why "works in Chrome, breaks everywhere else"</summary>
+          <div class="body">
+            <p>Browsers cache intermediates they've seen before and can fetch a missing one via the <code>AIA</code> (Authority Information Access) URL in the leaf. So a browser papers over your broken chain — but curl, most monitoring probes, Java clients, and older mobile stacks do not. The result is an outage that a human clicking around can't reproduce, while your API traffic and health checks fail. Always test with <code>openssl s_client</code> or curl, never just a browser. The fix is to make the server send <code>fullchain.crt</code> (leaf + intermediate), which is exactly what the working server in Lab 3 did. This is the single most common TLS incident, and now you can spot it in one command.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — will this cert expire before I'm back from holiday?</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>Expiry is the number-one cause of TLS outages, and it's the most preventable. <code>openssl verify</code> checks a chain; <code>-checkend</code> answers "is it still valid N seconds from now?" with an exit code you can put in a monitor.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>openssl verify -CAfile root.crt -untrusted int.crt leaf.crt     <span class="c"># full chain validation</span>
+openssl x509 -in leaf.crt -noout -enddate                        <span class="c"># when does it die?</span>
+openssl x509 -in leaf.crt -noout -checkend $((30*86400)); echo "exit=$?"   <span class="c"># still good in 30 days?</span>
+openssl x509 -in leaf.crt -noout -checkend $((365*86400)); echo "exit=$?"  <span class="c"># in 365 days?</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>leaf.crt: OK
+notAfter=Dec 20 11:08:07 2026 GMT
+Certificate will not expire
+exit=0
+Certificate will expire
+exit=1</code></div>
+        <p><b>Exit 0 means "safe for that window"; exit 1 means "will expire within it."</b> The senior question: you own 400 services behind various load balancers, and you never want a 3&nbsp;a.m. expiry page again. How do you make expiry a non-event? Think before opening.</p>
+        <details class="recall"><summary>Reveal an approach</summary>
+          <div class="body">
+            <p>Two layers. First, <b>automate issuance and renewal</b> so certs rotate long before expiry — ACME clients (certbot) or, in Kubernetes, <b>cert-manager</b>, which requests, renews, and stores certs as Secrets automatically. A 90-day cert renewed at 60 days means a missed renewal has 30 days of slack, not zero. Second, <b>monitor the expiry independently</b> of whatever issues the cert, because automation fails silently. A blackbox probe that runs <code>-checkend</code> against the live endpoint (over the wire, so it also catches chain and SNI problems) and alerts at, say, 21 days is the safety net. Never rely on a human remembering. The cert-manager and probe patterns are exactly what <a href="ch46-ingress-and-the-gateway-api.html">Chapter 46</a> and <a href="ch77-alerting-and-on-call-health.html">Chapter 77</a> build on.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <p>Three patterns cover the overwhelming majority of TLS pages. Learn to tell them apart in the first two minutes.</p>
+    <div class="box realworld"><div class="h">Incident pattern · the expired-certificate outage</div>
+      <p><b>Symptom:</b> a service that worked yesterday now fails <em>everywhere at once</em> — every client, every region — with "certificate has expired." <b>First cut:</b> <code>openssl s_client -connect host:443 -servername host &lt;/dev/null 2&gt;/dev/null | openssl x509 -noout -dates</code>. <b>Confirm:</b> the <code>notAfter</code> is in the past. <b>Cause is usually:</b> a renewal job that stopped running, a cert issued outside automation and forgotten, or a renewed cert that was never deployed to the box actually serving. The fix is to reissue and deploy; the real fix is automation plus an independent expiry monitor.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · the incomplete chain</div>
+      <p><b>Symptom:</b> works in browsers, fails in curl / mobile / server-to-server, error "unable to verify the first certificate" or "unable to get local issuer certificate." <b>First cut:</b> <code>openssl s_client -connect host:443 -servername host</code> and look at the certificate chain it prints — count the certs. <b>Confirm:</b> only the leaf came back; no intermediate. <b>Cause:</b> the server was configured with the leaf alone instead of the full chain. Deploy <code>fullchain.pem</code>. This appears constantly after a manual cert swap.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · the SNI / hostname mismatch</div>
+      <p><b>Symptom:</b> "certificate is valid for X, not Y," or a shared load balancer serving the <em>wrong</em> site's certificate. <b>First cut:</b> compare the name you requested against the cert's SAN — <code>... | openssl x509 -noout -ext subjectAltName</code>. <b>Confirm:</b> the requested host isn't in the SAN, or the client didn't send SNI so the server fell back to a default cert. <b>Cause:</b> a new hostname added to DNS but not to any cert, an internal client that omits SNI, or a Host/SNI split. This is the setup for how service meshes issue per-workload certs — hold it for <a href="ch69-istio-security.html">Chapter 69</a>.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Rotation is the whole job.</b> Public certs are moving to 90-day and shorter lifetimes, which makes manual renewal untenable — you must automate with ACME/cert-manager and monitor expiry from the outside. Treat a cert's private key like a password: it lives only on the terminating node (or in a KMS/HSM), never in a git repo, and a leak means immediate revocation and reissue.</p>
+    <p><b>Where TLS terminates decides your security model.</b> Most architectures terminate TLS at the edge — a load balancer or ingress — then talk plaintext (or re-encrypt) to backends inside a trusted network. That's fine until "inside the network" stops being trustworthy, which is the entire premise of zero-trust and service mesh: encrypt <em>every</em> hop with mutual TLS so a compromised pod can't sniff its neighbours. mTLS just means both ends present certificates; the server sends a <code>CertificateRequest</code> and validates the client the same way the client validates the server.</p>
+    <p><b>Performance.</b> The handshake costs a round trip and some asymmetric crypto (the CertificateVerify signature, the key exchange), which is why you want to <em>reuse</em> connections and use session resumption rather than doing a fresh full handshake per request. Modern CPUs do AES-GCM in hardware (AES-NI), so bulk encryption is nearly free; the cost is almost entirely in the handshake. <b>Common mistakes:</b> deploying the leaf without its chain; letting internal or "temporary" certs escape automation; pinning certificates in mobile apps and then rotating the CA (instant self-inflicted outage); and disabling verification (<code>curl -k</code>, <code>InsecureSkipVerify</code>) to "make it work," which quietly turns off the entire authentication half of TLS.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>TLS termination is an architectural decision, not a checkbox. Terminating at a global load balancer or CDN edge (<a href="ch52-load-balancing-alb-nlb-target-groups-health.html">Chapter 52</a>) cuts handshake latency for distant users and centralises cert management, but it means the edge holds every private key and traffic past it may be plaintext. Terminating (or re-encrypting) at each service with a mesh pushes keys to the workload and gives you mTLS everywhere, at the cost of running a CA for the mesh and rotating thousands of short-lived certs automatically — which is exactly what Istio's Citadel/istiod does in <a href="ch69-istio-security.html">Chapter 69</a>. The trust model you choose — one edge cert versus per-workload identity — shapes your blast radius when a node is compromised. And the identity in a cert (the SAN, or a SPIFFE URI in mesh certs) becomes the thing your authorization policies key off, tying this chapter to how services prove who they are to each other.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's the difference between TLS and PKI?</summary>
+        <div class="a"><p>TLS is the protocol that gives you a private, tamper-evident channel between two endpoints — the handshake agrees on keys and the records are encrypted and authenticated with an AEAD cipher. PKI is the trust system that answers <em>who</em> is on the other end: certificates bind a public key to an identity, a certificate authority signs them, and your machine trusts a small set of root CAs it ships with. TLS handles secrecy; PKI handles identity. They always ship together, but most TLS outages are PKI problems — expiry and broken chains — not encryption problems.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through the TLS 1.3 handshake and how it differs from 1.2.</summary>
+        <div class="a"><p>After TCP connects, the client sends a ClientHello carrying supported versions, cipher suites, an ephemeral Diffie-Hellman key_share, plus SNI and ALPN. Because the key_share is already there, the server can reply with its ServerHello and key_share and both sides immediately derive a shared secret — so everything after ServerHello is encrypted. The server then sends EncryptedExtensions, its certificate chain, a CertificateVerify signature proving it holds the private key, and Finished. The client validates the chain to a trusted root, checks the hostname against the SAN and the dates, then sends its own Finished and the HTTP request in the same flight. That's one round trip. TLS 1.2 needs two, because its ClientHello has no key_share, so the server's certificate goes out in the clear and there's an extra ServerKeyExchange/ClientKeyExchange exchange. TLS 1.3 also mandates forward-secret ephemeral key exchange and drops static RSA, CBC ciphers, compression, and renegotiation — the sources of most 1.2-era attacks.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>A cert works in Chrome but curl and your monitoring fail it. What's happening and how do you confirm?</summary>
+        <div class="a"><p>Almost certainly an incomplete chain: the server sends the leaf but not the intermediate. Browsers hide this because they cache intermediates and can fetch a missing one via the AIA extension in the leaf, so a human clicking around never sees it — but curl, Java, mobile stacks, and health checks build the chain strictly and fail with "unable to verify the first certificate." I'd confirm with <code>openssl s_client -connect host:443 -servername host</code> and count the certificates in the returned chain; if only the leaf is there, that's it. The fix is to serve the full chain (leaf + intermediates). I'd stress that browser success is not a valid test for TLS — always verify with s_client or curl, which is also why our monitoring should probe the same way clients do.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>At 03:00 every request to api.example.com fails TLS. Where do you start?</summary>
+        <div class="a"><p>A total, simultaneous failure across all clients screams certificate, not encryption. First command: <code>openssl s_client -connect api.example.com:443 -servername api.example.com &lt;/dev/null 2&gt;/dev/null | openssl x509 -noout -dates -subject -ext subjectAltName</code>. That one line tells me three things at once — whether it expired (dates), whether the chain built (the verify line), and whether the name matches (SAN). If <code>notAfter</code> is in the past, it's an expiry: reissue and deploy, then find why renewal stopped. If verify says "unable to verify the first certificate," it's a missing intermediate: deploy the full chain. If the SAN doesn't include the host, it's the wrong cert or a new name that was never added. I resist restarting things blindly — the failure is deterministic and the cert tells me exactly which of the three it is. Then the follow-up is prevention: automated renewal plus an external expiry monitor so this can't recur.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>What is mutual TLS, and when would you use it?</summary>
+        <div class="a"><p>In ordinary TLS only the server proves its identity; the client is anonymous at the TLS layer. In mutual TLS the server also sends a CertificateRequest and the client presents its own certificate and a CertificateVerify signature, so both ends authenticate cryptographically. You use it when the network itself can't be trusted and you want service-to-service authentication that doesn't depend on where a request came from — the zero-trust model. In practice a service mesh issues a short-lived certificate to every workload (identity encoded as a SPIFFE URI in the SAN) and rotates them automatically, so every pod-to-pod hop is mTLS and authorization policies can key off the verified identity rather than an IP. The cost is running a CA for the mesh and automating rotation at scale, which is why you let the mesh do it rather than managing per-service certs by hand.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>TLS gives you a private, tamper-evident channel; PKI tells you who's on the other end. The TLS 1.3 handshake is one round trip: the client offers an ephemeral key_share, SNI, and ALPN in the ClientHello; the server replies with its key_share and then, encrypted, its certificate chain, a CertificateVerify signature, and Finished; the client validates the chain to a trusted root, checks the SAN and dates, and sends its request. TLS 1.2 takes two round trips and sends the cert in the clear. A certificate binds a public key to hostnames (the SAN) and is signed up a chain from leaf through intermediates to a root in your trust store — and the server must send every intermediate. Most outages are PKI: expiry, incomplete chains, SNI mismatch — and <code>openssl s_client</code>, <code>openssl x509 -text</code>, <code>openssl verify</code>, and <code>-checkend</code> diagnose all three. Automate renewal and monitor expiry from the outside; never trust a browser as your TLS test.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>TLS = confidentiality + integrity (the channel); PKI = authentication (the identity). Keep them separate.</li>
+      <li>TLS 1.3 is one round trip and encrypts the handshake after ServerHello; 1.2 is two and sends the cert in clear.</li>
+      <li>The key_share in the ClientHello is what saves the round trip, and ephemeral key exchange gives forward secrecy.</li>
+      <li>TLS 1.3 dropped static RSA, CBC ciphers, compression, and renegotiation — the roots of most old attacks.</li>
+      <li>A certificate binds a public key to hostnames in the <b>SAN</b> (not the CN); clients check the SAN.</li>
+      <li>Chains go leaf → intermediate(s) → root; the server must send the intermediates, never the root.</li>
+      <li>"Works in Chrome, fails in curl" is an incomplete chain — browsers hide it, strict clients don't.</li>
+      <li>Expiry is the top TLS outage: automate renewal (ACME/cert-manager) <em>and</em> monitor it externally with <code>-checkend</code>.</li>
+      <li><code>openssl s_client</code>, <code>x509 -text</code>, and <code>verify</code> tell you version, cipher, chain, dates, and SAN in seconds.</li>
+      <li>mTLS means both ends present certs — the basis of service-mesh zero-trust and per-workload identity.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds toward:</span>
+      <a href="ch16-http-http-2-http-3-and-grpc.html"><b>Ch 16</b> HTTP &amp; ALPN</a>
+      <a href="ch19-capstone-trace-curl-https-example-com.html"><b>Ch 19</b> The curl capstone</a>
+      <a href="ch46-ingress-and-the-gateway-api.html"><b>Ch 46</b> Ingress &amp; cert-manager</a>
+      <a href="ch52-load-balancing-alb-nlb-target-groups-health.html"><b>Ch 52</b> Load balancers &amp; TLS termination</a>
+      <a href="ch69-istio-security.html"><b>Ch 69</b> Istio mTLS</a>
+      <a href="ch77-alerting-and-on-call-health.html"><b>Ch 77</b> Expiry alerting</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc8446">RFC 8446: The Transport Layer Security (TLS) Protocol Version 1.3</a>. The handshake, key schedule, and record protocol, from the source.</li>
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc5246">RFC 5246: TLS 1.2</a>, for the two-round-trip handshake you're contrasting against.</li>
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc5280">RFC 5280: Internet X.509 PKI Certificate and CRL Profile</a>. What every certificate field means and how chains validate.</li>
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc6066">RFC 6066 (TLS Extensions, incl. Server Name Indication)</a> and <a href="https://www.rfc-editor.org/rfc/rfc7301">RFC 7301 (ALPN)</a>.</li>
+      <li>OpenSSL — <a href="https://docs.openssl.org/master/man1/openssl-s_client/">openssl-s_client</a>, <a href="https://docs.openssl.org/master/man1/openssl-x509/">openssl-x509</a>, and <a href="https://docs.openssl.org/master/man1/openssl-verify/">openssl-verify</a> manual pages.</li>
+      <li>IANA — <a href="https://www.iana.org/assignments/tls-parameters/tls-parameters.xhtml">TLS Parameters registry</a>: the authoritative list of cipher suites and extensions.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch16-http-http-2-http-3-and-grpc.html"><span class="dir">← Prev</span><div class="ti">Ch 16 — HTTP, HTTP/2, HTTP/3, and gRPC</div></a>
+      <a class="nx" href="ch18-the-linux-network-stack-internals.html"><span class="dir">Next →</span><div class="ti">Ch 18 — The Linux network stack internals</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 17 of 121 · Part II · Networking from First Principles. Mint your own chain and break it on purpose; the reflexes are the point.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">The 1.3 handshake</a>
+    <a href="#internals">Step by step</a>
+    <a href="#components">The components</a>
+    <a href="#flow">One HTTPS connection</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

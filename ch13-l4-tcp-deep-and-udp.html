@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 13 — L4: TCP Deep, and UDP</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part II · Networking &nbsp;·&nbsp; Chapter 13</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part II · Networking from First Principles · Chapter 13</div>
+      <h1>L4 — TCP deep, and UDP</h1>
+      <p class="tagline">IP will lose your packets, reorder them, and duplicate them without apology. TCP turns that chaos into a reliable, ordered byte stream — and it does it with a state machine you can watch live, retransmission timers you can tune, and a TIME_WAIT rule that looks like a bug and is actually protecting you. This is the protocol behind almost every incident you'll ever debug.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~50 min read · Linux lab (Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Draw the three-way handshake and the four-way close, with the TCP states on both sides.</li>
+          <li>Explain TIME_WAIT — why it exists, who holds it, and why "getting rid of it" is usually the wrong fix.</li>
+          <li>Separate flow control (protect the receiver) from congestion control (protect the network).</li>
+          <li>Diagnose the Nagle + delayed-ACK stall, SYN-backlog overflow, and connection resets.</li>
+          <li>Say when you'd reach for UDP instead, and what you're signing up to rebuild yourself.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem TCP solves</h2>
+    <p>IP makes exactly one promise, and it's a weak one: it will make a best effort to move your packet one hop closer to its destination. That's all. Packets can be dropped when a queue fills, delivered out of order because two of them took different paths, duplicated by an over-eager retransmit somewhere upstream, or delayed for seconds and then arrive after you'd given up. From an application's point of view, raw IP is a firehose of unreliable, unordered fragments.</p>
+    <p>But almost everything you write wants the opposite. When you send an HTTP request or a SQL query, you want the bytes to arrive <em>all of them, in order, exactly once</em>, and you want to be told if that becomes impossible. Someone has to bridge that gap — to take the unreliable packet service underneath and present a reliable, ordered byte stream on top. That someone is <b>TCP</b> (Transmission Control Protocol), and the way it does it is the substance of this chapter.</p>
+    <p>TCP achieves reliability with four mechanisms working together: <b>sequence numbers</b> so the receiver can reorder and detect gaps, <b>acknowledgements</b> so the sender knows what arrived, <b>retransmission</b> so lost data is resent, and <b>windows</b> so neither the receiver nor the network is overwhelmed. Layer all four on top of best-effort IP and you get the illusion of a perfect pipe. The illusion is good enough that most engineers forget it's an illusion — until a retransmit storm or a stuck TIME_WAIT reminds them.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>TCP is a <b>stateful</b> protocol running over a <b>stateless</b> one. Both ends keep a control block tracking sequence numbers, windows, timers, and a connection state. Every TCP problem you'll debug is really a question about that state: which state is each end in, what's it waiting for, and why is it stuck there? UDP, by contrast, keeps almost no state — and that's its entire trade-off.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a tracked phone call vs a postcard</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p><b>TCP is a phone call with a meticulous note-taker.</b> First you establish the call — "can you hear me?" / "yes, can you hear me?" / "yes" — a three-part exchange so both sides know the line is open before either says anything important. Then you talk, and crucially, you <em>number every sentence</em> and the other person confirms which numbers they've heard: "got up to sentence 40." If they say "I'm still on 37," you know 38 and 39 were lost and you repeat them. When you're done, you don't just drop the phone — you say goodbye and wait for them to say goodbye back, so neither of you hangs up mid-sentence.</p>
+      <p><b>UDP is mailing postcards.</b> You write an address, drop it in the box, and hope. No call setup, no numbering, no confirmation, no goodbye. Most arrive; some don't; a few might arrive out of order or twice. You find out about losses only if <em>you</em> build your own scheme on top. In exchange, there's zero setup cost and zero waiting — you can blast a thousand postcards without waiting for a single reply.</p>
+      <p>That "wait a moment after saying goodbye before you reuse the phone number" habit is <b>TIME_WAIT</b>. It feels wasteful — the call's over, why keep the line reserved? — but it's what stops a stray late sentence from the old call being mistaken for the start of the next one on the same number.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In TCP/UDP</th></tr>
+      <tr><td>"Can you hear me?" ×3</td><td>The three-way handshake (SYN / SYN-ACK / ACK)</td></tr>
+      <tr><td>Numbering every sentence</td><td>Sequence numbers (per byte, not per packet)</td></tr>
+      <tr><td>"Got up to sentence 40"</td><td>Acknowledgements (cumulative ACKs)</td></tr>
+      <tr><td>Repeating 38 and 39</td><td>Retransmission after timeout or 3 duplicate ACKs</td></tr>
+      <tr><td>"You're going too fast, slow down"</td><td>Flow control (the receive window)</td></tr>
+      <tr><td>Both saying goodbye</td><td>The four-way close (FIN / ACK / FIN / ACK)</td></tr>
+      <tr><td>Waiting before reusing the number</td><td>TIME_WAIT (2 × maximum segment lifetime)</td></tr>
+      <tr><td>Mailing postcards, no confirmation</td><td>UDP — connectionless, unreliable, no ordering</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>The handshake, the states, and the close</h2>
+    <p>A TCP connection has a life: it's born in a three-segment handshake, lives in <code>ESTABLISHED</code> while data flows, and dies in a four-segment close. Both ends walk a state machine in lock-step, and every state has a reason to exist. The figure is the single most important diagram in this chapter — the handshake, the data phase, and the close, with the state each side occupies written beside its lifeline.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 588" role="img" aria-label="TCP connection sequence: three-way handshake, data transfer, and four-way close, with the state of client and server labelled at each step">
+        <defs>
+          <marker id="t1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="t2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+          <marker id="t3" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--deep)"/></marker>
+        </defs>
+
+        <!-- lifelines -->
+        <text x="175" y="34" text-anchor="middle" style="fill:var(--accent);font:700 14px sans-serif">CLIENT (active open)</text>
+        <text x="545" y="34" text-anchor="middle" style="fill:var(--accent2);font:700 14px sans-serif">SERVER (passive open)</text>
+        <line x1="175" y1="44" x2="175" y2="560" style="stroke:var(--line);stroke-width:2"/>
+        <line x1="545" y1="44" x2="545" y2="560" style="stroke:var(--line);stroke-width:2"/>
+
+        <!-- section labels -->
+        <text x="360" y="60" text-anchor="middle" style="fill:var(--muted);font:700 10.5px sans-serif;letter-spacing:.12em">— THREE-WAY HANDSHAKE —</text>
+
+        <!-- initial states -->
+        <text x="165" y="80" text-anchor="end" style="fill:var(--muted);font:600 11px ui-monospace,monospace">CLOSED</text>
+        <text x="555" y="80" text-anchor="start" style="fill:var(--muted);font:600 11px ui-monospace,monospace">LISTEN</text>
+
+        <!-- SYN -->
+        <line x1="177" y1="90" x2="543" y2="118" style="stroke:var(--accent);stroke-width:2" marker-end="url(#t1)"/>
+        <text x="360" y="102" text-anchor="middle" style="fill:var(--ink);font:600 12px ui-monospace,monospace">SYN  seq=x</text>
+        <text x="165" y="108" text-anchor="end" style="fill:var(--accent);font:700 11px ui-monospace,monospace">SYN-SENT</text>
+        <text x="555" y="128" text-anchor="start" style="fill:var(--accent2);font:700 11px ui-monospace,monospace">SYN-RECEIVED</text>
+
+        <!-- SYN-ACK -->
+        <line x1="543" y1="138" x2="177" y2="166" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#t2)"/>
+        <text x="360" y="150" text-anchor="middle" style="fill:var(--ink);font:600 12px ui-monospace,monospace">SYN,ACK  seq=y ack=x+1</text>
+        <text x="165" y="178" text-anchor="end" style="fill:var(--accent);font:700 11px ui-monospace,monospace">ESTABLISHED</text>
+
+        <!-- ACK -->
+        <line x1="177" y1="186" x2="543" y2="214" style="stroke:var(--accent);stroke-width:2" marker-end="url(#t1)"/>
+        <text x="360" y="198" text-anchor="middle" style="fill:var(--ink);font:600 12px ui-monospace,monospace">ACK  ack=y+1</text>
+        <text x="555" y="224" text-anchor="start" style="fill:var(--accent2);font:700 11px ui-monospace,monospace">ESTABLISHED</text>
+
+        <!-- data phase -->
+        <text x="360" y="252" text-anchor="middle" style="fill:var(--muted);font:700 10.5px sans-serif;letter-spacing:.12em">— DATA (both in ESTABLISHED) —</text>
+        <line x1="177" y1="266" x2="543" y2="284" style="stroke:var(--accent);stroke-width:1.5;stroke-dasharray:5 3" marker-end="url(#t1)"/>
+        <text x="360" y="272" text-anchor="middle" style="fill:var(--muted);font:11px ui-monospace,monospace">data seq=x+1 … / ACKs back</text>
+        <line x1="543" y1="296" x2="177" y2="312" style="stroke:var(--accent2);stroke-width:1.5;stroke-dasharray:5 3" marker-end="url(#t2)"/>
+
+        <!-- close -->
+        <text x="360" y="340" text-anchor="middle" style="fill:var(--muted);font:700 10.5px sans-serif;letter-spacing:.12em">— FOUR-WAY CLOSE (client closes first) —</text>
+
+        <!-- FIN -->
+        <line x1="177" y1="352" x2="543" y2="380" style="stroke:var(--deep);stroke-width:2" marker-end="url(#t3)"/>
+        <text x="360" y="364" text-anchor="middle" style="fill:var(--ink);font:600 12px ui-monospace,monospace">FIN</text>
+        <text x="165" y="372" text-anchor="end" style="fill:var(--deep);font:700 11px ui-monospace,monospace">FIN-WAIT-1</text>
+        <text x="555" y="390" text-anchor="start" style="fill:var(--applied);font:700 11px ui-monospace,monospace">CLOSE-WAIT</text>
+
+        <!-- ACK of FIN -->
+        <line x1="543" y1="400" x2="177" y2="424" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#t2)"/>
+        <text x="360" y="414" text-anchor="middle" style="fill:var(--ink);font:600 12px ui-monospace,monospace">ACK</text>
+        <text x="165" y="436" text-anchor="end" style="fill:var(--deep);font:700 11px ui-monospace,monospace">FIN-WAIT-2</text>
+
+        <!-- server FIN -->
+        <line x1="543" y1="452" x2="177" y2="476" style="stroke:var(--deep);stroke-width:2" marker-end="url(#t3)"/>
+        <text x="360" y="466" text-anchor="middle" style="fill:var(--ink);font:600 12px ui-monospace,monospace">FIN</text>
+        <text x="555" y="462" text-anchor="start" style="fill:var(--applied);font:700 11px ui-monospace,monospace">LAST-ACK</text>
+
+        <!-- final ACK -->
+        <line x1="177" y1="488" x2="543" y2="512" style="stroke:var(--accent);stroke-width:2" marker-end="url(#t1)"/>
+        <text x="360" y="502" text-anchor="middle" style="fill:var(--ink);font:600 12px ui-monospace,monospace">ACK</text>
+        <text x="165" y="500" text-anchor="end" style="fill:var(--deep);font:800 11px ui-monospace,monospace">TIME-WAIT</text>
+        <text x="555" y="522" text-anchor="start" style="fill:var(--muted);font:700 11px ui-monospace,monospace">CLOSED</text>
+        <text x="165" y="536" text-anchor="end" style="fill:var(--muted);font:600 10px ui-monospace,monospace">(waits 2·MSL)</text>
+        <text x="165" y="550" text-anchor="end" style="fill:var(--muted);font:700 11px ui-monospace,monospace">→ CLOSED</text>
+      </svg>
+      <figcaption>One connection, cradle to grave. Note who ends up in TIME_WAIT: the side that sent the first FIN — the active closer. That's almost always the client, but if your server closes first, the server pays.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>Ninety percent of the network incidents you'll be paged for are a connection stuck in the wrong state or churning through states too fast. A pile of <code>CLOSE_WAIT</code> means an app forgot to close sockets. A pile of <code>TIME_WAIT</code> on a busy client means port pressure. <code>SYN-SENT</code> that never advances means the SYN isn't getting through — firewall, wrong port, or nothing listening. Learn to read the states with <code>ss</code> and you're reading the connection's mind.</p>
+    </div>
+
+    <h2 id="states"><span class="beat">Internal working</span>The state machine and why TIME_WAIT protects you</h2>
+    <p>Walk the machine the way the kernel does. Each transition is triggered by a segment arriving or the application calling a syscall:</p>
+    <ol class="steps">
+      <li><b>The server does a passive open.</b> It calls <code>listen()</code> and sits in <code>LISTEN</code>, waiting. It sends nothing.</li>
+      <li><b>The client does an active open.</b> <code>connect()</code> sends a <code>SYN</code> carrying a random initial sequence number (the ISN — random for security, so off-path attackers can't guess it). The client moves to <code>SYN-SENT</code>.</li>
+      <li><b>The server replies <code>SYN,ACK</code></b> — acknowledging the client's ISN and offering its own — and moves to <code>SYN-RECEIVED</code>. This half-open connection lives in the <b>SYN queue</b>.</li>
+      <li><b>The client sends the final <code>ACK</code></b> and reaches <code>ESTABLISHED</code>. When that ACK arrives, the server also reaches <code>ESTABLISHED</code> and the connection moves from the SYN queue to the <b>accept queue</b>, where it waits for the app to call <code>accept()</code>. Three segments, and both ends now agree the pipe is open and know each other's starting sequence numbers.</li>
+      <li><b>Data flows.</b> Each byte has a sequence number; the receiver ACKs the highest contiguous byte it has (a cumulative ACK). SYN and FIN each consume one sequence number even though they carry no data — that's why the ACK is <code>seq+1</code>.</li>
+      <li><b>Closing takes four segments because close is one-directional.</b> The active closer sends <code>FIN</code> (→ <code>FIN-WAIT-1</code>). The peer ACKs it (→ <code>CLOSE-WAIT</code> on the peer, <code>FIN-WAIT-2</code> on the closer) — but the peer can keep sending data, because only <em>its</em> direction is still open. When the peer's app also closes, it sends its own <code>FIN</code> (→ <code>LAST-ACK</code>). The closer ACKs it and enters <code>TIME-WAIT</code>.</li>
+      <li><b>TIME_WAIT waits, then closes.</b> The active closer sits in <code>TIME-WAIT</code> for 2 × the maximum segment lifetime (on Linux this is a fixed 60 seconds, <code>TCP_TIMEWAIT_LEN</code>) before finally reaching <code>CLOSED</code> and releasing the 4-tuple.</li>
+    </ol>
+    <p><b>Why TIME_WAIT exists</b> is the question that separates people who memorised the diagram from people who understand it. It does two jobs. First, it guarantees the final ACK can be re-sent: if that ACK is lost, the peer (stuck in <code>LAST-ACK</code>) will retransmit its FIN, and the closer must still be around to ACK it again — if it had vanished, the peer would hang. Second, and more subtly, it lets any <em>old, delayed duplicate segments</em> from this connection drain out of the network before the same 4-tuple can be reused. Without it, a straggler from the dead connection could arrive during a brand-new connection on the identical <code>(src IP, src port, dst IP, dst port)</code> and be accepted as valid data — silent corruption. TIME_WAIT trades a held port for correctness. It is a feature.</p>
+
+    <details class="recall"><summary>Think first: your <em>server</em> has 40,000 sockets in TIME_WAIT and you're running low on resources. Whose fault is it, and what changed?</summary>
+      <div class="body">
+        <p>The active closer holds TIME_WAIT, so if the <b>server</b> is accumulating it, the server is closing connections first. Normally clients close first (browser finishes, disconnects), leaving TIME_WAIT on the client. A server drowning in TIME_WAIT usually means it's initiating the close — for example, an HTTP server with <code>keepalive_timeout</code> set aggressively low, or a proxy that closes upstream connections after each request. The right fixes are to let the client close (raise keep-alive), enable <code>net.ipv4.tcp_tw_reuse</code> for outbound connections, or reduce how often you open brand-new connections at all (pooling). What you should <em>not</em> do is slash <code>TCP_TIMEWAIT_LEN</code> to near zero — that re-opens the exact reuse hazard TIME_WAIT exists to prevent.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>Retransmission, flow control, congestion control, Nagle</h2>
+    <p>Four subsystems keep the byte stream reliable and polite. You tune all four in production, so name them precisely.</p>
+    <h4>Retransmission and the RTO</h4>
+    <p>TCP resends data it believes was lost. It decides "lost" two ways. The <b>retransmission timeout (RTO)</b>: the sender starts a timer per segment; if no ACK arrives before it fires, resend and double the timer (exponential backoff). The RTO isn't a constant — it's computed from a smoothed round-trip-time estimate plus its variance (RFC 6298: <code>RTO = SRTT + 4×RTTVAR</code>), so a connection to a nearby host has a tight timeout and one to the far side of the planet a loose one. The faster path is <b>fast retransmit</b>: three duplicate ACKs for the same sequence number mean "I keep getting later data but I'm still missing this one," so the sender resends immediately without waiting for the timer (RFC 5681). Selective ACK (SACK) lets the receiver say exactly which ranges it has, so the sender resends only the holes.</p>
+    <h4>Flow control — protect the receiver</h4>
+    <p>Every ACK carries a <b>receive window</b> (<code>rwnd</code>): "I have this many bytes of buffer free." The sender must never have more unacknowledged data in flight than the receiver's advertised window. If the receiver's application stops reading, its buffer fills, it advertises a <b>zero window</b>, and the sender stops and sends periodic window probes until space opens up. Because the window field is 16 bits (max 64&nbsp;KB), high-bandwidth long-distance links use the <b>window-scaling</b> option (RFC 7323) to multiply it — without scaling, a fat transcontinental link is capped absurdly low.</p>
+    <h4>Congestion control — protect the network</h4>
+    <p>Flow control protects the <em>receiver</em>; congestion control protects the <em>network in between</em>, which has no window to advertise. The sender keeps a second, hidden window — the <b>congestion window</b> (<code>cwnd</code>) — and the amount it may send is <code>min(rwnd, cwnd)</code>. It starts small and ramps up: <b>slow start</b> doubles <code>cwnd</code> each round trip (exponential) until it hits a threshold or sees loss; then <b>congestion avoidance</b> grows it roughly linearly. Loss is the signal — a drop means "the path is congested," so <code>cwnd</code> is cut (the AIMD rule: additive increase, multiplicative decrease). Linux's default algorithm is <b>CUBIC</b>; <b>BBR</b> is an alternative that models bandwidth and latency instead of treating loss as the only signal, and it can help on lossy or bufferbloated paths.</p>
+    <h4>Nagle and delayed ACK — the classic latency trap</h4>
+    <p>Two optimisations, each sensible alone, that combine into a notorious stall. <b>Nagle's algorithm</b> (RFC 896) says: if you have unacknowledged data outstanding, don't send a new <em>small</em> segment — buffer it until the outstanding data is ACKed, so you coalesce tiny writes into fewer packets. <b>Delayed ACK</b> (RFC 1122) says: don't ACK immediately, wait up to ~40&nbsp;ms (Linux) hoping to piggyback the ACK on a reply. Now picture a request/response protocol where the client sends a small request in two writes: Nagle holds the second write waiting for an ACK of the first, while the server's delayed-ACK holds that ACK waiting for data to piggyback on — deadlock, broken only when the ~40&nbsp;ms timer fires. The symptom is a protocol that should take microseconds taking a suspiciously round 40&nbsp;ms per exchange. The fix is <code>TCP_NODELAY</code> (disable Nagle) on latency-sensitive sockets — which is why nearly every RPC library and database driver sets it.</p>
+
+    <details class="recall"><summary>Think first: a client sees exactly ~40&nbsp;ms of latency on every small request to a service on the same rack, where round-trip should be under 1&nbsp;ms. What's happening?</summary>
+      <div class="body">
+        <p>That oddly precise, oddly constant 40&nbsp;ms is the delayed-ACK timer firing — the fingerprint of a Nagle + delayed-ACK interaction. The client (or server) is holding a small segment under Nagle because prior data is unacknowledged, and the other side is holding the ACK under delayed-ACK hoping to piggyback. Neither moves until the timer expires. The fix is <code>setsockopt(TCP_NODELAY)</code> on the sending side; if you can't touch the code, sometimes <code>TCP_QUICKACK</code> on the receiver helps. The giveaway is always that the latency is a fixed, network-independent constant (~40&nbsp;ms) rather than scaling with distance or load.</p>
+      </div>
+    </details>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one connection, SYN to FIN</h2>
+    <p>A client runs <code>curl http://server:8080</code>. The kernel picks an ephemeral source port and sends a <code>SYN</code> with a random ISN; the client socket is <code>SYN-SENT</code>. The server, in <code>LISTEN</code>, receives it, creates a half-open entry in its SYN queue, and returns <code>SYN,ACK</code> (<code>SYN-RECEIVED</code>). The client ACKs and both reach <code>ESTABLISHED</code>; the server's connection moves to the accept queue, and the server app's <code>accept()</code> pops it. Now data: curl writes the HTTP request; the server ACKs bytes as they arrive, growing <code>cwnd</code> from slow start; the response streams back, bounded by <code>min(rwnd, cwnd)</code>. When curl has the full response it calls <code>close()</code>, sending a <code>FIN</code> (<code>FIN-WAIT-1</code>). The server ACKs (client → <code>FIN-WAIT-2</code>, server → <code>CLOSE-WAIT</code>), finishes writing anything pending, then sends its own <code>FIN</code> (<code>LAST-ACK</code>). The client ACKs and enters <code>TIME-WAIT</code>, holding its 4-tuple for 60 seconds so no straggler can pollute a reused connection. The server reaches <code>CLOSED</code> immediately. Every step you just read is visible with <code>ss</code> and <code>tcpdump</code> — which is the whole point of the labs.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>All labs run in one throwaway Linux container. You'll open a couple of shells into it (<code>docker exec</code>).</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>docker run --rm -it --name tcp-lab ubuntu:24.04 bash
+
+<span class="c"># Inside:</span>
+apt-get update &amp;&amp; apt-get install -y iproute2 tcpdump netcat-openbsd curl python3</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — watch connection states with ss</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Start a listener, connect to it, and read the states. <code>ss</code> is the modern replacement for <code>netstat</code>; the <code>-o</code> flag shows the per-socket timers, which is how you see TIME_WAIT and retransmit countdowns.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>python3 -m http.server 8080 &amp;      <span class="c"># a server in LISTEN</span>
+ss -tlnp                            <span class="c"># list listening TCP sockets</span>
+curl -s localhost:8080 &gt;/dev/null &amp; <span class="c"># a quick client</span>
+ss -tno state established           <span class="c"># established, with timers</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>State   Recv-Q  Send-Q   Local Address:Port   Peer Address:Port
+LISTEN  0       5        0.0.0.0:8080         0.0.0.0:*
+
+ESTAB   0       0        127.0.0.1:8080       127.0.0.1:54012  timer:(keepalive,...)
+ESTAB   0       0        127.0.0.1:54012      127.0.0.1:8080</code></pre></div>
+        <p>Two <code>ESTAB</code> rows for one connection — because both ends live in the same host, you see both sides. Note the ephemeral client port (<code>54012</code>) versus the fixed server port (<code>8080</code>). For a listener, <code>Recv-Q</code> is the current accept-queue depth and <code>Send-Q</code> is its maximum — remember that, it's how you catch backlog overflow in Lab 4.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — tcpdump the handshake and the close</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>See the actual segments and their flags. Start the capture in one shell, then make a connection from another.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Shell A — capture loopback traffic to port 8080, with flags:</span>
+tcpdump -i lo -n 'tcp port 8080' -c 10
+
+<span class="c"># Shell B — one request, then it closes:</span>
+curl -s localhost:8080 &gt;/dev/null</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed, flags in brackets)</span>IP 127.0.0.1.54120 &gt; 127.0.0.1.8080: Flags [S],  seq 1043...      <span class="c"># SYN</span>
+IP 127.0.0.1.8080 &gt; 127.0.0.1.54120: Flags [S.], seq 2298..., ack 1044   <span class="c"># SYN-ACK</span>
+IP 127.0.0.1.54120 &gt; 127.0.0.1.8080: Flags [.],  ack 1        <span class="c"># ACK — established</span>
+IP 127.0.0.1.54120 &gt; 127.0.0.1.8080: Flags [P.], ...          <span class="c"># the GET (PSH)</span>
+IP 127.0.0.1.8080 &gt; 127.0.0.1.54120: Flags [P.], ...          <span class="c"># the response</span>
+IP 127.0.0.1.54120 &gt; 127.0.0.1.8080: Flags [F.], ...          <span class="c"># FIN — client closes</span>
+IP 127.0.0.1.8080 &gt; 127.0.0.1.54120: Flags [F.], ...          <span class="c"># FIN — server closes</span></code></pre></div>
+        <p>Read the flags: <code>[S]</code> is SYN, <code>[S.]</code> is SYN+ACK (the dot is ACK), <code>[.]</code> is a bare ACK, <code>[P.]</code> is PSH+ACK (data), <code>[F.]</code> is FIN+ACK, and you'll learn to dread <code>[R]</code> — RST. The whole life of the connection, exactly matching the figure, in seven lines. This is the ground truth: when logs disagree about "who hung up," tcpdump settles it by showing which side sent the FIN or RST.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — manufacture a pile of TIME_WAIT</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Open and close many short connections fast, then count the states. Because <code>curl</code> is the active closer, TIME_WAIT lands on the client side.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>for i in $(seq 1 200); do curl -s localhost:8080 &gt;/dev/null; done
+ss -tan state time-wait | wc -l
+ss -tan state time-wait | head -3</code></pre></div>
+        <div class="out"><span class="ol">Output</span>201
+TIME-WAIT  0  0  127.0.0.1:53990  127.0.0.1:8080
+TIME-WAIT  0  0  127.0.0.1:54004  127.0.0.1:8080</code></pre></div>
+        <p>Two hundred connections, two hundred TIME_WAIT sockets, each holding its ephemeral port for 60 seconds. On loopback that's harmless. Now the question a senior asks: <em>at what request rate does this become a problem, and why?</em></p>
+        <details class="recall"><summary>Reveal the math</summary>
+          <div class="body">
+            <p>You have roughly 28,000 ephemeral ports (<code>net.ipv4.ip_local_port_range</code> is about 32768–60999 by default). Each TIME_WAIT holds one port for 60 seconds. So the ceiling for brand-new connections <em>to a single destination IP:port</em> is about <code>28000 / 60 ≈ 460 connections per second</code> before you start reusing ports faster than they free up and <code>connect()</code> begins to fail with <code>EADDRNOTAVAIL</code>. A client hammering one backend with fresh short-lived connections hits this wall surprisingly early. The real fix is connection reuse (keep-alive / pooling) so you're not opening a new connection per request; <code>net.ipv4.tcp_tw_reuse=1</code> lets the kernel safely reuse TIME_WAIT sockets for new <em>outbound</em> connections and buys headroom. This is the port-pressure incident in miniature, and you'll meet it for real in <a href="ch14-ports-sockets-ephemeral-ports-connection-lifecycle.html">Chapter 14</a>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — SYN-backlog / accept-queue overflow</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>A listener has two queues: the SYN queue (half-open handshakes) and the accept queue (completed handshakes waiting for <code>accept()</code>). If the app is slow to accept and connections arrive faster, the accept queue fills and the kernel starts dropping. Reproduce it with a server that listens but never accepts.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># A socket with a tiny backlog that never calls accept():</span>
+python3 - &lt;&lt;'PY' &amp;
+import socket, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", 9090)); s.listen(2)   # backlog of 2, no accept()
+time.sleep(600)
+PY
+<span class="c"># Fire more connections than the backlog can hold:</span>
+for i in $(seq 1 20); do (curl -s --max-time 2 localhost:9090 &amp;) ; done
+sleep 1
+ss -tlnp 'sport = :9090'
+nstat -az | grep -iE 'ListenOverflow|ListenDrop'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>State   Recv-Q  Send-Q  Local Address:Port
+LISTEN  3       2       0.0.0.0:9090          <span class="c"># Recv-Q(3) > Send-Q(2): queue is over its limit</span>
+
+TcpExtListenOverflows           17
+TcpExtListenDrops               17</code></pre></div>
+        <p>For a listening socket, <code>Recv-Q</code> greater than <code>Send-Q</code> means completed connections are piling up past the accept-queue limit, and the <code>ListenOverflows</code> counter climbing confirms the kernel is dropping them. In production this looks like intermittent connection timeouts under load while the server's CPU looks fine — the app just isn't accepting fast enough, or its <code>listen()</code> backlog (and <code>net.core.somaxconn</code>) is too small. The fixes: raise the backlog and <code>somaxconn</code>, add worker threads/processes to accept faster, and for SYN floods specifically enable <code>net.ipv4.tcp_syncookies</code> so a full SYN queue can't wedge new legitimate handshakes.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — read a connection reset</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>"Connection reset by peer" is one of the most-misread errors in the industry. Force one and see exactly what it is on the wire. The cleanest way: connect to a port with nothing listening — the kernel answers with an immediate RST.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Shell A — capture:</span>
+tcpdump -i lo -n 'tcp port 9999' -c 4
+<span class="c"># Shell B — connect to a dead port:</span>
+curl -s --max-time 2 localhost:9999 ; echo "curl exit: $?"</code></pre></div>
+        <div class="out"><span class="ol">Output</span>IP 127.0.0.1.55220 &gt; 127.0.0.1.9999: Flags [S], seq ...      <span class="c"># SYN</span>
+IP 127.0.0.1.9999 &gt; 127.0.0.1.55220: Flags [R.], seq ...     <span class="c"># RST — no one home</span>
+curl exit: 7   <span class="c"># "Failed to connect" — ECONNREFUSED</span></code></pre></div>
+        <p>Now the senior distinction that saves you on call: <b>a fast RST is not a timeout.</b> Which of these are you seeing, and what does each tell you? Reason it out before opening the answer.</p>
+        <details class="recall"><summary>Reveal how to read resets vs timeouts</summary>
+          <div class="body">
+            <p>A <b>RST on the SYN</b> (like above) is <code>ECONNREFUSED</code>: something is reachable and actively said "no port here" — the host is up, the service is down or on a different port. It's <em>fast</em>. A <b>SYN with no reply at all</b> that eventually gives up is <code>ETIMEDOUT</code>: a firewall is silently dropping the packet, or the host is gone — nothing is refusing, nothing is answering. It's <em>slow</em> (the SYN retransmits with exponential backoff for seconds). A <b>RST mid-connection</b> (on an established flow) is "connection reset by peer" (<code>ECONNRESET</code>): the other side tore the connection down abnormally — it crashed, it hit an idle/keepalive timeout, a stateful firewall or load balancer expired the flow, or the app called close with unread data. The one-line rule: <em>refused = reachable but no service; timeout = filtered or gone; reset mid-stream = the peer or a middlebox killed an existing connection.</em> Confirming which one you have — with the socket error and a quick tcpdump — is usually 80% of the diagnosis.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · TIME_WAIT / ephemeral-port pressure</div>
+      <p><b>Symptom:</b> a client or proxy starts failing outbound connections under load with <code>EADDRNOTAVAIL</code> / "cannot assign requested address," while the backend is healthy. <b>First cut:</b> <code>ss -tan state time-wait | wc -l</code> and check <code>net.ipv4.ip_local_port_range</code>. <b>Confirm:</b> TIME_WAIT count is near the size of the ephemeral range for one destination. <b>Cause is usually:</b> opening a fresh connection per request to one backend instead of reusing connections. Fix with keep-alive/pooling first; <code>tcp_tw_reuse</code> as headroom. Never set TIME_WAIT to zero.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · SYN-backlog / accept-queue overflow</div>
+      <p><b>Symptom:</b> intermittent connection timeouts under traffic spikes; server CPU and memory look fine. <b>First cut:</b> <code>ss -tlnp</code> and look for listener <code>Recv-Q &gt; Send-Q</code>; watch <code>nstat</code> <code>ListenOverflows</code>/<code>ListenDrops</code>. <b>Confirm:</b> those counters climb during the spikes. <b>Cause is usually:</b> the app accepts too slowly or the backlog / <code>somaxconn</code> is too small. Raise both and speed up accept; enable <code>tcp_syncookies</code> if it's a SYN flood.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · mystery connection resets</div>
+      <p><b>Symptom:</b> apps log "connection reset by peer" at seemingly random times. <b>First cut:</b> tcpdump both ends and find who sends the <code>[R]</code>. <b>Confirm:</b> resets cluster at a fixed idle interval. <b>Cause is usually:</b> a stateful middlebox (NAT gateway, cloud load balancer, firewall) silently dropping the flow from its table after an idle timeout, so the next packet gets a RST — the classic "idle connections die after N minutes." Fix with TCP keep-alive tuned below the middlebox timeout, or shorter application-level heartbeats.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · retransmit storm / throughput collapse</div>
+      <p><b>Symptom:</b> throughput between two hosts is a fraction of the link and jittery. <b>First cut:</b> <code>ss -ti</code> shows <code>retrans</code>, <code>rtt</code>, and <code>cwnd</code> per socket; <code>nstat</code> shows <code>TcpRetransSegs</code>. <b>Confirm:</b> high retransmits and a <code>cwnd</code> that keeps collapsing. <b>Cause is usually:</b> packet loss on the path (a bad NIC, an overloaded switch, or bufferbloat) making congestion control repeatedly back off. Investigate the path; consider BBR on lossy links, but fix the loss first.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Reuse connections.</b> The single highest-value TCP lesson for throughput and stability is: don't open a new connection per request. The handshake costs a round trip, slow start means the first exchanges are slow, and short-lived connections generate TIME_WAIT and port pressure. Keep-alive and connection pools amortise all of that. This is why HTTP/1.1 defaults to persistent connections and why HTTP/2 multiplexes — topics for <a href="ch16-http-http-2-http-3-and-grpc.html">Chapter 16</a>.</p>
+    <p><b>Tune with intent, not superstition.</b> The knobs that actually earn their keep: <code>somaxconn</code> and the app backlog for accept-heavy services; <code>tcp_tw_reuse</code> for outbound-heavy clients; window scaling (on by default) for long-fat links; <code>TCP_NODELAY</code> for latency-sensitive RPC; TCP keep-alive below any middlebox idle timeout. The knobs people cargo-cult and shouldn't: gutting <code>TCP_TIMEWAIT_LEN</code>, and the old <code>tcp_tw_recycle</code> (removed from Linux precisely because it broke connections behind NAT).</p>
+    <p><b>Security touches L4 directly.</b> Random ISNs defend against off-path injection; SYN cookies defend against SYN-flood denial of service by letting the server not allocate state until the handshake completes. RSTs can be forged by on-path attackers to tear down connections, which is one reason TLS matters (<a href="ch17-tls-and-pki.html">Chapter 17</a>) — it authenticates the stream so a spoofed RST can drop the connection but can't inject data.</p>
+    <p><b>Common mistakes:</b> treating "connection reset" and "connection timeout" as the same thing (they point at opposite causes); blaming the app for TIME_WAIT that a load balancer's close policy created; opening a connection per request and then being surprised by port exhaustion; and reaching for kernel tunables before checking whether the real fix is connection reuse.</p>
+
+    <h2 id="udp"><span class="beat">The alternative</span>UDP and its trade-offs</h2>
+    <p>UDP is what's left when you strip TCP down to nothing. Its header is 8 bytes — source port, destination port, length, checksum — and that's the whole protocol. No handshake, no sequence numbers, no ACKs, no retransmission, no ordering, no flow control, no congestion control, no connection state. You send a datagram; it probably arrives; you're not told if it doesn't. That sounds useless until you notice what it buys: zero setup latency, no head-of-line blocking (a lost datagram doesn't stall the next one), and no per-connection state on the server, so one socket can serve enormous fan-out.</p>
+    <p>That's exactly right for some workloads. <b>DNS</b> uses UDP because a query and its answer each fit in one datagram and retrying is cheaper than a handshake (<a href="ch15-dns-end-to-end.html">Chapter 15</a>). <b>Real-time media and gaming</b> use it because a late packet is worthless — you'd rather skip it than wait for a retransmit that arrives after the moment has passed. <b>Metrics</b> like statsd fire-and-forget over UDP. And <b>QUIC</b> — the transport under HTTP/3 — is built on UDP precisely so it can implement <em>better</em> reliability and congestion control in user space without being trapped by TCP's in-kernel behaviour and middlebox ossification (<a href="ch16-http-http-2-http-3-and-grpc.html">Chapter 16</a>). The catch is honest: if you use UDP and you need reliability or ordering or congestion control, <em>you</em> are now writing it, and getting congestion control right is genuinely hard. UDP isn't "TCP but faster" — it's "TCP's guarantees are now your problem."</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>TCP's mechanics set hard limits you design around. The handshake round trip plus slow start is why latency-sensitive systems keep connections warm and pool them, and why putting a service physically closer to its clients (edge, regional replicas) pays off — fewer, shorter round trips. TIME_WAIT and the ephemeral-port ceiling cap how many fresh connections one client can make to one backend per second, which pushes you toward connection reuse and toward spreading load across many backends. Congestion control is why a single TCP flow rarely fills a fat pipe and why parallel connections (or protocols like QUIC) move bulk data faster. And the "reset vs timeout vs refused" distinction is the seed of good health checks and circuit breakers (<a href="ch88-reliability-engineering.html">Chapter 88</a>): a fast refuse should fail fast, a silent timeout needs a deadline, and a mid-stream reset should trigger a retry on a fresh connection — not the same dead one.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>Why does closing a TCP connection take four segments but opening takes three?</summary>
+        <div class="a"><p>Because a close is one direction at a time. In the handshake, the middle SYN and ACK can be combined into one <code>SYN,ACK</code> segment, giving three. In the close, each side has its own direction to shut down: the active closer sends FIN and gets an ACK, but the peer may still have data to send, so its FIN comes later as a separate segment with its own ACK — four in total. If both sides had nothing left to send, the ACK and the second FIN could coalesce, but you can't count on that.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>What is TIME_WAIT, who holds it, and why shouldn't you just disable it?</summary>
+        <div class="a"><p>TIME_WAIT is the state the <em>active closer</em> — the side that sent the first FIN — sits in after acknowledging the peer's FIN, for twice the maximum segment lifetime (60 seconds on Linux). It does two jobs. First, if its final ACK is lost, the peer will retransmit its FIN, and the closer must still exist to re-ACK it; otherwise the peer hangs in LAST-ACK. Second, it keeps the 4-tuple reserved long enough for any delayed duplicate segments from the old connection to expire, so they can't be misread as data on a new connection reusing the same tuple. Disabling it — slashing the timer to zero — brings back exactly that reuse hazard and risks silent data corruption. The legitimate ways to relieve TIME_WAIT pressure are connection reuse (keep-alive, pooling) so you close far fewer connections, and <code>tcp_tw_reuse</code> for new outbound connections, which is safe because it uses timestamps to reject stale segments. The thing to internalise is that TIME_WAIT is protection, not overhead.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Explain the difference between flow control and congestion control, and how the two windows interact.</summary>
+        <div class="a"><p>Flow control protects the receiver; congestion control protects the network. Flow control is explicit: every ACK carries the receiver's advertised window, <code>rwnd</code>, saying how much buffer it has free, and the sender never keeps more unacknowledged data in flight than that. If the receiver stops reading, it advertises a zero window and the sender pauses, probing until space frees up. Congestion control is inferred, because the routers in between have no window to advertise: the sender maintains a hidden congestion window, <code>cwnd</code>, that it grows on success and shrinks on loss — slow start doubles it per round trip until a threshold, then congestion avoidance grows it linearly, and loss cuts it (AIMD). The amount the sender may actually transmit is <code>min(rwnd, cwnd)</code>, so whichever is smaller governs. Practically: if throughput is limited and <code>rwnd</code> is large but <code>cwnd</code> keeps collapsing, you have loss on the path and a congestion problem; if <code>cwnd</code> is healthy but <code>rwnd</code> is small, the receiver's buffers or its read speed are the bottleneck. Linux uses CUBIC by default; BBR models bandwidth and RTT instead of treating loss as the sole congestion signal, which helps on lossy or over-buffered paths.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>Every small request to a nearby service takes ~40&nbsp;ms when it should take under 1&nbsp;ms. Diagnose.</summary>
+        <div class="a"><p>The suspiciously round, distance-independent 40&nbsp;ms is the delayed-ACK timer, which means I'm looking at a Nagle + delayed-ACK interaction. One side is holding a small segment under Nagle's algorithm because it has unacknowledged data outstanding, and the other side is holding the ACK under delayed-ACK, hoping to piggyback it on a reply that isn't coming — so nothing moves until the ~40&nbsp;ms timer fires and forces the ACK. I'd confirm with tcpdump: I'd see a small segment, then a ~40&nbsp;ms gap, then the ACK, then progress. The fix is to set <code>TCP_NODELAY</code> on the latency-sensitive socket to disable Nagle, which is exactly why RPC frameworks and database drivers set it by default. If I can't change the code, <code>TCP_QUICKACK</code> on the receiver can help. What I would <em>not</em> do is assume the network is slow — the constant, sub-round-trip-independent 40&nbsp;ms rules that out immediately.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>When would you choose UDP, and what are you taking on by doing so?</summary>
+        <div class="a"><p>I'd choose UDP when the workload doesn't want TCP's guarantees or can't afford its costs: single request/response exchanges that fit one datagram where a handshake is pure overhead (DNS), real-time media and gaming where a late packet is worthless so retransmission actively hurts, high-fan-out fire-and-forget like metrics, and anything that wants to implement its own smarter transport in user space (QUIC does this over UDP to escape TCP's kernel and middlebox ossification). What I'm taking on is everything TCP was doing for me: if I need reliability, ordering, deduplication, flow control, or congestion control, I now have to build it, and congestion control in particular is hard to get right and easy to get antisocially wrong. So the decision is really "do I need these guarantees, and if I do, am I prepared to reimplement the ones I still need?" UDP isn't faster TCP; it's TCP with the guarantees removed and handed back to me.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>TCP builds a reliable, ordered byte stream on top of best-effort IP using sequence numbers, acknowledgements, retransmission, and windows. A connection is born in the three-way handshake (SYN / SYN-ACK / ACK), lives in ESTABLISHED, and dies in a four-way close (FIN / ACK / FIN / ACK). The active closer holds TIME_WAIT for 2×MSL (60s on Linux) to protect a reused 4-tuple from stragglers and to be able to re-ACK a lost final FIN — it's protection, not waste. Flow control (rwnd) protects the receiver; congestion control (cwnd, slow start + AIMD, CUBIC/BBR) protects the network; the sender is bounded by their minimum. Nagle plus delayed-ACK produces the classic ~40&nbsp;ms stall, fixed by TCP_NODELAY. Most incidents are states gone wrong: TIME_WAIT/port pressure, accept-queue overflow, or resets from a middlebox timing out an idle flow. Read it all with <code>ss</code> and <code>tcpdump</code>. UDP is TCP with every guarantee removed — cheap, stateless, and yours to rebuild if you need any of them back.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>TCP is stateful over stateless IP: every problem is "which state, waiting for what, why stuck."</li>
+      <li>Handshake is three segments (SYN / SYN-ACK / ACK); close is four (FIN / ACK / FIN / ACK) because each direction closes separately.</li>
+      <li>The active closer — whoever sends the first FIN — holds TIME_WAIT for ~60s on Linux.</li>
+      <li>TIME_WAIT protects a reused 4-tuple from delayed duplicates and lets the final ACK be re-sent. Don't zero it.</li>
+      <li>Flow control (rwnd) protects the receiver; congestion control (cwnd) protects the network; sender sends min of the two.</li>
+      <li>Slow start ramps cwnd exponentially, congestion avoidance linearly, loss cuts it (AIMD). CUBIC default, BBR alternative.</li>
+      <li>Nagle + delayed-ACK = the ~40&nbsp;ms stall on small request/response; fix with TCP_NODELAY.</li>
+      <li>Refused (fast RST) = reachable but no service; timeout (silent) = filtered/gone; mid-stream RST = peer or middlebox killed it.</li>
+      <li><code>ss -tno</code> shows states and timers; a listener with Recv-Q &gt; Send-Q is overflowing its accept queue.</li>
+      <li>UDP strips all guarantees for zero setup and no head-of-line blocking — good for DNS, media, QUIC; you rebuild what you need.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on and toward:</span>
+      <a href="ch12-l3-ip-cidr-subnetting-routing-nat.html"><b>Ch 12</b> L3: IP &amp; routing</a>
+      <a href="ch14-ports-sockets-ephemeral-ports-connection-lifecycle.html"><b>Ch 14</b> Ports &amp; sockets</a>
+      <a href="ch16-http-http-2-http-3-and-grpc.html"><b>Ch 16</b> HTTP &amp; gRPC</a>
+      <a href="ch17-tls-and-pki.html"><b>Ch 17</b> TLS &amp; PKI</a>
+      <a href="ch88-reliability-engineering.html"><b>Ch 88</b> Timeouts &amp; circuit breakers</a>
+      <a href="ch105-network-runbooks.html"><b>Ch 105</b> Network runbooks</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc9293">RFC 9293: Transmission Control Protocol</a>. The current, consolidated TCP specification (obsoletes RFC 793) — states, handshake, and close.</li>
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc768">RFC 768: User Datagram Protocol</a>. Three pages; the entire protocol.</li>
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc5681">RFC 5681: TCP Congestion Control</a> and <a href="https://www.rfc-editor.org/rfc/rfc6298">RFC 6298: Computing TCP's Retransmission Timer</a>.</li>
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc7323">RFC 7323: TCP Extensions for High Performance</a> (window scaling, timestamps) and <a href="https://www.rfc-editor.org/rfc/rfc896">RFC 896</a> (Nagle's algorithm).</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man7/tcp.7.html">tcp(7)</a>: every Linux TCP socket option and sysctl, with real defaults.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch12-l3-ip-cidr-subnetting-routing-nat.html"><span class="dir">← Prev</span><div class="ti">Ch 12 — L3: IP, CIDR, subnetting, routing, NAT</div></a>
+      <a class="nx" href="ch14-ports-sockets-ephemeral-ports-connection-lifecycle.html"><span class="dir">Next →</span><div class="ti">Ch 14 — Ports, sockets, ephemeral ports, connection lifecycle</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 13 of 121 · Part II · Networking from First Principles. Keep a shell with <code>ss -tno</code> open the next time something's slow; the states will tell you the story.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Handshake &amp; close</a>
+    <a href="#states">The state machine</a>
+    <a href="#components">Retransmit, windows, Nagle</a>
+    <a href="#flow">One connection end to end</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#udp">UDP &amp; trade-offs</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 3 — Memory: Virtual Memory, Page Cache, Swap &amp; OOM</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part I · Linux &nbsp;·&nbsp; Chapter 3</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part I · Linux &amp; OS Foundations · Chapter 3</div>
+      <h1>Memory: virtual memory, page cache, swap &amp; OOM</h1>
+      <p class="tagline">Every process thinks it has the machine's whole memory to itself, laid out in a neat private map that starts at zero. It's a lie the kernel maintains with hardware help — and understanding the lie is the difference between "the box is out of RAM" (usually wrong) and knowing exactly which pod the OOM killer is about to shoot.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~40 min read · Linux lab (Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain virtual vs physical memory, pages, and how the MMU translates one to the other.</li>
+          <li>Read <code>free -m</code> and <code>/proc/meminfo</code> correctly — and know why low "free" is almost always fine.</li>
+          <li>Tell RSS from VSZ from shared, and say why the numbers rarely add up the way people expect.</li>
+          <li>Describe the page cache, dirty pages and writeback, swap, and memory overcommit.</li>
+          <li>Explain exactly how the OOM killer chooses a victim, and what <code>oom_score</code> and cgroup limits do.</li>
+          <li>Diagnose an OOMKilled pod, the "used vs cache" panic, and swap thrash.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem: many programs, one pool of RAM</h2>
+    <p>Give programs direct access to physical RAM and everything falls apart. Two programs both want the address at byte zero, so they collide. A program compiled to load at a fixed address can't run if that region is already taken. A process could read its neighbour's memory — passwords, keys, anything — by just reading the right physical address. And you could never run a program that needs more memory than is free right now, even if most of what's allocated is never actually touched.</p>
+    <p>Linux fixes all of this with one idea: <b>no process ever sees physical memory</b>. Each gets its own <b>virtual address space</b> — a private map that always starts at zero and looks contiguous and enormous, regardless of what's physically there. When a program reads address <code>0x400000</code>, the CPU and kernel translate that, on the fly, to wherever the real bytes live: some physical page, or a spot in the page cache, or out on swap, or nowhere yet at all. Your neighbour's <code>0x400000</code> translates somewhere completely different.</p>
+    <p>That translation buys three things at once. Isolation: you can't name, let alone touch, another process's memory. Flexibility: the kernel can move physical pages around, share them, or write them to disk without the program noticing. And <b>overcommit</b>: the kernel can promise more memory than exists, because most of what programs ask for, they never touch — until they do, which is where the OOM killer comes in.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>Memory is handed out lazily. <code>malloc(1&nbsp;GB)</code> almost always succeeds instantly and costs nothing — it just reserves address space. Real physical RAM is only committed when your program <em>writes</em> to a page and triggers a fault. This is why a process can show a 10&nbsp;GB virtual size (VSZ) while using 200&nbsp;MB of real RAM (RSS), and why "out of memory" happens on a write, not on the allocation.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: an apartment building with a translation desk</h2>
+    <p>Hold this picture for the rest of the chapter.</p>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Think of physical RAM as an apartment building with a fixed number of units — that's finite and real. Each <b>tenant</b> (process) is handed their own <b>private floor plan</b> that always numbers rooms from 1 upward. Every tenant's "room 1" is a different actual apartment; they never learn the real unit numbers. When a tenant wants to enter "their" room 5, they ask the <b>translation desk</b> in the lobby, which looks up the real unit and lets them in. That desk is the <b>MMU</b>, and the clerk keeps a sticky note of the last few lookups so repeat visits are instant — that note is the <b>TLB</b>.</p>
+      <p>Near the entrance is a <b>lending shelf</b> holding copies of documents tenants recently pulled from the deep archive in the basement (the disk). Read a document once and its copy stays on the shelf, so the next read is instant. That shelf is the <b>page cache</b>, and it grows to fill whatever space is spare — which is exactly what it should do. When a real apartment is needed and none is free, management first clears space off the lending shelf (those are just copies; toss them).</p>
+      <p>If that's not enough, management moves a tenant's belongings to a <b>storage annex across town</b> — the apartment is freed, but reaching those belongings is slow. That's <b>swap</b>. And when the building is genuinely, hopelessly full and a new tenant <em>must</em> be housed, the manager evicts whoever has the worst <b>eviction score</b> — the tenant using the most space and least protected. That manager is the <b>OOM killer</b>, and the score is <code>oom_score</code>.</p>
+    </div>
+    <p>The mapping:</p>
+    <table class="t">
+      <tr><th>In the building</th><th>In Linux</th></tr>
+      <tr><td>The building with a fixed number of units</td><td>Physical RAM (finite)</td></tr>
+      <tr><td>A tenant's private floor plan from room 1</td><td>A process's virtual address space</td></tr>
+      <tr><td>One room</td><td>A page (4&nbsp;KiB on x86-64)</td></tr>
+      <tr><td>The lobby translation desk</td><td>The MMU (memory-management unit)</td></tr>
+      <tr><td>The clerk's sticky note of recent lookups</td><td>The TLB (translation lookaside buffer)</td></tr>
+      <tr><td>The lending shelf of archive copies</td><td>The page cache (file data cached in RAM)</td></tr>
+      <tr><td>The storage annex across town</td><td>Swap (anonymous pages written to disk)</td></tr>
+      <tr><td>Promising more floor space than exists</td><td>Memory overcommit</td></tr>
+      <tr><td>The manager evicting the worst-scoring tenant</td><td>The OOM killer using <code>oom_score</code></td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>Virtual to physical, and where pages live</h2>
+    <p>The address space is divided into fixed-size <b>pages</b> — 4&nbsp;KiB each on x86-64. Physical RAM is divided into equal-size <b>frames</b>. The kernel keeps, per process, a <b>page table</b>: a lookup from virtual page to physical frame (or to "on swap," or to "not present"). The MMU does this lookup in hardware on every memory access, caching recent results in the TLB so it doesn't have to walk the multi-level table each time.</p>
+    <p>Not every page is the same kind. <b>Anonymous</b> pages are your heap and stack — they have no file behind them, so if the kernel needs to reclaim them it must write them to <b>swap</b> first. <b>File-backed</b> pages are memory that mirrors a file on disk (program code, memory-mapped files, and the page cache); a <em>clean</em> file page can be dropped instantly and re-read later, while a <em>dirty</em> one (modified, not yet saved) must be written back first.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 430" role="img" aria-label="A process virtual address space translated by the MMU to physical RAM frames, page cache, and swap">
+        <defs>
+          <marker id="m1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+          <marker id="m2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--deep)"/></marker>
+        </defs>
+        <!-- virtual address space -->
+        <rect x="18" y="26" width="170" height="378" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="103" y="46" text-anchor="middle" style="fill:var(--muted);font:700 11px sans-serif;letter-spacing:.04em">VIRTUAL SPACE (per process)</text>
+        <rect x="34" y="58" width="138" height="34" rx="6" style="fill:var(--panel);stroke:var(--line)"/><text x="103" y="80" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">stack ↓ (anon)</text>
+        <rect x="34" y="118" width="138" height="34" rx="6" style="fill:var(--panel);stroke:var(--line)"/><text x="103" y="140" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">mmap / libs (file)</text>
+        <rect x="34" y="200" width="138" height="34" rx="6" style="fill:var(--panel);stroke:var(--line)"/><text x="103" y="222" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">heap ↑ (anon)</text>
+        <rect x="34" y="300" width="138" height="34" rx="6" style="fill:var(--panel);stroke:var(--line)"/><text x="103" y="322" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">data / bss</text>
+        <rect x="34" y="352" width="138" height="34" rx="6" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.4"/><text x="103" y="374" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">text (code, file)</text>
+        <!-- MMU -->
+        <rect x="248" y="150" width="150" height="128" rx="10" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="323" y="200" text-anchor="middle" style="fill:var(--ink);font:700 14px sans-serif">MMU</text>
+        <text x="323" y="222" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">page-table walk</text>
+        <text x="323" y="244" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">TLB caches lookups</text>
+        <!-- physical RAM -->
+        <rect x="470" y="26" width="232" height="222" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="586" y="46" text-anchor="middle" style="fill:var(--accent);font:700 11px sans-serif;letter-spacing:.04em">PHYSICAL RAM (frames)</text>
+        <rect x="486" y="58" width="200" height="30" rx="5" style="fill:var(--panel);stroke:var(--line)"/><text x="586" y="78" text-anchor="middle" style="fill:var(--ink);font:11.5px sans-serif">anon frame (this proc, RSS)</text>
+        <rect x="486" y="94" width="200" height="30" rx="5" style="fill:var(--panel);stroke:var(--line)"/><text x="586" y="114" text-anchor="middle" style="fill:var(--ink);font:11.5px sans-serif">page cache (file copy)</text>
+        <rect x="486" y="130" width="200" height="30" rx="5" style="fill:var(--panel);stroke:var(--line)"/><text x="586" y="150" text-anchor="middle" style="fill:var(--ink);font:11.5px sans-serif">shared lib (shared by many)</text>
+        <rect x="486" y="166" width="200" height="30" rx="5" style="fill:var(--panel);stroke:var(--line)"/><text x="586" y="186" text-anchor="middle" style="fill:var(--ink);font:11.5px sans-serif">anon frame (other proc)</text>
+        <rect x="486" y="202" width="200" height="30" rx="5" style="fill:var(--panel);stroke:var(--line);stroke-dasharray:4 3"/><text x="586" y="222" text-anchor="middle" style="fill:var(--muted);font:11.5px sans-serif">free</text>
+        <!-- swap -->
+        <rect x="470" y="300" width="232" height="104" rx="10" style="fill:var(--panel);stroke:var(--deep);stroke-dasharray:5 4"/>
+        <text x="586" y="322" text-anchor="middle" style="fill:var(--deep);font:700 11px sans-serif;letter-spacing:.04em">SWAP (disk — slow)</text>
+        <text x="586" y="348" text-anchor="middle" style="fill:var(--muted);font:11.5px sans-serif">anon pages paged out here</text>
+        <text x="586" y="372" text-anchor="middle" style="fill:var(--muted);font:11.5px sans-serif">when RAM is under pressure</text>
+        <!-- arrows -->
+        <line x1="172" y1="217" x2="246" y2="210" style="stroke:var(--accent2);stroke-width:1.8" marker-end="url(#m1)"/>
+        <line x1="398" y1="200" x2="484" y2="73" style="stroke:var(--accent2);stroke-width:1.8" marker-end="url(#m1)"/>
+        <text x="430" y="120" style="fill:var(--accent2);font:600 10px sans-serif">present → frame</text>
+        <line x1="398" y1="240" x2="484" y2="340" style="stroke:var(--deep);stroke-width:1.8" marker-end="url(#m2)"/>
+        <text x="405" y="300" style="fill:var(--deep);font:600 10px sans-serif">paged out → swap</text>
+      </svg>
+      <figcaption>The MMU translates each virtual page to a physical frame, to a swapped-out location, or finds it not present (a fault). RSS is the frames resident in RAM; VSZ is the whole left column, most of which may not be backed at all.</figcaption>
+    </figure>
+
+    <p>This is where the memory numbers people misread come from. <b>VSZ</b> (virtual size) is the whole left column — every mapping, backed or not. <b>RSS</b> (resident set size) is only the pages actually in physical RAM right now — and it counts <em>shared</em> pages (like libc) in full for every process that maps them, so summing everyone's RSS overcounts real usage. <b>Shared</b> is the portion backed by pages other processes also map. When you need the honest per-process number, look at <b>PSS</b> (proportional set size), which splits shared pages by how many share them.</p>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>Almost every memory incident is a misread of these numbers. A dashboard shows "95% memory used" and someone panics — but most of that is page cache, which the kernel gives back the instant anything needs it. The real question is always <b>MemAvailable</b> (how much you can use without swapping) and, in containers, the <b>cgroup working set</b> versus its limit. Get comfortable reading those two and you'll stop chasing phantom memory emergencies — and catch the real ones, where anonymous memory is genuinely climbing toward a limit.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>The page fault, demand paging, and reclaim</h2>
+    <p>The engine underneath all of this is the <b>page fault</b>. Here's what happens when your program touches memory:</p>
+    <ol class="steps">
+      <li><b>The program reads or writes a virtual address.</b> The MMU checks the TLB. Hit → instant translation, done. Miss → the MMU walks the page table.</li>
+      <li><b>If the page table entry is present,</b> the MMU fills the TLB and the access proceeds. No kernel involvement — this is the fast, common case.</li>
+      <li><b>If the entry is <em>not</em> present, the CPU raises a page fault</b> and traps into the kernel. Now the kernel decides what kind of fault this is.</li>
+      <li><b>Minor fault:</b> the data is already in RAM but not yet mapped for this process — it's in the page cache, or it's a copy-on-write page, or it's a fresh anonymous page. The kernel just maps a frame (handing out a zeroed page for new anonymous memory) and returns. Fast — microseconds.</li>
+      <li><b>Major fault:</b> the data isn't in RAM at all — it's on disk (a file not yet cached) or on swap. The kernel issues I/O, puts the process to <b>sleep in D state</b> while it waits, and maps the frame when the read completes. Slow — this is disk latency, and a storm of major faults is what swap thrash feels like.</li>
+    </ol>
+    <p>This is <b>demand paging</b>: memory is only made real when touched. It's why VSZ can dwarf RSS, and why the reckoning for overcommit arrives on a write. When RAM fills, the kernel runs <b>reclaim</b>: it frees clean page-cache pages first (free, since they're just copies of files), writes back dirty pages, and — under real pressure — pages anonymous memory out to swap. The knob <code>vm.swappiness</code> (default 60) tunes how eagerly it prefers swapping anonymous pages versus dropping file cache.</p>
+
+    <h3>Overcommit and the OOM killer</h3>
+    <p>Linux lets total promised memory exceed RAM+swap — <code>vm.overcommit_memory=0</code> (the heuristic default) allows reasonable overcommit; <code>=2</code> refuses to overcommit at all. The bet is that not everyone cashes their promise at once. When the bet fails — processes actually touch more than can be backed, and reclaim has nothing left to free — the kernel invokes the <b>OOM killer</b>. It doesn't fail the allocation; it picks a process to kill so the rest can continue.</p>
+    <p>It chooses by <b>oom_score</b>, which is driven mostly by how much memory the process uses (killing the biggest hog frees the most), adjustable per process via <code>oom_score_adj</code> (range −1000 to +1000; −1000 makes a process effectively unkillable by OOM). The victim gets <code>SIGKILL</code> — no cleanup, no handler, gone. In cgroup v2, a memory limit (<code>memory.max</code>) scopes this: when a cgroup hits its limit and can't reclaim, the OOM killer fires <em>inside that cgroup only</em>, killing a process there rather than touching the rest of the host. That scoped kill is exactly what a Kubernetes memory limit gives you — and why an OOMKilled container shows exit code <b>137</b> (128 + signal 9).</p>
+
+    <details class="recall"><summary>Think first: <code>free -m</code> shows only 300 MB "free" out of 16 GB. Is the box about to run out of memory?</summary>
+      <div class="body">
+        <p>Almost certainly not. Low "free" is the normal, healthy state, because Linux uses spare RAM as page cache rather than leaving it idle — and that cache is instantly reclaimable. The number that answers "am I about to run out" is <b>available</b> (the <code>available</code> column in <code>free</code>, or <code>MemAvailable</code> in <code>/proc/meminfo</code>): the kernel's estimate of how much you can allocate without swapping. If available is several GB, you're fine even with "free" near zero. You'd only worry if <em>available</em> is small <em>and</em> anonymous memory (not cache) is what's filling RAM — that's memory you can't just drop.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, and what each owns</h2>
+    <ul>
+      <li><b>MMU + TLB.</b> Hardware. Translates virtual to physical on every access; the TLB caches recent translations. A context switch to another address space flushes the TLB unless the CPU tags entries (PCID). Huge pages (2&nbsp;MiB/1&nbsp;GiB) cut TLB misses for big memory footprints.</li>
+      <li><b>Page tables.</b> Per-process, kernel-maintained. Map virtual pages to frames, swap slots, or "not present." The source of truth the MMU walks.</li>
+      <li><b>The page cache.</b> File data cached in RAM. Clean pages are droppable for free; dirty pages must be written back (writeback is driven by <code>vm.dirty_*</code> ratios). This is the "buff/cache" you see grow when you read files — and it's why re-reads are fast.</li>
+      <li><b>Anonymous memory &amp; swap.</b> Heap/stack pages with no file behind them. Under pressure they go to swap; with no swap configured, they can't be reclaimed at all — so the OOM killer is the only relief valve.</li>
+      <li><b>The OOM killer.</b> Fires when allocation can't be satisfied and reclaim is exhausted. Ranks processes by <code>oom_score</code> (usage + <code>oom_score_adj</code>) and <code>SIGKILL</code>s one. Scoped per-cgroup when a cgroup limit is the constraint.</li>
+      <li><b>cgroup v2 memory controller.</b> <code>memory.max</code> (hard limit → cgroup OOM), <code>memory.high</code> (soft limit → throttle and reclaim, no kill), <code>memory.current</code> (usage now), <code>memory.swap.max</code>, and <code>memory.events</code> (counters including <code>oom_kill</code>). This is the machinery behind Kubernetes requests/limits.</li>
+      <li><b><code>/proc/meminfo</code> &amp; <code>/proc/&lt;pid&gt;/status</code>.</b> The truth. <code>MemTotal/MemFree/MemAvailable/Cached/Dirty/SwapTotal/SwapFree</code> for the system; <code>VmSize</code> (VSZ), <code>VmRSS</code>, <code>RssAnon</code>, <code>RssFile</code>, <code>RssShmem</code> per process.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one allocation to its grave</h2>
+    <p>Watch a process ask for a gigabyte and use it:</p>
+    <ol class="steps">
+      <li>The program calls <code>malloc(1&nbsp;GB)</code>. glibc satisfies this with an <code>mmap</code> of anonymous memory. <b>VSZ jumps by 1&nbsp;GB; RSS doesn't move</b> — nothing is backed yet.</li>
+      <li>The program writes to the first page. Page fault → minor fault → the kernel hands out a zeroed frame and maps it. RSS grows by 4&nbsp;KiB. Repeat for every page it touches; RSS climbs only as far as it actually writes.</li>
+      <li>RAM starts filling. The kernel reclaims: it drops clean page-cache pages first (cheap), then writes back dirty file pages.</li>
+      <li>Still under pressure, the kernel pages some anonymous memory out to swap. If this process (or others) keep touching swapped-out pages, you get major faults in both directions — <b>swap thrash</b>: the box spends its time moving pages instead of doing work, latency spikes, and CPU looks busy in I/O wait.</li>
+      <li>If there's a cgroup limit and usage hits <code>memory.max</code> with nothing left to reclaim, the cgroup OOM killer fires and <code>SIGKILL</code>s a process <em>in that cgroup</em>. On the whole host with no limit and no swap left, the global OOM killer picks the highest <code>oom_score</code> victim.</li>
+      <li>When the process exits (or is killed), all its pages — resident and swapped — are freed, and the frames return to the pool, mostly becoming page cache again until something needs them.</li>
+    </ol>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>Run these in a throwaway container. The OOM lab needs a memory limit, so note the extra flags where called out.</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>docker run --rm -it ubuntu:24.04 bash
+apt-get update &amp;&amp; apt-get install -y procps stress-ng python3</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — read the memory numbers correctly</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Start with <code>free -m</code> and learn to read the one column that matters.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>free -m
+grep -E 'MemTotal|MemFree|MemAvailable|^Cached|Buffers|Dirty' /proc/meminfo</code></pre></div>
+        <div class="out"><span class="ol">Output (example)</span>               total        used        free      shared  buff/cache   available
+Mem:            7940        1120         240          30        6580        6560
+MemTotal:        8130400 kB
+MemFree:          245900 kB
+MemAvailable:    6717600 kB
+Cached:          6210300 kB</code></pre></div>
+        <p>Only 240&nbsp;MB "free," but <b>6560&nbsp;MB available</b> — because 6.5&nbsp;GB is page cache the kernel will surrender on demand. The rule: ignore "free," read "available." Now prove the RSS-vs-VSZ gap. Map half a gigabyte, touch almost none of it, and watch the two diverge:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>python3 - &lt;&lt;'EOF' &amp;
+import mmap, os, time
+m = mmap.mmap(-1, 512*1024*1024)      <span class="c"># reserve 512 MiB, touch nothing</span>
+print("pid", os.getpid())
+time.sleep(15)
+for i in range(0, 64*1024*1024, 4096): m[i] = 1   <span class="c"># now touch 64 MiB</span>
+time.sleep(60)
+EOF
+PID=$!
+sleep 2 ; grep -E 'VmSize|VmRSS' /proc/$PID/status   <span class="c"># before touching</span>
+sleep 20; grep -E 'VmSize|VmRSS' /proc/$PID/status   <span class="c"># after touching 64 MiB</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>VmSize:	  538000 kB      # ~512 MiB reserved
+VmRSS:	    6100 kB      # almost nothing resident
+--- after touching 64 MiB ---
+VmSize:	  538000 kB      # unchanged: the reservation didn't move
+VmRSS:	   71000 kB      # ~64 MiB now resident</code></pre></div>
+        <p>VSZ is the promise; RSS is the reality, and it only grows as pages are touched. That single demo kills more memory confusion than any dashboard.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — watch the page cache breathe</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>The page cache is invisible until you make it move. Write a file, watch cache grow; read it back, watch reads get instant.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>free -m | awk 'NR==2{print "buff/cache before:", $6}'
+dd if=/dev/zero of=/tmp/big bs=1M count=1024 status=none   <span class="c"># write 1 GiB</span>
+free -m | awk 'NR==2{print "buff/cache after write:", $6}'
+
+<span class="c"># First read is from disk; second is from cache — time both.</span>
+sync
+time dd if=/tmp/big of=/dev/null bs=1M status=none          <span class="c"># cold-ish</span>
+time dd if=/tmp/big of=/dev/null bs=1M status=none          <span class="c"># now cached — much faster</span></code></pre></div>
+        <div class="out"><span class="ol">Output (example)</span>buff/cache before: 210
+buff/cache after write: 1240
+real  0m0.640s     # first read
+real  0m0.120s     # second read — served from the page cache</code></pre></div>
+        <p>The second read is several times faster because the bytes never left RAM. This is why "warming the cache" is a real thing, and why the first request after a deploy is slower. On a real host you can force the cache empty to compare (a diagnostic, never a fix, and it needs a privileged/host context):</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># On a host or privileged container only. Never do this to "free memory" in prod.</span>
+sync &amp;&amp; echo 3 &gt; /proc/sys/vm/drop_caches
+free -m | awk 'NR==2{print "buff/cache after drop:", $6}'</code></pre></div>
+        <p>Dropping caches just makes the next reads slow again while the kernel refills it. If someone proposes cron-ing <code>drop_caches</code> to "keep memory free," that's the misunderstanding this lab exists to cure.</p>
+      </div>
+    </div>
+
+    <details class="recall"><summary>Think first: a teammate says "our monitoring shows the node at 92% memory — we need bigger instances." What do you check before agreeing?</summary>
+      <div class="body">
+        <p>Whether that 92% is anonymous memory or page cache. Pull <code>MemAvailable</code> from <code>/proc/meminfo</code> (or the <code>available</code> column) and the split of <code>Cached</code> vs anonymous. If most of "used" is cache and <code>MemAvailable</code> is comfortably large, the node is healthy and using RAM the way it should — bigger instances would just give you a bigger cache. If instead anonymous memory is high and available is shrinking over time, that's a real trend (a leak or genuine growth), and now instance size or a limit review is the right conversation. Same 92%, opposite conclusions — the metric to trust is available, not used.</p>
+      </div>
+    </details>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — trigger an OOM kill inside a memory-limited container</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>This is the OOMKilled pod, reproduced on your laptop. Start a container with a hard 256&nbsp;MB limit and no swap, then allocate past it.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># --memory sets the cgroup memory.max; equal --memory-swap disables swap.</span>
+docker run --rm -it --memory=256m --memory-swap=256m ubuntu:24.04 bash
+
+<span class="c"># Inside: look at the limit the cgroup enforces.</span>
+cat /sys/fs/cgroup/memory.max          <span class="c"># 268435456 (256 MiB)</span>
+cat /sys/fs/cgroup/memory.current      <span class="c"># current usage</span></code></pre></div>
+        <p>Now allocate and <em>touch</em> 400&nbsp;MB — more than the 256&nbsp;MB ceiling — and watch what the kernel does:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>python3 -c 'a = bytearray(400*1024*1024)'   <span class="c"># bytearray zeroes it → touches every page</span>
+echo "exit code: $?"</code></pre></div>
+        <div class="out"><span class="ol">Output</span>Killed
+exit code: 137</code></pre></div>
+        <p>Exit <b>137</b> = 128 + 9: the process took a <code>SIGKILL</code> from the OOM killer. Before I tell you the mechanism, confirm it from inside the container — where did the evidence show up?</p>
+        <details class="recall"><summary>Reveal the evidence and the mechanism</summary>
+          <div class="body">
+            <p>The cgroup recorded it. <code>memory.events</code> increments an <code>oom_kill</code> counter every time the controller kills a process in this cgroup:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>cat /sys/fs/cgroup/memory.events</code></pre></div>
+            <div class="out"><span class="ol">Output</span>low 0
+high 0
+max 3
+oom 1
+oom_kill 1</code></pre></div>
+            <p>The <code>max</code> counter counts times usage hit the ceiling; <code>oom_kill</code> counts actual kills. On the <em>host</em>, <code>dmesg</code> shows the full report: <code>Memory cgroup out of memory: Killed process … (python3) total-vm:… anon-rss:…</code>. This is precisely what Kubernetes surfaces as <b>OOMKilled</b> with exit code 137 — the container's memory limit <em>is</em> a cgroup <code>memory.max</code>, and exceeding it kills a process in that container, not the node. The fix is never "just raise the limit" reflexively; it's to learn the app's real working set and set the limit above it (with headroom), or fix the leak.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — "the container is out of memory" (but is it?)</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>A common false alarm: a dashboard shows a container near its memory limit, an alert fires, someone wants to bump the limit. Reproduce the ambiguous picture and learn to read it. In a 512&nbsp;MB container, fill the cache by reading a big file, then inspect what's actually accounted.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker run --rm -it --memory=512m ubuntu:24.04 bash
+apt-get update &amp;&amp; apt-get install -y procps python3
+dd if=/dev/zero of=/tmp/f bs=1M count=400 status=none   <span class="c"># 400 MiB into page cache</span>
+cat /tmp/f &gt; /dev/null                                   <span class="c"># pull it through cache</span>
+cat /sys/fs/cgroup/memory.current                        <span class="c"># looks high — near the limit!</span></code></pre></div>
+        <p><code>memory.current</code> looks alarmingly close to <code>memory.max</code>. Is this container actually about to OOM? Investigate before deciding — the breakdown is in the stats file.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>grep -E '^anon |^file |^inactive_file|^active_file' /sys/fs/cgroup/memory.stat</code></pre></div>
+        <details class="recall"><summary>Reveal how to read it</summary>
+          <div class="body">
+            <p><code>memory.current</code> includes page cache, and cache is reclaimable. The honest question is: how much of the usage is <b>anon</b> (unreclaimable — heap/stack) versus <b>file</b> (page cache — droppable under pressure)?</p>
+            <div class="out"><span class="ol">Output</span>anon 24117248        # ~23 MiB truly resident anonymous
+file 419430400       # ~400 MiB page cache — will be dropped before any OOM</code></pre></div>
+            <p>Only ~23&nbsp;MB is anonymous; the rest is cache the kernel will evict the moment the cgroup needs room. This container is <em>not</em> about to OOM — cache pressure inside a cgroup causes reclaim, not kills. The tell for a real problem is <b>rising <code>anon</code> approaching <code>memory.max</code></b>, plus a climbing <code>oom_kill</code> count in <code>memory.events</code>. Kubernetes' "working set" metric already excludes reclaimable cache for exactly this reason, so alert on working set (or anon), not raw usage. Bumping the limit here would waste memory and hide nothing, because there's nothing wrong.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — swap thrash and a slow leak</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>A service on a swap-enabled host gets slower and slower over days; CPU shows high I/O wait, latency is erratic, but nothing has crashed. On another host, a process's RSS climbs steadily and never plateaus. Two different diseases with overlapping symptoms. First, feel swap thrash directly — allocate well past RAM on a swap-enabled box (do this on a disposable VM, not a shared host):</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>vmstat 1 5            <span class="c"># baseline: watch the si/so (swap-in/out) columns</span>
+stress-ng --vm 2 --vm-bytes 90% --vm-keep --timeout 30s &amp;
+vmstat 1 30           <span class="c"># si/so climb, 'wa' (I/O wait) climbs, throughput tanks</span></code></pre></div>
+        <p>Nonzero <code>si</code>/<code>so</code> that stay high is the signature of thrash — the box is moving pages to and from disk constantly. Now the senior task: on a struggling host, how do you tell swap thrash from a genuine memory leak, and what do you actually do about each? Work it out, then reveal.</p>
+        <details class="recall"><summary>Reveal the method and the fixes</summary>
+          <div class="body">
+            <p><b>Distinguish them.</b> Swap thrash shows sustained <code>si</code>/<code>so</code> in <code>vmstat</code> and high <code>%wa</code>, with total committed memory over RAM — but individual RSS may be stable. A leak shows one process's <b>RssAnon</b> climbing monotonically over hours with no plateau; watch it directly:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>for i in $(seq 1 20); do
+  grep -H RssAnon /proc/&lt;pid&gt;/status; sleep 60
+done                                  <span class="c"># steady climb = leak, not cache</span>
+ps -eo pid,rss,comm --sort=-rss | head <span class="c"># who is the biggest anon consumer?</span></code></pre></div>
+            <p><b>Thrash fix:</b> reduce demand or add RAM. On latency-sensitive hosts many teams disable swap entirely (or set <code>vm.swappiness=1</code>) so the box fails fast via OOM instead of degrading slowly — a slow-dying host is often worse than a fast-failing one you can replace. Kubernetes historically required swap off on nodes for exactly this predictability.</p>
+            <p><b>Leak fix:</b> the durable answer is in the app (find and fix the leak). Operationally, contain the blast radius: set a cgroup <code>memory.high</code> to apply reclaim pressure and slow the climb, and a <code>memory.max</code> so the leak gets OOMKilled in its own cgroup instead of taking the node down. Protect the truly critical process with <code>oom_score_adj</code>:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>echo -800 &gt; /proc/&lt;critical-pid&gt;/oom_score_adj   <span class="c"># make it a last resort for the OOM killer</span></code></pre></div>
+            <p>The mindset: you can't stop a leak from the outside, but you can decide <em>who</em> the OOM killer takes and <em>where</em> the failure is contained. That's the cgroup story we build fully in <a href="ch23-cgroups-v2-cpu-memory-io-limits.html">Chapter 23</a>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · OOMKilled pod (exit 137)</div>
+      <p><b>Symptom:</b> a pod restarts repeatedly; <code>kubectl describe pod</code> shows <code>Last State: Terminated, Reason: OOMKilled, Exit Code: 137</code>. <b>First cut:</b> compare the container's memory <b>limit</b> to its actual working set (metrics-server / <code>kubectl top pod</code>, or the container's <code>memory.current</code> and <code>memory.stat</code> anon). <b>Confirm:</b> the node's <code>dmesg</code> shows a memory-cgroup OOM naming the process. <b>Usual cause:</b> limit set below the real working set, a memory leak, or a workload spike (large request payload, batch job). <b>Fix:</b> set the limit above the observed working set with headroom, or fix the leak. Raising the limit blindly just moves the cliff; it's the right move only when the limit was genuinely too tight.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · "we're out of memory" that isn't</div>
+      <p><b>Symptom:</b> an alert fires on "memory used &gt; 90%"; the app is fine. <b>First cut:</b> read <code>MemAvailable</code> (system) or the <code>anon</code> line of <code>memory.stat</code> (cgroup) — not raw "used." <b>Confirm:</b> most of "used" is <code>Cached</code>/file, and available is large. <b>Usual cause:</b> the alert thresholds on total usage including reclaimable cache. <b>Fix:</b> alert on available / working set / anon, not on used. Never cron <code>drop_caches</code> to make the graph look better — you're just slowing every subsequent read.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · swap thrash</div>
+      <p><b>Symptom:</b> a host degrades slowly — rising latency, high I/O wait, CPU "busy" but low useful throughput, nothing crashes. <b>First cut:</b> <code>vmstat 1</code> and watch <code>si</code>/<code>so</code> (swap in/out) and <code>wa</code>. <b>Confirm:</b> committed memory exceeds RAM and <code>si</code>/<code>so</code> stay nonzero. <b>Usual cause:</b> genuine overcommit under load, or a leak slowly pushing anon into swap. <b>Fix:</b> reduce memory demand or add RAM; on latency-sensitive nodes, prefer swap off / low swappiness so you fail fast via OOM rather than thrashing. A host that dies quickly and gets replaced beats one that limps for an hour.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Set limits from the working set, not from guesswork.</b> A container memory limit that's below the app's real anonymous footprint guarantees OOMKills under load; one that's wildly above wastes schedulable memory and lets a leak run longer before it's contained. Measure the working set over a representative period, set the limit above the peak with headroom, and alert on approach — not on the kill.</p>
+    <p><b>Requests vs limits shape the node.</b> In Kubernetes, the memory <em>request</em> is what the scheduler reserves and what protects a pod from eviction; the <em>limit</em> is the cgroup <code>memory.max</code> that triggers an OOMKill when exceeded. Requests too low overcommit the node and invite node-pressure evictions; limits too low invite per-pod OOMKills. Both are this chapter wearing a Kubernetes hat, and we return to it in <a href="ch37-autoscaling-and-governance-hpa-vpa-cluster-autoscaler.html">Chapter 37</a>.</p>
+    <p><b>Performance lives in the TLB and the cache.</b> Big-memory workloads (databases, JVMs with huge heaps) suffer TLB misses; huge pages reduce that cost. And the page cache is doing more for your latency than most app-level caching — which is why cold caches after a deploy or a node replacement produce a latency bump you should expect and warm deliberately.</p>
+    <p><b>Common mistakes:</b> reading "free" instead of "available"; treating page cache as memory pressure; setting swap up on latency-critical nodes and then being surprised by thrash; raising a memory limit to "fix" an OOMKill without checking whether it's a leak; and forgetting that overcommit means the failure lands on a write, sometimes far from the code that over-allocated.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>Memory sets a hard ceiling on density: how many pods fit on a node, how big a cache or heap you can run, when you scale out versus up. The page cache is the reason read-heavy systems put hot data in RAM and design around cache hit ratio, and it's the same principle that reappears one layer up as Redis, CDNs, and application caches in <a href="ch85-caching.html">Chapter 85</a>. Overcommit and the OOM killer are why capacity planning (<a href="ch89-capacity-planning-and-performance.html">Chapter 89</a>) is about the <em>touched</em> working set under peak load, not the requested virtual size — plan for what processes cash in, not what they promise. And the choice to run without swap so nodes fail fast rather than thrash is a reliability decision: a predictable hard failure you can automate around beats a slow degradation that pages a human.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's the difference between RSS and VSZ?</summary>
+        <div class="a"><p>VSZ (virtual size) is the total virtual address space a process has mapped — every allocation and mapping, whether or not it's backed by physical memory. RSS (resident set size) is the subset actually resident in RAM right now. VSZ is the promise; RSS is what's real. They diverge because Linux allocates lazily — <code>malloc</code> reserves virtual space, and physical pages are only committed when the process writes to them. One catch: RSS counts shared pages (like libc) fully in every process that maps them, so summing RSS across processes overcounts; PSS is the number that splits shared pages proportionally.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through what happens on a page fault.</summary>
+        <div class="a"><p>When a process accesses a virtual address, the MMU tries to translate it, checking the TLB first. A TLB hit is instant. On a miss it walks the page table. If the page-table entry says the page is present, it fills the TLB and the access proceeds — no kernel involvement. If the entry is not present, the CPU raises a page fault and traps into the kernel. The kernel classifies it: a minor fault means the data is already in RAM but not mapped for this process — a page-cache page, a copy-on-write page, or a brand-new anonymous page — so the kernel just maps a frame (handing out a zeroed page for new memory) and returns; that's microseconds. A major fault means the data has to come from disk — a file not yet cached, or a page that was swapped out — so the kernel issues I/O, parks the process in uninterruptible sleep while it waits, and maps the frame when the read completes; that's disk latency. This whole mechanism is demand paging: memory becomes real only when touched, which is why a process's VSZ can be far larger than its RSS, and why a storm of major faults — swap thrash — makes a box slow without crashing it.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>How does the OOM killer choose a victim, and how do cgroup limits change that?</summary>
+        <div class="a"><p>When an allocation can't be satisfied and reclaim has nothing left to free, the kernel invokes the OOM killer rather than failing the allocation. It scores candidate processes with <code>oom_score</code>, driven mainly by memory usage — killing the biggest consumer frees the most and, ideally, ends the emergency in one shot — adjustable per process with <code>oom_score_adj</code> from −1000 to +1000, where −1000 makes a process effectively exempt. The victim gets an uncatchable SIGKILL. Scope is the important part: with cgroup v2, a memory limit (<code>memory.max</code>) means that when a cgroup hits its ceiling and can't reclaim, the OOM killer fires inside that cgroup and kills a process there, leaving the rest of the host alone. That scoped kill is exactly what a Kubernetes memory limit provides, and it's why an OOMKilled container reports exit code 137 — 128 plus signal 9 — while the node stays up. There's also <code>memory.high</code>, a softer limit that throttles and reclaims under pressure without killing, which you can use to slow a leak instead of letting it hit the hard wall.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A pod keeps getting OOMKilled. How do you decide whether to raise the limit or fix the app?</summary>
+        <div class="a"><p>I'd first confirm it's a limit problem, not a node problem: <code>kubectl describe</code> to see OOMKilled with exit 137, then compare the container's actual working set over time — via <code>kubectl top</code> or the cgroup's <code>memory.current</code> and the <code>anon</code> line of <code>memory.stat</code> — against the configured limit. If the working set is stable and simply sits above a too-tight limit, that's a sizing bug: raise the limit above the observed peak with headroom. If instead the anonymous footprint climbs steadily and never plateaus across restarts, that's a leak, and raising the limit only delays the next kill — the fix belongs in the app. I'd also check whether the kills correlate with a spike, like large request payloads or a batch path, which points at a specific code path rather than steady growth. The discipline is to look at the working-set trend before touching the limit; the reflex of bumping the limit is right maybe a third of the time and hides a real bug the other two-thirds.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>Should production nodes have swap on or off, and why?</summary>
+        <div class="a"><p>For latency-sensitive services I lean toward swap off, or swappiness very low, on the nodes. The reason is failure mode: with swap, a memory-overcommitted box degrades slowly into thrash — sustained swap-in/out, high I/O wait, erratic latency — and a slowly dying host that still answers health checks is harder to detect and automate around than one that fails fast. With swap off, exceeding memory triggers the OOM killer promptly, which in a cgroup world means one pod dies cleanly and gets rescheduled while the node stays healthy. That predictability is why Kubernetes historically required swap disabled on nodes. Swap still has legitimate uses — batch or memory-elastic workloads where slow-but-alive beats killed, and modern setups can use it more surgically — but the default instinct for a service tier is: fail fast and let the scheduler replace the pod, rather than thrash.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>Every process gets a private virtual address space; the MMU (with the TLB caching recent lookups) translates virtual pages to physical frames via per-process page tables. Memory is handed out lazily on demand, so a write triggers a page fault — minor if the data's already in RAM, major if it must come from disk or swap. VSZ is the mapped promise, RSS the resident reality, and shared pages skew per-process sums (use PSS). Spare RAM becomes page cache, which is reclaimable — so read <b>available</b>, not <b>free</b>. Under pressure the kernel drops clean cache, writes back dirty pages, then swaps anonymous memory; sustained swap-in/out is thrash. Linux overcommits, and when the bet fails the OOM killer SIGKILLs the highest-<code>oom_score</code> victim — scoped to a cgroup when a limit is the constraint, which is exactly what a Kubernetes memory limit and its exit-137 OOMKilled are.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>Every process sees a private virtual address space; the MMU translates it to physical RAM, TLB caches the lookups.</li>
+      <li>Memory is paged (4&nbsp;KiB) and allocated lazily — <code>malloc</code> reserves; physical RAM is committed only on the first write.</li>
+      <li>VSZ is what's mapped; RSS is what's resident. Shared pages inflate summed RSS — use PSS for honest per-process totals.</li>
+      <li>A minor page fault maps a frame already in RAM (fast); a major fault reads from disk/swap and blocks in D (slow).</li>
+      <li>Spare RAM is page cache and it's reclaimable — read <b>available</b>/<code>MemAvailable</code>, not <b>free</b>.</li>
+      <li>Anonymous memory needs swap to be reclaimed; clean file pages can be dropped for free, dirty ones written back first.</li>
+      <li>Linux overcommits memory; the reckoning is the OOM killer, which SIGKILLs by <code>oom_score</code> (tune with <code>oom_score_adj</code>).</li>
+      <li>A cgroup <code>memory.max</code> scopes the OOM kill to that cgroup — this is a Kubernetes memory limit, and OOMKilled = exit 137.</li>
+      <li>In a cgroup, read the <code>anon</code> vs <code>file</code> split in <code>memory.stat</code>; cache pressure causes reclaim, not kills.</li>
+      <li>Sustained swap-in/out (<code>vmstat</code> si/so) is thrash — prefer swap off / low swappiness on latency-sensitive nodes to fail fast.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Connects to:</span>
+      <a href="ch01-kernel-and-system-calls.html"><b>Ch 1</b> Syscalls &amp; the kernel</a>
+      <a href="ch02-processes-threads-scheduling-signals.html"><b>Ch 2</b> Processes &amp; D-state</a>
+      <a href="ch04-filesystems-inodes-file-descriptors-disk-i-o.html"><b>Ch 4</b> Page cache &amp; disk I/O</a>
+      <a href="ch23-cgroups-v2-cpu-memory-io-limits.html"><b>Ch 23</b> cgroups v2 — memory limits</a>
+      <a href="ch85-caching.html"><b>Ch 85</b> Caching</a>
+      <a href="ch104-compute-and-memory-runbooks.html"><b>Ch 104</b> Memory runbooks</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>The Linux Kernel documentation — <a href="https://docs.kernel.org/admin-guide/mm/concepts.html">Memory management concepts</a> and the <a href="https://docs.kernel.org/admin-guide/cgroup-v2.html">cgroup v2</a> guide (memory controller, <code>memory.max</code>/<code>high</code>/<code>events</code>).</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man5/proc.5.html">proc(5)</a> (every <code>/proc/meminfo</code> and <code>/proc/&lt;pid&gt;/status</code> field) and <a href="https://man7.org/linux/man-pages/man3/malloc.3.html">malloc(3)</a>.</li>
+      <li>The Linux Kernel documentation — <a href="https://docs.kernel.org/mm/overcommit-accounting.html">Overcommit accounting</a> and the <a href="https://docs.kernel.org/admin-guide/sysctl/vm.html">vm sysctl</a> knobs (<code>swappiness</code>, <code>overcommit_memory</code>, <code>drop_caches</code>).</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man2/mmap.2.html">mmap(2)</a> and <a href="https://man7.org/linux/man-pages/man7/cgroups.7.html">cgroups(7)</a>.</li>
+      <li>Google — <a href="https://sre.google/workbook/table-of-contents/"><i>The Site Reliability Workbook</i></a> (first-party): capacity and resource management in practice.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch02-processes-threads-scheduling-signals.html"><span class="dir">← Prev</span><div class="ti">Ch 2 — Processes, threads, scheduling &amp; signals</div></a>
+      <a class="nx" href="ch04-filesystems-inodes-file-descriptors-disk-i-o.html"><span class="dir">Next →</span><div class="ti">Ch 4 — Filesystems, inodes, file descriptors, disk I/O</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 3 of 121 · Part I · Linux &amp; OS Foundations. Run the labs in a container; the reflexes are the point.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Virtual to physical</a>
+    <a href="#internals">Page faults &amp; reclaim</a>
+    <a href="#components">The components</a>
+    <a href="#flow">One allocation's life</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

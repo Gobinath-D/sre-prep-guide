@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 60 — End-to-end synthesis: Internet to ALB to Pod</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part VI · AWS &amp; EKS &nbsp;·&nbsp; Chapter 60</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part VI · AWS &amp; EKS for SREs · Chapter 60</div>
+      <h1>End-to-end synthesis — Internet to ALB to Service to Pod</h1>
+      <p class="tagline">You now know each piece — DNS, the load balancer, Security Groups, the VPC CNI, kube-proxy — in isolation, from separate chapters. "The app is down" doesn't announce which one broke. This chapter puts all of it into one trace, in the order you should actually check it, so EKS stops being six mental models and becomes one white box.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~50 min read · EKS cluster (or eksctl/aws describe)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Trace one HTTPS request from a browser all the way to a pod's listening socket, naming every hop.</li>
+          <li>Tell apart the two datapaths — <code>ip</code>-mode target and <code>instance</code>/NodePort target — and say which hops each one adds or skips.</li>
+          <li>Point to exactly where IAM, Security Groups, and the VPC CNI each apply along that path.</li>
+          <li>Given only a symptom like "504 from the ALB," decide which layer to check first and why that order is faster than starting at the pod.</li>
+          <li>Explain how the reply gets back to the client, and what conntrack has to do with it.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>Knowing the pieces isn't the same as knowing the order</h2>
+    <p>Route 53 is one chapter. The ALB and target groups are another. Security Groups are another. The VPC CNI is its own flagship chapter. Services and kube-proxy came from Part V. Each one, read on its own, makes sense. None of that tells you what to check first when a page says "the app is down" and you have four minutes before someone escalates.</p>
+    <p>Engineers who only know the pieces in isolation default to checking the thing closest to them — the pod — first, because that's the layer they're most comfortable in. That's often the slowest possible starting point: it's the last hop in a chain of six or seven, and if you start there you learn nothing about the five hops before it. This chapter's entire point is to give you the order, not just the parts: start in the middle of the chain, at the target group's health check, and bisect from there. That single habit is worth more than memorizing any individual layer.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>Every layer in this trace has exactly one command or log that tells you, definitively, whether the request got that far. Learn the seven checkpoints once and "which layer is broken" stops being a guess — it becomes a five-minute bisection.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a parcel through a courier network</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>A parcel starts with a <b>sorting-label lookup</b> — the address gets translated into a routing code before anything moves. That's DNS: Route 53 turns a hostname into the load balancer's own address. The parcel then arrives at a <b>regional depot</b>, where a clerk reads the label and picks which delivery van will carry it onward — that's the ALB's listener rule choosing a target group. Before the van even gets loaded, it has to clear the depot's own <b>security checkpoint</b> — a Security Group, checked right there at the depot's gate.</p>
+      <p>From here there are two kinds of van route. Some depots have a van that drives <b>straight to the recipient's actual door</b> — no intermediate stop, because the depot already knows exactly which building and unit to go to. That's an <code>ip</code>-mode target: straight to the pod's real address. Other depots only know a <b>general delivery office</b> in the neighborhood — the van drops the parcel there, and an internal mail clerk re-addresses it to the correct unit before it goes any further. That's an <code>instance</code>/NodePort target: the van (the ALB) reaches a node, and kube-proxy is the mail clerk doing the re-addressing (DNAT) to the actual pod. Either way, there's a <b>hand-off scanner</b> at every checkpoint along the route — a place where you could, right now, check whether the parcel actually got that far.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>On EKS</th></tr>
+      <tr><td>Sorting-label lookup</td><td>Route 53 DNS resolution (alias record → ALB)</td></tr>
+      <tr><td>The depot clerk picking a van</td><td>ALB listener rule → target group selection</td></tr>
+      <tr><td>The depot's security checkpoint</td><td>Security Group at the ALB's ENI, then again at the target's ENI</td></tr>
+      <tr><td>A van that drives straight to the recipient's door</td><td><code>ip</code>-mode target — straight to the pod's real VPC IP</td></tr>
+      <tr><td>A van that drops at a general office for re-addressing</td><td><code>instance</code>/NodePort target — node ENI, then kube-proxy DNAT</td></tr>
+      <tr><td>The internal mail clerk re-addressing the parcel</td><td>kube-proxy's iptables rules choosing and rewriting to a pod</td></tr>
+      <tr><td>A hand-off scanner at every checkpoint</td><td>One specific command per hop that proves the request got that far</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>The whole path, annotated</h2>
+    <p>Here is every hop in one picture, with both datapaths shown side by side from the target group down, and IAM, Security Groups, and the VPC CNI marked exactly where each one actually applies.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 560" role="img" aria-label="A request path from a client through Route 53, an ALB listener and target group, then splitting into an ip-mode path straight to a pod and an instance-mode path through a node and kube-proxy to a pod">
+        <defs>
+          <marker id="s1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="s2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+        </defs>
+        <rect x="270" y="10" width="180" height="44" rx="8" style="fill:var(--panel);stroke:var(--accent)"/>
+        <text x="360" y="36" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">Client</text>
+        <line x1="360" y1="54" x2="360" y2="80" style="stroke:var(--accent);stroke-width:2" marker-end="url(#s1)"/>
+        <text x="440" y="70" style="fill:var(--muted);font:9.5px sans-serif">1 · dig / DNS resolves alias</text>
+
+        <rect x="240" y="82" width="240" height="46" rx="8" style="fill:var(--chip);stroke:var(--accent)"/>
+        <text x="360" y="102" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">Route 53 — alias record</text>
+        <text x="360" y="118" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">→ the ALB's own DNS name</text>
+        <line x1="360" y1="128" x2="360" y2="152" style="stroke:var(--accent);stroke-width:2" marker-end="url(#s1)"/>
+        <text x="440" y="144" style="fill:var(--muted);font:9.5px sans-serif">2 · TLS handshake to ALB node</text>
+
+        <rect x="200" y="154" width="320" height="82" rx="10" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="360" y="174" text-anchor="middle" style="fill:var(--ink);font:700 12px sans-serif">ALB — listener :443</text>
+        <text x="360" y="190" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">3 · rule match → target group</text>
+        <rect x="220" y="200" width="130" height="26" rx="5" style="fill:none;stroke:var(--deep);stroke-dasharray:5 4"/>
+        <text x="285" y="217" text-anchor="middle" style="fill:var(--deep);font:9px sans-serif">4 · SG at ALB ENI</text>
+        <text x="470" y="217" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">5 · target health check</text>
+
+        <line x1="280" y1="236" x2="220" y2="272" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#s2)"/>
+        <text x="150" y="262" style="fill:var(--accent2);font:9.5px sans-serif">ip mode (default)</text>
+        <line x1="440" y1="236" x2="500" y2="272" style="stroke:var(--accent);stroke-width:2" marker-end="url(#s1)"/>
+        <text x="500" y="262" style="fill:var(--accent);font:9.5px sans-serif">instance/NodePort mode</text>
+
+        <rect x="90" y="276" width="260" height="76" rx="10" style="fill:var(--chip);stroke:var(--accent2);stroke-width:1.4"/>
+        <text x="220" y="298" text-anchor="middle" style="fill:var(--accent2);font:700 11.5px sans-serif">6a · straight to the pod's ENI</text>
+        <text x="220" y="314" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">real VPC-CNI secondary IP</text>
+        <text x="220" y="330" text-anchor="middle" style="fill:var(--deep);font:9px sans-serif">SG checked again, at this ENI</text>
+
+        <rect x="410" y="276" width="260" height="76" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="540" y="298" text-anchor="middle" style="fill:var(--ink);font:700 11.5px sans-serif">6b · node ENI : NodePort</text>
+        <text x="540" y="314" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">SG must allow ALB SG on this port</text>
+        <text x="540" y="330" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">7 · kube-proxy iptables DNAT → a pod</text>
+
+        <line x1="220" y1="352" x2="220" y2="380" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#s2)"/>
+        <line x1="540" y1="352" x2="540" y2="380" style="stroke:var(--accent);stroke-width:2" marker-end="url(#s1)"/>
+
+        <rect x="70" y="382" width="620" height="70" rx="10" style="fill:var(--panel);stroke:var(--violet);stroke-width:1.5"/>
+        <text x="380" y="404" text-anchor="middle" style="fill:var(--violet);font:700 12px sans-serif">8 · pod network namespace</text>
+        <text x="380" y="422" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">veth pair → container's listening socket</text>
+        <text x="380" y="440" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">(the last hop — and the slowest place to start checking)</text>
+
+        <line x1="380" y1="452" x2="380" y2="476" style="stroke:var(--muted);stroke-width:2" marker-end="url(#s1)"/>
+        <text x="480" y="470" style="fill:var(--muted);font:9.5px sans-serif">9 · reply retraces the path</text>
+        <rect x="220" y="478" width="320" height="60" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="380" y="500" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">conntrack (instance mode only)</text>
+        <text x="380" y="518" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">remembers the DNAT — no re-decision on the way back</text>
+      </svg>
+      <figcaption>Both datapaths share hops 1–5 and 8–9. The split is hops 6–7: <code>ip</code> mode goes straight to a pod's real address; <code>instance</code> mode adds a node hop and a kube-proxy DNAT that conntrack has to remember for the reply.</figcaption>
+    </figure>
+
+    <h2 id="internals"><span class="beat">Internal working</span>The forward trace, hop by hop</h2>
+    <p>Follow a real <code>GET https://app.example.com/</code>. Each step names the checkpoint and the one command that proves the request reached it.</p>
+    <ol class="steps">
+      <li><b>DNS resolves the hostname.</b> Route 53's alias record for <code>app.example.com</code> resolves to the ALB's own DNS name, which in turn resolves to one IP per enabled Availability Zone. Alias records track the ALB automatically and cost nothing to query. <b>Check:</b> <code>dig app.example.com</code>.</li>
+      <li><b>TCP and TLS connect to an ALB node.</b> The client opens a connection to one of those per-AZ IPs and completes a TLS handshake; the ALB terminates it there. <b>Check:</b> <code>curl -v https://app.example.com/</code> — a hang here means DNS resolved but nothing answered on 443.</li>
+      <li><b>The listener evaluates rules in priority order</b> and the first match forwards to a target group. <b>Check:</b> <code>aws elbv2 describe-rules --listener-arn ...</code>.</li>
+      <li><b>The ALB's own Security Group is enforced</b> at its ENI before anything else happens — inbound 443 from the client has to be allowed here, or the connection in step 2 never completes at all. <b>Check:</b> <code>aws ec2 describe-security-groups --group-ids &lt;alb-sg&gt;</code>.</li>
+      <li><b>The target group picks a healthy target.</b> Only targets currently passing their health check are candidates — this is the single fastest signal in the whole chain, because it tells you in one call whether everything downstream of this point is even reachable. <b>Check:</b> <code>aws elbv2 describe-target-health --target-group-arn ...</code>.</li>
+      <li><b>The path splits by target type.</b> In <code>ip</code> mode (the default via the AWS Load Balancer Controller from <a href="ch59-aws-integrations.html">Chapter 59</a>), the ALB opens a back-end connection straight to the pod's real VPC-CNI address — a secondary IP or an address inside a delegated prefix, exactly as built in <a href="ch58-vpc-cni-the-deep-one.html">Chapter 58</a>. In <code>instance</code>/NodePort mode, it instead connects to a node's IP on the Service's NodePort. <b>Check:</b> the target's <code>Id</code> in the previous step's output — an IP address means <code>ip</code> mode, an instance ID means <code>instance</code> mode.</li>
+      <li><b>A second Security Group check happens at whichever ENI was just targeted</b> — the pod's ENI in <code>ip</code> mode, or the node's ENI in <code>instance</code> mode, which must allow the ALB's Security Group as a source on the relevant port (the container port, or the NodePort range). <b>Check:</b> <code>aws ec2 describe-network-interfaces</code> for the target's ENI, then its attached Security Groups.</li>
+      <li><b>In instance mode only, kube-proxy takes over.</b> The packet lands on the node at <code>NodeIP:NodePort</code>, and the node's iptables rules — the <code>KUBE-SERVICES</code> chain, exactly as built in Part V's Services chapter — DNAT it to a specific pod IP:port, chosen by the weighted <code>KUBE-SEP</code> rules. <b>Check:</b> <code>iptables -t nat -L KUBE-SERVICES -n | grep &lt;service&gt;</code> on the node, or simply <code>kubectl get endpointslices</code> to see which pods are even in rotation.</li>
+      <li><b>The packet crosses the veth pair into the pod's network namespace</b> and hits the container's listening socket. This is the same handoff from <a href="ch42-pod-networking-internals-pod-to-pod.html">Chapter 42</a>, just arriving from outside the cluster instead of from another pod. <b>Check:</b> <code>kubectl exec &lt;pod&gt; -- ss -tlnp</code> to confirm something is actually listening on the expected port.</li>
+    </ol>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>Step 5 is worth memorizing on its own: a single <code>describe-target-health</code> call tells you whether steps 1 through 5 are fine (a healthy target exists) or rules out the entire second half of the chain (no healthy targets, so nothing downstream matters yet). That's why the checklist in this chapter doesn't start at the pod, and it's why it doesn't start at DNS either — it starts in the middle, where one call answers the most questions per second spent.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: a request works when curled directly against a pod's IP from inside the cluster, but fails through the ALB. Does that tell you the pod is fine?</summary>
+      <div class="body">
+        <p>It tells you the pod and its listening socket are fine — step 9 works. It tells you nothing about steps 1 through 8. A curl from inside the cluster skips DNS, the ALB, both Security Group checks, and (in instance mode) kube-proxy's DNAT entirely. This is exactly the trap of "starting at the pod": a healthy pod proves the last hop works and leaves every earlier hop still unverified. Work from the target group's health check outward instead — it's the one call that tells you whether the ALB can even reach anything, before you've spent time confirming a hop that was never in question.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, and where they were actually built</h2>
+    <ul>
+      <li><b>Route 53 alias record.</b> Owns: turning a hostname into the ALB's address, for free, with automatic tracking. Built in <a href="ch53-route-53-dns-and-routing-policies.html">Chapter 53</a>.</li>
+      <li><b>ALB listener, rules, target group.</b> Owns: which target group a request goes to, and which targets in it are currently eligible. Built in <a href="ch52-load-balancing-alb-nlb-target-groups-health.html">Chapter 52</a>.</li>
+      <li><b>Security Groups.</b> Owns: the two independent allow/deny checkpoints — at the ALB's ENI and at the target's ENI. Built in <a href="ch51-vpc-security-security-groups-vs-nacls.html">Chapter 51</a>.</li>
+      <li><b>The VPC CNI / pod ENI.</b> Owns: the pod's real, routable address that an <code>ip</code>-mode target reaches directly. Built in <a href="ch58-vpc-cni-the-deep-one.html">Chapter 58</a>.</li>
+      <li><b>kube-proxy / iptables.</b> Owns: the DNAT decision from a NodePort or ClusterIP to a specific pod, in <code>instance</code> mode only. Built in Part V's Services chapter.</li>
+      <li><b>conntrack.</b> Owns: remembering a DNAT decision so the reply doesn't need kube-proxy to decide again. Native to the Linux network stack.</li>
+      <li><b>The AWS Load Balancer Controller and its IRSA/Pod Identity role.</b> Owns: keeping the target group's membership in sync with pod or node reality in the first place. Built in <a href="ch59-aws-integrations.html">Chapter 59</a>.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following the reply back</h2>
+    <p>The forward trace gets most of the attention; the reply is where the two datapaths actually feel different. In <b>instance mode</b>, the node's kernel made a DNAT decision in step 8 — packets addressed to <code>NodeIP:NodePort</code> got rewritten to a pod's real address. Nothing forces kube-proxy to make that same decision again for the reply: the kernel's <b>connection-tracking table</b> (conntrack) already recorded the mapping when the first packet passed through, so the reply is un-DNAT'd automatically back to look like it came from <code>NodeIP:NodePort</code>, and the ALB's back-end connection sees a normal, consistent conversation. You can watch this table directly on the node with <code>conntrack -L | grep &lt;pod-ip&gt;</code>.</p>
+    <p>In <b>ip mode</b>, there's nothing to reverse in the first place. The ALB's back-end connection went straight to the pod's real VPC IP, so the reply is just an ordinary TCP response leaving that real address, routed by the VPC like any other traffic, arriving back at the ALB's open connection. This is the quieter, and arguably more important, reason <code>ip</code> mode is simpler to reason about under load: there's one fewer piece of kernel state (a conntrack entry) that has to exist, stay correct, and not get evicted under connection-table pressure before the conversation finishes.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>These labs assume the Ingress and controller from <a href="ch59-aws-integrations.html">Chapter 59</a> are already in place. Each one is really a rehearsal of the checklist above under a specific failure.</p>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — run the seven-checkpoint trace on a working request</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Before anything is broken, run every checkpoint once so you know what "healthy" looks like at each hop.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>dig +short app.example.com
+curl -v https://app.example.com/ 2&gt;&amp;1 | grep -E 'Connected|HTTP'
+aws elbv2 describe-target-health --target-group-arn $TG_ARN \
+  --query 'TargetHealthDescriptions[].{id:Target.Id,state:TargetHealth.State}'
+kubectl get endpointslices -l kubernetes.io/service-name=web</code></pre></div>
+        <div class="out"><span class="ol">Output</span>203.0.113.9
+* Connected to app.example.com (203.0.113.9) port 443
+&lt; HTTP/1.1 200
+[ { "id": "10.0.3.14", "state": "healthy" } ]
+NAME           ADDRESSTYPE   PORTS   ENDPOINTS
+web-abcde      IPv4          8080    10.0.3.14</code></div>
+        <p>Four commands, four different layers, all consistent with each other. That consistency — the target ID matching the endpoint IP matching what actually answered — is what you're listing for on every future incident, and this is your baseline for what "matching" looks like.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — compare the two target modes side by side</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Deploy the same app behind two Services, one annotated for <code>ip</code>-mode, one left at the NodePort default, and watch the datapath actually differ.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>aws elbv2 describe-target-health --target-group-arn $TG_IP_ARN \
+  --query 'TargetHealthDescriptions[].Target.Id'
+aws elbv2 describe-target-health --target-group-arn $TG_INSTANCE_ARN \
+  --query 'TargetHealthDescriptions[].Target.Id'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>[ "10.0.3.14" ]
+[ "i-0a1b2c3d4e5f60789" ]</code></div>
+        <p>One target group lists a pod IP; the other lists an EC2 instance ID. Now generate traffic to each and check the node behind the instance-mode target:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>ssh $NODE 'sudo conntrack -L | grep 10.0.3'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>tcp  6 431999 ESTABLISHED src=203.0.113.9 dst=10.0.5.20 dport=31200
+    src=10.0.3.14 dport=8080 [ASSURED]</code></div>
+        <p>That conntrack entry — a NodePort (<code>31200</code>) rewritten to a pod address (<code>10.0.3.14:8080</code>) — only exists for the instance-mode path. Run the same check against the <code>ip</code>-mode target's node and you'll find nothing, because the ALB never touched that node at all.</p>
+      </div>
+    </div>
+
+    <details class="recall"><summary>Think first: why might a platform team standardize on <code>ip</code> mode for every Ingress, even though NodePort mode "also works"?</summary>
+      <div class="body">
+        <p>Fewer moving parts under load. NodePort mode adds a node hop, a kube-proxy DNAT decision, and a conntrack entry that has to survive for the life of the connection — any one of which is one more thing that can be wrong, evicted, or exhausted (conntrack tables have finite size). It also means the ALB's health check is testing a node's proxying behavior rather than the pod directly, so a healthy-looking target can still route to a pod that's actually struggling. <code>ip</code> mode collapses that down to "does the ALB have a direct, working connection to this exact pod" — a strictly more honest signal, with one fewer hop to debug at 3am.</p>
+      </div>
+    </details>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — pull one Security Group rule and watch which checkpoint fails</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Remove the rule that lets the ALB's Security Group reach the pod's container port, and run the checklist top to bottom.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>aws ec2 revoke-security-group-ingress --group-id $POD_SG \
+  --protocol tcp --port 8080 --source-group $ALB_SG
+curl -v https://app.example.com/</code></pre></div>
+        <div class="out"><span class="ol">Output</span>curl: (28) Failed to connect to app.example.com port 443 after 30001 ms: Connection timed out</code></div>
+        <p>DNS clearly worked — you got an IP and attempted a connection. Before revealing, run the checklist yourself: which checkpoint is the first one to show something wrong?</p>
+        <details class="recall"><summary>Reveal which checkpoint catches it</summary>
+          <div class="body">
+            <div class="codewrap"><span class="lang">bash</span><pre><code>aws elbv2 describe-target-health --target-group-arn $TG_ARN \
+  --query 'TargetHealthDescriptions[].TargetHealth'</code></pre></div>
+            <div class="out"><span class="ol">Output</span>[ { "State": "unhealthy", "Reason": "Target.Timeout" } ]</code></div>
+            <p><code>Target.Timeout</code>, not <code>Target.FailedHealthChecks</code> — the health checker sent packets and got silence, which is the fingerprint of a Security Group quietly dropping traffic, not an application actively refusing it. The target group check catches this in one call, well before you'd have needed to inspect the pod, the node, or kube-proxy at all — exactly the bisection this chapter is arguing for. Restore the rule and confirm the target flips back to healthy within a couple of health-check intervals.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — a 504 with every pod reporting Running</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>The ticket: users get 504 Gateway Timeout. <code>kubectl get pods</code> shows everything <code>Running</code> and <code>1/1 Ready</code>. Decide your first three commands before reading on.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>aws elbv2 describe-target-health --target-group-arn $TG_ARN
+kubectl exec debug-pod -- curl -m 3 -w '%{http_code}\n' http://10.0.3.14:8080/</code></pre></div>
+        <div class="out"><span class="ol">Output</span>[ { "Target": {"Id":"10.0.3.14"}, "TargetHealth": {"State":"healthy"} } ]
+000</code></div>
+        <p>The target is marked healthy by the ALB's own check, yet a direct curl to the same pod from inside the cluster times out with no HTTP code at all. Reconcile that contradiction before opening the answer.</p>
+        <details class="recall"><summary>Reveal the reconciliation</summary>
+          <div class="body">
+            <p>"Ready" and "healthy" and "fast enough for this one request" are three different claims. <code>1/1 Ready</code> only reflects the pod's own readiness probe, which usually hits a cheap, dependency-free endpoint. The ALB's health check hits whatever path you configured, on whatever schedule — it can lag reality by up to a full unhealthy-threshold's worth of failed checks before it flips. And a 504 specifically means a target was reached but didn't answer within the ALB's idle timeout — which fits a pod that's technically up and technically passing quick health checks, but is wedged or overloaded on a particular slow code path (a hung downstream call, a lock, a GC pause) that only shows up under the real request, not the health check's lightweight one. The fix here isn't at any of the AWS-layer checkpoints — it's inside the application, and the way you found that out was by noticing the target group said healthy while a real request still failed, which rules out every hop before the pod and points you straight at it.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — it works from the office, not from home</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>Half your users report total failure; the other half say it's fine. Nothing was deployed today. Work out a diagnostic order before opening the answer.</p>
+        <details class="recall"><summary>Reveal the diagnostic order and the likely causes</summary>
+          <div class="body">
+            <p>"Some users, not others" almost always means the split is happening at a layer that treats different clients differently — which rules out the pod and kube-proxy immediately, since neither one knows or cares where a client is connecting from. That leaves two real suspects, and you check them in order of how fast each is to rule out: first, the ALB's own Security Group — is it restricted to specific CIDRs (an office IP range) rather than open to the internet, which would explain "office yes, home no" perfectly and takes one <code>describe-security-groups</code> call to confirm. Second, if the SG is wide open, check target distribution across Availability Zones and cross-zone settings — an uneven or partially-unhealthy target set can make some ALB nodes route successfully while others don't, which correlates with client location only by accident (whichever AZ's node your ISP's routing happens to hit). The Security Group check comes first because it's the deliberate-looking cause and the cheapest to confirm; you'd only move to the AZ/target-distribution theory once you've ruled out something that was configured on purpose to restrict access.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · "the app is down," diagnosed by bisection</div>
+      <p><b>Symptom:</b> a vague report, no clue which of the seven hops is at fault. <b>The order that wastes the least time:</b> start at the target group's health check — it single-handedly confirms or rules out everything from DNS through the Security Group at once. If targets are healthy, the problem is likely inside the app or a downstream dependency (go to the pod). If targets are unhealthy, split further: <code>Target.Timeout</code> points at a Security Group or network path; <code>Target.FailedHealthChecks</code> points at nothing listening on that port; a wrong HTTP status points at the health-check path/matcher. Only after target health is explained should you touch DNS (fast to rule out anyway, do it first if it's free) or the pod directly.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · 504 with healthy-looking pods</div>
+      <p><b>Symptom:</b> Gateway Timeout from the ALB; <code>kubectl get pods</code> shows nothing wrong. <b>First cut:</b> confirm the target group itself reports healthy — if it does, the gap between "passes a lightweight readiness probe" and "answers this specific real request in time" is the actual bug, and it lives in the application or a dependency it calls, not in any AWS-layer checkpoint. <b>Usual cause:</b> a slow code path, a hung downstream call, or resource contention that a cheap health check never exercises.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · works for some clients, not others</div>
+      <p><b>Symptom:</b> failure correlates with the client's network, not with time or deploys. <b>First cut:</b> the ALB's own Security Group — is public access actually as open as you think? <b>Confirm:</b> <code>describe-security-groups</code> on the ALB's ENIs. <b>Usual cause:</b> a CIDR restriction added for a legitimate reason (an office allow-list, a WAF rule) that's now blocking traffic it wasn't meant to.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Keep this checklist somewhere the on-call can find at 3am</b> — a runbook that's just this chapter's seven checkpoints, in order, with the exact command for each, turns a stressful bisection into a mechanical one. <b>Prefer <code>ip</code>-mode targets</b> across the board: fewer hops, a more honest health check, and no dependency on conntrack table capacity holding up under load. <b>Reference Security Groups by ID, not CIDR</b>, wherever the source is another AWS resource (the ALB) rather than a genuine external network — SG-to-SG references survive scaling and IP churn that CIDR rules don't.</p>
+    <p><b>Common mistakes:</b> starting every investigation at the pod, which is the slowest possible entry point into a seven-hop chain; treating a passing readiness probe as proof a pod can handle the real request; forgetting that Security Groups apply at <em>two</em> separate ENIs on the path, not one; and not knowing, off the top of your head, which target mode your own Ingress is even using — that single fact changes which three of the seven checkpoints are relevant at all.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>The method in this chapter — draw the full request path, then bisect it from the middle instead of guessing — is not EKS-specific. It's the same discipline <a href="ch103-the-universal-troubleshooting-framework.html">Chapter 103</a> generalizes to any distributed system, and it's the first thing worth sketching in almost any system-design interview: before you optimize anything, you need the one diagram this chapter just built, because you can't reason about where a request is slow, insecure, or failing until you can point at every hop it takes. The specific insight that the fastest diagnostic isn't always at either end of a chain — it's wherever a single check rules out the most other checks — is a general debugging principle worth carrying into <a href="ch93-the-system-design-method.html">Chapter 93</a> and every incident you'll ever run.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>Describe the path from a browser to a pod on EKS, in one breath.</summary>
+        <div class="a"><p>DNS resolves the hostname to the ALB via a Route 53 alias record; the ALB's listener matches a rule and forwards to a target group; a Security Group is checked at the ALB's own ENI; the target group picks a healthy target, either a pod's real VPC-CNI address directly (ip mode) or a node's NodePort (instance mode); a second Security Group is checked at whichever ENI was targeted; in instance mode, kube-proxy's iptables rules DNAT the packet to a specific pod; and the packet crosses a veth pair into the pod's network namespace to reach the listening container.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk through every hop, and what you'd check to confirm each one.</summary>
+        <div class="a"><p>Start with DNS — dig the hostname and confirm it resolves to the ALB, which costs nothing and takes a second. Then the TLS handshake — curl -v shows whether anything answered on 443 at all. Next the listener's rule evaluation, checkable via describe-rules, though this rarely breaks since it's pure configuration. The most valuable single check comes next: describe-target-health, which tells you in one call whether a healthy target exists at all — if it doesn't, everything downstream is moot, and the failure reason string (Target.Timeout versus FailedHealthChecks versus a bad status code) tells you which specific thing to check next. If a target is healthy, the Security Group at that target's ENI has to allow the ALB's SG on the relevant port — describe-network-interfaces plus describe-security-groups confirms it. In instance mode specifically, kube-proxy's iptables KUBE-SERVICES chain on the node is doing a DNAT to a chosen pod, checkable with iptables -L or just by confirming the right pods appear in the Service's EndpointSlices. Finally, ss -tlnp inside the pod confirms something is actually listening on the expected port. I'd run these roughly in this order, but jump straight to target health first if I'm in a hurry, because it answers the most questions per command.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>How does the datapath differ between an ip-mode target and an instance-mode target, and why does it matter operationally?</summary>
+        <div class="a"><p>In ip mode, the ALB registers pod IPs directly and opens its back-end connection straight to a pod's real VPC-CNI address — there's no NodePort, no kube-proxy DNAT, and no conntrack entry required on any node, because the node was never involved in the forwarding decision at all. In instance mode, the ALB connects to a node's IP on the Service's NodePort, and that node's kube-proxy rewrites the destination to a specific pod via iptables, which means a conntrack entry has to exist and survive for the life of the connection so the reply gets un-DNAT'd correctly. Operationally this matters in three ways: ip mode's health check tests the actual pod, so "healthy" means what you think it means, where instance mode's health check partly tests the node's proxying; ip mode has one fewer hop and no dependency on a node's conntrack table capacity, which matters under high connection churn; and debugging instance-mode failures requires knowing about a layer (kube-proxy, conntrack) that ip mode removes from the picture entirely. That's why ip mode is the modern default and generally the better choice unless you have a specific reason to target instances.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>The ALB returns 504, but every pod looks healthy in kubectl. Where do you look, and in what order?</summary>
+        <div class="a"><p>I'd check the target group's health state first, because it's the fastest way to split the problem in two: if the ALB itself considers the target unhealthy, the issue is somewhere between the ALB and that target — a Security Group, or the health-check configuration — and kubectl's view of the pod is irrelevant to that. If the target is healthy by the ALB's own check, then the gap is between "passes a cheap health check" and "answers a real, possibly slower request within the ALB's idle timeout" — which means the actual problem lives inside the application or something it calls: a slow query, a hung downstream dependency, contention under real load that a lightweight probe never exercises. I'd confirm by hitting the pod directly with something closer to the real request and timing it, rather than trusting that Ready in kubectl says anything about request-level latency, since a readiness probe and a real request are not the same check.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>How does the reply actually get back to the client, and what does conntrack have to do with it?</summary>
+        <div class="a"><p>In ip mode, the reply needs no special handling — the pod's real address sent it, ordinary VPC routing carries it back to the ALB's open back-end connection, and the ALB relays it to the client over the original front-end connection. In instance mode, the forward packet was DNAT'd by kube-proxy from NodeIP:NodePort to a pod's address, and the reply has to be un-DNAT'd back to look like it came from NodeIP:NodePort or the ALB's back-end connection would see an address it never dialed. The Linux kernel's connection-tracking table, conntrack, is what makes that automatic: it recorded the original DNAT mapping when the first packet passed through, so every subsequent packet in that same connection — including the replies — gets translated consistently without kube-proxy having to re-decide anything. It's also why instance mode has a real, finite resource (conntrack table size) that ip mode simply doesn't need to worry about.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>The full path is DNS (Route 53 alias) → ALB listener/rule → target group → Security Group → either a pod's real VPC-CNI address directly (ip mode) or a node's NodePort followed by kube-proxy's iptables DNAT to a pod (instance mode) → the pod's network namespace. Security Groups apply twice: at the ALB's ENI and again at the target's ENI. The single fastest diagnostic is the target group's health state, because it confirms or rules out everything before it in one call — start there, not at the pod. 503 means no healthy target; 504 means a target was reached but didn't answer in time, which usually means the bug is inside the app, not the AWS layers. conntrack is what lets a NodePort's DNAT decision survive for the reply without kube-proxy re-deciding — and it's exactly the piece of state <code>ip</code> mode doesn't need at all.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>The path is: DNS (Route 53) → ALB listener/rule → target group → (pod directly, or node+kube-proxy) → pod network namespace.</li>
+      <li>Route 53 alias records resolve for free and auto-track the target resource's address — check with <code>dig</code> first, it's free and instant.</li>
+      <li>Security Groups are enforced at the ALB's ENI and again at the target's ENI — two separate checkpoints, not one.</li>
+      <li><code>ip</code>-mode targets go straight to a pod's real VPC IP (VPC CNI) — no kube-proxy hop, no NodePort, no extra DNAT.</li>
+      <li><code>instance</code>/NodePort-mode targets hit a node's NodePort, and kube-proxy's iptables rules DNAT the packet to a chosen pod — an extra hop <code>ip</code> mode skips.</li>
+      <li>Target group health checks are the fastest single signal — check them before you check a single pod, because they rule in/out half the path at once.</li>
+      <li>conntrack remembers a NodePort's DNAT decision so replies don't have to be re-decided by kube-proxy on the way back.</li>
+      <li>"Unauthorized" (IAM) and "connection timeout" (network/SG) are different failure families that live at different hops — don't mix up which tool answers which.</li>
+      <li>503 from the ALB means no healthy target; 504 means a target was picked but never answered in time; neither means "the pod crashed" by itself.</li>
+      <li>Bisect the path instead of guessing: check the middle of the chain (target health) first, then narrow toward DNS or toward the pod based on the result.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch43-services-and-the-datapath-pod-to-service.html"><b>Ch 43</b> Services &amp; the datapath</a>
+      <a href="ch44-nodeport-loadbalancer-internet-to-pod.html"><b>Ch 44</b> NodePort &amp; LoadBalancer</a>
+      <a href="ch51-vpc-security-security-groups-vs-nacls.html"><b>Ch 51</b> Security Groups</a>
+      <a href="ch52-load-balancing-alb-nlb-target-groups-health.html"><b>Ch 52</b> Load balancing</a>
+      <a href="ch53-route-53-dns-and-routing-policies.html"><b>Ch 53</b> Route 53</a>
+      <a href="ch58-vpc-cni-the-deep-one.html"><b>Ch 58</b> VPC CNI</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/elasticloadbalancing/latest/userguide/how-elastic-load-balancing-works.html">How Elastic Load Balancing works</a>: target health, listeners, and the request path through the ALB.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resource-record-sets-choosing-alias-non-alias.html">Choosing between alias and non-alias records</a>: how an alias record resolves and tracks its target.</li>
+      <li>Amazon EKS User Guide — <a href="https://docs.aws.amazon.com/eks/latest/userguide/aws-load-balancer-controller.html">Route internet traffic with AWS Load Balancer Controller</a>: <code>ip</code> vs <code>instance</code> target types.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/reference/networking/virtual-ips/">Virtual IPs and Service Proxies</a>: kube-proxy's iptables/IPVS modes and the DNAT path.</li>
+      <li>GitHub — <a href="https://github.com/aws/amazon-vpc-cni-k8s">aws/amazon-vpc-cni-k8s</a>: how a pod's address becomes reachable as a real ENI target.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch59-aws-integrations.html"><span class="dir">← Prev</span><div class="ti">Ch 59 — AWS integrations</div></a>
+      <a class="nx" href="ch61-helm.html"><span class="dir">Next →</span><div class="ti">Ch 61 — Helm</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 60 of 121 · Part VI · AWS &amp; EKS for SREs. EKS is a white box now — every hop has a name and a command. Part VII starts the platform layer built on top of everything you've traced here.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">The whole path</a>
+    <a href="#internals">The forward trace</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">The reply path</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

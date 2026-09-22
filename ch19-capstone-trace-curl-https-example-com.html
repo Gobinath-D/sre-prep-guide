@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 19 — Capstone: curl https://example.com</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part II · Networking &nbsp;·&nbsp; Chapter 19</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part II · Networking from First Principles · Chapter 19</div>
+      <h1>Capstone trace: curl https://example.com</h1>
+      <p class="tagline">One command. Twelve subsystems. You've met each of them alone in Chapters 10–18 — now watch them fire in sequence, in real time, in the order the packets actually leave your NIC. When you can narrate this trace from memory, you understand networking.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~55 min read · strace/tcpdump lab (Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Narrate every stage of an HTTPS request end to end, from process start to connection teardown, without notes.</li>
+          <li>Name the exact command or packet that reveals each stage, and run them yourself.</li>
+          <li>Map each stage back to the chapter that owns it — DNS, sockets, routing, ARP, TCP, TLS, HTTP.</li>
+          <li>Read <code>strace curl</code>, <code>tcpdump</code>, and <code>curl -v</code>/<code>-w</code> together and know which one to reach for.</li>
+          <li>Localise a "the site is slow/broken" report to a single layer in under two minutes using a timing breakdown.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem: the layers only make sense together</h2>
+    <p>You've spent nine chapters taking the network apart. The <a href="ch10-osi-vs-tcp-ip-encapsulation-the-layered.html">layered model</a>, <a href="ch11-l2-ethernet-mac-arp-switching.html">Ethernet and ARP</a>, <a href="ch12-l3-ip-cidr-subnetting-routing-nat.html">IP and routing</a>, <a href="ch13-l4-tcp-deep-and-udp.html">TCP</a>, <a href="ch14-ports-sockets-ephemeral-ports-connection-lifecycle.html">sockets and ports</a>, <a href="ch15-dns-end-to-end.html">DNS</a>, <a href="ch16-http-http-2-http-3-and-grpc.html">HTTP</a>, <a href="ch17-tls-and-pki.html">TLS</a>, and the <a href="ch18-the-linux-network-stack-internals.html">kernel stack</a> that carries all of it. Each was a clean, isolated idea. But nobody runs "a TCP handshake" for its own sake. In production these layers fire together, in a fixed order, in milliseconds — and when something breaks, the symptom ("the site is down") gives you no clue which layer failed.</p>
+    <p>So here's the problem this chapter solves: turning nine separate mental models into <em>one</em>. We take the most ordinary command an SRE runs — <code>curl https://example.com</code> — and follow it all the way down and back up, watching each layer hand off to the next with the actual tool that exposes the handoff. By the end, "the site is slow" stops being a mystery and becomes a decision tree, because you'll know exactly what happens between pressing Enter and seeing the HTML.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>Every distributed-systems failure you'll ever debug is a variation of this one request. A service calling another service does the same DNS lookup, the same routing decision, the same TCP and TLS handshakes, the same HTTP exchange. Master this trace and you've master the shape of <em>all</em> network requests — the only thing that changes is the endpoints.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: posting an international parcel</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Say you want to send a sealed, signed contract to a company overseas and get their signed copy back. You can't just throw it in the air. First you look up their address in a directory — you know the company name, not the street (that's <b>DNS</b>: name → IP). Then you decide which courier and route gets it out of your country — you don't know every road, you just hand it to the right outbound gateway (that's <b>routing</b>: which next hop). To physically hand the parcel to that first courier, you need to find <em>them</em> at the depot — their specific loading bay (that's <b>ARP</b>: next-hop IP → MAC).</p>
+      <p>Before either side sends anything valuable, you open an account with the courier and agree terms — a back-and-forth that both sides confirm (that's the <b>TCP handshake</b>). Because the contract is confidential, you also agree a private seal and check each other's ID against a trusted authority before exchanging anything (that's the <b>TLS handshake</b> and PKI). Only now do you send the actual letter — "please send me your homepage" — and get the reply (that's <b>HTTP</b>). When you're done, you both formally close the account so no charges linger (that's the <b>connection teardown</b>, and the reason <code>TIME_WAIT</code> exists).</p>
+      <p>Every step depends on the one before. Get the address wrong and nothing else happens. Find the depot but the courier never confirms the account, and your letter sits undelivered. That dependency chain is exactly why localising a network failure means walking the stages <em>in order</em>.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In the trace</th><th>Owned by</th></tr>
+      <tr><td>Look up the company's street address</td><td>DNS resolution (name → IP)</td><td><a href="ch15-dns-end-to-end.html">Ch 15</a></td></tr>
+      <tr><td>Choose the outbound gateway/courier</td><td>Routing decision (next hop)</td><td><a href="ch12-l3-ip-cidr-subnetting-routing-nat.html">Ch 12</a></td></tr>
+      <tr><td>Find that courier's loading bay</td><td>ARP for the next-hop MAC</td><td><a href="ch11-l2-ethernet-mac-arp-switching.html">Ch 11</a></td></tr>
+      <tr><td>Open an account, both confirm terms</td><td>TCP three-way handshake</td><td><a href="ch13-l4-tcp-deep-and-udp.html">Ch 13</a></td></tr>
+      <tr><td>Agree a private seal, check IDs</td><td>TLS handshake + certificate validation</td><td><a href="ch17-tls-and-pki.html">Ch 17</a></td></tr>
+      <tr><td>Send the letter, get the reply</td><td>HTTP request / response</td><td><a href="ch16-http-http-2-http-3-and-grpc.html">Ch 16</a></td></tr>
+      <tr><td>Formally close the account</td><td>FIN/ACK teardown, TIME_WAIT</td><td><a href="ch14-ports-sockets-ephemeral-ports-connection-lifecycle.html">Ch 14</a></td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>The whole journey, one diagram</h2>
+    <p>Here is the entire trace as a timeline, top to bottom, with the layer and the owning chapter on the left rail. Read it as time flowing downward; each horizontal arrow is real traffic on the wire.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 760 660" role="img" aria-label="End-to-end timeline of curl https example.com: process start, DNS, socket and routing, ARP, TCP handshake, TLS handshake, HTTP request and response, teardown">
+        <defs>
+          <marker id="mc" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="ms" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+          <marker id="md" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" style="fill:var(--applied)"/></marker>
+          <marker id="mv" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" style="fill:var(--violet)"/></marker>
+        </defs>
+        <!-- lanes -->
+        <rect x="150" y="16" width="150" height="30" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="225" y="36" text-anchor="middle" style="fill:var(--ink);font:700 12.5px sans-serif">curl (client)</text>
+        <rect x="360" y="16" width="120" height="30" rx="8" style="fill:var(--panel);stroke:var(--applied);stroke-width:1.5"/>
+        <text x="420" y="36" text-anchor="middle" style="fill:var(--ink);font:700 12px sans-serif">DNS resolver</text>
+        <rect x="560" y="16" width="180" height="30" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="650" y="36" text-anchor="middle" style="fill:var(--ink);font:700 12px sans-serif">example.com :443</text>
+        <line x1="225" y1="46" x2="225" y2="626" style="stroke:var(--line);stroke-width:2"/>
+        <line x1="420" y1="46" x2="420" y2="180" style="stroke:var(--line);stroke-width:1.5;stroke-dasharray:3 3"/>
+        <line x1="650" y1="46" x2="650" y2="626" style="stroke:var(--line);stroke-width:2"/>
+        <!-- left rail labels -->
+        <text x="12" y="70" style="fill:var(--muted);font:700 10px sans-serif">PROCESS · Ch 1–2</text>
+        <text x="12" y="128" style="fill:var(--applied);font:700 10px sans-serif">DNS · Ch 15</text>
+        <text x="12" y="205" style="fill:var(--muted);font:700 10px sans-serif">L4 socket · Ch 14</text>
+        <text x="12" y="235" style="fill:var(--muted);font:700 10px sans-serif">L3 route · Ch 12</text>
+        <text x="12" y="265" style="fill:var(--muted);font:700 10px sans-serif">L2 ARP · Ch 11</text>
+        <text x="12" y="322" style="fill:var(--accent2);font:700 10px sans-serif">TCP · Ch 13</text>
+        <text x="12" y="430" style="fill:var(--deep);font:700 10px sans-serif">TLS · Ch 17</text>
+        <text x="12" y="520" style="fill:var(--violet);font:700 10px sans-serif">HTTP · Ch 16</text>
+        <text x="12" y="600" style="fill:var(--muted);font:700 10px sans-serif">CLOSE · Ch 14</text>
+        <!-- process start -->
+        <rect x="150" y="56" width="150" height="24" rx="6" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="225" y="72" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">execve · ld.so · parse URL</text>
+        <!-- DNS -->
+        <line x1="225" y1="98" x2="418" y2="108" style="stroke:var(--applied);stroke-width:2" marker-end="url(#md)"/>
+        <text x="238" y="94" style="fill:var(--applied);font:600 10.5px sans-serif">A/AAAA? example.com (UDP 53)</text>
+        <line x1="418" y1="128" x2="227" y2="138" style="stroke:var(--applied);stroke-width:2" marker-end="url(#md)"/>
+        <text x="238" y="152" style="fill:var(--applied);font:600 10.5px sans-serif">104.20.23.154 (Cloudflare, low TTL)</text>
+        <!-- socket + route + arp (client-side box) -->
+        <rect x="150" y="188" width="150" height="86" rx="6" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="225" y="206" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">socket(AF_INET,STREAM)</text>
+        <text x="225" y="224" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">ip route get → via gateway</text>
+        <text x="225" y="242" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">ARP: who-has gateway?</text>
+        <text x="225" y="260" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">→ next-hop MAC cached</text>
+        <!-- TCP -->
+        <line x1="225" y1="292" x2="648" y2="300" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#ms)"/>
+        <text x="235" y="288" style="fill:var(--accent2);font:600 10.5px sans-serif">SYN</text>
+        <line x1="648" y1="318" x2="227" y2="326" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#ms)"/>
+        <text x="645" y="314" text-anchor="end" style="fill:var(--accent2);font:600 10.5px sans-serif">SYN, ACK</text>
+        <line x1="225" y1="344" x2="648" y2="352" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#ms)"/>
+        <text x="235" y="340" style="fill:var(--accent2);font:600 10.5px sans-serif">ACK &nbsp;— connection ESTABLISHED (1 RTT)</text>
+        <!-- TLS -->
+        <line x1="225" y1="382" x2="648" y2="390" style="stroke:var(--deep);stroke-width:2" marker-end="url(#mc)"/>
+        <text x="235" y="378" style="fill:var(--deep);font:600 10.5px sans-serif">ClientHello (SNI=example.com, ALPN h2)</text>
+        <line x1="648" y1="408" x2="227" y2="416" style="stroke:var(--deep);stroke-width:2" marker-end="url(#mc)"/>
+        <text x="645" y="404" text-anchor="end" style="fill:var(--deep);font:600 10.5px sans-serif">ServerHello · Certificate · Finished</text>
+        <line x1="225" y1="434" x2="648" y2="442" style="stroke:var(--deep);stroke-width:2" marker-end="url(#mc)"/>
+        <text x="235" y="430" style="fill:var(--deep);font:600 10.5px sans-serif">Finished — validate chain (1 RTT)</text>
+        <!-- HTTP -->
+        <line x1="225" y1="480" x2="648" y2="488" style="stroke:var(--violet);stroke-width:2.4" marker-end="url(#mv)"/>
+        <text x="235" y="476" style="fill:var(--violet);font:700 10.5px sans-serif">GET / HTTP/2 &nbsp;:authority example.com</text>
+        <line x1="648" y1="506" x2="227" y2="514" style="stroke:var(--violet);stroke-width:2.4" marker-end="url(#mv)"/>
+        <text x="645" y="502" text-anchor="end" style="fill:var(--violet);font:700 10.5px sans-serif">HTTP/2 200 · &lt;html&gt;…</text>
+        <!-- server think -->
+        <rect x="560" y="524" width="180" height="20" rx="5" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="650" y="538" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">server routes request → renders</text>
+        <!-- teardown -->
+        <line x1="225" y1="566" x2="648" y2="572" style="stroke:var(--muted);stroke-width:1.6" marker-end="url(#mc)"/>
+        <text x="235" y="562" style="fill:var(--muted);font:600 10.5px sans-serif">FIN, ACK</text>
+        <line x1="648" y1="588" x2="227" y2="594" style="stroke:var(--muted);stroke-width:1.6" marker-end="url(#ms)"/>
+        <text x="645" y="584" text-anchor="end" style="fill:var(--muted);font:600 10.5px sans-serif">FIN, ACK → client TIME_WAIT</text>
+        <text x="150" y="622" style="fill:var(--muted);font:11px sans-serif">Each arrow is a packet you can see with tcpdump; each phase is a syscall you can see with strace.</text>
+      </svg>
+      <figcaption>The complete request. DNS is a side-trip to a different server; everything else is one conversation with example.com. The two "1 RTT" markers are why a fresh HTTPS connection costs at least three round trips before the first byte of HTML.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>Count the round trips in that diagram: one for DNS (if uncached), one for TCP, one for the TLS 1.3 handshake — <em>then</em> the request. For a user 100&nbsp;ms away that's ~300&nbsp;ms of pure overhead before a single byte of content. This is the entire reason connection reuse, keep-alive, session resumption, and CDNs exist, and why "just add a retry" sometimes makes latency worse. You can't reason about any of it until you can see all the round trips at once.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>The twelve stages, and the tool that reveals each</h2>
+    <p>Here is the full journey. For every stage: what happens, and the exact command or packet that shows it to you.</p>
+    <ol class="steps">
+      <li><b>Process start.</b> Your shell <code>fork()</code>s and <code>execve()</code>s <code>curl</code>; the dynamic linker (<code>ld.so</code>) maps libc and libcurl; curl parses the URL into scheme <code>https</code>, host <code>example.com</code>, port 443, path <code>/</code>. <b>Reveal:</b> <code>strace -f curl ...</code> — the opening <code>execve</code>, <code>openat</code>, and <code>mmap</code> lines (<a href="ch01-kernel-and-system-calls.html">Ch 1</a>).</li>
+      <li><b>DNS resolution.</b> curl calls <code>getaddrinfo("example.com")</code>. libc reads <code>/etc/nsswitch.conf</code> to learn the lookup order, checks <code>/etc/hosts</code>, then reads <code>/etc/resolv.conf</code> for the resolver and sends a UDP query to port 53. The resolver returns A and AAAA records. <b>Reveal:</b> in strace, the <code>openat</code> of those files then a <code>socket(AF_INET, SOCK_DGRAM)</code> + <code>connect(...:53)</code>; on the wire, <code>tcpdump -n port 53</code> (<a href="ch15-dns-end-to-end.html">Ch 15</a>).</li>
+      <li><b>Address selection.</b> With both an A and AAAA answer, curl picks one (Happy Eyeballs: it may race IPv6 and IPv4 and take whichever connects first). Say it picks <code>104.20.23.154</code>. <b>Reveal:</b> <code>curl -v</code> prints <code>* Trying 104.20.23.154:443...</code>.</li>
+      <li><b>Socket creation.</b> curl calls <code>socket(AF_INET, SOCK_STREAM, 0)</code> to get a TCP socket — a file descriptor it will <code>connect()</code>, <code>write()</code>, and <code>read()</code> like any other fd. <b>Reveal:</b> strace shows the <code>socket()</code> returning an fd (<a href="ch14-ports-sockets-ephemeral-ports-connection-lifecycle.html">Ch 14</a>).</li>
+      <li><b>Routing decision.</b> Before a SYN can leave, the kernel asks: how do I reach <code>104.20.23.154</code>? It consults the routing table. The destination isn't on any local subnet, so it matches the default route and the next hop is the gateway. <b>Reveal:</b> <code>ip route get 104.20.23.154</code> prints the chosen source IP, device, and gateway (<a href="ch12-l3-ip-cidr-subnetting-routing-nat.html">Ch 12</a>).</li>
+      <li><b>ARP for the next hop.</b> To build the Ethernet frame the kernel needs the gateway's MAC. If it's not cached, it broadcasts an ARP request ("who has 192.168.1.1?") and caches the reply. Note: it resolves the MAC of the <em>gateway</em>, not of example.com — L2 only ever reaches the next hop. <b>Reveal:</b> <code>ip neigh</code> shows the cached MAC; <code>tcpdump -n arp</code> shows the request/reply (<a href="ch11-l2-ethernet-mac-arp-switching.html">Ch 11</a>).</li>
+      <li><b>TCP three-way handshake.</b> The kernel sends <code>SYN</code>, gets <code>SYN,ACK</code>, sends <code>ACK</code>; <code>connect()</code> returns and the socket is ESTABLISHED. One round trip. <b>Reveal:</b> <code>tcpdump</code> shows <code>Flags [S]</code>, <code>[S.]</code>, <code>[.]</code>; <code>ss -tan</code> shows the state (<a href="ch13-l4-tcp-deep-and-udp.html">Ch 13</a>). This whole exchange rides through the netfilter hooks of <a href="ch18-the-linux-network-stack-internals.html">Ch 18</a>.</li>
+      <li><b>TLS handshake.</b> Over the now-open stream, curl sends a <code>ClientHello</code> with <code>SNI=example.com</code>, ALPN offering <code>h2,http/1.1</code>, and a key_share. The server replies with ServerHello, its certificate chain, CertificateVerify, and Finished; curl validates the chain to a root in its trust store, checks the SAN and dates, and sends Finished. One round trip in TLS 1.3. <b>Reveal:</b> <code>curl -v</code> narrates each <code>TLS handshake, ClientHello (1)</code> line and prints the negotiated version and cipher (<a href="ch17-tls-and-pki.html">Ch 17</a>).</li>
+      <li><b>Application protocol chosen.</b> ALPN resolved to <code>h2</code>, so curl speaks HTTP/2. <b>Reveal:</b> <code>curl -v</code> prints <code>* ALPN: server accepted h2</code> (<a href="ch16-http-http-2-http-3-and-grpc.html">Ch 16</a>).</li>
+      <li><b>HTTP request.</b> curl sends the request headers — for HTTP/2 as a HEADERS frame with <code>:method GET</code>, <code>:authority example.com</code>, <code>:path /</code> — encrypted inside TLS records. <b>Reveal:</b> strace shows a <code>sendto()</code> (opaque ciphertext for HTTPS); <code>curl -v</code> prints the <code>&gt; GET /</code> lines it sent in the clear before encryption.</li>
+      <li><b>Server processing and response.</b> The server routes the request, renders, and streams back <code>HTTP/2 200</code> with headers and the HTML body. <b>Reveal:</b> <code>recvfrom()</code> in strace; <code>&lt; HTTP/2 200</code> in <code>curl -v</code>; the body on stdout.</li>
+      <li><b>Teardown.</b> curl is done, so it <code>close()</code>s the socket. TCP exchanges <code>FIN/ACK</code> both ways; the side that closed first sits in <code>TIME_WAIT</code> for a couple of minutes to absorb stray packets. <b>Reveal:</b> <code>tcpdump</code> shows the <code>[F.]</code> flags; <code>ss -tan</code> shows <code>TIME-WAIT</code> (<a href="ch14-ports-sockets-ephemeral-ports-connection-lifecycle.html">Ch 14</a>).</li>
+    </ol>
+    <div class="box keypoint"><div class="h">The dependency chain is the debugging order</div>
+      <p>Stages 2→7→8 are strictly sequential: no DNS answer, no SYN; no ESTABLISHED socket, no TLS; no TLS, no HTTP. That's why you localise a failure by walking the stages in order and stopping at the first one that fails. A slow or failed request is <em>always</em> one specific stage, and the timing breakdown in Lab 5 tells you which in one command.</p>
+    </div>
+
+    <h2 id="components"><span class="beat">Components</span>The actors involved</h2>
+    <ul>
+      <li><b>curl</b> — the user-space process driving the whole thing, making syscalls.</li>
+      <li><b>libc's resolver (getaddrinfo)</b> — turns the name into addresses using nsswitch, hosts, and resolv.conf.</li>
+      <li><b>The DNS resolver</b> — a separate server (your router, systemd-resolved on <code>127.0.0.53</code>, or a public resolver) that answers the query. A different endpoint from the web server.</li>
+      <li><b>The kernel socket + TCP/IP stack</b> — creates the socket, makes the routing decision, runs the handshake, moves bytes, and runs it all through the netfilter hooks.</li>
+      <li><b>The routing table and neighbour (ARP) cache</b> — decide the next hop and its MAC.</li>
+      <li><b>The NIC and everything past it</b> — the gateway, the internet, and finally the web server (here, Cloudflare's edge serving example.com).</li>
+      <li><b>The web server</b> — terminates TLS, speaks HTTP, and returns the response.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>The whole thing in one breath</h2>
+    <p>curl starts, parses the URL, and asks libc to resolve <code>example.com</code>; libc checks nsswitch and hosts, then fires a UDP query to the resolver in resolv.conf and gets back <code>104.20.23.154</code>. curl opens a TCP socket; the kernel checks the routing table, finds the default gateway is the next hop, ARPs for the gateway's MAC, and sends a SYN. After SYN/SYN-ACK/ACK the socket is established. curl runs a TLS 1.3 handshake over it — ClientHello with SNI and ALPN, server certificate validated to a trusted root — then sends an HTTP/2 GET inside encrypted records. The server returns <code>200</code> and the HTML. curl prints the body and closes the socket, leaving it in TIME_WAIT. Three round trips of setup (DNS, TCP, TLS), one for the request, done. Now let's watch it happen.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>Run everything in a container so the syscalls and packets are yours to watch. Give it <code>SYS_PTRACE</code> for strace and <code>NET_ADMIN</code>/<code>NET_RAW</code> for tcpdump:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>docker run --rm -it --cap-add=SYS_PTRACE --cap-add=NET_ADMIN --cap-add=NET_RAW ubuntu:24.04 bash
+apt-get update &amp;&amp; apt-get install -y curl strace tcpdump dnsutils iproute2</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — strace the whole request and read the syscalls</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p><code>strace</code> shows the request as the kernel sees it. Filter to the network-relevant calls so the DNS → socket → connect → send → recv sequence stands out:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>strace -f -e trace=openat,socket,connect,sendto,recvfrom -s 80 curl -s https://example.com -o /dev/null</code></pre></div>
+        <p>First you'll see the DNS resolver consult its files, then reach for a UDP socket to port 53 — this is stages 1–2, exactly:</p>
+        <div class="out"><span class="ol">Output — the DNS resolution (real, trimmed)</span>openat(AT_FDCWD, "/etc/host.conf", O_RDONLY|O_CLOEXEC) = 3
+openat(AT_FDCWD, "/etc/resolv.conf", O_RDONLY|O_CLOEXEC) = 3
+connect(3, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory)
+openat(AT_FDCWD, "/etc/nsswitch.conf", O_RDONLY|O_CLOEXEC) = 3
+openat(AT_FDCWD, "/etc/hosts", O_RDONLY|O_CLOEXEC) = 3
+socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, IPPROTO_IP) = 3
+connect(3, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("127.0.0.53")}, 16) = 0</code></div>
+        <p>Read it as the resolver's decision process: check <code>nsswitch.conf</code> for order, try the caching daemon (nscd, absent here → <code>ENOENT</code>), read <code>/etc/hosts</code>, then open a UDP socket and <code>connect</code> it to the resolver from <code>resolv.conf</code> on port 53. That's <a href="ch15-dns-end-to-end.html">Chapter 15</a> in six lines. Then comes the TCP socket for the actual request and the payload — this is the same real trace against a plain HTTP server, so you can see the cleartext GET (with HTTPS the bytes are encrypted, but the syscalls are identical):</p>
+        <div class="out"><span class="ol">Output — the TCP socket &amp; HTTP (real, from an http:// fetch)</span>socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 5
+connect(5, {sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr("...")}, 16) = -1 EINPROGRESS (Operation now in progress)
+sendto(5, "GET / HTTP/1.1\r\nHost: example.com\r\nUser-Agent: curl/8.5.0\r\n..."..., 78, MSG_NOSIGNAL, NULL, 0) = 78
+recvfrom(5, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n..."..., 102400, 0, NULL, NULL) = 724</code></div>
+        <p><code>connect</code> returns <code>EINPROGRESS</code> because curl uses a non-blocking socket and waits with <code>poll</code>/<code>epoll</code> — normal. Then one <code>sendto</code> carries the request and <code>recvfrom</code> receives the response. Socket → connect → send → receive: the L4 lifecycle from <a href="ch14-ports-sockets-ephemeral-ports-connection-lifecycle.html">Chapter 14</a>, live.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — curl -v narrates the layers</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p><code>curl -v</code> is the fastest way to see DNS → TCP → TLS → HTTP as labelled English. Run it and match every line to a stage above:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>curl -v https://example.com -o /dev/null</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed &amp; annotated)</span>* Host example.com:443 was resolved.
+* IPv4: 104.20.23.154, 172.66.147.243            <span class="c"># stage 2–3: DNS + selection</span>
+*   Trying 104.20.23.154:443...
+* Connected to example.com (104.20.23.154) port 443   <span class="c"># stage 5–7: routing + TCP</span>
+* ALPN: curl offers h2,http/1.1
+* TLSv1.3 (OUT), TLS handshake, ClientHello (1):   <span class="c"># stage 8: TLS</span>
+* TLSv1.3 (IN), TLS handshake, ServerHello (2):
+* SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384
+* Server certificate: subject: CN=example.com
+* ALPN: server accepted h2                          <span class="c"># stage 9: HTTP/2 chosen</span>
+&gt; GET / HTTP/2                                       <span class="c"># stage 10: request</span>
+&gt; Host: example.com
+&lt; HTTP/2 200                                         <span class="c"># stage 11: response</span></code></div>
+        <p>Every line here is a stage from the diagram, printed in order. When you're triaging, <code>curl -v</code> is the first thing to run — it tells you how far the request got before it failed.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Understand — tcpdump the packets alongside curl</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Now watch the wire. Run tcpdump in one shell and curl in another so you see the actual packets: DNS query, the TCP handshake, then the encrypted TLS/HTTP records.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># shell 1 — capture DNS and the connection to example.com</span>
+tcpdump -n -i any '(port 53) or host 104.20.23.154' &amp;
+<span class="c"># shell 2</span>
+curl -s https://example.com -o /dev/null</code></pre></div>
+        <div class="out"><span class="ol">Output (representative)</span>IP host.42311 &gt; 127.0.0.53.53: A? example.com. (29)            <span class="c"># DNS query</span>
+IP 127.0.0.53.53 &gt; host.42311: 1 1/0/0 A 104.20.23.154 (45)   <span class="c"># DNS answer</span>
+IP host.52134 &gt; 104.20.23.154.443: Flags [S], seq 12..        <span class="c"># SYN</span>
+IP 104.20.23.154.443 &gt; host.52134: Flags [S.], seq 88.., ack  <span class="c"># SYN,ACK</span>
+IP host.52134 &gt; 104.20.23.154.443: Flags [.], ack 1           <span class="c"># ACK — established</span>
+IP host.52134 &gt; 104.20.23.154.443: Flags [P.], length 517     <span class="c"># ClientHello (TLS)</span>
+IP 104.20.23.154.443 &gt; host.52134: Flags [P.], length 1462    <span class="c"># ServerHello + cert</span>
+...
+IP host.52134 &gt; 104.20.23.154.443: Flags [F.], ...            <span class="c"># teardown</span></code></div>
+        <p>The <code>[S]</code>, <code>[S.]</code>, <code>[.]</code> sequence is the three-way handshake from <a href="ch13-l4-tcp-deep-and-udp.html">Chapter 13</a>. After it, everything is <code>[P.]</code> (data) and you can't read it — that's TLS doing its job. tcpdump shows you <em>that</em> packets flow and their timing, even when it can't show you <em>what's</em> inside. Note the source port (<code>52134</code>) is an ephemeral port the kernel picked (<a href="ch14-ports-sockets-ephemeral-ports-connection-lifecycle.html">Chapter 14</a>).</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Break — three different failures, same command</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>The whole point of the trace is that different failures stop at different stages. Reproduce three and learn to tell them apart <em>before</em> reading the cause:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>curl -v https://nonexistent.invalid          <span class="c"># A</span>
+curl -v --connect-timeout 3 https://10.255.255.1   <span class="c"># B (unroutable / no reply)</span>
+curl -v https://expired.badssl.com           <span class="c"># C (needs internet)</span></code></pre></div>
+        <div class="out"><span class="ol">Output — the first line of each failure</span>A:  curl: (6) Could not resolve host: nonexistent.invalid
+B:  curl: (28) Failed to connect ... Connection timed out after 3000 ms
+C:  curl: (60) SSL certificate problem: certificate has expired</code></div>
+        <p>Three exit codes, three different stages. Before you read on: which stage did each stop at, and how would <code>curl -v</code> confirm it? Think it through.</p>
+        <details class="recall"><summary>Reveal — the diagnosis for each</summary>
+          <div class="body">
+            <p><b>A (exit 6)</b> failed at <b>stage 2, DNS</b> — the name never resolved, so no socket was even created. In <code>curl -v</code> you'd see it stop right after "Host ... was resolved" fails; nothing about "Trying" or "Connected." <b>B (exit 28)</b> resolved fine and got to <b>stage 7, the TCP handshake</b>: it printed "Trying 10.255.255.1:443..." and then hung — the SYN went out and no SYN-ACK came back (a silent drop by a firewall or a dead host). A connection <em>refused</em> would be instant (RST); a <em>timeout</em> means the packet vanished. <b>C (exit 60)</b> completed DNS, TCP, and reached <b>stage 8, TLS</b>, where certificate validation failed — you'd see the ClientHello/ServerHello lines and then the cert error. Same command, and the stage it dies at names the layer. This is the reflex Chapter 20 turns into a full toolkit.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — "the site is slow." Which layer?</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>"Slow" is useless until you attribute the milliseconds to a stage. curl's <code>-w</code> flag prints a timing breakdown that maps one-to-one onto the diagram — this single command is how a senior localises latency instantly.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>curl -w 'dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total}\n' \
+  -s -o /dev/null https://example.com</code></pre></div>
+        <div class="out"><span class="ol">Output (example)</span>dns=0.084 connect=0.121 tls=0.204 ttfb=0.336 total=0.340</code></div>
+        <p>These are cumulative seconds from the start. The senior skill is reading the <em>gaps</em>: DNS took 84&nbsp;ms; the TCP handshake added <code>connect − dns</code> = 37&nbsp;ms; the TLS handshake added <code>tls − connect</code> = 83&nbsp;ms; the server's think time was <code>ttfb − tls</code> = 132&nbsp;ms. The challenge: three services each report "slow," with these breakdowns — service X has <code>dns=1.9</code>, service Y has <code>connect=2.0</code> but tiny DNS, service Z has <code>ttfb=3.0</code> but tiny everything-else. What's wrong with each, and where do you look? Decide before revealing.</p>
+        <details class="recall"><summary>Reveal — attributing each</summary>
+          <div class="body">
+            <p><b>X (dns=1.9s):</b> DNS is slow — a failing or far-away resolver, or a record with a tiny TTL causing constant re-lookups. Look at <code>/etc/resolv.conf</code>, the resolver's health, and whether a cache (systemd-resolved, nscd, or a CoreDNS pod in-cluster) is doing its job. <b>Y (connect=2.0s, dns small):</b> the TCP handshake is slow — SYNs are being dropped and retransmitted (a saturated path, a firewall doing SYN-cookie games, or an overloaded server backlog), because a healthy handshake is one RTT. Capture with tcpdump and look for retransmitted <code>[S]</code>. <b>Z (ttfb=3.0s, rest small):</b> the network is fine; the <em>server</em> is slow to produce the first byte — a slow query, a cold cache, GC pause, or a downstream dependency. This is an application problem, not a network one, and no amount of network tuning fixes it. The lesson: the breakdown tells you which team's problem it is before you've opened a single dashboard. This is exactly the reasoning the <a href="ch20-the-network-troubleshooting-toolkit.html">next chapter</a> systematises.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · "half our requests are slow"</div>
+      <p><b>Symptom:</b> intermittent latency with no obvious pattern. <b>First cut:</b> run <code>curl -w</code> repeatedly and watch which phase varies. <b>Confirm:</b> if <code>time_namelookup</code> spikes on some runs, it's DNS (a flaky resolver in the pool); if <code>time_connect</code> spikes, it's packet loss causing SYN retransmits; if only <code>time_starttransfer</code> spikes, it's the server. <b>Cause is usually:</b> one bad resolver, one lossy path/AZ, or one slow backend — the breakdown tells you which without guessing.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · "connection refused vs timeout"</div>
+      <p><b>Symptom:</b> curl fails to connect. <b>First cut:</b> is it instant or does it hang? <b>Confirm:</b> instant "Connection refused" (exit 7) means the SYN reached a host that sent back a RST — something's there but nothing is listening on that port. A hang then "timed out" (exit 28) means the SYN got no reply at all — a firewall drop or a black-holed route. <b>Cause:</b> refused → wrong port / crashed service / not started; timeout → firewall, security group, or routing. These two feel identical to users and are opposite problems; the distinction is stage 7 behaviour.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · "works from my laptop, fails from the pod"</div>
+      <p><b>Symptom:</b> the same curl succeeds from one place and fails from another. <b>First cut:</b> run the identical <code>curl -v</code> from both and diff where they diverge. <b>Confirm:</b> different resolved IPs (split-horizon DNS), a TLS failure only from the pod (missing CA bundle in the image), or a connect timeout only from the pod (NetworkPolicy or security group). <b>Cause:</b> the environment differs at exactly one stage — and the trace shows which.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Every round trip is latency you pay per connection.</b> DNS, TCP, and TLS are three round trips of setup before the first request. That's why production clients <em>reuse</em> connections (HTTP keep-alive, HTTP/2 multiplexing, connection pools) so those three round trips are amortised over thousands of requests, and why CDNs put the TLS-terminating edge physically close to users to shrink each RTT. It's also why "add a retry" can backfire: a retry that opens a fresh connection re-pays all three handshakes.</p>
+    <p><b>Caching hides stages, which is good until it's stale.</b> A warm DNS cache skips stage 2; a resumed TLS session skips most of stage 8; a pooled connection skips 5–8 entirely. Great for latency — but it means a DNS change, a cert rotation, or a moved backend can take effect at wildly different times for different clients. When "it updated for me but not for them," a cache somewhere is holding an old stage-2 or stage-8 result.</p>
+    <p><b>Security lives at stages 2 and 8.</b> DNS is the soft underbelly — poison a resolver and stage 2 hands out an attacker's IP, and every later stage happily connects to it (which is what DNSSEC and DoH address). TLS at stage 8 is what makes stage-2 hijacking survivable: even if you connect to the wrong IP, certificate validation should fail. This is exactly why disabling verification (<code>curl -k</code>) is so dangerous — it removes the one check that catches a mis-resolved or intercepted connection. <b>Common mistakes:</b> reading a timeout as "server down" when it's a dropped SYN; blaming the network for a slow <code>ttfb</code> that's really the app; and assuming a browser's success proves the path works when it's using a cached everything.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>This single trace is the latency budget you design systems around. When you place a CDN or edge, you're cutting the RTT on stages 5–8 for distant users. When you choose connection pooling or a service mesh with persistent mTLS connections, you're amortising the three setup round trips across many requests (<a href="ch66-service-mesh-foundations.html">Chapter 66</a>). When you design a multi-region system, DNS-based routing (stage 2) is how you send users to the nearest healthy region, and its TTL is how fast you can fail over (<a href="ch53-route-53-dns-and-routing-policies.html">Chapter 53</a>). The end-to-end AWS synthesis in <a href="ch60-end-to-end-synthesis-internet-to-alb.html">Chapter 60</a> is literally this trace with an ALB, target group, and pod substituted for the single server — same stages, more hops. Every building block in <a href="ch94-building-blocks.html">Chapter 94</a> is a way to make one of these stages faster, cheaper, or more reliable.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>The classic "what happens when you type a URL and press Enter?" is this chapter. Answer each before opening.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What happens when you run <code>curl https://example.com</code>?</summary>
+        <div class="a"><p>curl parses the URL, then resolves <code>example.com</code> to an IP via DNS. The kernel makes a routing decision to find the next hop, ARPs for its MAC, and opens a TCP connection with a three-way handshake. Over that connection curl runs a TLS handshake — sending SNI and ALPN, validating the server's certificate against a trusted root — then sends an HTTP request inside encrypted records. The server returns the response, curl prints it, and the connection is torn down with FIN/ACK, leaving the client end in TIME_WAIT. DNS, TCP, and TLS are three round trips of setup before the request even goes out.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through the same command in full detail.</summary>
+        <div class="a"><p>The shell execs curl, which parses out scheme, host, and port. curl calls getaddrinfo, so libc reads nsswitch.conf for order, checks /etc/hosts, then queries the resolver from resolv.conf over UDP port 53 and gets back A and AAAA records; it selects one, possibly racing v6 and v4. It creates a TCP socket. Before the SYN leaves, the kernel consults the routing table — example.com isn't local, so the next hop is the default gateway — and resolves the gateway's MAC via ARP if it's not cached. Then the three-way handshake: SYN, SYN-ACK, ACK, and connect() returns. Over the established stream curl sends a TLS 1.3 ClientHello with SNI=example.com, ALPN offering h2, and a key_share; the server replies with ServerHello, its certificate chain, CertificateVerify, and Finished; curl builds the chain to a trusted root, checks the SAN and validity, and sends its Finished — one round trip. ALPN chose h2, so curl sends an HTTP/2 GET encrypted inside TLS records. The server returns 200 and the body. curl closes the socket; TCP does FIN/ACK both ways and the closing side sits in TIME_WAIT. I can see the syscalls with strace, the packets with tcpdump, and the labelled stages with curl -v.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>The command hangs for 30 seconds then fails. How do you find out where?</summary>
+        <div class="a"><p>A long hang points at a stage that waits on a network reply that never comes — most likely DNS or the TCP handshake, since those are the ones that block. I'd run <code>curl -v</code> and watch how far it gets: if it hangs before "Trying," DNS is timing out (a dead or unreachable resolver); if it prints "Trying &lt;ip&gt;" and then hangs, the SYN is going unanswered — a dropped packet, a firewall black hole, or a host that isn't there — which is different from an instant "Connection refused" that would mean a RST from a live host with nothing listening. To confirm, <code>curl -w</code> shows whether <code>time_namelookup</code> or <code>time_connect</code> is where the seconds go, and tcpdump shows whether SYNs are being retransmitted with no reply. The 30-second figure itself is a clue — it's near default connect/DNS timeouts. The method is always the same: walk the stages in order and stop at the first that doesn't complete.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>DNS resolves to the right IP, TCP connects, but TLS fails. What are the possibilities?</summary>
+        <div class="a"><p>Getting to TLS means stages 1–7 are healthy, so it's a certificate or handshake problem. The usual causes: an expired certificate; an incomplete chain (server didn't send the intermediate, so curl can't build a path to a root even though a browser could); a hostname mismatch (the name I asked for isn't in the cert's SAN, or I didn't send SNI and got the wrong default cert); a protocol/cipher mismatch (client and server share no common TLS version or suite); or a missing CA bundle on the client side, common in minimal container images. I'd confirm with <code>openssl s_client -connect host:443 -servername host</code> to see the chain, dates, and negotiated version directly. Each of these is a distinct fix, and they all present as "TLS failed" until you look — which is why stage 8 has its own diagnostic command from Chapter 17.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>How does this trace change for a service calling another service inside Kubernetes?</summary>
+        <div class="a"><p>The shape is identical; the endpoints and hops change. DNS resolves a Service name via CoreDNS instead of a public resolver. The routing decision and ARP happen inside the node's network namespace and across the pod bridge or CNI overlay from Chapter 18, and the Service IP gets DNAT'd by kube-proxy to a real pod IP. The TCP handshake is pod-to-pod. If there's a service mesh, the TLS handshake is mutual — both sides present workload certificates — and the connection is long-lived and pooled by the sidecars, so those setup round trips are paid once, not per request. Then it's the same HTTP exchange. So everything I described still happens; it just happens between two pods with a couple of extra NAT and policy hops, which is why the same debugging order — resolve, connect, handshake, request — works there too.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p><code>curl https://example.com</code> touches every layer in order. The process starts and parses the URL; DNS resolves the name to an IP via nsswitch/hosts/resolv.conf over UDP 53; curl opens a TCP socket; the kernel makes a routing decision (next hop = gateway) and ARPs for its MAC; the TCP three-way handshake establishes the connection; a TLS 1.3 handshake exchanges keys and validates the certificate; ALPN picks HTTP/2; curl sends the request and reads the response inside encrypted records; the socket is closed with FIN/ACK and sits in TIME_WAIT. DNS, TCP, and TLS are three sequential round trips before the request. You see the syscalls with <code>strace</code>, the packets with <code>tcpdump</code>, the labelled stages with <code>curl -v</code>, and the latency per stage with <code>curl -w</code>. Because the stages are strictly ordered, you localise any failure by walking them and stopping at the first that breaks.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>The order is fixed: process → DNS → socket → route → ARP → TCP → TLS → HTTP → teardown.</li>
+      <li>DNS is a side-trip to a different server (UDP 53) and must finish before any SYN goes out.</li>
+      <li>The routing decision picks the next hop; ARP resolves the <em>gateway's</em> MAC, not the server's.</li>
+      <li>DNS, TCP, and TLS are three round trips of setup — the reason keep-alive, pooling, and CDNs exist.</li>
+      <li><code>strace</code> shows syscalls, <code>tcpdump</code> shows packets, <code>curl -v</code> shows labelled stages, <code>curl -w</code> shows per-stage timing.</li>
+      <li>Failures stop at a stage: DNS (exit 6), connect timeout (28), refused (7), TLS (60) — the exit code names the layer.</li>
+      <li>"Refused" (instant RST) and "timeout" (silent drop) feel the same to users but are opposite problems.</li>
+      <li>Read <code>curl -w</code> as gaps: dns, connect−dns, tls−connect, ttfb−tls attribute the milliseconds.</li>
+      <li>A slow <code>ttfb</code> with fast setup is the server's problem, not the network's.</li>
+      <li>A service-to-service call in Kubernetes is this exact trace with extra NAT, policy, and mTLS hops.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Synthesises:</span>
+      <a href="ch11-l2-ethernet-mac-arp-switching.html"><b>Ch 11</b> ARP</a>
+      <a href="ch12-l3-ip-cidr-subnetting-routing-nat.html"><b>Ch 12</b> Routing</a>
+      <a href="ch13-l4-tcp-deep-and-udp.html"><b>Ch 13</b> TCP</a>
+      <a href="ch14-ports-sockets-ephemeral-ports-connection-lifecycle.html"><b>Ch 14</b> Sockets</a>
+      <a href="ch15-dns-end-to-end.html"><b>Ch 15</b> DNS</a>
+      <a href="ch16-http-http-2-http-3-and-grpc.html"><b>Ch 16</b> HTTP</a>
+      <a href="ch17-tls-and-pki.html"><b>Ch 17</b> TLS</a>
+      <a href="ch20-the-network-troubleshooting-toolkit.html"><b>Ch 20</b> The toolkit</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>The curl project — <a href="https://everything.curl.dev/">Everything curl</a> (the maintainers' official book) and the <a href="https://curl.se/docs/manpage.html">curl(1) manual</a>, especially the <code>-w</code> variables.</li>
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc1034">RFC 1034/1035 (DNS)</a>, <a href="https://www.rfc-editor.org/rfc/rfc9293">RFC 9293 (TCP)</a>, <a href="https://www.rfc-editor.org/rfc/rfc8446">RFC 8446 (TLS 1.3)</a>, <a href="https://www.rfc-editor.org/rfc/rfc9113">RFC 9113 (HTTP/2)</a>.</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man3/getaddrinfo.3.html">getaddrinfo(3)</a>, <a href="https://man7.org/linux/man-pages/man2/connect.2.html">connect(2)</a>, and <a href="https://man7.org/linux/man-pages/man5/nsswitch.conf.5.html">nsswitch.conf(5)</a>.</li>
+      <li>The Tcpdump project — <a href="https://www.tcpdump.org/manpages/tcpdump.1.html">tcpdump(1)</a> for reading the flags in the capture.</li>
+      <li>IANA — <a href="https://www.iana.org/help/example-domains">Example domains</a>: why <code>example.com</code> is reserved for documentation.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch18-the-linux-network-stack-internals.html"><span class="dir">← Prev</span><div class="ti">Ch 18 — The Linux network stack internals</div></a>
+      <a class="nx" href="ch20-the-network-troubleshooting-toolkit.html"><span class="dir">Next →</span><div class="ti">Ch 20 — The network troubleshooting toolkit</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 19 of 121 · Part II · Networking from First Principles. If you can narrate this trace from memory, you understand the network. Everything after this is more hops.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">Why one trace</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">The whole journey</a>
+    <a href="#internals">The twelve stages</a>
+    <a href="#components">The actors</a>
+    <a href="#flow">In one breath</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

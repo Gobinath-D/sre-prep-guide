@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 80 — SLI, SLO, SLA &amp; Error Budgets</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part VIII · Observability &nbsp;·&nbsp; Chapter 80</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part VIII · Observability · Chapter 80</div>
+      <h1>SLI, SLO, SLA &amp; error budgets</h1>
+      <p class="tagline">You have metrics, logs, and traces now — Part VIII gave you eyes. This chapter gives you a number: one figure that tells you, without an argument, whether the service is fine and whether you're allowed to ship today. That number is what turns "is it down?" from an opinion into a fact.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~48 min read · Prometheus in Docker (promtool)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Pick a good SLI for a real service instead of measuring whatever happens to be easy to query.</li>
+          <li>Turn an SLO into an error budget with a real number attached — days, minutes, or requests.</li>
+          <li>Write a PromQL burn-rate alert, and explain in one sentence why a plain threshold alert is a trap.</li>
+          <li>Build a multiwindow, multi-burn-rate alert that pages fast for a real outage and stays quiet through noise.</li>
+          <li>Tell an SLO apart from an SLA, and say what an error-budget policy forces a team to do when it's spent.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>"Is the service healthy?" is not a yes/no question until you make it one</h2>
+    <p>Ask five engineers on a team whether their service is "reliable enough" and you'll get five different answers, because nobody agreed on what "enough" means. One person is staring at a dashboard where CPU looks fine. Another remembers three tickets from angry customers last week. A third just wants to ship a risky change and would rather not think about it. Without a number everyone has agreed to in advance, "is it healthy" collapses into whoever argues loudest in the incident channel.</p>
+    <p>The fix sounds almost too simple: measure the thing users actually feel, pick a target for it, and agree in writing on what happens when you miss the target. That's the whole idea behind <b>SLI</b>, <b>SLO</b>, <b>SLA</b>, and the <b>error budget</b> — four pieces of vocabulary that turn a debate into arithmetic. Google's SRE book, which coined the working definitions most of the industry now uses, puts it plainly: you can't manage a service well without knowing which behaviors actually matter and how you'll react when they slip.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>An SLI is a <em>measurement</em>. An SLO is a <em>target</em> for that measurement. An SLA is a <em>contract</em> built on a target, with a consequence attached. An error budget is what's left of "allowed to be imperfect" once you subtract what you've already used. Four different jobs, four different words — mixing them up is where most of the confusion starts.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: the pizza delivery guarantee</h2>
+    <p>You've seen this one before, even if you never thought about it as reliability engineering.</p>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>A pizza chain's promise is famous: your pizza in 30 minutes, or it's free. Every single delivery gets a stopwatch time — 22 minutes, 34 minutes, 19 minutes. That one number, for one order, is an <b>SLI</b>: a measurement of one aspect of the service, taken every time.</p>
+      <p>The store manager doesn't panic over one slow delivery. Internally, the chain sets itself a target: "at least 95% of deliveries this month should be under 30 minutes." That's an <b>SLO</b> — a goal for what the SLI should look like, aggregated over time. It's not a promise to any one customer; it's the bar the manager runs the store against.</p>
+      <p>The public-facing "30 minutes or it's free" is the <b>SLA</b> — an actual agreement with a named consequence if it's broken for a given customer. Notice the SLA doesn't have to match the SLO. The store might target 95% success internally while promising something looser (or a specific refund, not a guarantee of speed) externally, and that gap is deliberate: it's a safety margin.</p>
+      <p>Now the part everyone forgets: the SLO isn't "never be late." It's a <b>budget</b> for being late. If the target is 95% on-time, then 5% of this month's deliveries are allowed to run over before anyone needs to act. That 5% is the <b>error budget</b> — a finite allowance the store is already spending, order by order, all month. A bad Friday night rush can burn through a big chunk of it in an hour; that's a high <b>burn rate</b>. A good shift manager watches two clocks at once: how many deliveries were late <em>in the last 30 minutes</em> (catches the oven that just broke) and how many were late <em>this whole week</em> (catches a driver shortage that's been quietly building). Only when both look bad do they call the district office — which is exactly the multiwindow alerting logic later in this chapter.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In SRE practice</th></tr>
+      <tr><td>One delivery's stopwatch time</td><td><b>SLI</b> — a single measurement of the service</td></tr>
+      <tr><td>"95% of deliveries under 30 min this month" (internal goal)</td><td><b>SLO</b> — the target value for an SLI over a window</td></tr>
+      <tr><td>"30 minutes or it's free" (public promise, named consequence)</td><td><b>SLA</b> — a contract built on hitting (or missing) an SLO</td></tr>
+      <tr><td>The 5% of deliveries allowed to run late this month</td><td><b>Error budget</b> — 1 − SLO, over the SLO's time window</td></tr>
+      <tr><td>How fast tonight's rush is using up that 5%</td><td><b>Burn rate</b> — the rate of budget consumption relative to the SLO</td></tr>
+      <tr><td>Watching the last 30 minutes <em>and</em> the whole week before calling the district office</td><td><b>Multiwindow, multi-burn-rate alerting</b></td></tr>
+      <tr><td>The written rule for what the store does at 80% of its monthly late-allowance</td><td><b>Error-budget policy</b> — the pre-agreed consequence of spending the budget</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>From one request to a page (or a ticket)</h2>
+    <p>Concretely, the chain from "a user made a request" to "someone's phone buzzes" has a fixed shape: an SLI has to be <em>measured</em>, <em>aggregated over a window</em>, <em>compared to the SLO</em>, and — only if the resulting burn rate is both fast enough and sustained enough — turned into a notification. Skip a step and you either miss real outages or drown on-call in noise.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 400" role="img" aria-label="A 30-day error budget depleting steadily at burn rate one, with a fast incident spike detected by a short window and a long window agreeing before a page fires">
+        <defs>
+          <marker id="e80a" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--deep)"/></marker>
+        </defs>
+        <text x="360" y="18" text-anchor="middle" style="fill:var(--muted);font:700 11.5px sans-serif;letter-spacing:.05em">99.9% SLO OVER 30 DAYS — 0.1% ERROR BUDGET</text>
+
+        <rect x="30" y="34" width="660" height="150" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="46" y="54" style="fill:var(--muted);font:700 10.5px sans-serif;letter-spacing:.04em">ERROR BUDGET REMAINING, DAY 0 → DAY 30</text>
+
+        <!-- reference: budget exhausted exactly at day 30, burn rate 1 -->
+        <line x1="60" y1="70" x2="660" y2="164" style="stroke:var(--muted);stroke-width:1.5;stroke-dasharray:4 4"/>
+        <text x="500" y="150" style="fill:var(--muted);font:600 10px sans-serif">burn rate 1 — uses it all by day 30</text>
+
+        <!-- actual path: flat, then steep drop (incident), then flat again -->
+        <path d="M60,70 L330,84 L365,158 L660,164" style="fill:none;stroke:var(--deep);stroke-width:2.5"/>
+        <circle cx="330" cy="84" r="4" style="fill:var(--deep)"/>
+        <circle cx="365" cy="158" r="4" style="fill:var(--deep)"/>
+        <text x="345" y="108" style="fill:var(--deep);font:700 10.5px sans-serif">incident: 100% errors</text>
+        <text x="345" y="122" style="fill:var(--deep);font:700 10.5px sans-serif">burn rate ~1,000 → 43 min to zero</text>
+        <text x="380" y="180" style="fill:var(--accent2);font:600 10px sans-serif">fixed — flat again, budget scarred but not gone</text>
+
+        <text x="46" y="70" style="fill:var(--ink);font:700 11px sans-serif">100%</text>
+        <text x="46" y="168" style="fill:var(--ink);font:700 11px sans-serif">0%</text>
+
+        <!-- multiwindow gate -->
+        <rect x="30" y="206" width="310" height="170" rx="10" style="fill:var(--panel);stroke:var(--accent)"/>
+        <text x="185" y="228" text-anchor="middle" style="fill:var(--accent);font:700 11px sans-serif">SHORT WINDOW · 5 min</text>
+        <rect x="55" y="240" width="260" height="40" rx="6" style="fill:var(--chip);stroke:var(--deep)"/>
+        <text x="185" y="264" text-anchor="middle" style="fill:var(--deep);font:700 11px sans-serif">rate5m &gt; 14.4 × 0.001 — TRUE</text>
+        <text x="185" y="300" text-anchor="middle" style="fill:var(--muted);font:600 10px sans-serif">clears ~5 min after errors stop</text>
+        <text x="185" y="318" text-anchor="middle" style="fill:var(--ink);font:800 16px sans-serif">AND</text>
+        <rect x="55" y="330" width="260" height="30" rx="6" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="185" y="349" text-anchor="middle" style="fill:var(--muted);font:600 9.5px sans-serif">(long window, mirrored — see right)</text>
+
+        <rect x="380" y="206" width="310" height="170" rx="10" style="fill:var(--panel);stroke:var(--accent)"/>
+        <text x="535" y="228" text-anchor="middle" style="fill:var(--accent);font:700 11px sans-serif">LONG WINDOW · 1 hour</text>
+        <rect x="405" y="240" width="260" height="40" rx="6" style="fill:var(--chip);stroke:var(--deep)"/>
+        <text x="535" y="264" text-anchor="middle" style="fill:var(--deep);font:700 11px sans-serif">rate1h &gt; 14.4 × 0.001 — TRUE</text>
+        <text x="535" y="300" text-anchor="middle" style="fill:var(--muted);font:600 10px sans-serif">confirms it's sustained, not a blip</text>
+
+        <line x1="340" y1="320" x2="378" y2="320" style="stroke:var(--deep);stroke-width:2" marker-end="url(#e80a)"/>
+
+        <rect x="230" y="382" width="260" height="0" style="fill:none"/>
+      </svg>
+      <figcaption>A clean burn rate of 1 uses the whole budget exactly by day 30 — the break-even line. A real incident burns much faster; a multiwindow alert only pages when both a short window and a long window agree the burn is real, which is what gives it a fast page and a fast reset.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>Every one of these pieces exists to answer a question that comes up in a live incident or a roadmap meeting: "do we stop and fix this, or keep shipping?" Without an error budget, that question gets answered by whoever's most anxious or most stubborn in the room. With one, it's arithmetic — and arithmetic doesn't have a bad day.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>Why the obvious alerting approach fails, six times in a row</h2>
+    <p>The Google SRE Workbook walks through this exact problem by trying the obvious thing, watching it break, and fixing one flaw at a time. It's worth following the same path, because every "obviously this should work" idea you'll have has already been tried and has a specific, named failure mode.</p>
+    <ol class="steps">
+      <li><b>Alert when the current error rate crosses the SLO threshold.</b> Simple: if the SLO is 99.9%, alert when a 10-minute window shows ≥0.1% errors. Detection is near-instant for a full outage — but precision is terrible. A 0.1% error rate sustained for just 10 minutes trips this alert while burning only 0.02% of the entire 30-day budget. A service could fire this alert 144 times a day, every day, and still comfortably meet its SLO. Nobody survives that pager load with their sanity or their trust in alerts intact.</li>
+      <li><b>Widen the window to demand a bigger budget spend before alerting</b> — say, enough to consume 5% of the 30-day budget, which works out to a 36-hour window. Precision improves a lot. But now a total outage takes over two minutes to detect (acceptable) and, far worse, the alert keeps firing for the next 36 hours after the outage is <em>completely fixed</em>, because the 36-hour rolling average takes that long to recover. Good precision, unusable reset time.</li>
+      <li><b>Keep the window short, but add a <code>for:</code> duration</b> so the alert only fires once the condition holds for, say, an hour. This is worse than it looks. A 100% outage now takes a full hour to page — no faster than a much smaller, slower-building problem — and if the error rate ever dips back under threshold even briefly, the duration timer resets from zero. A service throwing 100% errors for 5 minutes out of every 10 can burn 35% of its monthly budget and <em>never once trigger the alert</em>, because it never sustains the condition long enough.</li>
+      <li><b>Switch to burn rate.</b> Burn rate is how fast, relative to the SLO, you're spending the budget — a burn rate of 1 means "spending it exactly fast enough to hit zero right at the end of the window." A constant 0.1% error rate against a 99.9% SLO is burn rate 1; 1% errors is burn rate 10 (exhausts the 30-day budget in 3 days); 100% errors is burn rate ~1,000 (43 minutes to zero). Alerting on a sustained high burn rate over a short-ish window (say, 1 hour, at 14.4× burn rate — enough to signal "2% of the whole month's budget, gone, in one hour") gets you good precision and a much shorter window to compute. Reset time is better too, but still not great — roughly an hour of lingering after the fix.</li>
+      <li><b>Layer multiple burn rates and windows</b> — a fast, high-burn-rate check for "page now" and a slow, low-burn-rate check for "file a ticket, this can wait until tomorrow." This catches both a total outage and a slow, sustained leak that would otherwise fly under the radar.</li>
+      <li><b>Add a short window alongside each long window, and require both to agree.</b> This is the one Google recommends without reservation: a short window (about 1/12 the length of the long one) has to <em>also</b> be over threshold before the alert fires. The long window confirms the burn is real and sustained; the short window confirms it's <em>still happening right now</em> — so the page clears within minutes of the fix landing, instead of lingering for the long window's full duration.</li>
+    </ol>
+    <p>The recommended starting parameters, straight from the workbook, for a 99.9% SLO:</p>
+    <table class="t">
+      <tr><th>Severity</th><th>Long window</th><th>Short window</th><th>Burn rate</th><th>Budget consumed</th></tr>
+      <tr><td>Page</td><td>1 hour</td><td>5 minutes</td><td>14.4</td><td>2%</td></tr>
+      <tr><td>Page</td><td>6 hours</td><td>30 minutes</td><td>6</td><td>5%</td></tr>
+      <tr><td>Ticket</td><td>3 days</td><td>6 hours</td><td>1</td><td>10%</td></tr>
+    </table>
+    <details class="recall"><summary>Think first: your SLO is 99.9% over 30 days, and a deploy at 2pm sends error rate to 100%. Roughly how long until the entire month's error budget is gone, if nobody touches it?</summary>
+      <div class="body">
+        <p>About 43 minutes. A 100% error rate against a 99.9% SLO is a burn rate around 1,000 — the budget for the whole 30-day window (0.1% of all requests) gets consumed in 1/1000th of that window, and 30 days ÷ 1,000 is close to 43 minutes. This is exactly why a page-level alert needs to fire in minutes, not hours: at this burn rate, "wait for the daily report" means the budget is already gone before anyone reads it.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, named precisely</h2>
+    <ul>
+      <li><b>SLI (service level indicator).</b> A carefully defined, quantitative measurement — usually the ratio of "good" events to total events (successful requests / all requests, fast requests / all requests). Owns: what you're actually measuring.</li>
+      <li><b>SLO (service level objective).</b> A target value or range for an SLI, over a stated time window (99.9% over 30 days). Owns: what "good enough" means, and for how long a window that judgment is made.</li>
+      <li><b>SLA (service level agreement).</b> An explicit contract, usually with an external party, that names consequences for missing an SLO. Owns: the business/legal commitment. If there's no stated consequence, you're looking at an SLO someone mislabeled.</li>
+      <li><b>Error budget.</b> 1 − SLO, over the SLO's window, expressed as an allowance of bad events. Owns: how much "not perfect" the team is allowed to spend before it's a problem.</li>
+      <li><b>Burn rate.</b> The speed of error-budget consumption relative to the SLO's own pace. Burn rate 1 = exactly using up the whole budget by the end of the window. Owns: urgency.</li>
+      <li><b>Error-budget policy.</b> A document, agreed <em>before</em> an incident, stating exactly what happens at defined budget-consumption thresholds — freeze releases, add an on-call reviewer, escalate to leadership. Owns: turning "we should probably slow down" into something nobody has to argue about mid-incident.</li>
+      <li><b>Recording &amp; alerting rules.</b> The Prometheus (or equivalent) machinery that turns raw counters into a ratio, and the ratio into a page or a ticket. Owns: the plumbing between the SLI and a human's phone.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one bad request into a page</h2>
+    <p>A user's request to <code>checkout</code> times out and returns HTTP 500. That single event increments a <code>http_requests_total{status="500"}</code> counter, scraped by Prometheus within the next scrape interval. A recording rule — named by convention <code>level:metric:operations</code>, e.g. <code>job:errors_per_request:ratio_rate5m</code> — continuously recomputes the ratio of 5xx responses to all responses over a 5-minute and a 1-hour window, aggregating the numerator and denominator separately before dividing (never averaging an already-averaged ratio; that's not statistically valid). Two alerting rules watch those recorded ratios: a page-level rule checks whether both the 1-hour <em>and</em> the 5-minute ratio exceed 14.4 times the SLO's allowed error rate, and a ticket-level rule checks the slower 3-day/6-hour pair at burn rate 1. If this one bad request is an isolated blip, neither ratio moves enough to matter — the SLI absorbed it exactly as designed. If it's the leading edge of a real outage, both windows on the page rule cross their threshold within minutes of each other, Alertmanager fires, and the on-call engineer's phone buzzes with a burn rate and a "minutes until budget exhaustion" figure attached — not just "something, somewhere, is probably wrong."</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>Real burn-rate alerts operate over windows of hours to days — you can't wait that long in a lab. Prometheus ships the right tool for this: <code>promtool test rules</code> runs alerting rules against synthetic time series you define, and fast-forwards straight to any point in simulated time. Every lab below runs entirely on your laptop.</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># One Prometheus container, used only for its bundled promtool and query engine:</span>
+docker run --rm -it -v "$PWD":/work --entrypoint sh prom/prometheus:latest</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — a recording rule and a naive threshold alert</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Inside <code>/work</code>, write a rules file defining the ratio recording rule and the first (naive) alert from this chapter's walk-through:</p>
+        <div class="codewrap"><span class="lang">yaml</span><pre><code><span class="c"># rules.yml — checkout service, SLO 99.9% over 30 days</span>
+groups:
+  - name: checkout-slo
+    rules:
+      - record: job:errors_per_request:ratio_rate10m
+        expr: |
+          sum(rate(checkout_errors_total[10m]))
+            /
+          sum(rate(checkout_requests_total[10m]))
+      - alert: HighErrorRate
+        expr: job:errors_per_request:ratio_rate10m &gt;= 0.001
+        labels: {severity: page}</code></pre></div>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>promtool check rules /work/rules.yml</code></pre></div>
+        <div class="out"><span class="ol">Output</span>Checking /work/rules.yml
+  SUCCESS: 2 rules found</code></div>
+        <p><code>promtool</code> parsed and validated the rule syntax without needing a running Prometheus server at all — your fastest possible feedback loop before anything touches a real cluster.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — prove the naive alert's low precision</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Feed synthetic data through the rule: a healthy service, then exactly a 10-minute blip at 0.2% errors — nowhere near an outage.</p>
+        <div class="codewrap"><span class="lang">yaml</span><pre><code><span class="c"># unittest.yml</span>
+rule_files: [rules.yml]
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'checkout_requests_total'
+        values: '0+1000x60'
+      - series: 'checkout_errors_total'
+        values: '0+0x20 2+2x10 22+0x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: HighErrorRate
+        exp_alerts:
+          - exp_labels: {severity: page}</code></pre></div>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>promtool test rules /work/unittest.yml</code></pre></div>
+        <div class="out"><span class="ol">Output</span>SUCCESS</code></div>
+        <p>The alert fires, correctly, on a blip that — do the arithmetic — consumes roughly 0.02% of the entire 30-day error budget. Nothing here threatens the SLO. If this were a real pager, you'd have just been woken up for nothing, and this exact shape of blip can happen many times a day on a noisy but perfectly healthy service.</p>
+      </div>
+    </div>
+
+    <details class="recall"><summary>Think first: would adding a <code>for: 10m</code> duration to Lab 2's alert fix the false-positive problem?</summary>
+      <div class="body">
+        <p>It would fix <em>this</em> case, at the cost of creating a worse one. A duration parameter demands the condition hold continuously for the full duration, which does suppress single blips — but it also means a total, 100% outage takes just as long to page as a much smaller issue, and any error pattern that flickers above and below the threshold (common during a real, ongoing incident with retries and partial recovery) can reset the duration timer forever and never page at all. The Google SRE Workbook found exactly this in production: a service throwing 100% errors for 5 minutes out of every 10 burned 35% of its monthly budget while a 10-minute <code>for:</code> clause stayed silent the entire time. Duration is a blunt instrument; burn rate is the actual fix.</p>
+      </div>
+    </details>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — the alert that never fires</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Reproduce the workbook's real failure case: 100% errors for 5 minutes, healthy for 5 minutes, repeating, using a <code>for: 10m</code> duration alert.</p>
+        <div class="codewrap"><span class="lang">yaml</span><pre><code>  - alert: HighErrorRateDuration
+    expr: job:errors_per_request:ratio_rate1m &gt;= 0.001
+    for: 10m
+    labels: {severity: page}</code></pre></div>
+        <div class="codewrap"><span class="lang">yaml</span><pre><code><span class="c"># values alternate 5 min at 100% errors, 5 min clean, for 40 minutes</span>
+      - series: 'checkout_errors_total'
+        values: '0+1000x5 5000+0x5 5000+1000x5 10000+0x5 10000+1000x5 15000+0x5 15000+1000x5 20000+0x5'</code></pre></div>
+        <p>Run <code>promtool test rules</code> asserting <code>exp_alerts: []</code> (no alert) at the 40-minute mark. Before you run it: does this pattern threaten the SLO, and will the alert fire? Reason it through, then confirm.</p>
+        <details class="recall"><summary>Reveal what happened and why</summary>
+          <div class="body">
+            <p>The test passes with <em>no alert firing</em> — and that's the bug, not a success. Each 5-minute, 100%-error spike burns a huge share of the monthly budget (over the course of this pattern, well over a third of it), but the metric drops back to 0% every other 5 minutes, so the <code>for: 10m</code> timer never accumulates 10 continuous minutes above threshold and never fires. A real on-call engineer would have no idea the budget was disappearing. This is precisely why duration-based alerting on SLIs is a documented anti-pattern, not just a tuning problem you can fix by picking a different number.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — a burn-rate alert with a reset-time problem</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Replace the duration alert with a single-window burn-rate alert at 14.4× (2% of budget in 1 hour):</p>
+        <div class="codewrap"><span class="lang">yaml</span><pre><code>  - alert: HighBurnRate1h
+    expr: job:errors_per_request:ratio_rate1h &gt; (14.4 * 0.001)
+    labels: {severity: page}</code></pre></div>
+        <p>Simulate a 10-minute total outage, then a full recovery, and evaluate the alert at 15 minutes, 30 minutes, and 60 minutes after the outage started. It correctly fires around minute 6. The question: does it correctly <em>stop</em> firing shortly after the outage is fixed, or does it linger? Predict, then check the 60-minute evaluation.</p>
+        <details class="recall"><summary>Reveal the reset-time problem</summary>
+          <div class="body">
+            <p>It's still firing at 60 minutes, even though the outage was over at minute 10 — because the 1-hour rolling window still contains those bad minutes for most of the following hour. This is the exact reset-time weakness a single-window burn-rate alert has: good precision and reasonable detection time, but the page keeps buzzing for a long time after the fire is out, training on-call to distrust "still firing" notifications. The fix is Lab 5: pair this long window with a short one and require both.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — the full multiwindow, multi-burn-rate rule set</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>Build the configuration this chapter has been building toward — page on 14.4×/1h+5m or 6×/6h+30m, ticket on 1×/3d+6h — and prove it clears fast:</p>
+        <div class="codewrap"><span class="lang">yaml</span><pre><code>  - alert: ErrorBudgetBurnPage
+    expr: |
+      (job:errors_per_request:ratio_rate1h &gt; (14.4*0.001) and job:errors_per_request:ratio_rate5m &gt; (14.4*0.001))
+      or
+      (job:errors_per_request:ratio_rate6h &gt; (6*0.001) and job:errors_per_request:ratio_rate30m &gt; (6*0.001))
+    labels: {severity: page}
+  - alert: ErrorBudgetBurnTicket
+    expr: |
+      job:errors_per_request:ratio_rate3d &gt; 0.001 and job:errors_per_request:ratio_rate6h &gt; 0.001
+    labels: {severity: ticket}</code></pre></div>
+        <p>Re-run the Lab 4 outage-then-recovery scenario against <code>ErrorBudgetBurnPage</code> and check the alert state at minute 6, minute 15, and minute 65. Before checking: at minute 65, is the page still active?</p>
+        <details class="recall"><summary>Reveal the result and the remaining caveat</summary>
+          <div class="body">
+            <p>The page fires by minute 6 (both the 5-minute and 1-hour ratios are already over threshold) and clears about 5 minutes after the outage ends, because the short 5-minute window recovers fast even while the 1-hour window is still elevated — the <code>and</code> requires <em>both</em>, so as soon as either drops, the page condition goes false. That's the whole win: detection time of a single-window alert, reset time close to the short window's length.</p>
+            <p>One caveat this exact configuration doesn't solve on its own: a genuinely low-traffic service (say, 10 requests/hour) can hit a 1,000× burn rate off a single failed request, purely by bad luck, with no real systemic problem. The workbook's fix isn't a bigger threshold — it's combining low-traffic request classes into a larger pool, or generating synthetic traffic, so the ratio has enough denominator to mean something.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · alert fatigue from a naive SLO alert</div>
+      <p><b>Symptom:</b> on-call is paged constantly for a service that, by every measure, is meeting its SLO comfortably. <b>First cut:</b> check whether the alert is a plain threshold-crossing rule with a short window and no burn-rate weighting. <b>Confirm:</b> compute how much budget each firing actually consumed — if it's a fraction of a percent, the alert has a precision problem, not the service. <b>Fix:</b> replace it with a multiwindow, multi-burn-rate rule at the recommended 2%/5%/10% thresholds.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · the budget was gone and nobody noticed</div>
+      <p><b>Symptom:</b> a monthly SLO report shows the budget was blown weeks ago, but no page or ticket ever fired. <b>First cut:</b> look for a <code>for:</code> duration clause on the SLO alert, or a window so long that fast, spiky degradation slips underneath it. <b>Confirm:</b> replay the historical error data against the alert rule with <code>promtool test rules</code> — if it doesn't fire on data you know was bad, the rule is the bug. <b>Fix:</b> burn-rate alerting with a short-window confirmation, not duration-based suppression.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · the error-budget policy nobody had actually agreed to</div>
+      <p><b>Symptom:</b> the budget is exhausted, an engineer proposes freezing releases, and the conversation turns into a 45-minute argument about whether that's really necessary. <b>Cause:</b> there was no error-budget policy written and agreed before the incident — so the response itself becomes a negotiation under pressure, which is the exact failure the policy exists to prevent. <b>Fix:</b> write the policy in advance (Google publishes a real example — see Sources) with concrete thresholds and named actions, signed off by the people who'll resist it later, before there's an incident to argue about.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Pick SLIs users would recognize, not ones that are merely easy to query.</b> Server-side 5xx rate is convenient, but it misses client-side failures — a broken JavaScript bundle that never even reaches your backend, or a mobile client that gives up and shows an error before your server responds. Where you can, measure closer to the user, and prefer a ratio of good events to total events over a raw count, since that's the form that plugs cleanly into a percentage-based SLO.</p>
+    <p><b>Have as few SLOs as you can defend.</b> Every SLO is something you must be willing to prioritize fixing over shipping a feature, in an actual argument, in front of a skeptical stakeholder. An SLO you'd quietly ignore under pressure was never a real SLO — it's decoration. It's also worth deliberately <em>not</em> hitting 100% of an aspirational target on paper: an SLO of "100% available" is unachievable and, worse, unnecessary — near-100% is usually indistinguishable to users from perfect, at a fraction of the engineering cost.</p>
+    <p><b>Low-traffic services need a different approach entirely.</b> At 10 requests an hour, one failure is a 10% hourly error rate — enough to page immediately under normal thresholds, while still allowing only seven failures a month total. The fixes are structural, not numerical: generate synthetic traffic so there's a real signal to alert on, combine related low-traffic request types into one larger pool, or explicitly set a looser SLO that matches the actual business impact of one failed request.</p>
+    <p><b>Common mistakes:</b> setting an SLO from "whatever we're currently doing" instead of what users need (you'll never improve past your starting point); alerting on the mean latency instead of a high percentile, which hides exactly the long-tail pain users feel; publishing an SLA that's tighter than your actual SLO, leaving no safety margin; and treating the error budget as a scoreboard nobody actually consults until a postmortem, instead of a live number that gates release decisions in the moment.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>The error budget is the cleanest lever a team has for deciding, without a meeting, whether to invest in more redundancy, slow down and stabilize, or keep shipping features at full speed — it converts "how reliable should we be" from a philosophical question into a number you review weekly. It's also the concrete trigger behind practices you'll meet properly in <a href="ch88-reliability-engineering.html">Chapter 88</a> and <a href="ch92-incident-management-postmortems-and-the-sre-operating.html">Chapter 92</a>: a fast-burning budget is what justifies a canary rollback, a feature freeze, or an all-hands incident review, and a healthy budget is what justifies taking a calculated risk on a launch. Every reliability investment in <a href="ch93-the-system-design-method.html">Part X's system-design chapters</a> — extra replicas, multi-region failover, more aggressive caching — ultimately has to be justified against what it actually buys in SLO headroom, not against a vague sense that "more reliable is always better."</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's the difference between an SLI, an SLO, and an SLA?</summary>
+        <div class="a"><p>An SLI is a measurement — a quantitative indicator like the ratio of successful requests to total requests. An SLO is a target for that measurement over a time window, like 99.9% over 30 days. An SLA is a contract built on an SLO that names a consequence if it's missed, usually with an external party. A simple test: if there's no stated consequence for missing it, it's an SLO, not an SLA, whatever anyone's calling it in the meeting.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Design a multiwindow, multi-burn-rate alert for a service with a 99.9% availability SLO.</summary>
+        <div class="a"><p>I'd start from the error budget: 99.9% over 30 days means 0.1% of requests are allowed to fail across the month. Burn rate measures how fast that budget is being spent relative to a break-even pace, so a burn rate of 14.4 over one hour means the service would exhaust the entire month's budget in about 50 hours if sustained — worth 2% of the budget consumed in that hour, which is a reasonable page threshold. I'd pair that one-hour window with a five-minute window at the same threshold, requiring both to be true before paging: the long window proves the burn is sustained and real, the short window proves it's still happening right now, so the page clears within minutes of a fix instead of lingering for the full hour. I'd add a second, slower pair — six-hour and thirty-minute windows at burn rate 6 — to catch a slower leak, and a ticket-level check at burn rate 1 over three days for anything that doesn't need a human paged at 3 a.m. but does need fixing this week. These are Google's own published starting numbers, and I wouldn't deviate from them without a specific reason.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Why does a single-window burn-rate alert have a reset-time problem, and how does adding a short window fix it?</summary>
+        <div class="a"><p>A burn-rate alert on a one-hour window computes its ratio over a full rolling hour, so even after an outage is completely fixed, the bad minutes stay inside that rolling window — and therefore inside the computed ratio — for most of the following hour. The alert keeps firing long after there's anything to act on, which trains on-call to distrust "still firing" and slows response to the <em>next</em> real incident. Adding a short window, typically about one-twelfth the length of the long one, and requiring both to independently cross the threshold, fixes this asymmetrically: during a real, sustained incident, both windows go over threshold together, so detection time is unaffected. But the moment the fix lands, the short window's ratio recovers within its own short duration — five minutes instead of an hour — and since the alert requires both conditions, it clears as soon as either one goes false. You get the long window's precision and the short window's fast reset, which is why Google recommends the pair rather than either alone.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A low-traffic internal service pages every time a single request fails. How do you fix the alerting without hiding real problems?</summary>
+        <div class="a"><p>First I'd check the actual traffic volume and do the arithmetic a real failure represents — at, say, 10 requests an hour, one failure is a 10% hourly error rate, which trips almost any reasonable burn-rate threshold immediately even though it might only cost a handful of failed requests all month. I wouldn't just raise the alert threshold, because that risks hiding a real, larger-scale outage on this same service. Instead I'd look at whether this service's traffic can be reasonably combined with a related, higher-volume request class that shares the same failure domain — a shared backend, a shared database — so the ratio has enough denominator to carry a real signal. If there's truly no sensible service to combine it with, I'd generate synthetic traffic against it so the SLI has continuous signal instead of depending on sparse real requests, or I'd explicitly renegotiate the SLO to reflect what a single failure actually costs the business, rather than pretending a 99.9% target means the same thing at 10 requests an hour that it does at 10,000.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>What's an error-budget policy, and why does it need to exist before an incident, not during one?</summary>
+        <div class="a"><p>An error-budget policy is a written, pre-agreed document stating exactly what happens at specific levels of budget consumption — for example, a mandatory release freeze once 100% of the budget is spent within the window, or a required senior review once 75% is spent. The reason it has to be written and agreed in advance is that deciding "should we freeze releases right now" during a live incident is a negotiation with every incentive pointed the wrong way: the team that wants to ship is emotionally invested in their change, everyone's under time pressure, and there's no neutral party in the room. A policy agreed calmly, weeks earlier, by people including whoever's most likely to resist it later, turns that moment into a lookup instead of an argument. Google publishes a real example error-budget policy for exactly this reason — it's meant to be adapted, not invented from scratch under pressure.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>An SLI is a measurement; an SLO is a target for that measurement over a time window; an SLA is a contract with a named consequence for missing the SLO; an error budget is 1 − SLO, spent like an allowance. Naive threshold alerts have terrible precision; wider windows fix precision but wreck reset time; duration clauses (<code>for:</code>) can hide sustained, budget-destroying problems entirely. Burn rate — how fast the budget is being spent relative to break-even — fixes precision and detection time; pairing a long window with a short window at the same threshold, requiring both, fixes reset time too. Google's starting numbers: 14.4×/1h+5m and 6×/6h+30m to page, 1×/3d+6h to ticket. Low-traffic services need combined request classes or synthetic traffic, not just a looser threshold. An error-budget policy has to be agreed before an incident, or the incident becomes the negotiation.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>SLI = measurement. SLO = target for that measurement over a window. SLA = contract with a named consequence. Don't blur them.</li>
+      <li>Error budget = 1 − SLO, over the SLO's window — a finite allowance of "not perfect," not a wish for zero failures.</li>
+      <li>A plain threshold alert on a short window has terrible precision — it can fire 144 times a day on a service that still meets its SLO.</li>
+      <li>A <code>for:</code> duration clause on an SLO alert can hide a real, budget-destroying, flickering outage entirely — it's a documented anti-pattern, not a tuning knob.</li>
+      <li>Burn rate = how fast the budget is being spent relative to break-even; burn rate 1 means "exactly gone by the end of the window."</li>
+      <li>A single-window burn-rate alert has good precision and detection time but a bad reset time — it keeps firing long after the fix lands.</li>
+      <li>Pairing a long window with a short window at the same threshold, requiring both, gets fast detection <em>and</em> fast reset.</li>
+      <li>Google's recommended starting point: page at 14.4×/1h+5m (2% budget) and 6×/6h+30m (5% budget); ticket at 1×/3d+6h (10% budget).</li>
+      <li>Low-traffic services need combined request classes or synthetic traffic — raising the threshold alone just hides real outages.</li>
+      <li>Write the error-budget policy before you need it. Deciding consequences during a live incident is a negotiation, not engineering.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch74-observability-foundations.html"><b>Ch 74</b> Observability foundations</a>
+      <a href="ch75-prometheus.html"><b>Ch 75</b> Prometheus</a>
+      <a href="ch77-alerting-and-on-call-health.html"><b>Ch 77</b> Alerting &amp; on-call health</a>
+      <a href="ch81-distributed-systems-fundamentals.html"><b>Ch 81</b> Distributed-systems fundamentals</a>
+      <a href="ch88-reliability-engineering.html"><b>Ch 88</b> Reliability engineering</a>
+      <a href="ch92-incident-management-postmortems-and-the-sre-operating.html"><b>Ch 92</b> Incident management &amp; postmortems</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Google SRE Book — <a href="https://sre.google/sre-book/service-level-objectives/">Chapter 4, Service Level Objectives</a>: the original SLI/SLO/SLA definitions and how to choose targets.</li>
+      <li>Google SRE Workbook — <a href="https://sre.google/workbook/alerting-on-slos/">Chapter 5, Alerting on SLOs</a>: the full six-approach derivation of multiwindow, multi-burn-rate alerting, including the exact recommended parameters used in this chapter.</li>
+      <li>Google SRE Workbook — <a href="https://sre.google/workbook/error-budget-policy/">Appendix B, Example Error Budget Policy</a>: a real, adaptable error-budget policy document.</li>
+      <li>Prometheus documentation — <a href="https://prometheus.io/docs/practices/rules/">Recording rules</a>: naming conventions and correct aggregation for SLI ratios.</li>
+      <li>Prometheus documentation — <a href="https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/">Alerting rules</a> and <a href="https://prometheus.io/docs/prometheus/latest/configuration/unit_testing_rules/">Unit testing for rules</a>: the exact mechanics and the <code>promtool test rules</code> format used in this chapter's labs.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch79-distributed-tracing-and-opentelemetry.html"><span class="dir">← Prev</span><div class="ti">Ch 79 — Distributed tracing and OpenTelemetry</div></a>
+      <a class="nx" href="ch81-distributed-systems-fundamentals.html"><span class="dir">Next →</span><div class="ti">Ch 81 — Distributed-systems fundamentals</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 80 of 121 · Part VIII · Observability. That's the last piece of the observability stack — turning signals into a number worth waking someone up for. Part IX turns from watching one service to reasoning about many of them at once, failing together or apart.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Request to page</a>
+    <a href="#internals">Six attempts at alerting</a>
+    <a href="#components">The components</a>
+    <a href="#flow">One bad request</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 22 — Linux Namespaces</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part III · Containers &nbsp;·&nbsp; Chapter 22</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part III · Containers &amp; Container Internals · Chapter 22</div>
+      <h1>Linux namespaces</h1>
+      <p class="tagline">A container has no walls. What makes the process inside it think it's alone on the machine — its own PID 1, its own hostname, its own network — is eight kernel features called namespaces. Learn to see them, and containers stop being magic.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~40 min read · Linux lab (Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Name all eight namespace types and say exactly what each one hides or isolates.</li>
+          <li>Read <code>/proc/&lt;pid&gt;/ns/</code> and tell whether two processes share a namespace by comparing inode numbers.</li>
+          <li>Carve out your own PID, UTS, and network namespaces by hand with <code>unshare</code>, and enter a running container's with <code>nsenter</code>.</li>
+          <li>Answer "why can't the container see the host's processes?" from first principles, not hand-waving.</li>
+          <li>Explain user namespaces and why rootless containers make "root inside" mean "nobody outside".</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem namespaces solve</h2>
+    <p>You've got one Linux machine and you want to run ten programs on it that each believe they own the whole box. One wants to be PID 1 and manage its children. One wants to bind port 80. One wants the hostname <code>web-01</code>. Two of them ship the same library at different versions and both want it mounted at <code>/usr/lib</code>. On a plain machine they'd collide immediately: there's one process table, one port 80, one hostname, one filesystem tree.</p>
+    <p>The old fix was a whole virtual machine per program — its own kernel, its own everything. That works, but it's heavy: a full OS image, minutes to boot, hundreds of megabytes of RAM before your program runs a single line. Most of the time you don't need a second kernel. You need the <em>illusion</em> of a private machine while still sharing the one real kernel underneath. That illusion is what containers sell, and namespaces are what deliver it.</p>
+    <p>A <b>namespace</b> takes one global kernel resource — the process table, the network stack, the mount table, the hostname — and wraps it so that the processes inside see their own private copy. The man page says it plainly: a namespace makes a global resource "appear to the processes within the namespace that they have their own isolated instance." Change something inside, and processes elsewhere never see it. Eight resources can be virtualised this way, and a container is nothing more than a normal process that has been placed into a fresh set of them.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>Namespaces don't limit <em>how much</em> a process can use — that's cgroups, the next chapter. Namespaces limit <em>what a process can see</em>. Two different jobs, always confused. Isolation of visibility (namespaces) and metering of resources (cgroups) together make a container; neither alone is enough.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: private rooms in a shared building</h2>
+    <p>Back to the office building from <a href="ch01-kernel-and-system-calls.html">Chapter 1</a>. The kernel still owns the back room with all the hardware. What's new is how the tenants experience the front offices.</p>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Imagine a large open floor. Without namespaces, every tenant shares one address book, one phone directory, one supply closet, one wall clock — step on anyone's toes and they notice. Now the building manager installs <b>one-way glass partitions</b>. Each tenant gets a private suite. Inside your suite you have <em>your own</em> address book that starts at "extension 1" (you), your own supply closet arranged how you like, your own name on the door. You genuinely believe you're alone.</p>
+      <p>But there's still only one building. The plumbing, the power, the elevator — the manager (the kernel) runs all of it, once, for everyone. The partitions only control what each tenant <em>sees</em>. And the manager keeps a master key: from the hallway they can look straight into any suite. That master key is the difference that will bite you later — the host can always see into the container, even though the container can't see out.</p>
+      <p>Each kind of partition hides a different thing: one hides the phone directory, one hides the supply closet, one hides the name on the door. You can install any subset. Install all eight and the suite feels like its own building — that's a container.</p>
+    </div>
+    <p>Every piece of the analogy maps onto a specific namespace:</p>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In Linux</th></tr>
+      <tr><td>The building + plumbing/power</td><td>The one shared kernel and the real hardware</td></tr>
+      <tr><td>The private phone directory (starts at ext. 1)</td><td><b>PID namespace</b> — its own process IDs; first process is PID 1</td></tr>
+      <tr><td>The private phone lines and jacks</td><td><b>Network namespace</b> — its own interfaces, routes, ports, firewall</td></tr>
+      <tr><td>The private supply closet layout</td><td><b>Mount namespace</b> — its own set of mounts / filesystem tree</td></tr>
+      <tr><td>The name on the door</td><td><b>UTS namespace</b> — its own hostname and NIS domain</td></tr>
+      <tr><td>The internal memo/whiteboard system</td><td><b>IPC namespace</b> — its own System&nbsp;V IPC and POSIX message queues</td></tr>
+      <tr><td>The staff badges and who counts as "manager"</td><td><b>User namespace</b> — its own user/group IDs and capabilities</td></tr>
+      <tr><td>Which floor plan you think you're on</td><td><b>Cgroup namespace</b> — its own view of the cgroup tree root</td></tr>
+      <tr><td>Your own stopwatch (not the wall clock)</td><td><b>Time namespace</b> — its own monotonic and boot clock offsets</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>One process, eight namespaces</h2>
+    <p>A process is not "in a container." A process is a member of exactly one namespace of each type. When all eight of those are fresh and private, we call the collection a container — but the kernel has no object called "container." It only knows processes and the namespaces they belong to. Membership is recorded per type, and you can mix: a process can share the host's network namespace while having a private mount namespace (that's what <code>docker run --network=host</code> does).</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 350" role="img" aria-label="One process attached to its eight namespaces, four above and four below">
+        <text x="360" y="20" text-anchor="middle" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">A CONTAINER = ONE PROCESS + EIGHT FRESH NAMESPACES</text>
+        <!-- top row -->
+        <g>
+          <rect x="20" y="34" width="158" height="76" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+          <text x="99" y="58" text-anchor="middle" style="fill:var(--ink);font:700 14px sans-serif">pid</text>
+          <text x="99" y="76" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">CLONE_NEWPID</text>
+          <text x="99" y="94" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">processes · PID 1</text>
+
+          <rect x="194" y="34" width="158" height="76" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+          <text x="273" y="58" text-anchor="middle" style="fill:var(--ink);font:700 14px sans-serif">net</text>
+          <text x="273" y="76" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">CLONE_NEWNET</text>
+          <text x="273" y="94" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">NICs · routes · ports</text>
+
+          <rect x="368" y="34" width="158" height="76" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+          <text x="447" y="58" text-anchor="middle" style="fill:var(--ink);font:700 14px sans-serif">mnt</text>
+          <text x="447" y="76" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">CLONE_NEWNS</text>
+          <text x="447" y="94" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">mounts · rootfs</text>
+
+          <rect x="542" y="34" width="158" height="76" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+          <text x="621" y="58" text-anchor="middle" style="fill:var(--ink);font:700 14px sans-serif">uts</text>
+          <text x="621" y="76" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">CLONE_NEWUTS</text>
+          <text x="621" y="94" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">hostname</text>
+        </g>
+        <!-- process band -->
+        <rect x="40" y="150" width="640" height="72" rx="10" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.6"/>
+        <text x="360" y="180" text-anchor="middle" style="fill:var(--ink);font:600 15px sans-serif">one process — nginx</text>
+        <text x="360" y="202" text-anchor="middle" style="fill:var(--muted);font:11.5px sans-serif">host PID 4242 · in-namespace PID 1 · handles at /proc/4242/ns/{pid,net,mnt,uts,ipc,user,cgroup,time}</text>
+        <!-- bottom row -->
+        <g>
+          <rect x="20" y="262" width="158" height="76" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+          <text x="99" y="286" text-anchor="middle" style="fill:var(--ink);font:700 14px sans-serif">ipc</text>
+          <text x="99" y="304" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">CLONE_NEWIPC</text>
+          <text x="99" y="322" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">SysV IPC · shm</text>
+
+          <rect x="194" y="262" width="158" height="76" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+          <text x="273" y="286" text-anchor="middle" style="fill:var(--ink);font:700 14px sans-serif">user</text>
+          <text x="273" y="304" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">CLONE_NEWUSER</text>
+          <text x="273" y="322" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">uid/gid · caps</text>
+
+          <rect x="368" y="262" width="158" height="76" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+          <text x="447" y="286" text-anchor="middle" style="fill:var(--ink);font:700 14px sans-serif">cgroup</text>
+          <text x="447" y="304" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">CLONE_NEWCGROUP</text>
+          <text x="447" y="322" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">cgroup root view</text>
+
+          <rect x="542" y="262" width="158" height="76" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+          <text x="621" y="286" text-anchor="middle" style="fill:var(--ink);font:700 14px sans-serif">time</text>
+          <text x="621" y="304" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">CLONE_NEWTIME</text>
+          <text x="621" y="322" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">mono/boot clock</text>
+        </g>
+        <!-- connectors -->
+        <g style="stroke:var(--accent2);stroke-width:1.6">
+          <line x1="99" y1="110" x2="99" y2="150"/>
+          <line x1="273" y1="110" x2="273" y2="150"/>
+          <line x1="447" y1="110" x2="447" y2="150"/>
+          <line x1="621" y1="110" x2="621" y2="150"/>
+          <line x1="99" y1="222" x2="99" y2="262"/>
+          <line x1="273" y1="222" x2="273" y2="262"/>
+          <line x1="447" y1="222" x2="447" y2="262"/>
+          <line x1="621" y1="222" x2="621" y2="262"/>
+        </g>
+      </svg>
+      <figcaption>Each namespace type isolates one global resource. A process holds exactly one membership per type; a fresh set of all eight is what we call a container.</figcaption>
+    </figure>
+
+    <p>Here is each type, and precisely what it hides. The flag column is the <code>CLONE_NEW*</code> constant you pass to <code>clone(2)</code>, <code>unshare(2)</code>, or the <code>unshare</code> command.</p>
+    <ul>
+      <li><b>PID</b> (<code>CLONE_NEWPID</code>) — process IDs. The first process becomes PID 1 and reaps orphans. Processes in the namespace can't see or signal processes outside it. This is the one that answers "why can't the container see the host's processes."</li>
+      <li><b>Network</b> (<code>CLONE_NEWNET</code>) — network devices, IPv4/IPv6 stacks, routing tables, firewall rules, port numbers, <code>/proc/net</code>. A fresh net namespace has only a loopback interface, and it starts <em>down</em>. Port 80 in one net namespace has nothing to do with port 80 in another.</li>
+      <li><b>Mount</b> (<code>CLONE_NEWNS</code>) — the set of mount points, i.e. the filesystem tree. This is the oldest namespace (it predates the others, which is why its flag is the odd-one-out <code>NEWNS</code> and not <code>NEWMNT</code>). It's how a container gets its own root filesystem.</li>
+      <li><b>UTS</b> (<code>CLONE_NEWUTS</code>) — the hostname and NIS domain name. "UTS" is UNIX Time-sharing System, a historical name; it's just the two strings <code>uname()</code> returns.</li>
+      <li><b>IPC</b> (<code>CLONE_NEWIPC</code>) — System&nbsp;V IPC objects (shared memory, semaphores, message queues) and POSIX message queues. Two containers can each hold a shared-memory segment with the same key and never touch each other's.</li>
+      <li><b>User</b> (<code>CLONE_NEWUSER</code>) — user and group IDs, and the capability sets. This is the powerful and dangerous one: it lets a process be root (UID 0) <em>inside</em> the namespace while being an ordinary unprivileged UID <em>outside</em>. Since Linux 3.8 it's the only namespace an unprivileged user can create without <code>CAP_SYS_ADMIN</code>.</li>
+      <li><b>Cgroup</b> (<code>CLONE_NEWCGROUP</code>, since Linux 4.6) — the cgroup root directory the process sees. It stops a container from reading the host's full cgroup path and hierarchy; inside, its own cgroup looks like the root.</li>
+      <li><b>Time</b> (<code>CLONE_NEWTIME</code>, since Linux 5.6) — offsets for the <code>CLOCK_MONOTONIC</code> and <code>CLOCK_BOOTTIME</code> clocks. Note the limit: it does <em>not</em> virtualise <code>CLOCK_REALTIME</code> (the wall clock). It exists mainly so a checkpointed/restored or migrated container can keep a consistent uptime.</li>
+    </ul>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>When you <code>kubectl exec</code> into a pod and run <code>ps</code>, you see two processes, not the node's four hundred. That's the PID namespace. When two pods both listen on <code>:8080</code> on the same node without colliding, that's the network namespace. When a pod's <code>/etc/hostname</code> says the pod name, that's UTS. Every "how is it isolated?" question about a container decomposes into "which namespace is doing that?" — and every isolation <em>gap</em> ("the container could see the host's X") is a namespace that wasn't applied.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>How a process gets its namespaces</h2>
+    <p>There are three system calls in the whole namespace API, and the man page for <code>namespaces(7)</code> lists exactly these. Everything <code>docker</code>, <code>runc</code>, and Kubernetes do reduces to them.</p>
+    <ol class="steps">
+      <li><b><code>clone(2)</code> creates a new process already inside new namespaces.</b> If you pass <code>CLONE_NEWPID | CLONE_NEWNET | …</code> in the flags, the child is born into fresh namespaces of each type named. This is how a runtime starts a container: fork a child straight into the isolated set. The child's first process becomes PID 1 of its new PID namespace.</li>
+      <li><b><code>unshare(2)</code> moves the caller into new namespaces.</b> Same flags, but instead of creating a new process it detaches the current one from its shared namespaces and gives it private ones. The <code>unshare</code> command-line tool wraps this — it's how you'll experiment by hand in the labs.</li>
+      <li><b><code>setns(2)</code> joins an existing namespace.</b> You open a file under <code>/proc/&lt;pid&gt;/ns/</code> to get a handle to some process's namespace, then call <code>setns()</code> to enter it. The <code>nsenter</code> command wraps this — it's how you drop into a running container to debug it.</li>
+      <li><b>The kernel records membership and enforces visibility.</b> Once a process is in, say, a PID namespace, every syscall that lists or names processes is answered relative to that namespace. <code>getpid()</code> returns the in-namespace PID; <code>kill()</code> can only reach PIDs the namespace knows. The kernel does the translation; the process never learns its "real" host PID.</li>
+      <li><b>Creating a namespace needs <code>CAP_SYS_ADMIN</code> — except the user namespace.</b> This is the security hinge. You can't just carve out a new network namespace as a nobody. But you <em>can</em> create a user namespace unprivileged, and inside it you hold a full set of capabilities — which then lets you create the other namespaces. That chain is the entire basis of rootless containers.</li>
+    </ol>
+    <p>Namespaces are exposed as files. Each process has <code>/proc/&lt;pid&gt;/ns/</code> holding one symlink per type. The symlink's target looks like <code>net:[4026531969]</code> — the type and an inode number. That inode number <em>is</em> the namespace's identity. Two processes are in the same network namespace if, and only if, their <code>net</code> symlinks point to the same inode. That's the whole trick behind <code>lsns</code> and behind the labs below.</p>
+
+    <details class="recall"><summary>Think first: a namespace normally disappears when its last process exits. How could you keep an empty network namespace alive with no process in it?</summary>
+      <div class="body">
+        <p>Pin it with a file descriptor or a bind mount. As <code>namespaces(7)</code> spells out, opening one of the <code>/proc/&lt;pid&gt;/ns/*</code> files — or bind-mounting it somewhere like <code>/run/netns/foo</code> — keeps the namespace alive even after every process in it terminates, because the open handle counts as a reference. That's exactly the mechanism <code>ip netns add</code> uses: it creates a net namespace and bind-mounts it under <code>/run/netns/</code> so you can configure it before any process joins. It's also how you can leak namespaces: a forgotten bind mount pins a namespace (and its interfaces, its memory) forever.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The tools that name the pieces</h2>
+    <p>Four tools show up constantly, and you should know which syscall each is a front-end for:</p>
+    <ul>
+      <li><b><code>unshare</code></b> (util-linux) — front-end for <code>unshare(2)</code>. <code>unshare --pid --net --mount-proc bash</code> gives that shell fresh PID and network namespaces. This is your "build a container by hand" tool.</li>
+      <li><b><code>nsenter</code></b> (util-linux) — front-end for <code>setns(2)</code>. <code>nsenter -t &lt;pid&gt; -n -p</code> enters the network and PID namespaces of process <code>&lt;pid&gt;</code>. This is your "get inside a running container from the node" tool, and it works even when the container image has no shell or no tools of its own.</li>
+      <li><b><code>lsns</code></b> (util-linux) — lists namespaces on the system, grouped by type, with the owning PID and inode. When you're staring at a node asking "how many net namespaces exist and who owns them," this is the answer.</li>
+      <li><b><code>/proc/&lt;pid&gt;/ns/</code></b> — the kernel's own record. Not a tool, but the source of truth <code>lsns</code> reads. <code>readlink /proc/$$/ns/net</code> tells you your shell's network-namespace inode directly.</li>
+    </ul>
+    <p>The runtime you actually use in production — <code>runc</code> under <code>containerd</code> under the kubelet, all covered in <a href="ch26-docker-containerd-runc-and-the-oci-model.html">Chapter 26</a> — is just a careful, correct sequencer of <code>clone</code>/<code>unshare</code>/<code>setns</code> plus the cgroup and mount setup. Nothing it does is off-limits to you at the shell; it's only doing it in the right order with the right error handling.</p>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one <code>docker run</code></h2>
+    <p>Watch the namespaces come into being when you start a container. <code>docker run -d --name web nginx</code> triggers, roughly, this sequence. The runtime calls <code>clone()</code> with the <code>CLONE_NEW*</code> flags for every namespace type. The child is now alone: PID 1 in its PID namespace, a bare loopback in its net namespace, an empty mount table. The runtime then furnishes the empty rooms — it mounts the image's root filesystem into the mount namespace (that's <a href="ch24-container-filesystems-overlayfs-and-image-layers.html">Chapter 24</a>), creates a veth pair and moves one end into the net namespace and configures an address (that's <a href="ch25-container-networking.html">Chapter 25</a>), sets the hostname in the UTS namespace, and places the process in a cgroup for limits (that's <a href="ch23-cgroups-v2-cpu-memory-io-limits.html">Chapter 23</a>). Finally it <code>exec</code>s nginx. From nginx's point of view it booted onto a fresh little machine. From the host's point of view it's PID 4242 with eight interesting symlinks under <code>/proc/4242/ns/</code>. Both views are true at once. The labs make every step of this visible.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>These labs need a Linux box with the capability to create namespaces. On your Mac, use a throwaway container. Creating most namespaces needs <code>CAP_SYS_ADMIN</code>, so grant it (a real container runtime holds it while setting things up):</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># --cap-add SYS_ADMIN lets unshare/nsenter create and enter namespaces.</span>
+docker run --rm -it --cap-add=SYS_ADMIN ubuntu:24.04 bash
+
+<span class="c"># Inside the container, install the namespace toolkit:</span>
+apt-get update &amp;&amp; apt-get install -y util-linux iproute2 procps</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — carve out your own hostname and PID 1</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Make a shell that has its own hostname (UTS) and its own process table (PID). This is a hand-built container in one command.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>hostname                       <span class="c"># note the current name, e.g. 3f9c1a2b4d5e</span>
+unshare --uts --pid --fork --mount-proc bash   <span class="c"># new UTS + PID ns, run a shell</span>
+
+<span class="c"># You are now inside. Change the hostname and look at the process table:</span>
+hostname box-of-my-own
+ps -e</code></pre></div>
+        <div class="out"><span class="ol">Output</span>    PID TTY          TIME CMD
+      1 pts/0    00:00:00 bash
+      7 pts/0    00:00:00 ps</code></div>
+        <p>Your shell is <b>PID 1</b>. There are two processes in the whole table — because this PID namespace was born empty and you're its first inhabitant. The <code>--fork</code> matters: <code>unshare</code> itself can't become PID 1 (it created the namespace from outside), so it forks a child to be PID 1. The <code>--mount-proc</code> matters too: it gives you a fresh <code>/proc</code> mounted for this PID namespace, so <code>ps</code> reads the right process list instead of the host's. Now open a <em>second</em> terminal into the same container (<code>docker exec -it &lt;id&gt; bash</code>) and run <code>hostname</code> — it still shows the original name. You changed the hostname in your private UTS namespace; the host's was never touched. Type <code>exit</code> to leave and watch PID 1 die and the namespaces vanish with it.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — a namespace is an inode</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>"Membership" isn't a label; it's a shared inode. Prove it. First read your shell's namespace inodes, then create a new network namespace and watch one number change.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>readlink /proc/$$/ns/net /proc/$$/ns/uts   <span class="c"># $$ = this shell's PID</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>net:[4026531840]
+uts:[4026531838]</code></div>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>unshare --net bash                 <span class="c"># give this shell a private net namespace</span>
+readlink /proc/$$/ns/net           <span class="c"># same shell, new PID, read again</span>
+ip link                            <span class="c"># what interfaces do we have now?</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>net:[4026532567]
+1: lo: &lt;LOOPBACK&gt; mtu 65536 qdisc noop state DOWN mode DEFAULT ...
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00</code></div>
+        <p>The <code>net</code> inode changed (<code>...840</code> → <code>...567</code>): you're in a different network namespace now. And it contains exactly one interface, <code>lo</code>, in state <code>DOWN</code> — a brand-new net namespace has no connectivity at all until someone plugs it in. Now use <code>lsns</code> to see every namespace grouped by type, and <code>nsenter</code> to prove you can re-enter one. Start a sleeper in its own net namespace and enter it from outside:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>exit                                        <span class="c"># back to the shell's original namespaces</span>
+unshare --net --fork sleep 1000 &amp;
+SLEEPER=$!
+lsns -t net                                 <span class="c"># list network namespaces + owners</span>
+nsenter -t $SLEEPER -n ip link              <span class="c"># enter the sleeper's net ns, look around</span></code></pre></div>
+        <p><code>nsenter -t $SLEEPER -n</code> opened <code>/proc/$SLEEPER/ns/net</code> and called <code>setns()</code> to join it, then ran <code>ip link</code> there — showing only that namespace's lonely <code>lo</code>. You just did by hand what happens every time an SRE runs <code>nsenter</code> to debug a container's networking from the node.</p>
+      </div>
+    </div>
+
+    <details class="recall"><summary>Think first: in Lab 2, why did the new net namespace show <code>lo</code> as <code>DOWN</code> rather than <code>UP</code>? Wouldn't loopback "just work"?</summary>
+      <div class="body">
+        <p>No interface comes up on its own, not even loopback. A fresh network namespace is genuinely empty except for the loopback device the kernel creates, and that device starts administratively down. Until something runs <code>ip link set lo up</code>, even <code>ping 127.0.0.1</code> fails inside that namespace. Container runtimes bring <code>lo</code> up for you as part of setup, which is why you never notice — but if you ever build a net namespace by hand and find that localhost doesn't answer, this is why. It's the most common self-inflicted wound when people first script <code>ip netns</code>.</p>
+      </div>
+    </details>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — the container that can't see the host</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Here's the question everyone asks once: I <code>exec</code> into my container and <code>ps</code> shows almost nothing, but I <em>know</em> the node is running hundreds of processes. Where did they go? Reproduce it, then investigate before revealing the cause.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># From your Mac host terminal, not inside the lab container:</span>
+docker run -d --name web nginx
+docker exec web ps -e            <span class="c"># the container's view of processes</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>    PID TTY          TIME CMD
+      1 ?        00:00:00 nginx
+     29 ?        00:00:00 nginx
+     30 ?        00:00:00 ps</code></div>
+        <p>Three processes, and nginx is PID 1. Meanwhile the node running this is executing hundreds. The container isn't "hiding" them with a filter you could turn off, and it isn't a permissions issue. What single kernel fact explains both "can't see them" and "nginx is PID 1 not PID 4242"? Work it out, then check your reasoning.</p>
+        <details class="recall"><summary>Reveal the cause</summary>
+          <div class="body">
+            <p>It's the <b>PID namespace</b>. nginx was started as the first process in a fresh PID namespace, so inside it <em>is</em> PID 1, and the process table it can read only contains processes that are also members of that PID namespace. The host's processes exist in a different (parent) PID namespace, and there is no syscall a process can make to enumerate a namespace it isn't in — the kernel answers <code>readdir</code> of <code>/proc</code> relative to the caller's PID namespace. Prove it from the node side, where you <em>can</em> see in:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>PID=$(docker inspect -f '{{.State.Pid}}' web)   <span class="c"># nginx's REAL host PID</span>
+echo $PID                                        <span class="c"># e.g. 4242 — not 1</span>
+sudo readlink /proc/$PID/ns/pid                  <span class="c"># its PID-namespace inode</span>
+sudo readlink /proc/1/ns/pid                     <span class="c"># the host init's — a different inode</span></code></pre></div>
+            <p>Same nginx process, two identities: PID 1 inside, PID 4242 outside. The host and the container are in different PID namespaces (different inodes). That asymmetry — the host sees in, the container can't see out — is the master key from the analogy, and it's why you always debug containers <em>from the node</em>, never the other way around.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — enter a live container's namespaces to debug it</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>A container is misbehaving and its image is a scratch/distroless one — no shell, no <code>curl</code>, no <code>ip</code>. You can't <code>docker exec bash</code> because there is no bash. This is normal in production. How do you inspect its network without adding anything to the image? Think about which tool crosses <em>into</em> a namespace, then look.</p>
+        <details class="recall"><summary>Reveal the approach</summary>
+          <div class="body">
+            <p>Use <code>nsenter</code> from a toolbox that has the utilities, targeting the container's PID. On a real Linux node you run <code>nsenter</code> directly; with Docker Desktop you get there through a privileged helper that shares the host's PID namespace, so it can see the container's real PID:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>PID=$(docker inspect -f '{{.State.Pid}}' web)
+
+<span class="c"># A toolbox that shares the host PID namespace so $PID is meaningful:</span>
+docker run --rm -it --privileged --pid=host ubuntu:24.04 bash
+apt-get update &amp;&amp; apt-get install -y iproute2 &gt;/dev/null
+
+<span class="c"># Now step into the target's NET namespace only, and inspect it:</span>
+nsenter -t &lt;PID&gt; -n ip addr
+nsenter -t &lt;PID&gt; -n ss -tlnp        <span class="c"># what's listening inside the container</span></code></pre></div>
+            <p>You borrowed the container's network view using tools that live in your toolbox, not in the container. The <code>-n</code> selects only the net namespace; add <code>-p</code> for PID, <code>-m</code> for mount, or <code>-a</code> for all. This is the single most useful container-debugging move an SRE owns: when the container is too minimal to help you, enter its namespaces from outside and bring your own tools. The same idea powers Kubernetes ephemeral debug containers (<a href="ch40-kubernetes-troubleshooting-methodology.html">Chapter 40</a>).</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — user namespaces &amp; "root that isn't root"</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>The user namespace is the one that turns "container root" into "unprivileged nobody on the host." Create one with no privilege at all, become root inside it, then find out who you really are from the outside.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>id                              <span class="c"># your real identity, e.g. uid=1000(alice)</span>
+unshare --user --map-root-user bash
+id                              <span class="c"># inside the new user namespace</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>uid=0(root) gid=0(root) groups=0(root)</code></div>
+        <p>You're "root" — inside this user namespace. Now inspect the mapping the kernel installed, and create a file to see how the outside world scores your UID:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>cat /proc/self/uid_map          <span class="c"># inside-uid  outside-uid  count</span>
+touch /tmp/made-by-container-root
+exit                            <span class="c"># back to your real identity</span>
+ls -ln /tmp/made-by-container-root   <span class="c"># who owns it out here?</span></code></pre></div>
+        <p>The <code>uid_map</code> reads something like <code>0 1000 1</code>: "UID 0 inside maps to UID 1000 outside, for a range of 1." So the file you made as root shows owner <code>1000</code> on the host. The senior question: given this, why is a rootless container (one where the container's root is a mapped unprivileged UID) meaningfully safer than a normal container, and where does that safety <em>stop</em>? Reason it out before opening the answer.</p>
+        <details class="recall"><summary>Reveal the reasoning</summary>
+          <div class="body">
+            <p>Safety: if a process escapes the container, or writes to a bind-mounted host directory, it acts as the mapped unprivileged UID (1000), not real UID 0. A "root" exploit inside a rootless container lands you as a nobody outside — it can't read <code>/etc/shadow</code>, can't load kernel modules, can't touch other users' files. The capabilities the process holds are only valid <em>within</em> its user namespace; they don't translate to power over host-owned resources.</p>
+            <p>Where it stops: the kernel is still shared and still the boundary from <a href="ch01-kernel-and-system-calls.html">Chapter 1</a>. A kernel bug reachable via a syscall doesn't care about your UID mapping — a local privilege-escalation vulnerability in the kernel can still be a full escape. User namespaces also historically <em>expanded</em> kernel attack surface (they let unprivileged users reach code paths that were previously root-only), which is why some hardened distros restrict them. So rootless raises the floor a lot and is the right default, but it is not a substitute for keeping the kernel patched, seccomp on, and capabilities dropped — the layered story you'll finish in <a href="ch27-container-security-and-process-to-container-to.html">Chapter 27</a>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <p>Namespace problems rarely announce themselves as "namespace problems." They show up as spooky isolation gaps or spooky isolation that's too tight.</p>
+    <div class="box realworld"><div class="h">Incident pattern · the container can see the host's processes</div>
+      <p><b>Symptom:</b> a container's <code>ps</code> shows the node's processes, or a compromised container was able to inspect and signal host services. <b>First cut:</b> compare PID-namespace inodes — <code>readlink /proc/1/ns/pid</code> inside vs on the node. <b>Confirm:</b> check how it was launched. <b>Usual cause:</b> <code>docker run --pid=host</code> or a pod with <code>hostPID: true</code>. That flag deliberately joins the host PID namespace — great for a node-debug toolbox, a serious problem for a normal workload. The fix is to stop setting it (and to block it via PodSecurity in <a href="ch39-security-rbac-admission-policy-securitycontext.html">Chapter 39</a>).</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · "no space left" creating containers, but the disk is empty</div>
+      <p><b>Symptom:</b> new containers or pods fail to start; <code>clone</code>/<code>unshare</code> returns <code>ENOSPC</code> even though <code>df</code> shows free space. <b>First cut:</b> this <code>ENOSPC</code> isn't about disk — <code>namespaces(7)</code> defines per-user namespace limits in <code>/proc/sys/user/max_*_namespaces</code>, and hitting them fails with <code>ENOSPC</code>. <b>Confirm:</b> <code>lsns | wc -l</code> and read <code>/proc/sys/user/max_net_namespaces</code>. <b>Usual cause:</b> a leak — namespaces pinned alive by forgotten bind mounts or leaked file descriptors (often orphaned <code>ip netns</code> entries under <code>/run/netns</code>, or a runtime bug). The fix is finding and releasing the pin, not raising the limit.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · localhost works on the VM, breaks in the container</div>
+      <p><b>Symptom:</b> a sidecar that talks to the main app over <code>127.0.0.1</code> works when co-located but not when split. <b>Usual cause:</b> a network namespace boundary. Two containers share <code>localhost</code> only if they share a net namespace — which is exactly what pods give you (all containers in a pod share one net namespace) and what separate containers do not. The tell is that the connection gets <code>ECONNREFUSED</code>: nothing is listening on that loopback because "that loopback" is a different namespace's loopback. You'll see this reasoning again in pod networking, <a href="ch42-pod-networking-internals-pod-to-pod.html">Chapter 42</a>.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Security.</b> Namespaces are a visibility boundary, not a hard security boundary on their own. The user namespace is the one that adds real teeth, because it decouples in-container privilege from host privilege — run workloads rootless where you can. But remember what namespaces do <em>not</em> cover: they don't stop a process from reaching the shared kernel through a syscall, so you still need seccomp to shrink the syscall surface and dropped capabilities to remove privileged operations. The three together — namespaces, seccomp, capabilities — are what people mean by "container isolation," and any one missing is a gap. Treat <code>hostPID</code>, <code>hostNetwork</code>, <code>hostIPC</code>, and privileged containers as things you justify in writing, not defaults.</p>
+    <p><b>Performance.</b> Namespaces are close to free. Entering one is a pointer swap in the kernel; there's no per-syscall tax the way a VM's trap-and-emulate can cost. This is the whole economic case for containers over VMs: you get most of the isolation at almost none of the overhead because there's no second kernel. The one place cost creeps in is the network namespace — a packet crossing the veth pair and bridge does more work than a packet on the host stack, which is why high-throughput workloads sometimes choose <code>hostNetwork</code> or newer datapaths. That's a <a href="ch25-container-networking.html">Chapter 25</a> and <a href="ch58-vpc-cni-the-deep-one.html">Chapter 58</a> conversation.</p>
+    <p><b>Common mistakes:</b> conflating namespaces (visibility) with cgroups (resources) and being surprised a container with no memory limit ate the node; assuming a container can't see the host when someone quietly set <code>hostPID: true</code>; forgetting that <code>--network=host</code> throws away the net namespace entirely, so port conflicts and localhost surprises come right back; and treating "root in the container" as "root on the host" when a user namespace is in play, or worse, assuming a user namespace is present when it isn't.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>Namespaces are the reason the container model scales the way it does. Because isolation is per-process and nearly free, you can pack dozens of workloads onto one node and schedule them in milliseconds — the premise the entire orchestration stack is built on. The Kubernetes <b>pod</b> is a direct expression of namespace mechanics: the containers in a pod share the network and IPC namespaces (so they reach each other on <code>localhost</code> and share memory) while keeping separate mount namespaces (so their filesystems don't collide). Understanding that one design decision — "share net, split mnt" — explains most of why pods behave as they do, from sidecar patterns to why a crash in one container doesn't reset another's files. When you design a platform, the questions "what should be shared and what should be isolated?" are literally "which namespaces do these processes share?", and getting that mapping right is the difference between a clean sidecar and a debugging nightmare.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first, then open it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What is a Linux namespace, in one breath?</summary>
+        <div class="a"><p>A namespace wraps a global kernel resource — like the process table, the network stack, or the mount table — so that the processes inside see their own private instance of it. There are eight types (pid, net, mnt, uts, ipc, user, cgroup, time), and a container is just a normal process placed into a fresh set of them. Namespaces control what a process can <em>see</em>; they don't limit how much it can use — that's cgroups.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through what makes a process "a container."</summary>
+        <div class="a"><p>The kernel has no container object — only processes and namespaces. A runtime calls <code>clone()</code> with the <code>CLONE_NEW*</code> flags so the new process is born into fresh namespaces of each type: it's PID 1 in a new PID namespace, has a bare loopback in a new net namespace, an empty mount table, its own hostname, and so on. Then the runtime furnishes those empty namespaces — mounts the image's root filesystem into the mount namespace, plumbs a veth into the net namespace, sets the hostname, and drops the process into a cgroup for CPU/memory limits — and finally <code>exec</code>s the workload. From inside, it looks like a private machine; from the host it's one process with eight namespace handles under <code>/proc/&lt;pid&gt;/ns/</code>. I'd stress three things: namespaces are per-type membership you can mix, creating them needs <code>CAP_SYS_ADMIN</code> except the user namespace, and the host can always see into the container but not vice-versa.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>How does the kernel know two processes are in the same namespace, and how do you check?</summary>
+        <div class="a"><p>Each namespace has a kernel object identified by an inode number, exposed as a symlink under <code>/proc/&lt;pid&gt;/ns/&lt;type&gt;</code> whose target is like <code>net:[4026531969]</code>. Two processes share a namespace of that type exactly when those symlinks resolve to the same inode — you can compare with <code>readlink</code> or by <code>stat</code>'s device+inode. That inode is also what keeps a namespace alive: as long as a process, an open file descriptor, or a bind mount references it, it persists; otherwise it's torn down when the last member exits. Tools like <code>lsns</code> just read these. This is why the debugging move is always "compare the inodes" — it's a definite yes/no, not a guess.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A pod's app container reaches its sidecar on <code>127.0.0.1:9000</code>, but a standalone container can't reach another container the same way. Why?</summary>
+        <div class="a"><p>Because <code>localhost</code> is per network namespace. Containers in the same pod share one network namespace, so they share one loopback and one port space — <code>127.0.0.1:9000</code> in the app is the same loopback the sidecar listens on. Two standalone containers each have their own net namespace and therefore their own separate loopback; a connection to <code>127.0.0.1</code> stays inside the caller's namespace and gets <code>ECONNREFUSED</code> because nothing is listening there. To make standalone containers talk, you route between their namespaces over the bridge by IP or DNS name, not over loopback. The fix in Kubernetes terms is: co-locate them in a pod if they truly need loopback, otherwise use a Service.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>What does a user namespace change, and why do we call the result "rootless"?</summary>
+        <div class="a"><p>A user namespace remaps user and group IDs and scopes capabilities to that namespace. It lets a process be UID 0 with a full capability set <em>inside</em> the namespace while being an ordinary unprivileged UID <em>outside</em>, via a mapping like <code>0 100000 65536</code>. "Rootless" means the container's root is one of those mapped unprivileged host UIDs, so a break-out or a write to a host mount happens as a nobody, not as real root. It's also the only namespace an unprivileged user can create without <code>CAP_SYS_ADMIN</code>, which is what lets rootless runtimes work at all. The caveat I'd add: the kernel is still shared, so a kernel-level exploit can still escape — user namespaces raise the bar, they don't remove the need for seccomp, dropped capabilities, and a patched kernel.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>A namespace virtualises one global kernel resource so the processes inside see a private instance. There are eight: pid (process IDs, own PID 1), net (interfaces, ports, routes), mnt (the filesystem tree), uts (hostname), ipc (System&nbsp;V IPC and message queues), user (UID/GID and capabilities), cgroup (the cgroup root view), and time (monotonic/boot clock offsets, not the wall clock). A process is a member of one namespace per type; a fresh set of all eight is a container. Three syscalls do everything — <code>clone</code> creates a process in new namespaces, <code>unshare</code> moves you into new ones, <code>setns</code> joins an existing one — fronted by <code>unshare</code> and <code>nsenter</code>. Membership is an inode under <code>/proc/&lt;pid&gt;/ns/</code>; same inode means same namespace. Creating namespaces needs <code>CAP_SYS_ADMIN</code>, except user namespaces since Linux 3.8. The host sees into the container; the container can't see out. Namespaces isolate visibility; they don't meter resources or seal the shared kernel.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>A namespace isolates what a process can <em>see</em> of one global resource; cgroups meter how much it can <em>use</em>. Never conflate them.</li>
+      <li>There are eight types: pid, net, mnt, uts, ipc, user, cgroup, time. A container is a process in a fresh set of all of them.</li>
+      <li>Three syscalls: <code>clone</code> (born into new ns), <code>unshare</code> (move into new ns), <code>setns</code> (join existing ns). <code>unshare</code> and <code>nsenter</code> are the CLIs.</li>
+      <li>Membership is an inode shown by <code>readlink /proc/&lt;pid&gt;/ns/&lt;type&gt;</code>; equal inodes mean the same namespace.</li>
+      <li>The mount namespace's flag is the historical odd one, <code>CLONE_NEWNS</code> — it was the first namespace Linux had.</li>
+      <li>A fresh net namespace has only <code>lo</code>, and <code>lo</code> starts DOWN — no connectivity until something plumbs it in.</li>
+      <li>PID namespaces explain "why the container can't see the host": <code>/proc</code> is read relative to the caller's PID namespace, and the same process is PID 1 inside, PID N outside.</li>
+      <li>Creating namespaces needs <code>CAP_SYS_ADMIN</code>; the exception is user namespaces, creatable unprivileged since Linux 3.8 — the basis of rootless.</li>
+      <li>User namespaces make "root inside" an unprivileged UID outside; they raise the bar but don't seal the shared kernel.</li>
+      <li>The host can always see into a container (debug from the node with <code>nsenter</code>); the container cannot see out.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch01-kernel-and-system-calls.html"><b>Ch 1</b> Kernel &amp; syscalls</a>
+      <a href="ch21-what-a-container-really-is.html"><b>Ch 21</b> What a container is</a>
+      <a href="ch23-cgroups-v2-cpu-memory-io-limits.html"><b>Ch 23</b> cgroups v2</a>
+      <a href="ch24-container-filesystems-overlayfs-and-image-layers.html"><b>Ch 24</b> Overlayfs &amp; layers</a>
+      <a href="ch25-container-networking.html"><b>Ch 25</b> Container networking</a>
+      <a href="ch27-container-security-and-process-to-container-to.html"><b>Ch 27</b> Container security</a>
+      <a href="ch42-pod-networking-internals-pod-to-pod.html"><b>Ch 42</b> Pod networking</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man7/namespaces.7.html">namespaces(7)</a>: the authoritative overview, the type table, the <code>/proc/&lt;pid&gt;/ns/</code> layout, and namespace lifetime.</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man7/user_namespaces.7.html">user_namespaces(7)</a> and <a href="https://man7.org/linux/man-pages/man7/pid_namespaces.7.html">pid_namespaces(7)</a>: the two you'll reason about most.</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man2/unshare.2.html">unshare(2)</a>, <a href="https://man7.org/linux/man-pages/man2/setns.2.html">setns(2)</a>, <a href="https://man7.org/linux/man-pages/man2/clone.2.html">clone(2)</a>: the whole namespace API.</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man1/nsenter.1.html">nsenter(1)</a> and <a href="https://man7.org/linux/man-pages/man1/unshare.1.html">unshare(1)</a>: the tools used in the labs.</li>
+      <li>The Linux Kernel documentation — <a href="https://docs.kernel.org/">docs.kernel.org</a>: the kernel's own namespace and <code>/proc</code> references.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch21-what-a-container-really-is.html"><span class="dir">← Prev</span><div class="ti">Ch 21 — What a container really is</div></a>
+      <a class="nx" href="ch23-cgroups-v2-cpu-memory-io-limits.html"><span class="dir">Next →</span><div class="ti">Ch 23 — cgroups v2: CPU, memory, I/O limits</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 22 of 121 · Part III · Containers &amp; Container Internals. Build the container by hand once; you'll never fear it again.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">One process, eight ns</a>
+    <a href="#internals">How ns get created</a>
+    <a href="#components">The tools</a>
+    <a href="#flow">Following docker run</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

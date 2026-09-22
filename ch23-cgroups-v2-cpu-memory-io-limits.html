@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 23 — cgroups v2: CPU, Memory, I/O Limits</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part III · Containers &nbsp;·&nbsp; Chapter 23</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part III · Containers &amp; Container Internals · Chapter 23</div>
+      <h1>cgroups v2: CPU, memory, I/O limits</h1>
+      <p class="tagline">Namespaces stop a container from <em>seeing</em> the rest of the machine. cgroups stop it from <em>eating</em> the whole machine. This is where "the pod got OOMKilled" and "the service is throttled to a crawl at 30% CPU" come from — and where you'll fix them.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~45 min read · Linux lab (Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain the cgroup v2 unified hierarchy and the "no internal processes" rule without hand-waving.</li>
+          <li>Set <code>cpu.max</code> and <code>cpu.weight</code> and say precisely how quota differs from proportional share.</li>
+          <li>Read <code>cpu.stat</code> and diagnose CPU throttling from <code>nr_throttled</code> and <code>throttled_usec</code>.</li>
+          <li>Trigger and explain a cgroup OOM kill via <code>memory.max</code>, and tell it apart from <code>memory.high</code>.</li>
+          <li>Map Kubernetes requests and limits onto the exact cgroup files the kubelet writes.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem cgroups solve</h2>
+    <p>You've packed twelve containers onto one node. Namespaces gave each of them the illusion of a private machine, but they all still draw from one real pool of CPU, RAM, and disk bandwidth. Nothing you've built so far stops one of them from spinning up forty threads and pinning every core, or leaking memory until the kernel starts killing things, or hammering the disk so hard that everyone else's writes stall. Isolation of <em>view</em> doesn't give you isolation of <em>consumption</em>. One noisy neighbour can still take down the whole node.</p>
+    <p>You need a way to say: "this group of processes gets at most 1.5 CPUs, 512&nbsp;MB of RAM, and 50&nbsp;MB/s of write bandwidth, and if it exceeds memory, kill it, not someone else." That mechanism is <b>control groups</b> — cgroups. A cgroup is a labelled bucket of processes that the kernel accounts and limits as a unit. The scheduler and the memory and block subsystems all consult the cgroup a process belongs to before granting it CPU time, memory, or I/O.</p>
+    <p>There have been two generations. cgroups v1 gave each resource (CPU, memory, I/O) its own separate hierarchy, which let a process sit in inconsistent places across controllers and made coordinated decisions hard. cgroups v2 replaced that with a single <b>unified hierarchy</b>: one tree, and every controller reads the same tree. That's what modern kernels default to, what systemd manages, and what Kubernetes now assumes. This chapter is v2 only; if you ever meet <code>cpu.cfs_quota_us</code> or <code>cpu.shares</code>, you're looking at legacy v1, and the concepts map but the files differ.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>Namespaces and cgroups are the two halves of a container and they answer different questions. Namespaces: "what can this process <em>see</em>?" cgroups: "how much can this process <em>use</em>, and what happens when it wants more?" A container missing its cgroup limits is a perfectly isolated process that can still starve the node. Both, always.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: metered utilities in an apartment block</h2>
+    <p>Namespaces gave each tenant a private suite. cgroups are the building's utility metering.</p>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>The building has one electrical supply, one water main, one internet uplink. Management gives each suite a <b>metered allocation</b>. Electricity works two ways: there's a <b>hard breaker</b> — draw more than your amperage and the breaker trips (that's a hard limit, <code>cpu.max</code> and <code>memory.max</code>) — and there's a <b>fair-share rule</b> for when everyone's busy at once: if the whole block is maxed, power is split in proportion to each suite's rating, so a "weight 200" suite gets twice the amps of a "weight 100" suite, but only while there's contention (that's <code>cpu.weight</code>).</p>
+      <p>Water (memory) is different: there's a <b>soft warning line</b> where management starts aggressively asking you to conserve and slows your taps (that's <code>memory.high</code>), and a <b>hard cap</b> where, if you still won't stop, they shut off <em>your</em> suite entirely rather than let the building flood (that's <code>memory.max</code> and the OOM kill). And the internet uplink (disk I/O) is rate-limited per suite in megabits (that's <code>io.max</code>).</p>
+      <p>The detail that matters: metering is per <em>suite</em>, and suites nest — a floor can have a budget that its suites share. Meters attach to the leaves where people actually live, never to the hallway. That last sentence is the "no internal processes" rule, and it trips up everyone the first time.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In cgroups v2</th></tr>
+      <tr><td>A metered suite (or a floor's shared budget)</td><td>A cgroup — a directory under <code>/sys/fs/cgroup</code></td></tr>
+      <tr><td>The electrical breaker (trip if exceeded)</td><td><code>cpu.max</code> — quota per period; hard CPU ceiling</td></tr>
+      <tr><td>Fair-share amperage under load</td><td><code>cpu.weight</code> — proportional share, only when contended</td></tr>
+      <tr><td>The "please conserve" warning line on water</td><td><code>memory.high</code> — throttle + heavy reclaim, no kill</td></tr>
+      <tr><td>The hard shut-off to save the building</td><td><code>memory.max</code> — hard cap; OOM kill inside the cgroup</td></tr>
+      <tr><td>Rate-limited internet uplink</td><td><code>io.max</code> — bytes/s and IOPS caps per device</td></tr>
+      <tr><td>Meters attach to suites, not hallways</td><td>Processes live only in leaf cgroups (no internal processes)</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>The unified hierarchy and its controllers</h2>
+    <p>cgroup v2 is a single filesystem tree mounted at <code>/sys/fs/cgroup</code> (filesystem type <code>cgroup2</code>). Each directory is a cgroup; make a subdirectory and you've made a child cgroup. A process's membership is written by echoing its PID into that cgroup's <code>cgroup.procs</code> file. The controllers — <code>cpu</code>, <code>memory</code>, <code>io</code>, <code>pids</code>, and a few others — are the per-resource logic that reads the tree and enforces limits.</p>
+    <p>Two files govern how controllers flow down the tree. <code>cgroup.controllers</code> lists which controllers are <em>available</em> in this cgroup. <code>cgroup.subtree_control</code> is where you <em>enable</em> them for your children, by writing <code>+cpu +memory +io</code>. A controller must be enabled in the parent's <code>subtree_control</code> before the child even has the corresponding interface files. That's how delegation works: the root enables controllers for <code>kubepods.slice</code>, which enables them for each pod, which enables them for each container.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 760 440" role="img" aria-label="The cgroup v2 unified tree with controllers delegated down to container leaves">
+        <text x="380" y="20" text-anchor="middle" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">CGROUP v2 — ONE UNIFIED TREE, CONTROLLERS DELEGATED DOWNWARD</text>
+        <!-- root -->
+        <rect x="290" y="32" width="190" height="60" rx="9" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.6"/>
+        <text x="385" y="55" text-anchor="middle" style="fill:var(--ink);font:600 13.5px sans-serif">/sys/fs/cgroup (root)</text>
+        <text x="385" y="74" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">controllers: cpu memory io pids</text>
+        <text x="385" y="108" text-anchor="middle" style="fill:var(--accent2);font:600 10.5px sans-serif">subtree_control: +cpu +memory +io</text>
+        <!-- level 2 -->
+        <rect x="110" y="128" width="170" height="50" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="195" y="149" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">system.slice</text>
+        <text x="195" y="166" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">host daemons</text>
+        <rect x="490" y="128" width="170" height="50" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="575" y="149" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">kubepods.slice</text>
+        <text x="575" y="166" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">all pods on the node</text>
+        <!-- level 3 -->
+        <rect x="110" y="224" width="170" height="48" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="195" y="245" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">sshd.service</text>
+        <text x="195" y="261" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">leaf · has processes</text>
+        <rect x="490" y="220" width="170" height="44" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="575" y="240" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">pod-abc123 (slice)</text>
+        <text x="575" y="256" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">shared pod budget</text>
+        <!-- leaf -->
+        <rect x="490" y="308" width="170" height="56" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.6"/>
+        <text x="575" y="330" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">container leaf</text>
+        <text x="575" y="347" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">cgroup.procs → PID 1..N</text>
+        <!-- interface panel -->
+        <rect x="70" y="308" width="368" height="112" rx="9" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="86" y="328" style="fill:var(--muted);font:700 10.5px sans-serif;letter-spacing:.04em">CONTAINER LEAF — INTERFACE FILES</text>
+        <text x="86" y="348" style="fill:var(--ink);font:12px ui-monospace,monospace">cpu.max = 150000 100000  (1.5 CPU ceiling)</text>
+        <text x="86" y="366" style="fill:var(--ink);font:12px ui-monospace,monospace">cpu.weight = 200         (share under load)</text>
+        <text x="86" y="384" style="fill:var(--ink);font:12px ui-monospace,monospace">memory.max = 512M        (hard: OOM here)</text>
+        <text x="86" y="402" style="fill:var(--ink);font:12px ui-monospace,monospace">io.max = 259:0 wbps=52428800</text>
+        <!-- connectors -->
+        <g style="stroke:var(--muted);stroke-width:1.4">
+          <line x1="340" y1="92" x2="195" y2="128"/>
+          <line x1="430" y1="92" x2="575" y2="128"/>
+          <line x1="195" y1="178" x2="195" y2="224"/>
+          <line x1="575" y1="178" x2="575" y2="220"/>
+          <line x1="575" y1="264" x2="575" y2="308"/>
+        </g>
+        <line x1="438" y1="336" x2="490" y2="336" style="stroke:var(--accent);stroke-width:1.5;stroke-dasharray:5 4"/>
+      </svg>
+      <figcaption>One tree, read by every controller. Limits are written as files on the leaf where the container's processes actually live; the kubelet builds the <code>kubepods.slice</code> subtree for you.</figcaption>
+    </figure>
+
+    <p>The <b>no internal processes</b> rule is the one structural constraint to internalise: a cgroup may either contain processes <em>or</em> distribute controllers to children, but not both — the root cgroup is the sole exception. That's why the tree bottoms out in leaves: processes attach at the leaves, and every interior node is pure structure. When you build cgroups by hand in the lab, this is why your first move is always to migrate your shell into a fresh leaf before enabling controllers on the parent.</p>
+
+    <details class="recall"><summary>Think first: you <code>mkdir</code> a cgroup and immediately try <code>echo "+cpu" &gt; cgroup.subtree_control</code>, but it returns <code>EBUSY</code>. Why?</summary>
+      <div class="body">
+        <p>Because the current cgroup still has processes in it (your shell, at least), and the no-internal-processes rule forbids a cgroup from both holding processes and delegating controllers to children — outside the true root. Move the processes down first: make a leaf, <code>echo $$ &gt; leaf/cgroup.procs</code> to relocate your shell, and <em>then</em> the parent is process-free and will accept <code>+cpu</code> in <code>subtree_control</code>. The kernel isn't being difficult; it's keeping accounting unambiguous, because a controller can't sensibly split a resource between "processes right here" and "these child groups" at the same level.</p>
+      </div>
+    </details>
+
+    <h2 id="internals"><span class="beat">Internal working</span>How each limit is enforced</h2>
+    <p>Each controller hooks a different kernel subsystem. Here's what actually happens, per resource.</p>
+    <ol class="steps">
+      <li><b>CPU ceiling — <code>cpu.max</code>.</b> The file holds two numbers, <code>$MAX $PERIOD</code>, in microseconds; the default is <code>max 100000</code> (no limit, 100&nbsp;ms period). Write <code>50000 100000</code> and the cgroup may run for at most 50&nbsp;ms of CPU time in every 100&nbsp;ms window — half a CPU. This is the CFS bandwidth controller: once the cgroup burns its quota for the current period, every runnable task in it is <b>throttled</b> — taken off-CPU until the next period starts. The limit is enforced per period, not smoothed, which is the root of the throttling latency problem you'll meet below.</li>
+      <li><b>CPU share — <code>cpu.weight</code>.</b> A single number, default <code>100</code>, range 1–10000. It only matters <em>under contention</em>: when runnable tasks want more CPU than exists, the scheduler divides CPU between sibling cgroups in proportion to their weights. Weight 200 beside weight 100 gets two-thirds of the contested CPU. When there's spare CPU, weight is irrelevant — a low-weight cgroup can use the whole machine if nobody else wants it. This is the opposite of <code>cpu.max</code>, which caps you even on an idle box.</li>
+      <li><b>Memory soft/hard — <code>memory.high</code> and <code>memory.max</code>.</b> Both default to <code>max</code>. Cross <code>memory.high</code> and the kernel puts the cgroup under heavy reclaim pressure and throttles its allocations to slow it down — but it <em>never</em> invokes the OOM killer; usage can even breach the line temporarily. Reach <code>memory.max</code> and, if reclaim can't bring usage back under, the kernel invokes the OOM killer <em>inside that cgroup</em> and kills a process there. So <code>high</code> is a rubber wall that slows you; <code>max</code> is a brick wall that kills you.</li>
+      <li><b>The OOM event trail — <code>memory.events</code>.</b> When a kill happens, the kernel increments counters in <code>memory.events</code>: <code>max</code> (times usage hit the ceiling), <code>oom</code> (times an OOM was entered), and <code>oom_kill</code> (processes actually killed). This file is your proof, after the fact, that a container died because of its own memory limit rather than something else.</li>
+      <li><b>I/O rate — <code>io.max</code>.</b> Keyed per block device by <code>$MAJ:$MIN</code>, with nested keys <code>rbps</code>, <code>wbps</code>, <code>riops</code>, <code>wiops</code>. Write <code>259:0 wbps=52428800</code> to cap writes on that device at 50&nbsp;MB/s. The block layer delays I/O that would exceed the rate. One wrinkle: buffered writes are charged when the kernel flushes dirty pages (writeback), not when your program calls <code>write()</code>, so throttling of buffered I/O looks laggy — direct I/O throttles immediately.</li>
+      <li><b>Accounting is hierarchical.</b> A child's usage counts against every ancestor. A pod-level <code>memory.max</code> caps the sum of its containers; a container that stays under its own limit can still be killed if the pod's shared budget is blown. The tree isn't decoration — limits compose downward.</li>
+    </ol>
+
+    <div class="box keypoint"><div class="h">cpu.max vs cpu.weight — the distinction that gets asked</div>
+      <p><code>cpu.max</code> is an absolute ceiling enforced every period, even on an otherwise idle machine: quota exhausted means throttled, full stop. <code>cpu.weight</code> is a relative share that only bites when the CPU is contended, and imposes no ceiling at all when it isn't. Kubernetes uses both: your CPU <em>request</em> becomes weight (fair share under load), your CPU <em>limit</em> becomes <code>cpu.max</code> (hard ceiling). Confusing the two is why people set a low CPU limit "to be safe" and then can't understand why a barely-busy service is slow.</p>
+    </div>
+
+    <h2 id="components"><span class="beat">Components</span>Who writes these files in production</h2>
+    <p>You will rarely echo into <code>cgroup.procs</code> yourself outside a lab. In production three actors own the tree:</p>
+    <ul>
+      <li><b>systemd</b> owns the top of the tree on most distros. It carves the machine into <code>system.slice</code> (daemons), <code>user.slice</code> (logins), and slices for whatever it manages, and it's the cgroup manager the kubelet and containerd coordinate with (the <code>systemd</code> cgroup driver). Fighting systemd for control of the tree is a classic misconfiguration.</li>
+      <li><b>The kubelet</b> builds and owns <code>kubepods.slice</code> (or <code>kubepods</code> path) on a Kubernetes node. It translates every pod's requests and limits into the <code>cpu.max</code>, <code>cpu.weight</code>, and <code>memory.max</code> files on the right leaves, and it groups pods into QoS sub-trees. When you write a pod spec, you are, at one remove, writing these files.</li>
+      <li><b>The runtime — runc via containerd</b> (<a href="ch26-docker-containerd-runc-and-the-oci-model.html">Chapter 26</a>) does the actual mkdir-and-write for a container's leaf, from the cgroup section of the OCI runtime spec, at the moment it starts the container.</li>
+    </ul>
+    <p>Your job is usually to <em>read</em> these files during an incident — <code>cpu.stat</code>, <code>memory.current</code>, <code>memory.events</code> — and to set the right numbers in the spec that eventually produces them.</p>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following a Kubernetes pod's limits down to the kernel</h2>
+    <p>You write <code>resources: {requests: {cpu: 250m, memory: 256Mi}, limits: {cpu: "1", memory: 512Mi}}</code>. Here's where each number lands. The kubelet takes the CPU <em>request</em>, 250m, and turns it into a <code>cpu.weight</code> on the container's leaf — proportional to the millicores, so the pod gets its fair slice under contention. It takes the CPU <em>limit</em>, 1 core, and writes <code>cpu.max = 100000 100000</code> (100&nbsp;ms quota per 100&nbsp;ms period = one CPU). It takes the memory <em>limit</em>, 512Mi, and writes <code>memory.max = 536870912</code>. The memory <em>request</em>, by default, is used only for scheduling and eviction ranking — it isn't a hard cgroup limit unless you've enabled the MemoryQoS feature, in which case it becomes <code>memory.min</code> (protected memory) and a <code>memory.high</code> throttle line is set below the max. The pod's QoS class — Guaranteed, Burstable, or BestEffort — decides which sub-slice it lands in and how aggressively it's reclaimed or evicted under node pressure. When the container later exceeds <code>memory.max</code>, the kernel OOM-kills a process in that leaf, the runtime sees the process exit with signal 9, and the pod status reads <b>OOMKilled</b> with exit code 137. Every step of that is visible; the labs walk it.</p>
+
+    <details class="recall"><summary>Think first: inside a container with a 512&nbsp;Mi memory limit, <code>free -h</code> proudly reports the node's 64&nbsp;GB of RAM. At what point does the app get OOM-killed?</summary>
+      <div class="body">
+        <p>At roughly 512&nbsp;Mi, not 64&nbsp;GB. The OOM decision is made against the cgroup's <code>memory.max</code>, which the kubelet set from the limit — the number <code>free</code> and <code>/proc/meminfo</code> print is the <em>host's</em> total, because those tools read host-wide files that aren't namespaced. So "the container thinks it has 64&nbsp;GB" is a reporting artefact, and any runtime that sizes a heap or a cache off <code>free</code> will happily allocate its way straight into an OOM kill long before it reaches what it believed was available. The truth lives in <code>memory.max</code> and <code>memory.current</code> under the cgroup — read those, and make sure your language runtime is cgroup-aware.</p>
+      </div>
+    </details>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>These labs write to the cgroup v2 filesystem, which needs a privileged container on a cgroup-v2 host (Docker Desktop is v2). Start one:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># --privileged so /sys/fs/cgroup is writable and dmesg is readable.</span>
+docker run --rm -it --privileged ubuntu:24.04 bash
+
+<span class="c"># Confirm you're on cgroup v2 — you want the type 'cgroup2':</span>
+mount | grep cgroup
+cat /sys/fs/cgroup/cgroup.controllers</code></pre></div>
+    <div class="out"><span class="ol">Output</span>cgroup2 on /sys/fs/cgroup type cgroup2 (rw,nosuid,nodev,noexec,relatime,...)
+cpu io memory pids ...</code></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — create a cgroup and enable controllers</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Make a leaf for your shell (to satisfy the no-internal-processes rule), enable controllers, then make a <code>demo</code> cgroup you'll limit.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>cd /sys/fs/cgroup
+mkdir -p init &amp;&amp; echo $$ &gt; init/cgroup.procs   <span class="c"># move THIS shell out of the root view</span>
+echo "+cpu +memory +io" &gt; cgroup.subtree_control  <span class="c"># now allowed: root has no procs left</span>
+mkdir demo
+cat demo/cpu.max demo/memory.max              <span class="c"># the fresh defaults</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>max 100000
+max</code></div>
+        <p>A brand-new cgroup inherits no limits: <code>cpu.max</code> is <code>max 100000</code> (unlimited, 100&nbsp;ms period) and <code>memory.max</code> is <code>max</code>. Because you enabled <code>+cpu +memory +io</code> in the parent's <code>subtree_control</code>, the <code>demo</code> leaf now has all the interface files — <code>cpu.max</code>, <code>cpu.weight</code>, <code>memory.max</code>, <code>memory.high</code>, <code>io.max</code>, <code>cpu.stat</code>. If you'd skipped the <code>subtree_control</code> step, those files wouldn't exist. That's delegation in action.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — cap CPU and watch throttling</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Limit <code>demo</code> to one-fifth of a CPU, drop a busy loop into it, and read the throttling counters.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>echo "20000 100000" &gt; demo/cpu.max     <span class="c"># 20ms per 100ms = 0.2 CPU</span>
+bash -c 'while true; do :; done' &amp;      <span class="c"># a pure CPU burner</span>
+BURN=$!
+echo $BURN &gt; demo/cgroup.procs          <span class="c"># place it under the limit</span>
+sleep 5
+cat demo/cpu.stat</code></pre></div>
+        <div class="out"><span class="ol">Output</span>usage_usec 1003217
+user_usec 1001880
+system_usec 1337
+nr_periods 51
+nr_throttled 50
+throttled_usec 3987541</code></div>
+        <p>Read this like a story. The burner wants a whole CPU but is capped at 0.2. So in almost every 100&nbsp;ms period (<code>nr_periods 51</code>) it burns its 20&nbsp;ms quota fast and then gets <b>throttled</b> for the rest — <code>nr_throttled 50</code>, nearly every period, for a total <code>throttled_usec</code> of ~4 seconds of forced idle over those 5 seconds of wall time. Confirm the ceiling held: <code>top -b -n1 -p $BURN | tail -1</code> shows it pinned near 20% CPU. This is <code>cpu.max</code> doing exactly its job. Now change the number to <code>50000 100000</code> and re-read <code>cpu.stat</code> — throttling drops as the quota loosens. Kill it: <code>kill $BURN</code>.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — trigger a cgroup OOM kill</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Give <code>demo</code> a small memory ceiling, then run a process inside it that keeps allocating. Watch what the kernel does — and work out <em>which</em> limit killed it before you look.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>echo 50M &gt; demo/memory.max
+<span class="c"># tail on /dev/zero never finds a 'last line' — it buffers forever, growing RAM:</span>
+bash -c 'echo $$ &gt; /sys/fs/cgroup/demo/cgroup.procs; exec tail /dev/zero'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>Killed</code></div>
+        <p>The process died with a bare <code>Killed</code>. But <em>who</em> killed it, and why exactly at ~50&nbsp;MB? It wasn't the host running out of RAM (the host has gigabytes free). Reason about what you set, then confirm.</p>
+        <details class="recall"><summary>Reveal the cause</summary>
+          <div class="body">
+            <p>The <b>cgroup OOM killer</b> fired, scoped to <code>demo</code>, because <code>tail</code>'s memory reached <code>memory.max = 50M</code> and reclaim couldn't claw it back. This is a <em>local</em> OOM — only processes in that cgroup were candidates; the rest of the machine was never at risk. The proof is in the event counters and the kernel log:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>cat /sys/fs/cgroup/demo/memory.events    <span class="c"># oom and oom_kill counters</span>
+dmesg | grep -i 'oom\|killed process' | tail -3</code></pre></div>
+            <div class="out"><span class="ol">Output</span>low 0
+high 0
+max 141
+oom 1
+oom_kill 1
+[ 8123.55 ] Memory cgroup out of memory: Killed process 812 (tail) ...
+             anon-rss:51200kB ... oom_score_adj:0</code></div>
+            <p><code>oom_kill 1</code> is the smoking gun: one process killed by the cgroup OOM killer. In Kubernetes this exact event surfaces as a container that exits with code <b>137</b> (128 + signal 9) and a pod status of <b>OOMKilled</b>. Note what it is <em>not</em>: it's not <code>memory.high</code> (that throttles, never kills — its counter stayed 0), and it's not the host OOM killer. Getting this distinction right is the whole game when triaging an OOMKilled pod: was it the pod's own limit (fix the limit or the leak) or node-level memory pressure (fix scheduling/capacity)? We go deeper on the memory side in <a href="ch03-memory-virtual-memory-page-cache-swap-oom.html">Chapter 3</a> and on the Kubernetes side in <a href="ch36-scheduling-deep.html">Chapter 36</a>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — "slow service, but CPU is only 30%"</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>The most misdiagnosed cgroup problem in production. A latency-sensitive service reports p99 spikes, but your dashboard shows its CPU averaging a comfortable 30% of its limit. Everyone says "it's not CPU-bound, look elsewhere." They're wrong, and <code>cpu.stat</code> tells you why. Reproduce the shape: a workload that does short bursts of heavy compute, under a modest limit.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>echo "10000 100000" &gt; demo/cpu.max     <span class="c"># 0.1 CPU limit</span>
+<span class="c"># Bursty worker: 30ms of hard work, then sleep 70ms, forever.</span>
+bash -c 'echo $$ &gt; /sys/fs/cgroup/demo/cgroup.procs
+while true; do end=$((SECONDS+0)); t=0
+  s=$(date +%s%N); while [ $(( ($(date +%s%N)-s)/1000000 ) ) -lt 30 ]; do :; done
+  sleep 0.07; done' &amp;
+W=$!
+sleep 6
+cat demo/cpu.stat
+kill $W</code></pre></div>
+        <p>Average CPU use is low — the worker sleeps most of every 100&nbsp;ms. Yet each burst wants more than the 10&nbsp;ms quota allows, so it gets throttled mid-burst and its "30ms of work" stretches into the next period. The user sees latency; the average CPU graph looks calm. What in <code>cpu.stat</code> proves throttling is the culprit, and what's the fix? Decide before revealing.</p>
+        <details class="recall"><summary>Reveal the diagnosis and fix</summary>
+          <div class="body">
+            <p><b>Diagnosis:</b> <code>nr_throttled</code> is climbing and <code>throttled_usec</code> is large despite low average utilisation. That combination — "low mean CPU, high throttle count" — is the signature of a workload whose <em>bursts</em> exceed the per-period quota even though its <em>average</em> is well under the limit. The CFS bandwidth controller doesn't care about your average; it enforces the quota inside each 100&nbsp;ms window, so a spiky workload gets punished for its peaks.</p>
+            <p><b>Fixes, in order of preference:</b> raise the CPU limit so a normal burst fits within one period; or, for latency-critical services, consider removing the CPU limit entirely and relying on <code>cpu.weight</code> (the request) for fairness — a widely used pattern precisely because throttling hurts tail latency more than it protects neighbours. Tuning the CFS period is possible but rarely the right lever. The key SRE reflex: whenever someone says "it's slow but not CPU-bound," check <code>nr_throttled</code> before you believe them. This is one of the highest-value single metrics on a container platform, and it's the direct link to <a href="ch36-scheduling-deep.html">Chapter 36</a> and the runbooks in <a href="ch104-compute-and-memory-runbooks.html">Chapter 104</a>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — I/O limits and the requests/limits mapping</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>First, throttle disk I/O to see the third resource in action. Find your backing device's major:minor, then cap writes.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>lsblk                                   <span class="c"># find the backing block device, e.g. vda</span>
+cat /sys/class/block/vda/dev            <span class="c"># its MAJ:MIN, e.g. 254:0</span>
+echo "254:0 wbps=10485760" &gt; demo/io.max   <span class="c"># cap writes at 10 MB/s on that device</span>
+bash -c 'echo $$ &gt; /sys/fs/cgroup/demo/cgroup.procs
+         dd if=/dev/zero of=/tmp/blob bs=1M count=200 oflag=direct'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>200+0 records in
+200+0 records out
+209715200 bytes (210 MB) copied, ~20 s, ~10.0 MB/s</code></div>
+        <p>Without the limit that <code>dd</code> finishes in a second or two; with <code>io.max</code> it's pinned to 10&nbsp;MB/s. (Use <code>oflag=direct</code> — buffered writes are throttled only at writeback, so the cap looks laggy otherwise.) Now the senior question, no shell required: for a <b>Guaranteed</b> pod (requests equal limits) with <code>cpu: "1"</code> and <code>memory: 512Mi</code>, which cgroup files does the kubelet write, and should you set a CPU limit on a latency-sensitive service at all? Reason it through.</p>
+        <details class="recall"><summary>Reveal the reasoning</summary>
+          <div class="body">
+            <p><b>The mapping.</b> The CPU request (1 core) becomes <code>cpu.weight</code> on the leaf — the fair share under contention. The CPU limit (also 1 core) becomes <code>cpu.max = 100000 100000</code> — a hard one-CPU ceiling enforced every period. The memory limit becomes <code>memory.max = 536870912</code>. The memory request feeds scheduling and eviction ordering (or <code>memory.min</code>/<code>memory.high</code> under MemoryQoS). Because requests equal limits, this pod is Guaranteed: it lands in the protected QoS slice and is the last to be evicted under node pressure.</p>
+            <p><b>Should you set the CPU limit?</b> This is a genuine staff-level judgement call, not a rule. A CPU limit caps you even when the node is idle, so a bursty latency-sensitive service can be throttled while cores sit free — the Lab 4 pathology. Many teams deliberately set CPU <em>requests</em> (for fair scheduling and weight) but omit CPU <em>limits</em> on latency-critical workloads, letting them burst into spare capacity, and rely on requests plus the scheduler to prevent starvation. The counter-argument is predictability and protecting noisy-neighbour blast radius in dense multi-tenant clusters. Memory limits are different — you almost always want <code>memory.max</code> set, because unbounded memory growth OOM-kills <em>someone</em>, and you'd rather it be the offender than a random victim. "Always limit memory; think hard before limiting CPU" is a defensible default you can articulate in an interview and defend on a cluster.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · OOMKilled with a healthy-looking node</div>
+      <p><b>Symptom:</b> a pod restarts repeatedly, status <code>OOMKilled</code>, exit code 137, but the node has plenty of free memory. <b>First cut:</b> read the container's <code>memory.events</code> — a nonzero <code>oom_kill</code> confirms it was the <em>cgroup</em> limit, not the node. <b>Confirm:</b> compare <code>memory.current</code> against <code>memory.max</code> just before the kill (or from monitoring). <b>Usual cause:</b> the limit is genuinely too low for the workload's peak, or there's a memory leak. The fix is right-sizing the limit or fixing the leak — never silently raising it forever, which just moves the wall. Distinguish this from node-level OOM, where the kubelet evicts pods by QoS class under host pressure; that's a scheduling/capacity problem, not a per-pod limit problem.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · CPU throttling masquerading as a downstream problem</div>
+      <p><b>Symptom:</b> tail latency spikes; CPU utilisation looks moderate; the team chases the database and the network for days. <b>First cut:</b> <code>cat /sys/fs/cgroup/&lt;path&gt;/cpu.stat</code> or the <code>container_cpu_cfs_throttled_periods_total</code> metric. <b>Confirm:</b> high <code>nr_throttled</code> relative to <code>nr_periods</code>. <b>Usual cause:</b> a CPU limit set too tight for the workload's bursts, so it's throttled at the peaks that matter for latency even though its average is low. This is common enough that "check throttling first" belongs at the top of any container latency runbook.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · a container with no limits eats the node</div>
+      <p><b>Symptom:</b> one workload starts, and every other pod on the node slows down or gets evicted. <b>First cut:</b> check whether the offender has resource requests/limits at all (BestEffort pods have none). <b>Usual cause:</b> a workload deployed with no <code>resources</code> block, so it has no <code>cpu.max</code> and a wide-open <code>memory.max</code>, letting it consume whatever it wants and starve its neighbours. The fix is enforcing requests/limits via LimitRange and admission policy — visibility isolation (namespaces) was never going to save you here; only cgroups do.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Right-sizing beats guessing.</b> The two numbers that cause the most pain are the memory limit (too low → OOMKilled, too high → poor bin-packing and wasted capacity) and the CPU limit (too low → throttling and latency). Set memory limits from observed peak plus headroom, and revisit them as the workload changes. For CPU, set requests from steady-state usage so the scheduler and <code>cpu.weight</code> behave, and be deliberate — as argued in Lab 5 — about whether a CPU limit helps or hurts a given service. Autoscaling and VPA (<a href="ch37-autoscaling-and-governance-hpa-vpa-cluster-autoscaler.html">Chapter 37</a>) exist largely to take this guesswork off your plate.</p>
+    <p><b>Security.</b> cgroups are also a denial-of-service boundary: without a <code>pids.max</code>, a fork bomb in one container can exhaust the node's PID space and take down everything; without memory and CPU limits, one tenant can starve the rest. In multi-tenant clusters, enforced limits are a security control, not just a performance knob. The <code>memory.max</code> that OOM-kills the offender is what keeps a leak from becoming a node outage.</p>
+    <p><b>Performance and correctness of monitoring.</b> Two traps. First, some runtimes and older JVMs read the host's CPU/RAM instead of the cgroup limit and size their thread pools or heaps for a 64-core box they can't actually use — modern JDKs and Go runtimes are cgroup-aware, but verify. Second, plenty of tools inside a container report host totals (<code>free</code>, <code>/proc/meminfo</code>) rather than the cgroup limit, so "the container thinks it has 128&nbsp;GB" is a reporting artefact, not reality — read the cgroup files for the truth. The metric that actually predicts latency pain is throttling, so put <code>nr_throttled</code> on your dashboards, not just utilisation.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>cgroups are what make dense multi-tenancy safe, and dense multi-tenancy is the entire economic argument for Kubernetes. Bin-packing many workloads onto few nodes only works if the platform can promise each one a floor (requests → weight) and enforce a ceiling (limits → <code>cpu.max</code>/<code>memory.max</code>) so a single misbehaving tenant can't take the shared substrate down. That promise is the foundation the scheduler reasons about (<a href="ch36-scheduling-deep.html">Chapter 36</a>), that autoscalers act on (<a href="ch37-autoscaling-and-governance-hpa-vpa-cluster-autoscaler.html">Chapter 37</a>), and that capacity planning models (<a href="ch89-capacity-planning-and-performance.html">Chapter 89</a>). When you design a platform, the requests/limits policy — who must set them, what the defaults are, whether CPU limits are mandatory — is one of the most consequential decisions you'll make, because it sets the trade-off between utilisation, predictability, and blast radius for every team on the cluster.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first, then open it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What do cgroups do, and how are they different from namespaces?</summary>
+        <div class="a"><p>cgroups meter and limit how much of a resource — CPU, memory, I/O, PIDs — a group of processes may use, and decide what happens when they want more. Namespaces isolate what a process can <em>see</em>; cgroups limit what it can <em>use</em>. A container needs both: namespaces for isolation, cgroups so it can't starve the node. cgroup v2 is a single unified tree under <code>/sys/fs/cgroup</code> that every controller reads.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Explain <code>cpu.max</code> versus <code>cpu.weight</code>.</summary>
+        <div class="a"><p><code>cpu.max</code> is a hard ceiling: two numbers, quota and period in microseconds, like <code>50000 100000</code> for half a CPU. Once the cgroup burns its quota in the current period, every task in it is throttled until the next period — and that's enforced even if the rest of the machine is idle. <code>cpu.weight</code> is a proportional share, default 100: it only matters under contention, dividing contested CPU between sibling cgroups in proportion to their weights, and imposes no ceiling when there's spare CPU. Kubernetes uses both — the CPU request becomes weight, the CPU limit becomes <code>cpu.max</code>. The practical consequence is that a tight <code>cpu.max</code> can throttle a bursty service even at low average utilisation, which is why I'm cautious about setting CPU limits on latency-sensitive workloads while always setting memory limits.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>A pod is OOMKilled but the node has free memory. Walk me through what happened.</summary>
+        <div class="a"><p>That's a cgroup-local OOM, not a node OOM. The container's usage reached its <code>memory.max</code>, the kernel tried to reclaim within that cgroup, couldn't get under the limit, and invoked the OOM killer scoped to that cgroup — so only processes in that container were candidates, and the rest of the node was never at risk. I'd confirm by reading <code>memory.events</code>: a nonzero <code>oom_kill</code> proves the cgroup limit did it, and I can see it in <code>dmesg</code> as "Memory cgroup out of memory." The container exits with signal 9, so exit code 137 and status OOMKilled. Root cause is either a limit set below the workload's real peak or a genuine leak; the fix is right-sizing or fixing the leak, not reflexively raising the limit. This is distinct from node-level pressure, where the kubelet evicts whole pods by QoS class — that's a capacity problem, and <code>memory.events</code> on the individual container would <em>not</em> show the oom_kill.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>Latency is spiking but CPU sits at 30% of the limit. Where do you look?</summary>
+        <div class="a"><p><code>cpu.stat</code>, immediately — specifically <code>nr_throttled</code> and <code>throttled_usec</code>, or the equivalent throttling metric. Low average CPU with high throttle counts is the classic signature of a bursty workload whose peaks exceed the per-period quota even though its mean is well under the limit; the CFS bandwidth controller enforces the quota in each 100&nbsp;ms window, so spikes get throttled and stretched into the next period, and the user sees latency while the average graph looks fine. The fix is to raise the CPU limit so normal bursts fit, or drop the CPU limit on that latency-critical service and lean on the request/weight for fairness. I would not go chasing the database or the network until I'd ruled throttling out, because this misdiagnosis routinely burns days.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>Why do people say "always limit memory but be careful limiting CPU"?</summary>
+        <div class="a"><p>Because the failure modes are asymmetric. Unbounded memory growth ends in an OOM kill of <em>someone</em> — better it be the offending container (its own <code>memory.max</code>) than a random neighbour or the node, so a memory limit contains the blast radius. CPU is different: exceeding a CPU limit doesn't crash anything, it just throttles, and throttling a bursty latency-sensitive service can hurt its tail latency even when cores are sitting idle, because <code>cpu.max</code> caps you regardless of spare capacity. So the memory limit is protective with little downside, while the CPU limit trades latency for predictability — a trade you should make consciously per workload, often preferring CPU requests (weight) without a hard CPU limit on latency-critical paths.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>cgroups v2 is one unified tree under <code>/sys/fs/cgroup</code> that every controller reads. A cgroup is a directory; processes join via <code>cgroup.procs</code>; controllers flow to children through <code>cgroup.subtree_control</code>; and processes live only in leaves (the no-internal-processes rule). CPU has two knobs: <code>cpu.max</code> is a hard quota-per-period ceiling enforced even on an idle box, and <code>cpu.weight</code> is a proportional share that bites only under contention. <code>cpu.stat</code>'s <code>nr_throttled</code>/<code>throttled_usec</code> reveal throttling — the cause of "slow at 30% CPU." Memory has a soft <code>memory.high</code> (throttle + reclaim, never kills) and a hard <code>memory.max</code> (OOM-kill inside the cgroup when reclaim fails), with <code>memory.events</code> recording the kills. <code>io.max</code> rate-limits a device by bytes/s and IOPS. Kubernetes maps CPU request → weight, CPU limit → <code>cpu.max</code>, memory limit → <code>memory.max</code>; an OOM there is exit 137 / OOMKilled. Always limit memory; think before limiting CPU.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>cgroups meter resource <em>use</em>; namespaces isolate <em>visibility</em>. A container needs both, and one without the other is a gap.</li>
+      <li>v2 is one unified tree at <code>/sys/fs/cgroup</code> (type <code>cgroup2</code>); every controller reads the same hierarchy.</li>
+      <li>Enable controllers for children via <code>cgroup.subtree_control</code> (<code>+cpu +memory +io</code>); processes attach only at leaves.</li>
+      <li><code>cpu.max</code> = <code>quota period</code> (µs): a hard ceiling enforced every period, even on an idle machine.</li>
+      <li><code>cpu.weight</code> (default 100) is a proportional share that only matters under contention — no ceiling when CPU is free.</li>
+      <li><code>cpu.stat</code>'s <code>nr_throttled</code> + <code>throttled_usec</code> are how you prove throttling; low CPU + high throttling = tight limit.</li>
+      <li><code>memory.high</code> throttles and reclaims but never kills; <code>memory.max</code> OOM-kills inside the cgroup when reclaim fails.</li>
+      <li><code>memory.events</code> (<code>oom_kill</code>) proves a cgroup OOM; in Kubernetes that's exit 137 / OOMKilled.</li>
+      <li>Kubernetes: CPU request → <code>cpu.weight</code>, CPU limit → <code>cpu.max</code>, memory limit → <code>memory.max</code>; requests also drive QoS and eviction.</li>
+      <li>Default posture: always set a memory limit; be deliberate about CPU limits because they throttle even when cores are idle.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch03-memory-virtual-memory-page-cache-swap-oom.html"><b>Ch 3</b> Memory &amp; OOM</a>
+      <a href="ch22-linux-namespaces.html"><b>Ch 22</b> Namespaces</a>
+      <a href="ch24-container-filesystems-overlayfs-and-image-layers.html"><b>Ch 24</b> Overlayfs &amp; layers</a>
+      <a href="ch36-scheduling-deep.html"><b>Ch 36</b> Scheduling deep</a>
+      <a href="ch37-autoscaling-and-governance-hpa-vpa-cluster-autoscaler.html"><b>Ch 37</b> Autoscaling</a>
+      <a href="ch104-compute-and-memory-runbooks.html"><b>Ch 104</b> Compute/memory runbooks</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>The Linux Kernel documentation — <a href="https://docs.kernel.org/admin-guide/cgroup-v2.html">Control Group v2</a>: the authoritative spec for the unified hierarchy, <code>cpu.max</code>, <code>cpu.weight</code>, <code>cpu.stat</code>, <code>memory.max</code>, <code>memory.high</code>, <code>memory.events</code>, and <code>io.max</code>.</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man7/cgroups.7.html">cgroups(7)</a>: overview of controllers, the v1-to-v2 differences, and delegation.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/">Resource Management for Pods and Containers</a>: how requests and limits are defined and enforced.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/">Pod Quality of Service Classes</a>: Guaranteed, Burstable, BestEffort and eviction ordering.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/architecture/cgroups/">About cgroup v2</a>: the kubelet's cgroup driver and v2 requirements.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch22-linux-namespaces.html"><span class="dir">← Prev</span><div class="ti">Ch 22 — Linux namespaces</div></a>
+      <a class="nx" href="ch24-container-filesystems-overlayfs-and-image-layers.html"><span class="dir">Next →</span><div class="ti">Ch 24 — Container filesystems: overlayfs &amp; image layers</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 23 of 121 · Part III · Containers &amp; Container Internals. Set a memory limit and OOM-kill it once; the reflex sticks.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Unified hierarchy</a>
+    <a href="#internals">How limits are enforced</a>
+    <a href="#components">Who writes the files</a>
+    <a href="#flow">Pod limits → kernel</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

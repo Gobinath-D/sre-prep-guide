@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 57 — EKS architecture</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part VI · AWS &amp; EKS &nbsp;·&nbsp; Chapter 57</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part VI · AWS &amp; EKS for SREs · Chapter 57</div>
+      <h1>EKS architecture</h1>
+      <p class="tagline">EKS runs the Kubernetes control plane so you don't have to — and then hides it behind an endpoint and an IAM handshake. That trade is what makes EKS pleasant on a good day and baffling on a bad one. When kubectl says "you must be logged in to the server," you're standing at exactly the seam this chapter takes apart.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~45 min read · AWS CLI / eksctl (kind fallback)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Draw what AWS runs for you in EKS and what stays your problem — the shared-responsibility line.</li>
+          <li>Choose between managed node groups, self-managed nodes, and Fargate, and say why.</li>
+          <li>Explain exactly how <code>kubectl</code> authenticates to EKS: the STS token, the webhook, then RBAC.</li>
+          <li>Map an IAM principal to cluster access two ways — the legacy <code>aws-auth</code> ConfigMap and the newer access entries — and know which to reach for.</li>
+          <li>Diagnose "you must be logged in to the server (Unauthorized)" and a node that never joins, from first principles.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>Running the control plane yourself is a second job</h2>
+    <p>In <a href="ch29-the-control-plane-api-server-etcd-scheduler.html">Chapter 29</a> you took the Kubernetes control plane apart: the API server, etcd, the scheduler, the controller manager. Now picture owning all of that in production. etcd wants an odd number of members spread across availability zones, with backups you've actually tested restoring. The API server wants at least two instances behind a load balancer, with certificates that rotate before they expire. Every quarter there's a Kubernetes minor upgrade, and you get to sequence it: control plane first, then nodes, without dropping the cluster. Get any of it wrong and the blast radius is <em>every</em> workload on the cluster.</p>
+    <p>That's a full-time on-call rotation before you've shipped a single application. Most teams don't want it, and AWS will sell you out of it. <b>Amazon EKS runs the control plane for you</b> — the API server, etcd, the scheduler, and the controller manager live in an AWS-owned account, spread across three availability zones, patched and scaled and backed up by AWS. You get one thing back: a highly-available API endpoint. You never SSH to a control-plane node, never touch etcd, never see those machines.</p>
+    <p>The catch is that "managed" doesn't mean "invisible." EKS glues its control plane to your world with two seams, and both become your incident when they leak. The first is <b>identity</b>: EKS decides who you are using AWS IAM, then hands you to normal Kubernetes RBAC — so a perfectly valid <code>kubectl</code> can be rejected before it reaches any authorization rule. The second is the <b>network path</b> between the managed control plane and your nodes, stitched with cross-account network interfaces dropped into your subnets. This chapter makes both seams visible so they stop being mysterious.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>EKS is Kubernetes with the control plane converted into an AWS service. The Kubernetes you learned in Part IV is <em>unchanged</em> — same API objects, same reconciliation, same RBAC. What's new is a thin identity-and-networking shell AWS wraps around it. Learn the shell and EKS stops being "different Kubernetes"; it's the Kubernetes you know, reached through an IAM front door.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a managed apartment building</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Think of EKS as a serviced apartment building. Down in a locked basement is the <b>mechanical core</b> — the boilers, the electrical panels, the water mains. That's the control plane, and <b>building management</b> (AWS) owns it completely. You never get a key to the basement; if a boiler fails at 3am, that's their pager, not yours. In exchange you get reliable heat and water at a wall socket — the <b>cluster endpoint</b>.</p>
+      <p>You rent <b>units</b> on the floors above — that's your data plane, where your furniture (pods) actually lives. And you choose how much furnishing you want to manage: a unit where you bring and maintain everything yourself (<b>self-managed nodes</b>), a serviced unit where management handles appliances and repairs on a schedule (<b>managed node groups</b>), or a hotel-style room you just walk into per-guest with no furniture to own at all (<b>Fargate</b>).</p>
+      <p>To give any instruction — "let a plumber into unit 5" — you first show ID at the <b>concierge desk</b>. The concierge checks your government ID (your <b>IAM identity</b>) against the building's guest list (the <code>aws-auth</code> ConfigMap, or the newer <b>access entries</b>) to learn <em>which tenant</em> you are, and only then do the house rules (Kubernetes <b>RBAC</b>) decide what that tenant may actually do. Fail the ID check and you're turned away at the desk — you were never let inside to be told "no, you can't do that."</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In EKS</th></tr>
+      <tr><td>The locked basement + mechanical core</td><td>The control plane (API server, etcd, scheduler, controller manager) — AWS-owned account</td></tr>
+      <tr><td>The wall socket you plug into</td><td>The cluster API <b>endpoint</b> (public and/or private)</td></tr>
+      <tr><td>Your rented units + your furniture</td><td>The <b>data plane</b>: your nodes and the pods on them, in your VPC</td></tr>
+      <tr><td>Bring-your-own vs serviced vs hotel room</td><td>Self-managed nodes · managed node groups · Fargate</td></tr>
+      <tr><td>Government ID at the desk</td><td>Your <b>IAM</b> principal (user or role)</td></tr>
+      <tr><td>The building's guest list</td><td><code>aws-auth</code> ConfigMap (legacy) or <b>access entries</b> (current)</td></tr>
+      <tr><td>The house rules for each tenant</td><td>Kubernetes <b>RBAC</b> (Roles, ClusterRoles, bindings)</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>The managed control plane, your data plane, and the wire between</h2>
+    <p>Here's the shape of it. Everything above the dashed line is AWS's problem; everything below is yours. The two are joined by the endpoint (how <em>you</em> reach the API) and by cross-account network interfaces (how the <em>control plane</em> reaches back into your VPC for things like <code>kubectl exec</code>, <code>logs</code>, and admission webhooks).</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 470" role="img" aria-label="EKS managed control plane in an AWS account, joined by the endpoint and cross-account ENIs to your data plane in your VPC">
+        <defs>
+          <marker id="e1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="e2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+          <marker id="em" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" style="fill:var(--muted)"/></marker>
+        </defs>
+        <!-- AWS-managed band -->
+        <rect x="14" y="26" width="692" height="150" rx="12" style="fill:var(--chip);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="30" y="48" style="fill:var(--accent);font:700 12px sans-serif;letter-spacing:.04em">AWS-MANAGED ACCOUNT — EKS control plane · you never touch these</text>
+        <rect x="34" y="60" width="150" height="60" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="109" y="85" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">kube-apiserver</text>
+        <text x="109" y="103" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">≥2 instances, HA</text>
+        <rect x="196" y="60" width="180" height="60" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="286" y="85" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">etcd</text>
+        <text x="286" y="103" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">managed · multi-AZ · backed up</text>
+        <rect x="388" y="60" width="150" height="60" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="463" y="85" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">scheduler</text>
+        <text x="463" y="103" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">+ controller-mgr</text>
+        <rect x="550" y="60" width="140" height="60" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="620" y="85" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">3 AZs</text>
+        <text x="620" y="103" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">spread + failover</text>
+        <text x="30" y="145" style="fill:var(--muted);font:11px sans-serif">Exposed to you as one thing only:</text>
+        <rect x="196" y="132" width="342" height="30" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="367" y="152" text-anchor="middle" style="fill:var(--accent);font:600 12px sans-serif">cluster API endpoint — public and/or private</text>
+        <!-- boundary -->
+        <line x1="14" y1="196" x2="706" y2="196" style="stroke:var(--deep);stroke-width:1.5;stroke-dasharray:7 5"/>
+        <text x="360" y="191" text-anchor="middle" style="fill:var(--deep);font:700 10.5px sans-serif;letter-spacing:.03em">SHARED-RESPONSIBILITY LINE · AWS above · you below</text>
+        <!-- your VPC band -->
+        <rect x="14" y="212" width="692" height="244" rx="12" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="30" y="234" style="fill:var(--accent2);font:700 12px sans-serif;letter-spacing:.04em">YOUR AWS ACCOUNT — your VPC · your data plane · your bill</text>
+        <!-- cross-account ENIs -->
+        <rect x="470" y="246" width="220" height="48" rx="8" style="fill:var(--chip);stroke:var(--deep)"/>
+        <text x="580" y="266" text-anchor="middle" style="fill:var(--deep);font:600 11px sans-serif">cross-account ENIs</text>
+        <text x="580" y="282" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">control plane → your subnets</text>
+        <line x1="470" y1="150" x2="470" y2="150" style="stroke:none"/>
+        <line x1="560" y1="196" x2="560" y2="244" style="stroke:var(--deep);stroke-width:1.5" marker-end="url(#em)"/>
+        <text x="566" y="222" style="fill:var(--deep);font:9.5px sans-serif">exec · logs · webhooks</text>
+        <!-- data plane options -->
+        <rect x="30" y="310" width="205" height="130" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="132" y="332" text-anchor="middle" style="fill:var(--ink);font:700 12px sans-serif">Managed node group</text>
+        <text x="132" y="349" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">EC2 in an ASG AWS runs</text>
+        <rect x="52" y="360" width="70" height="30" rx="6" style="fill:var(--panel);stroke:var(--violet)"/><text x="87" y="380" text-anchor="middle" style="fill:var(--violet);font:600 10px sans-serif">pod</text>
+        <rect x="142" y="360" width="70" height="30" rx="6" style="fill:var(--panel);stroke:var(--violet)"/><text x="177" y="380" text-anchor="middle" style="fill:var(--violet);font:600 10px sans-serif">pod</text>
+        <text x="132" y="416" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">kubelet · aws-node · kube-proxy</text>
+        <rect x="248" y="310" width="205" height="130" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="350" y="332" text-anchor="middle" style="fill:var(--ink);font:700 12px sans-serif">Self-managed nodes</text>
+        <text x="350" y="349" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">your ASG · your AMI</text>
+        <rect x="270" y="360" width="70" height="30" rx="6" style="fill:var(--panel);stroke:var(--violet)"/><text x="305" y="380" text-anchor="middle" style="fill:var(--violet);font:600 10px sans-serif">pod</text>
+        <rect x="360" y="360" width="70" height="30" rx="6" style="fill:var(--panel);stroke:var(--violet)"/><text x="395" y="380" text-anchor="middle" style="fill:var(--violet);font:600 10px sans-serif">pod</text>
+        <text x="350" y="416" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">most control, most work</text>
+        <rect x="466" y="310" width="224" height="130" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="578" y="332" text-anchor="middle" style="fill:var(--ink);font:700 12px sans-serif">Fargate</text>
+        <text x="578" y="349" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">one microVM per pod · no nodes</text>
+        <rect x="500" y="360" width="70" height="30" rx="6" style="fill:var(--panel);stroke:var(--violet)"/><text x="535" y="380" text-anchor="middle" style="fill:var(--violet);font:600 10px sans-serif">pod</text>
+        <rect x="588" y="360" width="70" height="30" rx="6" style="fill:var(--panel);stroke:var(--violet)"/><text x="623" y="380" text-anchor="middle" style="fill:var(--violet);font:600 10px sans-serif">pod</text>
+        <text x="578" y="416" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">no OS to patch, per-pod pricing</text>
+        <!-- kubectl -->
+        <rect x="30" y="246" width="150" height="48" rx="8" style="fill:var(--panel);stroke:var(--accent)"/>
+        <text x="105" y="266" text-anchor="middle" style="fill:var(--accent);font:600 12px sans-serif">your kubectl</text>
+        <text x="105" y="282" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">+ IAM identity</text>
+        <line x1="180" y1="255" x2="360" y2="178" style="stroke:var(--accent);stroke-width:2" marker-end="url(#e1)"/>
+        <text x="210" y="228" style="fill:var(--accent);font:600 9.5px sans-serif">authenticated call to endpoint</text>
+      </svg>
+      <figcaption>AWS owns everything above the dashed line and exposes it only as an endpoint. You own the VPC, the nodes, and the bill below it. Two wires cross the seam: your authenticated <code>kubectl</code> reaching in, and cross-account ENIs letting the control plane reach your pods for exec, logs, and webhooks.</figcaption>
+    </figure>
+
+    <p>The second picture is the one that trips people up most, because nothing about it looks like vanilla Kubernetes: how a <code>kubectl</code> call proves who you are. EKS bolts an AWS-IAM front door onto the standard Kubernetes webhook token authenticator.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 210" role="img" aria-label="How kubectl authenticates to EKS: get-token produces a presigned STS URL, the API server verifies it via the authenticator, resolves an IAM principal to a Kubernetes identity, then RBAC authorizes">
+        <defs>
+          <marker id="a1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+        </defs>
+        <text x="360" y="20" text-anchor="middle" style="fill:var(--muted);font:700 11px sans-serif;letter-spacing:.05em">HOW kubectl PROVES WHO YOU ARE ON EKS</text>
+        <rect x="12" y="40" width="120" height="66" rx="9" style="fill:var(--panel);stroke:var(--accent)"/>
+        <text x="72" y="66" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">kubectl</text>
+        <text x="72" y="83" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">runs</text>
+        <text x="72" y="97" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">aws eks get-token</text>
+        <rect x="152" y="40" width="140" height="66" rx="9" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="222" y="63" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">signed STS token</text>
+        <text x="222" y="80" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">k8s-aws-v1.&lt;presigned</text>
+        <text x="222" y="93" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">GetCallerIdentity URL&gt;</text>
+        <rect x="312" y="40" width="130" height="66" rx="9" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="377" y="66" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">EKS API server</text>
+        <text x="377" y="83" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">webhook authn</text>
+        <rect x="462" y="40" width="150" height="66" rx="9" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="537" y="60" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">identity mapping</text>
+        <text x="537" y="76" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">access entries /</text>
+        <text x="537" y="89" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">aws-auth → user+groups</text>
+        <rect x="632" y="40" width="76" height="66" rx="9" style="fill:var(--panel);stroke:var(--accent2)"/>
+        <text x="670" y="66" text-anchor="middle" style="fill:var(--accent2);font:600 11px sans-serif">RBAC</text>
+        <text x="670" y="83" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">allow/deny</text>
+        <line x1="132" y1="73" x2="150" y2="73" style="stroke:var(--accent);stroke-width:1.7" marker-end="url(#a1)"/>
+        <line x1="292" y1="73" x2="310" y2="73" style="stroke:var(--accent);stroke-width:1.7" marker-end="url(#a1)"/>
+        <line x1="442" y1="73" x2="460" y2="73" style="stroke:var(--accent);stroke-width:1.7" marker-end="url(#a1)"/>
+        <line x1="612" y1="73" x2="630" y2="73" style="stroke:var(--accent);stroke-width:1.7" marker-end="url(#a1)"/>
+        <text x="360" y="140" text-anchor="middle" style="fill:var(--deep);font:600 11px sans-serif">Fail the identity mapping (steps 3–4) and you get "Unauthorized" —</text>
+        <text x="360" y="158" text-anchor="middle" style="fill:var(--deep);font:600 11px sans-serif">rejected before any RBAC rule is even consulted.</text>
+        <text x="360" y="184" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">Authentication (AWS decides "who") and authorization (Kubernetes decides "what") are two different steps.</text>
+      </svg>
+      <figcaption>EKS authentication is AWS IAM; EKS authorization is plain Kubernetes RBAC. The token is a presigned <code>sts:GetCallerIdentity</code> URL — AWS proves your identity, EKS maps it to a Kubernetes user and groups, and only then does RBAC decide what you can do.</figcaption>
+    </figure>
+
+    <h2 id="internals"><span class="beat">Internal working</span>What AWS runs, your compute choices, and the identity handshake</h2>
+
+    <h4>1 · What AWS actually runs for you</h4>
+    <p>When you create a cluster, AWS provisions a dedicated Kubernetes control plane in an account it owns — not shared with your other clusters. It runs the API server on at least two instances behind an AWS-managed load balancer, keeps etcd across three availability zones with automated backups, and runs the scheduler and controller manager. It rotates the internal certificates, patches the OS, scales the API servers under load, and replaces any instance that fails. You are charged a flat hourly fee per cluster for this, on top of your data-plane compute. What AWS does <em>not</em> do is run your workloads or your nodes — that's the line the whole chapter turns on.</p>
+    <p>You can turn on <b>control-plane logging</b> to CloudWatch for five log types — <code>api</code>, <code>audit</code>, <code>authenticator</code>, <code>controllerManager</code>, and <code>scheduler</code>. The <code>authenticator</code> log is the one you'll grep during an access incident: it records every IAM-principal-to-Kubernetes-identity decision the front door makes.</p>
+
+    <h4>2 · Your three data-plane options</h4>
+    <p>The nodes are yours, and EKS gives you three ways to run them. The choice is a trade of control against toil:</p>
+    <table class="t">
+      <tr><th>Option</th><th>Who runs the machine</th><th>Reach for it when</th></tr>
+      <tr><td><b>Managed node group</b></td><td>AWS runs the EC2 Auto Scaling group, supplies the EKS-optimised AMI, and cordons+drains nodes during a rolling update you trigger.</td><td>You want normal EC2 nodes without hand-building the ASG, bootstrap, and upgrade dance. The default choice.</td></tr>
+      <tr><td><b>Self-managed nodes</b></td><td>You. Your own ASG, your own AMI (or a customised EKS AMI), your own bootstrap and upgrade automation.</td><td>You need something the managed group won't do — a custom kernel, a special AMI, GPU quirks, Windows edge cases, bespoke bootstrap.</td></tr>
+      <tr><td><b>Fargate</b></td><td>AWS. Each pod runs in its own right-sized microVM; there is no node for you to see, patch, or scale.</td><td>You want zero node management and per-pod isolation, and can accept its limits (no DaemonSets, no privileged pods, no host access, sized per pod).</td></tr>
+    </table>
+    <p>There is now a fourth path, <b>EKS Auto Mode</b>, where AWS manages the compute, scaling, networking, and storage for you — it runs Karpenter and the core add-ons under the hood so you stop managing node groups at all. Treat it as "managed node groups plus autoscaling plus add-ons, operated by AWS." Under everything, though, the mechanics are still the kubelet, the runtime, and the CNI from <a href="ch30-the-node-kubelet-kube-proxy-runtime-cri.html">Chapter 30</a> — Auto Mode doesn't change what a node <em>is</em>, only who babysits it.</p>
+
+    <h4>3 · The authentication handshake, in detail</h4>
+    <p>This is the part that has no analogue in vanilla Kubernetes, so slow down here. Your kubeconfig (written by <code>aws eks update-kubeconfig</code>) doesn't hold a static token. Instead it holds an <code>exec</code> block that runs <code>aws eks get-token</code> every time you call the cluster. That command uses your AWS credentials to build a <b>presigned URL for <code>sts:GetCallerIdentity</code></b> and base64-encodes it into a bearer token that starts with <code>k8s-aws-v1.</code>. The token is short-lived (about 15 minutes) and proves one thing: "whoever holds this could call GetCallerIdentity as this IAM principal, right now."</p>
+    <ol class="steps">
+      <li><b>kubectl gets a token.</b> The kubeconfig <code>exec</code>s <code>aws eks get-token --cluster-name X</code>, which signs a GetCallerIdentity request with your IAM credentials and returns the <code>k8s-aws-v1.</code> token.</li>
+      <li><b>kubectl sends it as a bearer token</b> to the cluster endpoint over TLS, exactly like any Kubernetes token.</li>
+      <li><b>The API server verifies it</b> through EKS's webhook token authenticator: EKS actually executes that presigned GetCallerIdentity call against STS to confirm the token is genuine and to learn the caller's IAM ARN. A forged or expired token dies here.</li>
+      <li><b>EKS maps the IAM ARN to a Kubernetes identity</b> — a username and a set of groups — using either an access entry or the <code>aws-auth</code> ConfigMap (next section). No mapping, no identity.</li>
+      <li><b>RBAC authorizes.</b> Now it's plain Kubernetes: the resolved username/groups are checked against Roles and ClusterRoles. This is where a mapped-but-under-privileged user gets "forbidden" (as opposed to "Unauthorized").</li>
+    </ol>
+    <div class="box gotcha"><div class="h">"Unauthorized" and "Forbidden" are different failures</div>
+      <p>Two error messages, two entirely different fixes. <b>"error: You must be logged in to the server (Unauthorized)"</b> means step 3–4 failed: your IAM identity isn't mapped to any Kubernetes identity — no access entry, no <code>aws-auth</code> row. The front door didn't recognise you. <b>"Error from server (Forbidden)"</b> means steps 1–4 <em>succeeded</em> — you're a known Kubernetes user — but RBAC says that user can't do this action. Unauthorized is an identity-mapping problem (fix the access entry / aws-auth); Forbidden is an RBAC problem (fix the Role/binding). Read which word you got before touching anything.</p>
+    </div>
+
+    <h4>4 · Two ways to grant access: aws-auth vs access entries</h4>
+    <p>Step 4 above needs a mapping from IAM principal to Kubernetes identity, and EKS has two mechanisms. The original one is the <b><code>aws-auth</code> ConfigMap</b> in <code>kube-system</code>: a YAML blob with <code>mapRoles</code> and <code>mapUsers</code> lists that pair an IAM ARN with a Kubernetes username and groups. It works, but it's a foot-gun — it lives <em>inside</em> the cluster, so a bad edit can lock everyone out, and there's no AWS-side audit of who has access. Node groups also depend on it: the node instance role is mapped here to <code>system:bootstrappers</code> and <code>system:nodes</code> so kubelets can register.</p>
+    <p>The newer, and now recommended, mechanism is <b>access entries</b>, managed through the EKS API itself (<code>aws eks create-access-entry</code>). An access entry associates an IAM principal with Kubernetes permissions in one of two ways: attach an <b>access policy</b> (an AWS-maintained permission template like <code>AmazonEKSClusterAdminPolicy</code>, <code>AmazonEKSAdminPolicy</code>, <code>AmazonEKSEditPolicy</code>, or <code>AmazonEKSViewPolicy</code>, optionally scoped to specific namespaces), or map the principal to Kubernetes groups and write your own RBAC. Because it lives in the EKS control plane, it's auditable in CloudTrail, editable even when you can't reach the Kubernetes API, and it can't be wiped by a fat-fingered ConfigMap edit.</p>
+    <p>Which is active is set by the cluster's <b>authentication mode</b>: <code>CONFIG_MAP</code> (aws-auth only — legacy), <code>API_AND_CONFIG_MAP</code> (both, access entries win — the migration sweet spot), or <code>API</code> (access entries only — the end state). You can move a cluster forward through those modes but not backward. New clusters should start at <code>API</code>; existing clusters should migrate their <code>aws-auth</code> rows to access entries and switch to <code>API_AND_CONFIG_MAP</code>, then <code>API</code>.</p>
+    <div class="box keypoint"><div class="h">One migration gotcha worth knowing before it bites</div>
+      <p>When you enable access entries on an existing cluster, EKS auto-creates an entry only for the <em>original cluster creator</em>. Every other row in your <code>aws-auth</code> ConfigMap — the developer roles, the CI role, the service roles — is <b>not</b> migrated automatically. If you switch straight to <code>API</code> mode expecting parity, you'll lock those principals out. Migrate each row to an explicit access entry first, verify, then flip the mode.</p>
+    </div>
+
+    <h4>5 · EKS add-ons</h4>
+    <p>A bare cluster needs a few components to be useful: the VPC CNI for pod networking (<a href="ch58-vpc-cni-the-deep-one.html">Chapter 58</a>), kube-proxy for Services, and CoreDNS for service discovery. You can install those yourself as plain manifests ("self-managed"), or let EKS install and version them as <b>EKS add-ons</b> — curated, AWS-tested packages you manage through the EKS API (<code>aws eks create-addon</code>). Add-ons are versioned against your Kubernetes version, can be upgraded with a defined conflict-resolution strategy, and can be wired to an IAM role for their AWS permissions. The common ones: VPC CNI, kube-proxy, CoreDNS, the EBS and EFS CSI drivers, and the EKS Pod Identity Agent. Using managed add-ons is the difference between "which random YAML version of the CNI is on this cluster?" and "the CNI is add-on v1.x, upgraded through the API, logged in CloudTrail."</p>
+
+    <details class="recall"><summary>Think first: your teammate can run <code>kubectl get pods</code> but you get "Unauthorized" with the same cluster and the same command. What's different, and where do you look?</summary>
+      <div class="body">
+        <p>Same command, same cluster, different <em>IAM identity</em>. Authentication on EKS is per-principal, so the variable is which AWS role/user each of you is. Your teammate's ARN is mapped (via an access entry or an <code>aws-auth</code> row) to a Kubernetes identity; yours isn't. Confirm your own identity first with <code>aws sts get-caller-identity</code> — you may be assuming a different role than you think (a common cause: a stale profile, or <code>update-kubeconfig</code> written with <code>--role-arn</code> pointing at a role you can't assume). Then check whether that exact ARN has a mapping: <code>aws eks list-access-entries --cluster-name X</code> and, if the cluster still uses it, the <code>aws-auth</code> ConfigMap. The fix is to add an access entry for your ARN — not to touch RBAC, because RBAC was never reached. "Unauthorized" is always an identity-mapping story.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, named</h2>
+    <ul>
+      <li><b>The managed control plane</b> — API server, etcd, scheduler, controller manager, in an AWS account, multi-AZ. Owns: serving the Kubernetes API and keeping cluster state durable. You never log into it.</li>
+      <li><b>The cluster endpoint</b> — the HA URL you point <code>kubectl</code> at. Can be public, private (reachable only from your VPC/peered networks), or both. Owns: being the one door into the API.</li>
+      <li><b>Cross-account ENIs</b> — elastic network interfaces EKS places in your subnets so the control plane can reach your pods for <code>exec</code>, <code>logs</code>, port-forward, and admission webhook calls. Owns: the control-plane-to-node direction of traffic.</li>
+      <li><b>Node groups / Fargate profiles</b> — your compute. Managed node groups and self-managed nodes are EC2; Fargate profiles select which pods run serverless. Owns: actually running your containers.</li>
+      <li><b>The cluster IAM role</b> and the <b>node IAM role</b> — the control plane's role (to manage AWS resources on your behalf) and the nodes' instance role (with <code>AmazonEKSWorkerNodePolicy</code> and image-pull permissions). Owns: the clusters' and nodes' own AWS permissions.</li>
+      <li><b>The OIDC provider</b> — the cluster's identity issuer, registered in IAM, that makes IRSA possible (<a href="ch55-irsa-and-eks-pod-identity.html">Chapter 55</a>). Owns: letting pods assume IAM roles.</li>
+      <li><b>Access entries / <code>aws-auth</code></b> — the IAM-to-Kubernetes identity mapping. Owns: who gets in and as whom.</li>
+      <li><b>Add-ons</b> — AWS-managed installs of CNI, kube-proxy, CoreDNS, CSI drivers, Pod Identity Agent. Owns: the cluster's baseline plumbing.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one <code>kubectl get pods</code></h2>
+    <p>You type <code>kubectl get pods -n prod</code> against an EKS cluster. Here's every hop:</p>
+    <ol class="steps">
+      <li>kubectl reads your kubeconfig, sees the <code>exec</code> credential plugin, and runs <code>aws eks get-token</code>. That signs a GetCallerIdentity request with your current AWS credentials and returns a <code>k8s-aws-v1.</code> bearer token.</li>
+      <li>kubectl opens TLS to the cluster endpoint and sends <code>GET /api/v1/namespaces/prod/pods</code> with that bearer token.</li>
+      <li>The API server hands the token to the EKS authenticator, which executes the presigned STS call, confirms it's valid, and extracts your IAM ARN.</li>
+      <li>EKS looks up an access entry (or <code>aws-auth</code> row) for that ARN and resolves it to a Kubernetes username and groups — say, group <code>view-only</code>.</li>
+      <li>RBAC checks: does <code>view-only</code> have <code>get</code>/<code>list</code> on pods in <code>prod</code>? If yes, the request proceeds; if no, you get "Forbidden."</li>
+      <li>The API server reads the pod list from etcd (managed by AWS) and returns it. If you'd asked for <code>kubectl logs</code>, the API server would instead reach your pod through a cross-account ENI — the reverse direction.</li>
+    </ol>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>The AWS-specific labs assume you can create a cluster (<code>eksctl create cluster</code> gives you one in ~15 minutes) and have the AWS CLI configured. Each lab notes a <b>local alternative</b> you can run on <b>kind</b> when you don't have an account handy — the identity <em>flow</em> is EKS-specific, but the Kubernetes side (RBAC, ConfigMaps) is identical.</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># AWS path: a small cluster to explore (managed node group, 2 nodes).</span>
+eksctl create cluster --name lab57 --nodes 2 --node-type t3.small --version 1.31
+
+<span class="c"># Local alternative for the Kubernetes-side labs:</span>
+kind create cluster --name lab57</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — read the control plane you don't own</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p><code>describe-cluster</code> is the single most useful EKS command: it shows the endpoint, version, the managed-vs-yours boundary, and the OIDC issuer, without touching Kubernetes at all.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>aws eks describe-cluster --name lab57 \
+  --query 'cluster.{version:version,endpoint:endpoint,status:status,oidc:identity.oidc.issuer,authMode:accessConfig.authenticationMode}'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>{
+    "version": "1.31",
+    "endpoint": "https://A1B2C3.gr7.us-east-1.eks.amazonaws.com",
+    "status": "ACTIVE",
+    "oidc": "https://oidc.eks.us-east-1.amazonaws.com/id/A1B2C3...",
+    "authMode": "API_AND_CONFIG_MAP"
+}</code></div>
+        <p>That endpoint is the wall socket from the analogy — the only thing AWS exposes of the control plane. The OIDC issuer is what makes IRSA possible. The auth mode tells you whether access entries, <code>aws-auth</code>, or both are in force. <b>Local alternative:</b> on kind the analogue is <code>kubectl cluster-info</code> and <code>kubectl config view --minify</code> — same idea (an endpoint URL and a credential), minus the AWS managing it for you.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — watch the IAM handshake happen</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>See the token your kubeconfig actually sends, and confirm which IAM identity you are. These two facts explain almost every access surprise.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>aws sts get-caller-identity            <span class="c"># WHO am I to AWS right now?</span>
+aws eks get-token --cluster-name lab57 | head -c 120 ; echo
+kubectl config view --minify -o jsonpath='{.users[0].user.exec.command} {.users[0].user.exec.args}{"\n"}'</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>{ "Arn": "arn:aws:iam::111122223333:role/Admin/alice" }
+{"kind":"ExecCredential","status":{"token":"k8s-aws-v1.aHR0cHM6Ly9zdHMu...
+aws [eks get-token --cluster-name lab57 --output json]</code></div>
+        <p>Read it top to bottom: AWS knows you as that ARN; kubectl turns that identity into a <code>k8s-aws-v1.</code> token on every call; the kubeconfig proves it does so by <code>exec</code>-ing the CLI rather than storing a static secret. The token is a base64 presigned STS URL — decode it and you'll literally see <code>sts.amazonaws.com/?Action=GetCallerIdentity</code>. <b>Local alternative:</b> kind uses a client certificate instead of an exec plugin — inspect it with the same <code>kubectl config view --minify</code> to contrast a static credential with EKS's dynamic one.</p>
+      </div>
+    </div>
+
+    <details class="recall"><summary>Think first: why does EKS use a short-lived presigned STS URL as the token instead of a long-lived static token like a plain Kubernetes ServiceAccount?</summary>
+      <div class="body">
+        <p>Because it makes AWS IAM the single source of truth for human access and avoids a standing secret. A static token, if leaked, is valid until someone notices and rotates it. The presigned URL expires in about 15 minutes and carries no secret material of its own — it's a signature over a request that only <em>your</em> IAM credentials could have produced. So access follows your IAM identity automatically: disable the IAM principal and the cluster access dies with it, no per-cluster token to hunt down. It also means every human's cluster access inherits IAM's controls — MFA, permission boundaries, CloudTrail — for free. The trade is that you depend on STS being reachable and on the CLI/credentials being present, which is why "my token expired" or "wrong profile" shows up as an auth failure rather than an RBAC one.</p>
+      </div>
+    </details>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — get yourself "Unauthorized"</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Reproduce the classic failure on purpose. Assume (or create) an IAM role that has <em>no</em> mapping on the cluster, point kubectl at it, and call the API.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Write a kubeconfig entry that authenticates as an unmapped role:</span>
+aws eks update-kubeconfig --name lab57 --alias lab57-stranger \
+  --role-arn arn:aws:iam::111122223333:role/some-unmapped-role
+kubectl --context lab57-stranger get pods</code></pre></div>
+        <div class="out"><span class="ol">Output</span>error: You must be logged in to the server (Unauthorized)</code></div>
+        <p>The token was valid — AWS happily proved you can assume that role — but EKS found no Kubernetes identity for its ARN, so you never reached RBAC. Before revealing, ask yourself: which of the two error words did you get, and what does that alone tell you to fix?</p>
+        <details class="recall"><summary>Reveal the diagnosis</summary>
+          <div class="body">
+            <p>The word is <b>Unauthorized</b>, so this is an identity-<em>mapping</em> failure, not an RBAC one — do not go editing Roles. Confirm the role has no entry and confirm which ARN you're actually presenting:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>aws eks list-access-entries --cluster-name lab57
+kubectl --context lab57-stranger config view --minify \
+  -o jsonpath='{.users[0].user.exec.args}{"\n"}'   <span class="c"># shows the --role-arn in play</span></code></pre></div>
+            <p>If the role ARN isn't in the access-entries list (and isn't in <code>aws-auth</code>), that's your whole story: EKS doesn't know who this is. The fix is Lab 4 — add an access entry. The habit: on <em>any</em> "Unauthorized" from EKS, run <code>aws sts get-caller-identity</code> first to see who you really are, then check the mappings for that exact ARN. Nine times out of ten it's the wrong profile/role, not a cluster problem.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — grant access with an access entry</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Fix Lab 3 the modern way — no ConfigMap edits. Create an access entry for the role and attach a read-only access policy scoped to the whole cluster.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>ROLE=arn:aws:iam::111122223333:role/some-unmapped-role
+aws eks create-access-entry --cluster-name lab57 --principal-arn $ROLE
+aws eks associate-access-policy --cluster-name lab57 --principal-arn $ROLE \
+  --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy \
+  --access-scope type=cluster
+kubectl --context lab57-stranger get pods -A | head</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAMESPACE     NAME                       READY   STATUS    RESTARTS   AGE
+kube-system   aws-node-4t8bx             1/1     Running   0          12m
+kube-system   coredns-6f9-abcde         1/1     Running   0          14m</code></div>
+        <p>Now the same role that got "Unauthorized" can list pods — because EKS resolves its ARN to a Kubernetes identity and the <code>AmazonEKSViewPolicy</code> grants read access. Try <code>kubectl delete pod</code> as this role and you'll get <b>Forbidden</b> instead: mapped identity, but the view policy doesn't allow writes. That's the two-step in action. <b>Local alternative:</b> on kind you can't use access entries, but you can model the same authorization half — create a <code>ServiceAccount</code>, bind it to the built-in <code>view</code> ClusterRole, and see the identical "can list, can't delete" behaviour.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — you locked everyone out</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>The nightmare: someone edited the <code>aws-auth</code> ConfigMap and removed a needed row, or switched the cluster to <code>API</code> auth mode without migrating all the <code>aws-auth</code> entries, and now the whole team gets "Unauthorized." No one can <code>kubectl</code> in to fix it — the fix normally lives <em>inside</em> the very API you're locked out of. What do you do?</p>
+        <details class="recall"><summary>Reveal the recovery paths</summary>
+          <div class="body">
+            <p>This is exactly the failure access entries were built to survive, because they live in the <em>EKS control-plane API</em>, not inside Kubernetes. From any principal with EKS IAM permissions (<code>eks:CreateAccessEntry</code>, <code>eks:AssociateAccessPolicy</code>) you can restore access without touching the Kubernetes API at all:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>MYARN=$(aws sts get-caller-identity --query Arn --output text)
+aws eks create-access-entry --cluster-name lab57 --principal-arn $MYARN
+aws eks associate-access-policy --cluster-name lab57 --principal-arn $MYARN \
+  --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy \
+  --access-scope type=cluster</code></pre></div>
+            <p>That grants you cluster-admin through the AWS side and you're back in. Two things make this work as a break-glass: the cluster must be in <code>API</code> or <code>API_AND_CONFIG_MAP</code> mode (so access entries are honoured), and the <b>original cluster creator's</b> identity always retains an auto-created admin access entry — so worst case, whoever created the cluster can always get in. This is the single best argument for migrating off pure <code>aws-auth</code>: with <code>CONFIG_MAP</code>-only mode, a bad ConfigMap edit can leave you with <em>no</em> AWS-side lever, and recovery means an AWS support case. Clean up: <code>eksctl delete cluster --name lab57</code> (and <code>kind delete cluster --name lab57</code>).</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · "you must be logged in to the server (Unauthorized)"</div>
+      <p><b>Symptom:</b> every <code>kubectl</code> command returns Unauthorized, often right after a role change, a new CI pipeline, or an auth-mode migration. <b>First cut:</b> <code>aws sts get-caller-identity</code> — are you even the ARN you think you are? A wrong profile or an un-assumable <code>--role-arn</code> in the kubeconfig is the most common cause. <b>Confirm:</b> is that exact ARN in <code>aws eks list-access-entries</code> (or the <code>aws-auth</code> ConfigMap)? <b>Usual cause:</b> the principal was never mapped, or an <code>aws-auth</code> row was dropped during a migration. <b>Fix:</b> add an access entry for the ARN. Do not touch RBAC — "Unauthorized" means RBAC was never reached.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · nodes stuck NotReady / never join the cluster</div>
+      <p><b>Symptom:</b> EC2 instances launch but never appear in <code>kubectl get nodes</code>, or appear and stay NotReady. <b>First cut:</b> on a node, <code>journalctl -u kubelet</code> — you'll often see the kubelet failing to register with an auth error. <b>Usual causes:</b> the node instance role isn't mapped (missing <code>system:bootstrappers</code>/<code>system:nodes</code> in <code>aws-auth</code>, or no EC2 access entry), the role lacks <code>AmazonEKSWorkerNodePolicy</code>, or the nodes can't reach the endpoint (security group / private-endpoint / no route). <b>Confirm:</b> node role policies, the mapping, and endpoint reachability from the node subnet. With managed node groups on access-entry clusters, EKS creates the node mapping for you — a big reason to prefer them.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · "the cluster is up but I can't reach it from my laptop"</div>
+      <p><b>Symptom:</b> the cluster is ACTIVE and colleagues in the office VPN can use it, but you time out connecting to the endpoint. <b>Usual cause:</b> the endpoint is configured <b>private-only</b> (or public access is restricted to an allow-list of CIDRs that doesn't include you). <b>Confirm:</b> <code>aws eks describe-cluster --query 'cluster.resourcesVpcConfig'</code> and read <code>endpointPublicAccess</code>, <code>endpointPrivateAccess</code>, and <code>publicAccessCidrs</code>. <b>Fix:</b> connect through the VPC (VPN, bastion, or SSM) for a private endpoint, or add your CIDR to the public allow-list — deliberately, since widening public access is a security decision, not a convenience one.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Lock the endpoint down on purpose.</b> A brand-new cluster defaults to a public endpoint reachable from anywhere (still IAM-authenticated, but reachable). For anything real, enable private access and either disable public access or restrict it to known CIDRs. The pattern most teams settle on is a private endpoint reached over VPN or SSM, with the control-plane logs shipping to CloudWatch so you keep an audit trail.</p>
+    <p><b>Treat access as least-privilege and auditable.</b> Migrate off the <code>aws-auth</code> ConfigMap to access entries and move the cluster to <code>API</code> auth mode. Grant humans the narrowest access policy that works — <code>AmazonEKSViewPolicy</code> for most, namespace-scoped <code>AmazonEKSEditPolicy</code> for app teams, and <code>AmazonEKSClusterAdminPolicy</code> for a small break-glass set. Because access entries are IAM-native, you get CloudTrail records of who was granted what, which is the difference between passing and failing an access review.</p>
+    <p><b>Plan upgrades; they're not optional.</b> AWS supports each Kubernetes minor version for a bounded window (roughly 14 months of standard support before extended-support surcharges), so you're upgrading about every year whether you like it or not. Upgrade the control plane first, then the node groups, and test against the deprecated-API warnings before you go — a minor bump can remove an API your manifests still use. Managed node groups make the node half a rolling, cordon-and-drain operation instead of a hand-built one.</p>
+    <p><b>Prefer managed add-ons and managed node groups.</b> Managed add-ons give you versioned, API-driven, CloudTrail-logged CNI/kube-proxy/CoreDNS instead of drifting manifests, and managed node groups handle bootstrap and upgrades and wire up node access for you. <b>Common mistakes:</b> leaving a wide-open public endpoint; running <code>CONFIG_MAP</code>-only auth so a bad ConfigMap edit can lock everyone out with no AWS-side recovery; forgetting that the node role needs both the EKS worker policy and image-pull permissions; and assuming "managed" means you never upgrade.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>EKS is the textbook example of a <b>shared-responsibility boundary</b>, and drawing that boundary is a design skill you'll use far beyond Kubernetes. AWS took the hardest-to-run, highest-blast-radius component — a replicated, consensus-backed control plane — and turned it into a service with an SLA, leaving you the part that's genuinely yours: your workloads and the compute under them. When you architect any platform, the same question applies: which components are undifferentiated heavy lifting you should buy as a managed service, and which are your actual product? The seams EKS exposes — an endpoint and an identity handshake — are also a lesson in <b>interface design under a trust boundary</b>: two parties that don't share an account still need a crisp, auditable contract for "who are you" (IAM + STS) and "how do we reach each other" (the endpoint and cross-account ENIs). That authentication-then-authorization split — one system proves identity, a different system decides permissions — is the same pattern you'll design into any multi-tenant service, and getting the two stages cleanly separated is what lets you reason about "Unauthorized" versus "Forbidden" instead of one muddy "access denied." It connects forward to <a href="ch55-irsa-and-eks-pod-identity.html">Chapter 55</a>, where the same OIDC-and-STS machinery lets your <em>pods</em> assume IAM roles.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What does EKS manage, and what do you still own?</summary>
+        <div class="a"><p>EKS manages the Kubernetes control plane — the API server, etcd, scheduler, and controller manager — in an AWS-owned account, spread across three AZs, patched, scaled, and backed up by AWS, exposed to you only as a highly-available API endpoint. You own everything below that line: the VPC, the nodes (managed node groups, self-managed, or Fargate), the workloads, the add-ons, and the IAM and networking that connect it all. The Kubernetes itself is unchanged; EKS just converts the control plane into a managed service and wraps it in an IAM front door.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through how <code>kubectl</code> authenticates to an EKS cluster.</summary>
+        <div class="a"><p>The kubeconfig doesn't hold a static token; it holds an exec block that runs <code>aws eks get-token</code> on every call. That command uses your AWS credentials to build a presigned URL for <code>sts:GetCallerIdentity</code> and base64-encodes it into a bearer token starting with <code>k8s-aws-v1.</code>, valid about 15 minutes. kubectl sends it to the endpoint over TLS. The API server passes it to EKS's webhook authenticator, which actually executes that presigned STS call to verify the token is genuine and to learn the caller's IAM ARN. EKS then maps that ARN to a Kubernetes username and groups using either an access entry or the <code>aws-auth</code> ConfigMap. Finally, plain Kubernetes RBAC authorizes the resolved identity. The key insight is that this is two separate stages: AWS decides <em>who you are</em>, Kubernetes decides <em>what you may do</em>. So "Unauthorized" means the identity mapping failed — RBAC was never reached — while "Forbidden" means you were recognised but RBAC said no. That one distinction resolves most EKS access incidents.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Compare the <code>aws-auth</code> ConfigMap with access entries. Why did AWS build the second one?</summary>
+        <div class="a"><p>Both map an IAM principal to a Kubernetes identity for step 4 of authentication. The <code>aws-auth</code> ConfigMap is the original mechanism: a YAML object in <code>kube-system</code> with <code>mapRoles</code>/<code>mapUsers</code> lists. Its problems are structural — it lives inside the cluster, so a bad edit can lock everyone out with no AWS-side recovery; there's no CloudTrail audit of access grants; and it's just free-form YAML with no validation. Access entries move this into the EKS control-plane API: you manage them with <code>aws eks create-access-entry</code>, attach AWS-maintained access policies (ClusterAdmin, Admin, Edit, View) optionally scoped to namespaces, and it's all IAM-native — auditable in CloudTrail, editable even when the Kubernetes API is unreachable, and impossible to wipe with a ConfigMap edit. The auth mode controls which is live: <code>CONFIG_MAP</code>, <code>API_AND_CONFIG_MAP</code>, or <code>API</code>, moving forward only. AWS built access entries mainly to kill the lockout foot-gun and to make cluster access a first-class, auditable IAM concept. The migration gotcha: enabling access entries only auto-creates an entry for the original cluster creator, so you must migrate every other <code>aws-auth</code> row by hand before switching to <code>API</code>-only.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>New nodes launch but never join the cluster. How do you debug it?</summary>
+        <div class="a"><p>I'd split it into "can the node authenticate and register?" and "can the node reach the control plane?" First, on the node (or its console/SSM), <code>journalctl -u kubelet</code> — the kubelet almost always logs why registration fails. If it's an auth error, the node instance role either isn't mapped to <code>system:bootstrappers</code>/<code>system:nodes</code> (in <code>aws-auth</code>) or lacks an EC2 access entry, or the role is missing <code>AmazonEKSWorkerNodePolicy</code> and image-pull permissions — I'd check the role's policies and the mapping. If instead the kubelet can't reach the API at all, it's networking: the node's security group or the cluster security group, a private-only endpoint the node subnet can't route to, or missing outbound to the endpoint. I'd verify endpoint reachability from the node subnet and the security-group rules between nodes and control plane. Managed node groups on access-entry clusters wire the node mapping automatically, so if I'm hand-rolling self-managed nodes I'd suspect the mapping first; if it's a managed group, I'd suspect networking or the role policies first.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>When would you pick Fargate over managed node groups, and what do you give up?</summary>
+        <div class="a"><p>Fargate when I want zero node management and per-pod isolation — no OS to patch, no ASG to size, and each pod in its own microVM, which is attractive for spiky or untrusted workloads and small teams. You pay per pod-resource rather than per node, which can be cheaper for bursty low-density workloads and pricier for steady high-density ones. What you give up is real: no DaemonSets (so node-level agents like some log shippers or the standard CNI/kube-proxy model don't apply the same way), no privileged pods or host access, no GPUs, sizing fixed per pod, and slower cold starts since each pod provisions a microVM. So Fargate for isolation and no-ops; managed node groups when you need DaemonSets, custom AMIs, GPUs, host access, or the density economics of packing many pods per node. Many clusters run both — Fargate for a few isolated or bursty services, managed node groups for the bulk.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>EKS runs the Kubernetes control plane — API server, etcd, scheduler, controller manager — in an AWS-owned account across three AZs, and exposes it to you as one HA endpoint; you own the VPC, the nodes, and the workloads. Your compute is managed node groups (the default), self-managed nodes (most control, most toil), or Fargate (no nodes, per-pod microVMs), with EKS Auto Mode as an AWS-operated option on top. Authentication is AWS IAM: kubectl runs <code>aws eks get-token</code> to build a short-lived presigned STS token, EKS verifies it and resolves your IAM ARN to a Kubernetes identity via an access entry or the <code>aws-auth</code> ConfigMap, and only then does RBAC authorize — so "Unauthorized" is an identity-mapping failure and "Forbidden" is an RBAC failure. Access entries are the modern, IAM-native, auditable, lockout-resistant replacement for <code>aws-auth</code>; auth modes move forward <code>CONFIG_MAP</code> → <code>API_AND_CONFIG_MAP</code> → <code>API</code> only. Add-ons (CNI, kube-proxy, CoreDNS, CSI, Pod Identity Agent) are best run as versioned EKS-managed add-ons. When access breaks, read the error word, run <code>aws sts get-caller-identity</code>, and check the mapping for that exact ARN.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>EKS manages the control plane (API server, etcd, scheduler, controller manager) multi-AZ; you own the data plane.</li>
+      <li>The control plane is exposed only as an endpoint (public and/or private) plus cross-account ENIs into your subnets.</li>
+      <li>Data-plane options: managed node groups (default), self-managed nodes, Fargate; EKS Auto Mode operates compute for you.</li>
+      <li>Auth is IAM: <code>aws eks get-token</code> makes a short-lived presigned <code>sts:GetCallerIdentity</code> token (<code>k8s-aws-v1.</code>).</li>
+      <li>EKS verifies the token, resolves the IAM ARN to a Kubernetes user+groups, then RBAC authorizes — two stages.</li>
+      <li>"Unauthorized" = identity not mapped (fix access entry/aws-auth); "Forbidden" = mapped but RBAC denies.</li>
+      <li>Access entries (EKS API, auditable, lockout-resistant) are the modern replacement for the <code>aws-auth</code> ConfigMap.</li>
+      <li>Auth modes go forward only: <code>CONFIG_MAP</code> → <code>API_AND_CONFIG_MAP</code> → <code>API</code>; only the creator's entry auto-migrates.</li>
+      <li>Nodes that never join usually mean an unmapped node role, a missing worker policy, or no route to the endpoint.</li>
+      <li>Lock the endpoint down, ship control-plane logs to CloudWatch, and plan a Kubernetes upgrade roughly yearly.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch29-the-control-plane-api-server-etcd-scheduler.html"><b>Ch 29</b> The control plane</a>
+      <a href="ch49-the-aws-mental-model-regions-azs-failure.html"><b>Ch 49</b> AWS mental model</a>
+      <a href="ch54-iam-and-sts.html"><b>Ch 54</b> IAM &amp; STS</a>
+      <a href="ch55-irsa-and-eks-pod-identity.html"><b>Ch 55</b> IRSA &amp; Pod Identity</a>
+      <a href="ch58-vpc-cni-the-deep-one.html"><b>Ch 58</b> VPC CNI</a>
+      <a href="ch60-end-to-end-synthesis-internet-to-alb.html"><b>Ch 60</b> End-to-end on EKS</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Amazon EKS User Guide — <a href="https://docs.aws.amazon.com/eks/latest/userguide/clusters.html">Amazon EKS clusters</a>: what the managed control plane provides and the endpoint model.</li>
+      <li>Amazon EKS User Guide — <a href="https://docs.aws.amazon.com/eks/latest/userguide/eks-compute.html">Managed node groups, self-managed nodes, and Fargate</a>: the data-plane options and their trade-offs.</li>
+      <li>Amazon EKS User Guide — <a href="https://docs.aws.amazon.com/eks/latest/userguide/grant-k8s-access.html">Grant IAM users and roles access to Kubernetes</a>: the authentication model.</li>
+      <li>Amazon EKS User Guide — <a href="https://docs.aws.amazon.com/eks/latest/userguide/access-entries.html">EKS access entries</a> and <a href="https://docs.aws.amazon.com/eks/latest/userguide/access-policy-permissions.html">access policy permissions</a>: the modern access mechanism.</li>
+      <li>Amazon EKS User Guide — <a href="https://docs.aws.amazon.com/eks/latest/userguide/eks-add-ons.html">Amazon EKS add-ons</a>: versioned, API-managed cluster plumbing.</li>
+      <li>Amazon EKS Best Practices Guide — <a href="https://docs.aws.amazon.com/eks/latest/best-practices/introduction.html">Security and cluster architecture</a>: endpoint access, identity, and upgrade guidance.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch56-compute-and-data-services-for-sres.html"><span class="dir">← Prev</span><div class="ti">Ch 56 — Compute and data services for SREs</div></a>
+      <a class="nx" href="ch58-vpc-cni-the-deep-one.html"><span class="dir">Next →</span><div class="ti">Ch 58 — VPC CNI: the deep one</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 57 of 121 · Part VI · AWS &amp; EKS for SREs. You've seen the managed shell and the IAM front door. Next we go under the floor of the data plane — how every pod gets a real VPC IP, and what happens when they run out.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Control plane &amp; data plane</a>
+    <a href="#internals">What AWS runs · auth</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">One kubectl call</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

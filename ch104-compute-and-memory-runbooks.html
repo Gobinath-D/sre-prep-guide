@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 104 — Compute &amp; Memory Runbooks</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part XI · Troubleshooting &nbsp;·&nbsp; Chapter 104</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part XI · SRE Problem-Solving &amp; Production Troubleshooting · Chapter 104</div>
+      <h1>Compute and memory runbooks</h1>
+      <p class="tagline">"High CPU," "high memory," "OOMKilled," "disk full" — four pages that look like four different fires. They're actually the same handful of kernel and cgroup mechanisms from Parts I and III, showing up at the surface in different clothes. This chapter is the pre-written runbook for each one, traced all the way down to the internals that explain it.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~55 min read · Docker + kind lab</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Split a CPU alert into %us/%sy/%wa in the first minute and know which of three completely different investigations to run.</li>
+          <li>Explain why a container can be OOMKilled while <code>free -h</code> on the node still shows gigabytes free.</li>
+          <li>Tell page-cache memory from real memory pressure without guessing — and stop paging people over healthy cache growth.</li>
+          <li>Diagnose disk-full when <code>df -h</code> lies to you, because the real ceiling is inodes, not bytes.</li>
+          <li>Run the eight-step runbook — symptom, hypotheses, evidence, isolation, root cause, fix, validation, prevention — on all four, and reproduce every one yourself first.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>A resource alert names a symptom, not a layer</h2>
+    <p>PagerDuty fires: "node-7 CPU above 90% for 10 minutes." Or: "checkout-7f9d OOMKilled, 3 restarts." Or: "disk 92% full on /var/lib/docker." Each of those sentences is true and almost useless on its own, because each one hides three or four mechanically distinct causes that all produce the identical alert. High CPU can mean your code is doing real work, or it can mean the kernel is drowning in syscalls, or it can mean the box is actually I/O-bound and the scheduler is just spinning while data limps off a disk. "OOMKilled" can mean a genuine leak, or a limit set without ever measuring real usage, or a completely healthy process that briefly needed a burst the limit didn't allow for. Guessing from the alert text sends you down the wrong one of those roughly half the time.</p>
+    <p>This chapter is a set of runbooks — pre-written investigations for the four resource failures you'll see most: high CPU, high memory, OOMKilled, and disk full. Each one follows the same eight-step shape: state the <b>symptom</b> precisely, list the <b>hypotheses</b> that could mechanically produce it, gather the <b>evidence</b> that discriminates between them, <b>isolate</b> the one the evidence actually supports, name the <b>root cause</b> specifically enough to act on, apply the <b>fix</b>, <b>validate</b> that the fix held under real conditions rather than just for a moment, and write down the <b>prevention</b> so the same page doesn't reach you again. That's the general troubleshooting loop from <a href="ch103-the-universal-troubleshooting-framework.html">Chapter 103</a>, with three extra steps this chapter insists on by name — fix, validation, prevention — because "isolated the cause" and "actually done" are not the same thing at 3 a.m.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>Every failure in this chapter is a surface effect of mechanisms you already have the internals for: the CFS scheduler and syscalls (<a href="ch01-kernel-and-system-calls.html">Chapter 1</a>, <a href="ch02-processes-threads-scheduling-signals.html">Chapter 2</a>), the page cache and the OOM killer (<a href="ch03-memory-virtual-memory-page-cache-swap-oom.html">Chapter 3</a>), inodes and block allocation (<a href="ch04-filesystems-inodes-file-descriptors-disk-i-o.html">Chapter 4</a>), and cgroup v2 accounting (<a href="ch23-cgroups-v2-cpu-memory-io-limits.html">Chapter 23</a>). This chapter doesn't re-teach those; it points them at an alert.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a restaurant kitchen at peak service</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Picture a restaurant kitchen slammed on a Saturday night. The <b>cooks</b> are the CPU cores — there are only so many hands, and every ticket needs some of their time. The <b>counter space and prep trays</b> are RAM — a working area for whatever's actively being cooked. The <b>walk-in fridge and dry storage</b> is disk — where ingredients live until something needs them.</p>
+      <p>Here's the part people miss: most of the counter is covered in trays from dishes that finished five minutes ago, washed and stacked, ready to be reused the instant someone needs tray space. That's the page cache — it looks "used" but it's free for the taking. If a cook needs the counter and there's nothing washable left to clear, the <b>expediter</b> starts pulling whole dishes off the counter to make room, starting with whichever one is hogging the most space for the least urgent order. That's the OOM killer. And if the walk-in genuinely runs out of shelf space — every hook, every shelf, full — nothing new can be stored, full stop, no matter how organized the labels are. That's disk full.</p>
+      <p>A busy kitchen and a slow kitchen look identical from the dining room: tickets are taking forever either way. The manager who walks in and guesses "we need another cook" without checking whether the cooks are actually cooking, or just standing around waiting for the fridge, wastes a hire. That's the entire chapter in one sentence: don't add resources to a symptom you haven't localized.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the kitchen</th><th>On the machine</th></tr>
+      <tr><td>Cooks working the line</td><td>CPU cores executing instructions</td></tr>
+      <tr><td>Counter space and prep trays</td><td>RAM holding a process's working set</td></tr>
+      <tr><td>Clean, stacked trays ready for reuse</td><td>Page cache — reclaimable, not a leak</td></tr>
+      <tr><td>The walk-in fridge and dry storage</td><td>Disk (block storage)</td></tr>
+      <tr><td>The expediter pulling a dish to free counter space</td><td>The kernel or cgroup OOM killer</td></tr>
+      <tr><td>A ticket rail backing up because cooks can't turn tickets</td><td>Load average / run-queue length climbing</td></tr>
+      <tr><td>Every shelf in the walk-in full, nothing more fits</td><td>Disk full — <code>ENOSPC</code></td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>The decision tree: which signal, which runbook</h2>
+    <p>Before you touch a single hypothesis, route the alert to the right column. CPU, memory, and disk alerts are read with three completely different commands, and the sub-branch under each one is where the actual runbook starts.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 800 390" role="img" aria-label="Decision tree: a compute or memory alert branches into CPU, memory, or disk, each read with a different first command, each splitting into its own set of causes">
+        <defs>
+          <marker id="rm1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--muted)"/></marker>
+        </defs>
+        <text x="400" y="16" text-anchor="middle" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">ALERT FIRES → WHICH SIGNAL → WHICH RUNBOOK</text>
+
+        <rect x="290" y="26" width="220" height="38" rx="9" style="fill:var(--panel);stroke:var(--ink);stroke-width:1.5"/>
+        <text x="400" y="50" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">CPU / memory / disk alert fires</text>
+
+        <line x1="330" y1="64" x2="145" y2="86" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#rm1)"/>
+        <line x1="400" y1="64" x2="400" y2="86" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#rm1)"/>
+        <line x1="470" y1="64" x2="655" y2="86" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#rm1)"/>
+
+        <rect x="20" y="88" width="250" height="46" rx="8" style="fill:var(--chip);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="145" y="106" text-anchor="middle" style="fill:var(--accent);font:700 12px sans-serif">top -b -n1</text>
+        <text x="145" y="122" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">read %us vs %sy vs %wa</text>
+
+        <rect x="285" y="88" width="230" height="46" rx="8" style="fill:var(--chip);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="400" y="106" text-anchor="middle" style="fill:var(--accent2);font:700 12px sans-serif">free -h + cgroup files</text>
+        <text x="400" y="122" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">memory.current vs memory.max</text>
+
+        <rect x="530" y="88" width="250" height="46" rx="8" style="fill:var(--chip);stroke:var(--applied);stroke-width:1.5"/>
+        <text x="655" y="106" text-anchor="middle" style="fill:var(--applied);font:700 12px sans-serif">df -h  &amp;&amp;  df -i</text>
+        <text x="655" y="122" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">blocks vs inodes</text>
+
+        <line x1="145" y1="134" x2="145" y2="148" style="stroke:var(--muted);stroke-width:1.4" marker-end="url(#rm1)"/>
+        <line x1="400" y1="134" x2="400" y2="148" style="stroke:var(--muted);stroke-width:1.4" marker-end="url(#rm1)"/>
+        <line x1="655" y1="134" x2="655" y2="148" style="stroke:var(--muted);stroke-width:1.4" marker-end="url(#rm1)"/>
+
+        <rect x="20" y="150" width="250" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="145" y="168" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">%us high → real work</text>
+        <text x="145" y="184" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">profile it: perf top, py-spy, pprof</text>
+
+        <rect x="20" y="208" width="250" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="145" y="226" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">%sy high → syscall storm</text>
+        <text x="145" y="242" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif"><tspan style="font-family:ui-monospace,monospace">strace -c -p &lt;pid&gt;</tspan> (Ch 1)</text>
+
+        <rect x="20" y="266" width="250" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="145" y="284" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">%wa high → blocked on disk</text>
+        <text x="145" y="300" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif"><tspan style="font-family:ui-monospace,monospace">iostat -x 1</tspan> — not a CPU problem</text>
+
+        <rect x="285" y="150" width="230" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="400" y="168" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">RSS climbs, never drops → leak</text>
+        <text x="400" y="184" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">ps -o rss,cmd · pmap · Ch 3</text>
+
+        <rect x="285" y="208" width="230" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="400" y="226" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">cache high, available still high</text>
+        <text x="400" y="242" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">buff/cache ≠ used memory</text>
+
+        <rect x="285" y="266" width="230" height="50" rx="7" style="fill:var(--panel);stroke:var(--deep);stroke-width:1.5"/>
+        <text x="400" y="284" text-anchor="middle" style="fill:var(--deep);font:700 11px sans-serif">killed, Reason: OOMKilled</text>
+        <text x="400" y="300" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">exit 137 → memory.max hit (Ch 23)</text>
+
+        <rect x="530" y="150" width="250" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="655" y="168" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">Use% 100 on df -h → blocks full</text>
+        <text x="655" y="184" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">log growth, core dumps, old layers</text>
+
+        <rect x="530" y="208" width="250" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="655" y="226" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">df -h has room, df -i is 100%</text>
+        <text x="655" y="242" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">millions of tiny files — sessions, tmp</text>
+
+        <rect x="530" y="266" width="250" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="655" y="284" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">kubelet: nodefs vs imagefs</text>
+        <text x="655" y="300" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">different eviction signal, Ch 30</text>
+
+        <rect x="20" y="332" width="760" height="42" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="400" y="350" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">All three columns can produce the exact same first symptom: "the service is slow."</text>
+        <text x="400" y="366" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">The column is decided by which file you read next — never by how the alert text reads.</text>
+      </svg>
+      <figcaption>Route first, hypothesize second. The alert tells you a service is unhappy; it never tells you which of these nine boxes you're in.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>Autoscalers and on-call engineers make the same mistake in different clothes: both add capacity in response to a number, without checking which column that number lives in. Adding CPU cores to a box that's blocked on disk I/O does nothing — <code>%wa</code> isn't waiting for more CPU, it's waiting for the disk to answer. Bumping a memory limit to silence an OOMKill without checking whether it's a leak just delays the same page by a few hours. The five minutes this chapter asks you to spend routing the alert correctly is cheaper than the capacity you'd burn compensating for the wrong diagnosis.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: a dashboard shows CPU at 85% and memory at 40%. Is this a CPU-bound service?</summary>
+      <div class="body">
+        <p>Not necessarily — 85% is a single aggregate number, and it collapses three completely different states into one line. It could be <code>%us</code>-heavy (the app is genuinely doing 85% worth of computation — a real CPU-bound service), <code>%sy</code>-heavy (a syscall storm eating CPU without doing useful work, per <a href="ch01-kernel-and-system-calls.html">Chapter 1</a>), or <code>%wa</code>-heavy (the CPU is sitting nearly idle but marked "busy" because processes are stuck waiting on disk, and depending on your monitoring stack, iowait sometimes gets bucketed into the same utilization graph as real work). You cannot tell which from one aggregate percentage. The very next command has to be one that breaks that number apart — <code>top</code>'s per-state breakdown, at minimum — before a single hypothesis is worth forming.</p>
+      </div>
+    </details>
+
+    <h2 id="internals"><span class="beat">Internal working</span>The eight-step runbook, applied to a resource alert</h2>
+    <ol class="steps">
+      <li><b>Symptom.</b> Write down the exact reading, not your interpretation of it: "node-7, <code>%sy</code> 71%, <code>%us</code> 9%, been climbing for 12 minutes" is a symptom. "The node is overloaded" already threw away the one number that matters.</li>
+      <li><b>Hypotheses.</b> Constrain the list to what that specific column can mechanically produce. High <code>%sy</code> narrows to: a syscall-heavy poll loop, excessive logging, a retry loop with no backoff, or (on a container host) an unusually chatty network/IPC pattern. It does not include "the disk is slow" — that's a different column entirely.</li>
+      <li><b>Evidence.</b> Pick the one command that discriminates. For <code>%sy</code>, that's <code>strace -c -p &lt;pid&gt;</code> for a few seconds: one syscall with a huge count versus a healthy spread tells you immediately whether you're looking at a storm or normal I/O-bound work.</li>
+      <li><b>Isolation.</b> Read the evidence against each hypothesis specifically, not against your favorite one. A count of 400,000 <code>futex</code> calls in five seconds says lock contention, not "the CPU is slow" — those are different fixes.</li>
+      <li><b>Root cause.</b> Specific enough to imply the fix: "the retry client has no backoff and is hammering <code>connect()</code> against a dependency that's been down for ten minutes" — not "networking issues."</li>
+      <li><b>Fix.</b> Apply the smallest change that addresses the root cause, not the symptom. Restarting the process resets the visible number; it does not touch a retry loop with no backoff, which will simply resume the storm the moment the same condition recurs.</li>
+      <li><b>Validation.</b> Watch the actual signal you started with, over a real window — <code>%sy</code> staying low for the next thirty minutes, not just the ten seconds right after you deployed the fix. Cgroup CPU throttling in particular can look fine for a burst and then reappear the moment traffic returns to a normal pattern.</li>
+      <li><b>Prevention.</b> Turn the specific finding into something durable: a circuit breaker or backoff policy, a rate limit, a resource request set from measured usage instead of a guess, an alert on <code>nr_throttled</code> instead of only on raw CPU percentage. This is the step almost everyone skips, and it's the only one that stops the page from recurring.</li>
+    </ol>
+    <div class="box keypoint"><div class="h">The three extra steps are not busywork</div>
+      <p>Isolating a root cause and actually closing the incident are different achievements. A fix without validation is a guess you haven't disproven yet. A fix without prevention is a guarantee that whoever is on call next month gets the identical page, starting from zero, because nothing about the system changed except that this one instance got better.</p>
+    </div>
+
+    <h2 id="components"><span class="beat">Components</span>Where the evidence actually lives</h2>
+    <ul>
+      <li><b><code>top</code> / <code>htop</code>.</b> The first stop for CPU. The breakdown row — <code>%us</code>, <code>%sy</code>, <code>%ni</code>, <code>%id</code>, <code>%wa</code>, <code>%hi</code>, <code>%si</code>, <code>%st</code> — is the whole story in one line. Most people read the total and skip straight past the one row that would have told them which column they're in.</li>
+      <li><b>Load average.</b> On Linux, unlike some other Unixes, the run-queue count used for load average includes processes stuck in uninterruptible sleep (state <code>D</code>) — waiting on disk, typically. A load average of 40 on an 8-core box with near-zero <code>%us</code> is a disk-wait story, not a CPU story; <code>ps -eo state,pid,cmd | grep '^D'</code> confirms it.</li>
+      <li><b><code>free -h</code> and <code>/proc/meminfo</code>.</b> The column that matters is <code>available</code>, not <code>free</code>. <code>buff/cache</code> is memory the kernel is using productively but will hand back instantly under pressure — treating it as "used" is the single most common false alarm in this chapter.</li>
+      <li><b>cgroup v2 files — <code>memory.current</code>, <code>memory.max</code>, <code>memory.events</code>, <code>cpu.stat</code>.</b> Ground truth for anything running in a container or a pod. <code>memory.events</code>'s <code>oom_kill</code> counter and <code>cpu.stat</code>'s <code>nr_throttled</code> tell you, per cgroup, exactly what the kernel actually did — no inference required. See <a href="ch23-cgroups-v2-cpu-memory-io-limits.html">Chapter 23</a> for the full file layout.</li>
+      <li><b><code>df -h</code> and <code>df -i</code>.</b> Two independent ceilings on the same filesystem: bytes and inodes. A filesystem can be at 40% byte usage and 100% inode usage simultaneously — <code>df -h</code> alone will tell you the disk looks fine while every <code>write()</code> fails.</li>
+      <li><b><code>dmesg</code> and the kernel log.</b> The OOM killer's own account of what it killed and why, including the exact memory cgroup and the process's RSS at the moment of death — the fastest way to confirm an OOMKill actually happened versus a crash that merely looks like one.</li>
+      <li><b><code>kubectl describe pod</code> / <code>kubectl top</code>.</b> The Kubernetes-flavored view of the same cgroup data: container <code>Last State</code>, <code>Reason</code>, and <code>Exit Code</code> for OOMKilled; <code>kubectl top pod</code> for a live read against the configured limit.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one alert through all eight steps</h2>
+    <p>The page: "payments-api pod restarted, Reason OOMKilled, 3 times in the last hour." <b>Symptom, precisely:</b> three restarts in sixty minutes, same reason each time, memory limit set to 512Mi. <b>Hypotheses:</b> a leak that eventually exceeds 512Mi regardless of traffic, a limit that was never sized against real peak usage, or a genuine, occasional burst (a large batch request, a cold-start cache fill) that only needs headroom, not a structural fix.</p>
+    <p><b>Evidence:</b> <code>kubectl top pod payments-api --containers</code> sampled over the hour, plus the timestamps of the three kills. The memory climbs steadily from pod start, crosses 512Mi at roughly the same elapsed time each cycle — 40, 42, and 39 minutes after start — and shows no correlation with a traffic spike in the dashboards. <b>Isolation:</b> a fixed climb-to-limit time regardless of load is the signature of a leak, not a burst — a burst would track request volume, and a too-small static limit would fail immediately under peak load, not reliably at the 40-minute mark under normal traffic.</p>
+    <p><b>Root cause:</b> a connections list that appends on every request and is never trimmed — confirmed by attaching a memory profiler and watching one data structure grow monotonically. <b>Fix:</b> patch the leak (bound the list, or close what it opens). <b>Validation:</b> watch <code>memory.current</code> for the same container hold flat across several of the old 40-minute cycles, not just avoid a restart in the first ten minutes. <b>Prevention:</b> add an alert on memory climbing linearly over a rolling window — which catches the next leak long before it reaches the limit — instead of only alerting on the OOMKill itself, which is the failure you were trying to prevent, not a leading indicator of it.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>Labs 1, 2, and 4 use a throwaway Docker container; Labs 3 and 5 use a local <code>kind</code> cluster, since real memory limits and OOM behavior are what you'll actually diagnose against in production. Start the container labs:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># A disposable box with the tools this chapter uses:</span>
+docker run --rm -it --cap-add=SYS_PTRACE ubuntu:24.04 bash
+apt-get update &amp;&amp; apt-get install -y stress-ng strace procps sysstat python3</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — split a CPU alert into %us vs %sy</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Generate two kinds of "100% CPU" that look identical on a graph and completely different under <code>top</code>. First, real computational work:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>stress-ng --cpu 1 --cpu-method matrixprod --timeout 60s &amp;
+top -b -n1 | head -12</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>%Cpu(s): 98.7 us,  0.8 sy,  0.0 ni,  0.5 id,  0.0 wa</code></div>
+        <p><code>%us</code> is doing essentially all the work — this is real computation, and the fix (if it's a problem at all) is more cores, a faster algorithm, or caching. Now the syscall-storm shape from <a href="ch01-kernel-and-system-calls.html">Chapter 1</a>, at scale:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kill %1 2&gt;/dev/null
+bash -c 'while true; do date &gt;/dev/null; done' &amp;
+top -b -n1 | head -12</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>%Cpu(s): 11.2 us, 86.4 sy,  0.0 ni,  0.0 id,  2.4 wa</code></div>
+        <p>Same "100% CPU" headline, opposite column, opposite fix. The first one needs more compute or a faster algorithm; this one needs fewer syscalls — no amount of added CPU touches a process that's mostly paying mode-switch overhead. Clean up: <code>kill %1</code>.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — page cache is not a leak</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>The single most common false page in this chapter: memory usage graphs climbing after reading files, with nothing actually leaking. Watch it happen:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>free -h
+dd if=/dev/zero of=/tmp/bigfile bs=1M count=1500
+free -h</code></pre></div>
+        <div class="out"><span class="ol">Output</span>              total   used   free   shared  buff/cache   available
+Mem:          3.8Gi   180Mi  3.4Gi   1.0Mi      210Mi        3.5Gi
+Mem:          3.8Gi   190Mi  1.9Gi   1.0Mi      1.7Gi         3.4Gi</code></div>
+        <p><code>free</code> dropped by 1.5Gi and <code>buff/cache</code> absorbed almost exactly that much — the kernel cached the file it just wrote. Look at <code>available</code>: it barely moved. That's the column that answers "do I actually have a problem," and it says no. Now the real thing:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>python3 -c '
+data = []
+for i in range(200000):
+    data.append("x" * 10000)
+import time; time.sleep(60)
+' &amp;
+sleep 5 &amp;&amp; free -h</code></pre></div>
+        <div class="out"><span class="ol">Output</span>              total   used   free   shared  buff/cache   available
+Mem:          3.8Gi   2.1Gi   1.5Gi   1.0Mi      210Mi        1.6Gi</code></div>
+        <p><code>used</code> climbed and <code>available</code> climbed down with it, one-for-one, with <code>buff/cache</code> barely involved. That's a real allocation holding real memory the kernel can't reclaim on demand. Same shape on a graph — a rising line — and only <code>available</code> tells you which one you're looking at. Clean up: <code>kill %1; rm /tmp/bigfile</code>.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — an OOMKilled pod, cause hidden</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Switch to <code>kind</code> for this one — real cgroup limits, real kubelet behavior.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kind create cluster --name runbooks
+kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: Pod
+metadata: { name: grower }
+spec:
+  containers:
+  - name: c
+    image: python:3.12-slim
+    command: ["python3", "-c", "
+import time
+data = []
+while True:
+    data.append('x' * 10_000_000)
+    time.sleep(1)
+"]
+    resources:
+      limits: { memory: "128Mi" }
+EOF
+kubectl get pod grower -w</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME      READY   STATUS               RESTARTS      AGE
+grower    0/1     CrashLoopBackOff     2 (20s ago)   45s</code></div>
+        <p>Run the eight steps yourself before revealing anything. State the symptom precisely, list what could produce a container that restarts on a backoff, and name the one command that would tell you whether this is memory-related at all.</p>
+        <details class="recall"><summary>Reveal the evidence and the root cause</summary>
+          <div class="body">
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl describe pod grower | grep -A6 "Last State"</code></pre></div>
+            <div class="out"><span class="ol">Output</span>Last State:     Terminated
+  Reason:       OOMKilled
+  Exit Code:    137</code></div>
+            <p><code>Reason: OOMKilled</code>, exit code 137 (128 + SIGKILL) — the cgroup memory controller killed it, the process didn't choose to exit. <b>Root cause:</b> the script allocates roughly 10MB every second with no upper bound, so it always crosses a 128Mi limit — this isn't a burst, it's an unbounded allocation that will hit any limit given enough time. <b>Fix:</b> bound the data structure in the app, and separately size the limit against real steady-state usage rather than a guess. <b>Validate</b> by watching <code>memory.events</code>'s <code>oom_kill</code> counter stay at zero across several minutes post-fix, not just checking that the pod is <code>Running</code> right now:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>docker exec runbooks-control-plane bash -c \
+  'cat /sys/fs/cgroup/kubepods.slice/*/memory.events 2&gt;/dev/null | grep oom' </code></pre></div>
+            <p>Clean up: <code>kubectl delete pod grower</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <details class="recall"><summary>Think first: two pods hit the exact same memory limit, one after 40 seconds and one after 4 days. Same root cause?</summary>
+      <div class="body">
+        <p>Probably not, and the time-to-kill is itself evidence. A limit crossed in 40 seconds under normal startup traffic usually means the limit was set below what the process needs even at rest — check the steady-state <code>memory.current</code> right after a clean start, before touching the code. A limit crossed only after four days of otherwise-normal operation is the signature of a slow leak — something that grows a small, fixed amount per request or per hour and only becomes visible once it accumulates past the ceiling. Same alert, same exit code, same <code>Reason: OOMKilled</code> — and one is a sizing problem you fix with a number, the other is a bug you fix with a profiler.</p>
+      </div>
+    </details>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — disk full, but df -h says there's room</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Back in the Docker container. Something is about to write and fail, and the obvious first check is going to look wrong.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>mkdir -p /tmp/many &amp;&amp; cd /tmp/many
+for i in $(seq 1 200000); do touch "f$i"; done 2&gt;&amp;1 | tail -3</code></pre></div>
+        <div class="out"><span class="ol">Output (near the end)</span>touch: cannot touch 'f198213': No space left on device</code></div>
+        <p><code>No space left on device</code> is <code>ENOSPC</code> — but check the obvious thing first, the way an on-call engineer under pressure actually would:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>df -h /tmp</code></pre></div>
+        <div class="out"><span class="ol">Output</span>Filesystem      Size  Used Avail Use% Mounted on
+overlay          59G   14G   42G   25% /</code></div>
+        <p>25% used, 42G free, and the filesystem just refused a write. Before you conclude the tool is lying, run the command that checks the <em>other</em> ceiling.</p>
+        <details class="recall"><summary>Reveal the second check and the cause</summary>
+          <div class="body">
+            <div class="codewrap"><span class="lang">bash</span><pre><code>df -i /tmp</code></pre></div>
+            <div class="out"><span class="ol">Output</span>Filesystem      Inodes  IUsed   IFree IUse% Mounted on
+overlay        3932160 3932160      0  100%  /</code></div>
+            <p><code>IUse% 100</code>. Every filesystem has two independent limits — bytes and inodes, one per file/directory/link regardless of that file's size — and this one ran out of the second while the first had room to spare. <b>Root cause:</b> a runaway loop creating empty files, each one consuming an inode and zero meaningful bytes. This is the exact shape of a real incident caused by an unbounded session-file directory, a cache that writes one tiny file per key, or a log rotation policy that rotates by size but never caps file <em>count</em>. <b>Fix</b> is deleting the files (or, structurally, writing fewer, bigger files). <b>Prevention:</b> alert on <code>df -i</code> the same way you alert on <code>df -h</code> — most default disk-space alerts only watch bytes. Clean up: <code>rm -rf /tmp/many</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — the CPU alert that was never about CPU</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>Back on <code>kind</code>. The page says: "worker pod CPU pegged at 100%, throughput near zero." Reproduce the setup and investigate as if the pager text is all you know:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: Pod
+metadata: { name: worker }
+spec:
+  containers:
+  - name: c
+    image: busybox:1.36
+    command: ["sh", "-c", "
+i=0
+while true; do
+  i=$((i+1))
+  echo \"processing job $i, writing log\" &gt;&gt; /scratch/worker.log
+done
+"]
+    volumeMounts: [{ name: scratch, mountPath: /scratch }]
+  volumes:
+  - name: scratch
+    emptyDir: { sizeLimit: 10Mi }
+EOF
+sleep 30 &amp;&amp; kubectl top pod worker</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME     CPU(cores)   MEMORY(bytes)
+worker   980m         12Mi</div></code></div>
+        <p>CPU near a full core, exactly as paged. Before you reach for "give it more CPU" or "raise the limit," run the eight steps from the top — the pager text told you which alert fired, not which layer broke.</p>
+        <details class="recall"><summary>Reveal the reasoning</summary>
+          <div class="body">
+            <p><b>Symptom, precisely:</b> near-100% CPU, near-zero useful throughput — that mismatch itself is the clue; genuine CPU-bound work usually produces visible output proportional to the CPU it burns. <b>Hypotheses:</b> real computation (ruled out by the mismatch), a syscall storm, or something failing and retrying in a tight loop. Check the column first:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl exec worker -- sh -c 'cat /proc/1/status | grep State'
+kubectl exec worker -- sh -c 'df -h /scratch'</code></pre></div>
+            <div class="out"><span class="ol">Output</span>Filesystem                Size  Used Avail Use% Mounted on
+/scratch                  10.0M  10.0M     0  100%  /scratch</code></div>
+            <p><b>Evidence:</b> the mounted <code>emptyDir</code> is completely full — this pod's disk, not the node's, because <code>sizeLimit</code> caps the volume itself. <b>Isolation:</b> the shell script's <code>while true</code> loop never checks whether the <code>&gt;&gt;</code> write succeeded — once the volume fills, every write fails instantly with <code>ENOSPC</code>, the loop doesn't sleep or back off, and it re-executes <code>echo</code> and re-attempts the write hundreds of thousands of times a second. That's a pure <code>%sy</code>-shaped syscall storm wearing a "100% CPU" costume. <b>Root cause:</b> a fixed-size scratch volume with no rotation, feeding a write loop with no error handling and no backoff. <b>Fix:</b> handle the write failure (stop, alert, or rotate the log) instead of retrying blindly; separately, either raise the volume's size limit to match real needs or add log rotation. <b>Validate</b> by confirming CPU drops to near-idle and <code>%sy</code> specifically, not just checking that the pod is still <code>Running</code>. <b>Prevention:</b> this pattern — a resource exhausted, causing a retry loop, causing a second, unrelated-looking alert — is common enough that it's worth a standing rule: whenever a CPU or connection-storm alert fires, check the disk and memory of that same workload before assuming the CPU number is the whole story. Clean up: <code>kubectl delete pod worker</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>The four runbooks</h2>
+    <div class="box realworld"><div class="h">Runbook · high CPU</div>
+      <p><b>Symptom:</b> sustained high CPU utilization on a host or container. <b>Hypotheses:</b> real computational load, a syscall storm, or a process misreported as CPU-bound while actually blocked on I/O. <b>Evidence:</b> <code>top</code>'s <code>%us</code>/<code>%sy</code>/<code>%wa</code> split, then <code>strace -c -p &lt;pid&gt;</code> if <code>%sy</code> dominates, or <code>iostat -x 1</code> if <code>%wa</code> dominates. <b>Isolation:</b> match the dominant column to its hypothesis family — the other two are ruled out by the same reading. <b>Root cause:</b> usually a hot loop, a missing cache, a retry with no backoff, or lock contention. <b>Fix:</b> profile and patch the hot path, add backoff, or fix the contention — never "add CPU" before you know the column. <b>Validation:</b> the specific column returns to baseline over a sustained window. <b>Prevention:</b> alert on the split, not the aggregate, and add CPU-throttling (<code>nr_throttled</code>) as a second signal alongside raw usage.</p>
+    </div>
+    <div class="box realworld"><div class="h">Runbook · high memory</div>
+      <p><b>Symptom:</b> memory usage graph trending up, alert on a "used" or "utilization" threshold. <b>Hypotheses:</b> healthy page-cache growth, a real leak, or a workload that legitimately needs more than it was given. <b>Evidence:</b> <code>free -h</code>'s <code>available</code> column, and for containers, <code>memory.current</code> against <code>memory.max</code> over time. <b>Isolation:</b> if <code>available</code> stays healthy, it's cache — stop here. If <code>available</code> falls in lockstep with "used," profile the process's own allocations. <b>Root cause:</b> an unbounded cache, a growing collection that's never trimmed, or a limit set without measuring real peak usage. <b>Fix:</b> bound the data structure, or right-size the request/limit from measured data. <b>Validation:</b> RSS plateaus under sustained real traffic, not just at idle. <b>Prevention:</b> alert on the slope of memory growth over a rolling window, which catches a leak long before it becomes an OOMKill.</p>
+    </div>
+    <div class="box realworld"><div class="h">Runbook · OOMKilled</div>
+      <p><b>Symptom:</b> a container's last state shows <code>Reason: OOMKilled</code>, exit code 137. <b>Hypotheses:</b> a slow leak, a limit set too low for real steady-state usage, or a legitimate, occasional burst that exceeds a limit sized only for the average case. <b>Evidence:</b> the elapsed time from container start to kill, across multiple occurrences, plus <code>kubectl top</code> or <code>memory.current</code> sampled over that window. <b>Isolation:</b> a consistent time-to-kill regardless of load points at a leak; an immediate kill under normal startup points at a limit that's simply too small; a kill correlated with a specific traffic pattern points at a real, occasional burst. <b>Root cause:</b> named specifically enough to fix — "the connection list is appended to on every request and never trimmed," not "memory issues." <b>Fix:</b> patch the leak, or size the limit from measured peak usage with headroom. <b>Validation:</b> <code>memory.events</code>'s <code>oom_kill</code> counter stays at zero across the workload's normal peak, not just at idle. <b>Prevention:</b> set requests and limits from real profiling data (<a href="ch37-autoscaling-and-governance-hpa-vpa-cluster-autoscaler.html">Chapter 37</a>'s VPA is built for exactly this), and alert on the growth trend, not only the kill.</p>
+    </div>
+    <div class="box realworld"><div class="h">Runbook · disk full</div>
+      <p><b>Symptom:</b> writes failing with <code>ENOSPC</code>, sometimes with <code>df -h</code> showing free space. <b>Hypotheses:</b> genuine byte exhaustion (logs, core dumps, unpruned image layers), inode exhaustion (many small files), or a per-volume limit (a K8s <code>emptyDir</code> <code>sizeLimit</code>, a small dedicated partition) distinct from the node's overall disk. <b>Evidence:</b> <code>df -h</code> and <code>df -i</code> together, always both — never one alone. <b>Isolation:</b> bytes full and inodes fine points at large files; inodes full and bytes fine points at file count; both fine at the node level but the workload still fails points at a scoped volume limit. <b>Root cause:</b> named down to the actual source — "a debug flag left on writes a one-line file per request into an unrotated directory." <b>Fix:</b> remove the excess, then eliminate the source (rotation, size caps, a scoped limit sized to real need). <b>Validation:</b> both <code>Use%</code> figures stay under a safe threshold across a full normal cycle, not just right after cleanup. <b>Prevention:</b> alert on <code>df -i</code> alongside <code>df -h</code> everywhere the latter is already monitored — most default dashboards only watch one.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>CPU throttling hides inside a healthy-looking average.</b> A container with a CPU limit gets a quota per <code>cpu.max</code> period (commonly 100ms); burn through it and the kernel throttles the process for the rest of the period, which shows up as <code>cpu.stat</code>'s <code>nr_throttled</code> climbing while the <em>average</em> CPU percentage over a minute looks unremarkable. This is why a service can be "only using 40% CPU" and still have terrible p99 latency — it's being throttled in bursts too short for a one-minute average to show. Watch <code>nr_throttled</code>, not just usage.</p>
+    <p><b>Requests and limits are a promise, not a suggestion.</b> A pod's memory limit set well above its request gets more restart-on-OOM risk in exchange for burst headroom; set too close to the request, and normal variance triggers kills that a slightly larger limit would have absorbed for free. Neither number should come from a guess — profile real usage first, per <a href="ch89-capacity-planning-and-performance.html">Chapter 89</a>.</p>
+    <p><b>Common mistakes:</b> alerting on raw CPU or memory percentage without the breakdown that makes the number actionable; treating page-cache growth as a leak and restarting healthy processes over it; watching <code>df -h</code> without <code>df -i</code>; and — the one that costs the most time — restarting the workload the instant the alert clears, without ever running the isolation step, which means the exact same page returns on the exact same schedule.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>Every autoscaling policy you'll ever configure is a bet on which column an alert lives in — the Horizontal Pod Autoscaler in <a href="ch37-autoscaling-and-governance-hpa-vpa-cluster-autoscaler.html">Chapter 37</a> scales on CPU or memory precisely because those are the two columns this chapter just taught you to read correctly, and scaling on a misread number (page cache, iowait) wastes money without fixing anything. Capacity planning in <a href="ch89-capacity-planning-and-performance.html">Chapter 89</a> is this chapter's evidence step, done in advance instead of during an incident — profiling real usage before you set a limit, rather than discovering the right number from an OOMKill. And the eight-step shape itself — symptom through prevention — is the compute/memory dialect of the same loop <a href="ch103-the-universal-troubleshooting-framework.html">Chapter 103</a> names in general and <a href="ch40-kubernetes-troubleshooting-methodology.html">Chapter 40</a> specializes for pod status words; you'll run a version of it in every chapter for the rest of this Part.
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>How do you tell a CPU problem from an I/O problem in the first minute?</summary>
+        <div class="a"><p><code>top</code>'s CPU breakdown row. High <code>%us</code> means the code itself is doing real work — a compute problem. High <code>%sy</code> means time is going into the kernel — usually a syscall storm, not useful computation. High <code>%wa</code> means the CPU is mostly idle but processes are stuck waiting on disk, which isn't a CPU problem at all even though it can drag the load average way up. I check that split before forming any hypothesis, because "CPU is high" alone is consistent with three unrelated root causes and three different fixes.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through diagnosing an OOMKilled pod.</summary>
+        <div class="a"><p>First I confirm it's actually an OOM kill and not a crash that looks like one — <code>kubectl describe</code>'s Last State should show <code>Reason: OOMKilled</code> and exit code 137, which is 128 plus SIGKILL, meaning something external killed the process rather than it exiting on its own. Then I look at timing: I pull memory usage over the window leading up to each kill, across as many occurrences as I have. If the time from pod start to kill is consistent regardless of load, that points to a leak — something growing at a steady rate independent of traffic. If it dies almost immediately under completely normal load, the limit is probably just set below real steady-state usage. If it only happens during a specific traffic pattern, it's a genuine burst hitting a limit that was sized for the average case, not the peak. Each of those has a different fix — patch the leak, right-size the limit, or add headroom for the burst — and I don't commit to one until the timing evidence actually points that way. After the fix, I validate by watching memory hold flat across the same window that used to trigger the kill, not just checking that the pod is running five minutes later.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Why can a container get OOMKilled while <code>free -h</code> on the node shows plenty of memory available?</summary>
+        <div class="a"><p>Because there are two independent memory ceilings in play, and the container hits the lower one. The node has its own memory limit, and separately, if the container is running under a cgroup with a <code>memory.max</code> set — which is exactly what a Kubernetes memory limit configures — that cgroup has its own private ceiling that has nothing to do with what else is free on the node. The kernel's cgroup-scoped OOM killer acts the moment that container's <code>memory.current</code> crosses its own <code>memory.max</code>, regardless of how much memory sits free at the node level. It's the same mechanism as the system-wide OOM killer from Chapter 3, just scoped to one cgroup instead of the whole machine. This is precisely why "just give it more resources" as a blanket fix doesn't always mean the same thing — sometimes the node genuinely is out of memory, and sometimes one container's limit is the only thing that's tight, and you tell them apart by checking the node's memory and that one cgroup's memory.max separately, not by looking at one number and assuming it explains the other.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A service's CPU graph looks flat and low, but users report slow responses, and you find it's being throttled. What's happening?</summary>
+        <div class="a"><p>This is CPU throttling hiding inside an average that's too coarse to show it. A container with a CPU limit gets a fixed quota per scheduling period — commonly 100 milliseconds — and if it bursts through that quota, the kernel throttles it for the rest of the period. If those bursts are short and don't happen in every single period, a one-minute average CPU percentage can look completely unremarkable while the service is actually getting paused repeatedly in sub-second slices, which shows up to users as latency spikes with no visible cause on the usual dashboard. The tell is <code>cpu.stat</code>'s <code>nr_throttled</code> and <code>throttled_time</code> counters climbing while overall CPU usage looks fine. The fix is either raising the CPU limit to give the burst room, or, if the limit is intentional, smoothing the workload so it doesn't need to burst in the first place. The broader lesson is that averaged utilization metrics can hide exactly the kind of short, sharp resource pressure that produces the latency users actually feel — which is why I always pair a usage metric with a throttling or saturation metric, never just one.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>How does this change when the workload is a container versus a bare-metal or VM process?</summary>
+        <div class="a"><p>The tools and the top-level reasoning are identical — you still split CPU into us/sy/wa, still separate page cache from real memory pressure, still check bytes and inodes separately for disk. What changes is that a container adds a second, tighter ceiling underneath the machine-wide one: its own cgroup limits for CPU and memory, which the kernel enforces independently of what's free at the node level. On bare metal, "the machine is out of memory" is the only memory story there is. In a container, you have to check two scopes — the node's memory and that specific cgroup's memory.max — because either one can be the actual limiting factor, and they can disagree; a node with gigabytes free can still OOM-kill a single tightly-limited container. Practically, that means every runbook in this chapter gets an extra first step in a containerized environment: confirm which scope — node or cgroup — the pressure is actually in, before you start hypothesizing about why.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>A resource alert names a symptom, never a layer — high CPU can mean real work, a syscall storm, or disk wait; high memory can mean healthy cache, a leak, or an under-sized limit; disk full can mean bytes or inodes; OOMKilled can mean a leak, a bad limit, or a real burst. The eight-step runbook — symptom, hypotheses, evidence, isolation, root cause, fix, validation, prevention — routes each alert to the right column before you touch a single knob, and the last three steps are what separate a real fix from a snoozed page. <code>top</code>'s us/sy/wa split, <code>free</code>'s <code>available</code> column, cgroup v2's <code>memory.current</code>/<code>memory.max</code>/<code>memory.events</code>/<code>cpu.stat</code>, and <code>df -h</code> paired with <code>df -i</code> are the five readings that answer almost every question in this chapter. None of it is new mechanism — it's Parts I and III, pointed at a pager.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>Route before you hypothesize: CPU, memory, and disk each need a different first command, and the alert text never tells you which.</li>
+      <li>CPU is three signals wearing one number — <code>%us</code> (real work), <code>%sy</code> (syscall storm), <code>%wa</code> (disk wait, not a CPU problem).</li>
+      <li>Linux load average counts processes blocked on disk (state D), so a high load average can mean zero CPU pressure.</li>
+      <li><code>free -h</code>'s <code>available</code> column, not <code>free</code> or <code>used</code>, tells you whether page-cache growth is actually a problem — it usually isn't.</li>
+      <li>A container's cgroup memory limit is a second, tighter ceiling under the node's — you can be OOMKilled while the node has memory to spare.</li>
+      <li>Exit code 137 = SIGKILL, almost always the OOM killer; check <code>memory.events</code>'s <code>oom_kill</code> counter to confirm without guessing.</li>
+      <li>Time-to-kill is evidence: a fixed climb-to-limit time regardless of load points at a leak; an immediate kill points at an under-sized limit.</li>
+      <li>Every filesystem has two independent ceilings — bytes and inodes. <code>df -h</code> can show room while <code>df -i</code> is full, and writes still fail.</li>
+      <li>CPU throttling (<code>nr_throttled</code> in <code>cpu.stat</code>) can hide inside a healthy-looking one-minute average — pair usage metrics with saturation metrics.</li>
+      <li>A fix without validation is an unproven guess; a fix without prevention guarantees the same page comes back.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch03-memory-virtual-memory-page-cache-swap-oom.html"><b>Ch 3</b> Memory &amp; the OOM killer</a>
+      <a href="ch04-filesystems-inodes-file-descriptors-disk-i-o.html"><b>Ch 4</b> Inodes &amp; disk I/O</a>
+      <a href="ch23-cgroups-v2-cpu-memory-io-limits.html"><b>Ch 23</b> cgroups v2 limits</a>
+      <a href="ch40-kubernetes-troubleshooting-methodology.html"><b>Ch 40</b> K8s troubleshooting method</a>
+      <a href="ch103-the-universal-troubleshooting-framework.html"><b>Ch 103</b> The universal framework</a>
+      <a href="ch105-network-runbooks.html"><b>Ch 105</b> Network runbooks</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>The Linux Kernel documentation — <a href="https://docs.kernel.org/admin-guide/cgroup-v2.html">Control Group v2</a> (official): <code>memory.max</code>, <code>memory.events</code>, <code>cpu.max</code>, <code>cpu.stat</code>, and the OOM-kill accounting this chapter reads directly.</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man5/proc.5.html">proc(5)</a>: <code>/proc/meminfo</code>, <code>/proc/[pid]/status</code>, and the fields behind <code>free</code> and <code>ps</code>.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/">Node-pressure Eviction</a>: the kubelet's memory, disk, and PID pressure signals and thresholds.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/">Resource Management for Pods and Containers</a>: requests, limits, and how they map to cgroup enforcement.</li>
+      <li>Google — <a href="https://sre.google/sre-book/table-of-contents/"><i>Site Reliability Engineering</i></a> (first-party): the hypothesis-driven diagnosis model this chapter specializes for compute and memory.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch103-the-universal-troubleshooting-framework.html"><span class="dir">← Prev</span><div class="ti">Ch 103 — The universal troubleshooting framework</div></a>
+      <a class="nx" href="ch105-network-runbooks.html"><span class="dir">Next →</span><div class="ti">Ch 105 — Network runbooks</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 104 of 121 · Part XI · SRE Problem-Solving &amp; Production Troubleshooting. Reproduce every failure yourself before you trust yourself to read it live.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">The decision tree</a>
+    <a href="#internals">The eight-step runbook</a>
+    <a href="#components">Where evidence lives</a>
+    <a href="#flow">Following one alert</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">The four runbooks</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

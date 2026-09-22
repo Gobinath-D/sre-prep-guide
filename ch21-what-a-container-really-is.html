@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 21 — What a container really is</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part III · Containers &nbsp;·&nbsp; Chapter 21</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part III · Containers &amp; Container Internals · Chapter 21</div>
+      <h1>What a container really is</h1>
+      <p class="tagline">There is no such thing as a "container" in the Linux kernel. There's a process — an ordinary process — that has been given a private view of the system and a budget for its resources. Once you build one by hand from those parts, "it's just an isolated process sharing the host kernel" stops being a slogan and becomes something you can see.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~45 min read · unshare/cgroups lab (Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>State precisely what a container is — and what it is not — in one sentence, and defend it.</li>
+          <li>Assemble a working container by hand from namespaces, cgroups, and <code>pivot_root</code>, with no Docker involved.</li>
+          <li>Explain the three ingredients: namespaces isolate the <em>view</em>, cgroups limit the <em>resources</em>, pivot_root changes the <em>root filesystem</em>.</li>
+          <li>Say exactly why a container is cheaper than a VM and, in the same breath, why it's a weaker security boundary.</li>
+          <li>Map every step of <code>docker run</code> onto the primitives you assembled yourself.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem: isolation without a second kernel</h2>
+    <p>You want to pack many independent workloads onto one machine. Each should believe it has the box to itself — its own filesystem, its own process list, its own network, its own slice of CPU and memory — and one misbehaving workload shouldn't be able to see or starve the others. The old answer was a <b>virtual machine</b>: give each workload a whole simulated computer with its own kernel. That works, and the isolation is strong, but every VM carries a full operating system — gigabytes of image, a kernel to boot, a minute of startup, and RAM reserved just to exist. Run fifty of them and most of your machine is spent running fifty copies of Linux.</p>
+    <p>The insight behind containers is that you usually don't need a second kernel — you need the <em>illusion</em> of one. The host kernel is already perfectly good at keeping processes apart; it just needs to lie to each workload about what exists. So instead of booting a new kernel per workload, Linux lets a single kernel hand each process a private <em>view</em> (you see only your own processes, your own network, your own filesystem) and a private <em>budget</em> (you get this much CPU and memory, no more). A process wrapped that way looks and feels like it's alone on the machine, but it's just a normal process on the shared host kernel. That wrapped process is a container.</p>
+    <div class="box keypoint"><div class="h">Key point — the one-sentence definition</div>
+      <p>A container is a normal Linux process (or process tree) that the kernel has given an isolated view of the system — via <b>namespaces</b> — and a capped share of resources — via <b>cgroups</b> — usually running on its own root filesystem set up with <b>pivot_root</b>. There is no "container" object in the kernel; there are only processes with these properties. Everything else — Docker, images, registries — is packaging and tooling around that fact.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: suites in a shared building</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Picture one office building with one set of shared utilities — power, water, HVAC, the structure itself. That's the <b>host kernel</b>: a single system everyone actually runs on. Now you partition the floor into tenant <b>suites</b>. Each suite has frosted-glass walls: from inside, a tenant sees only their own rooms, their own staff directory, their own mail slots — they have no idea the other suites exist. That partitioning of <em>what you can see</em> is <b>namespaces</b>. The building didn't get new plumbing; the tenants just can't see past their walls.</p>
+      <p>Each suite also has <b>metered utilities</b>: a cap on how much power and water it may draw, so one tenant running space heaters can't brown out the floor. That's <b>cgroups</b> — a limit on <em>how much</em> you may consume. And each suite has its own <b>front door and furniture</b> — its own entryway and layout, independent of the others. That's <b>pivot_root</b>: its own root filesystem, the container image.</p>
+      <p>The contrast that matters: a <b>virtual machine</b> is not a suite — it's a separate building with its own power plant, its own boiler, its own everything. Far more isolated (a fire in one building can't cross to another), and far more expensive (you're paying to run a whole second set of utilities). A container shares the utilities and just partitions the space. That single difference — shared kernel vs. own kernel — explains every trade-off in this chapter.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In Linux</th></tr>
+      <tr><td>The shared building &amp; utilities</td><td>The host <b>kernel</b> — one kernel, shared by all containers</td></tr>
+      <tr><td>Frosted-glass suite walls (what you can see)</td><td><b>Namespaces</b> (mount, PID, network, UTS, IPC, user, cgroup, time)</td></tr>
+      <tr><td>Metered power/water (how much you can use)</td><td><b>cgroups v2</b> (CPU, memory, IO, PIDs limits)</td></tr>
+      <tr><td>The suite's own front door &amp; furniture</td><td>The container's <b>root filesystem</b> via <b>pivot_root</b> / the image</td></tr>
+      <tr><td>A separate building with its own power plant</td><td>A <b>virtual machine</b> — its own kernel on a hypervisor</td></tr>
+      <tr><td>The building's security guard &amp; rules</td><td><b>capabilities</b> + <b>seccomp</b> limiting what syscalls a container may make</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>Process vs container vs VM — same kernel or not</h2>
+    <p>This one picture is the whole chapter. On the left, a host: ordinary processes and a container, all sharing one kernel. On the right, a VM for contrast, carrying its own kernel. Notice the container process reaches the same kernel the host processes do — it's just walled off from seeing its neighbours.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 760 430" role="img" aria-label="On one host, normal processes and a container share a single kernel; a VM by contrast runs its own guest kernel on a hypervisor">
+        <defs>
+          <marker id="ka" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+        </defs>
+        <!-- LEFT: host with container -->
+        <text x="24" y="26" style="fill:var(--muted);font:700 11px sans-serif;letter-spacing:.05em">ONE HOST — ONE SHARED KERNEL</text>
+        <!-- host processes -->
+        <rect x="24" y="40" width="120" height="60" rx="9" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="84" y="66" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">process</text>
+        <text x="84" y="84" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">sshd</text>
+        <rect x="152" y="40" width="120" height="60" rx="9" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="212" y="66" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">process</text>
+        <text x="212" y="84" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">cron</text>
+        <!-- container -->
+        <rect x="288" y="30" width="180" height="82" rx="10" style="fill:var(--chip);stroke:var(--accent);stroke-width:2;stroke-dasharray:6 4"/>
+        <text x="378" y="26" text-anchor="middle" style="fill:var(--accent);font:700 11px sans-serif">CONTAINER</text>
+        <rect x="304" y="44" width="148" height="54" rx="8" style="fill:var(--panel);stroke:var(--accent)"/>
+        <text x="378" y="66" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">process (nginx)</text>
+        <text x="378" y="84" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">own ns + cgroup + rootfs</text>
+        <!-- kernel band -->
+        <rect x="24" y="150" width="444" height="70" rx="10" style="fill:var(--panel);stroke:var(--accent);stroke-width:2"/>
+        <text x="246" y="180" text-anchor="middle" style="fill:var(--accent);font:700 15px sans-serif">Linux kernel (shared)</text>
+        <text x="246" y="202" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">namespaces · cgroups · syscalls · scheduler · one kernel for everyone</text>
+        <!-- arrows down to kernel -->
+        <line x1="84" y1="100" x2="84" y2="148" style="stroke:var(--accent);stroke-width:1.8" marker-end="url(#ka)"/>
+        <line x1="212" y1="100" x2="212" y2="148" style="stroke:var(--accent);stroke-width:1.8" marker-end="url(#ka)"/>
+        <line x1="378" y1="112" x2="378" y2="148" style="stroke:var(--accent);stroke-width:1.8" marker-end="url(#ka)"/>
+        <text x="392" y="134" style="fill:var(--muted);font:10px sans-serif">same syscall interface</text>
+        <!-- hardware -->
+        <rect x="24" y="238" width="444" height="40" rx="9" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="246" y="263" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">hardware (CPU · RAM · disk · NIC)</text>
+        <text x="24" y="306" style="fill:var(--muted);font:11.5px sans-serif">The container process runs on the very same kernel as sshd and cron.</text>
+        <text x="24" y="324" style="fill:var(--muted);font:11.5px sans-serif">Namespaces just change what it can see; cgroups cap what it can use.</text>
+        <!-- divider -->
+        <line x1="500" y1="20" x2="500" y2="410" style="stroke:var(--line);stroke-width:1;stroke-dasharray:4 4"/>
+        <!-- RIGHT: VM -->
+        <text x="520" y="26" style="fill:var(--muted);font:700 11px sans-serif;letter-spacing:.05em">A VM — FOR CONTRAST</text>
+        <rect x="520" y="36" width="216" height="52" rx="9" style="fill:var(--chip);stroke:var(--accent2);stroke-width:1.6;stroke-dasharray:6 4"/>
+        <text x="628" y="56" text-anchor="middle" style="fill:var(--accent2);font:700 11px sans-serif">GUEST VM</text>
+        <text x="628" y="76" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">guest processes</text>
+        <rect x="520" y="100" width="216" height="46" rx="9" style="fill:var(--panel);stroke:var(--deep);stroke-width:2"/>
+        <text x="628" y="128" text-anchor="middle" style="fill:var(--deep);font:700 13px sans-serif">GUEST kernel (its own!)</text>
+        <rect x="520" y="158" width="216" height="40" rx="9" style="fill:var(--panel);stroke:var(--accent)"/>
+        <text x="628" y="183" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">hypervisor</text>
+        <rect x="520" y="210" width="216" height="40" rx="9" style="fill:var(--panel);stroke:var(--accent);stroke-width:2"/>
+        <text x="628" y="235" text-anchor="middle" style="fill:var(--accent);font:700 12.5px sans-serif">HOST kernel</text>
+        <rect x="520" y="262" width="216" height="34" rx="9" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="628" y="284" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">hardware</text>
+        <text x="520" y="320" style="fill:var(--muted);font:11px sans-serif">Two kernels stacked = stronger</text>
+        <text x="520" y="338" style="fill:var(--muted);font:11px sans-serif">isolation, more overhead, slower boot.</text>
+      </svg>
+      <figcaption>The entire difference between a container and a VM is on this page: the container shares one kernel with the host; the VM stacks its own kernel on top. Cheap density on the left, strong isolation on the right.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>"Shares the host kernel" is not trivia — it's the fact that drives density, startup speed, and your entire threat model. Containers start in milliseconds and pack hundreds per node because there's no kernel to boot and no OS to run per workload. But the flip side is equally concrete: a kernel bug is a bug in the boundary itself, so a single kernel CVE (Dirty COW, Dirty Pipe) can let a container read or write outside its walls, something a VM's separate kernel would contain. This is why "a container is not a security boundary the way a VM is" is a sentence you'll repeat in design reviews for the rest of your career.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>Assembling a container by hand</h2>
+    <p>There's no <code>create_container()</code> syscall. A runtime builds a container by combining three independent kernel features. Here's the recipe, which is exactly what the labs run:</p>
+    <ol class="steps">
+      <li><b>Isolate the view with namespaces.</b> The <code>unshare()</code> / <code>clone()</code> syscalls create new namespaces and put the process into them. A new <b>PID</b> namespace makes the process believe it's PID 1 and hides all other processes. A new <b>mount</b> namespace gives it a private set of mounts. A new <b>network</b> namespace gives it its own interfaces (the veth-and-bridge of <a href="ch18-the-linux-network-stack-internals.html">Chapter 18</a>). A new <b>UTS</b> namespace lets it set its own hostname. Each is independent — you pick which walls to build.</li>
+      <li><b>Give it its own root filesystem with pivot_root.</b> Inside the mount namespace, the runtime makes the container's image directory the new <code>/</code> using <code>pivot_root</code> (a safer successor to <code>chroot</code>), so the process sees the image's files as the whole filesystem and can't reach the host's. Then it mounts a fresh <code>/proc</code> so tools see only the container's processes.</li>
+      <li><b>Cap the resources with cgroups v2.</b> The runtime creates a cgroup, writes limits into it (<code>memory.max</code>, <code>cpu.max</code>, <code>pids.max</code>), and moves the process into it by writing its PID to <code>cgroup.procs</code>. Now the kernel enforces the budget: exceed <code>memory.max</code> and the process is OOM-killed <em>inside its cgroup</em>, without touching the rest of the host.</li>
+      <li><b>Drop privilege with capabilities and seccomp.</b> A well-built runtime also strips Linux <a href="ch05-users-groups-permissions-capabilities.html">capabilities</a> down to a minimal set and installs a <b>seccomp</b> filter that blocks dangerous syscalls — the security tightening of the shared-kernel boundary from <a href="ch01-kernel-and-system-calls.html">Chapter 1</a>.</li>
+      <li><b>Exec the workload.</b> Finally the runtime <code>execve()</code>s your actual program (nginx, your app). It's now PID 1 inside its namespaces, rooted at its image, capped by its cgroup — a container. Nothing more happened than these ordinary syscalls in sequence.</li>
+    </ol>
+    <div class="box keypoint"><div class="h">The pieces are independent — that's the whole design</div>
+      <p>Namespaces, cgroups, and pivot_root are orthogonal. You can use a namespace without a cgroup, a cgroup without a namespace, a new hostname without a new network. A "container" is just a <em>convention</em> for combining them a certain way. That's why you can have a network namespace with no resource limits (a bare <code>ip netns</code>), or a cgroup limiting a normal host service with no isolation at all (that's what systemd does to every service). Understanding them as separate Lego bricks is what lets you debug and reason about the combined thing.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: inside a container, <code>ps aux</code> shows only a handful of processes and your app is PID 1. Where did the host's hundreds of processes go?</summary>
+      <div class="body">
+        <p>Nowhere — they're all still running on the same kernel; you just can't <em>see</em> them. The container is in its own PID namespace, which renumbers processes starting from 1 and hides everything outside it. From the host you can see the exact same container process with its real, host-side PID (say 24601). Two names for one process: PID 1 in the container's namespace, PID 24601 in the host's. Nothing was hidden from the kernel; only the <em>view</em> was partitioned. That's the entire trick of namespaces, and it's why <code>nsenter</code> from the host can step into a container's view, and why a host-level tool sees every container's processes at once.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, named</h2>
+    <ul>
+      <li><b>Namespaces (8 kinds).</b> <b>mount</b> (filesystems), <b>PID</b> (process IDs), <b>network</b> (interfaces, routes), <b>UTS</b> (hostname), <b>IPC</b> (shared memory, queues), <b>user</b> (UID/GID mapping — lets an unprivileged host user be root <em>inside</em>), <b>cgroup</b> (the cgroup tree view), and <b>time</b> (clocks, newest). Each covered in depth in <a href="ch22-linux-namespaces.html">Chapter 22</a>.</li>
+      <li><b>cgroups v2.</b> The unified control-group hierarchy that limits and accounts CPU, memory, IO, and PID count. The controllers are enabled per subtree; limits are just files you write. Deep dive in <a href="ch23-cgroups-v2-cpu-memory-io-limits.html">Chapter 23</a>.</li>
+      <li><b>The root filesystem (image).</b> The files the container sees as <code>/</code>. In practice built from stacked, read-only image layers with a writable top layer via overlayfs — <a href="ch24-container-filesystems-overlayfs-and-image-layers.html">Chapter 24</a>. <code>pivot_root</code> switches the process onto it.</li>
+      <li><b>The runtime.</b> The program that actually calls the syscalls above. The low-level one is <b>runc</b>, which reads an OCI spec and does the clone/pivot_root/cgroup/exec dance — <a href="ch26-docker-containerd-runc-and-the-oci-model.html">Chapter 26</a>. Docker and containerd sit above it.</li>
+      <li><b>Capabilities &amp; seccomp.</b> The privilege controls that make the shared kernel survivable — dropping root's powers to a minimum and filtering syscalls. Security in <a href="ch27-container-security-and-process-to-container-to.html">Chapter 27</a>.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>What <code>docker run</code> actually does</h2>
+    <p>When you type <code>docker run nginx</code>, the Docker daemon asks containerd to start a container; containerd unpacks the image layers into an overlayfs rootfs and calls <b>runc</b>; runc reads the OCI runtime spec and does precisely the by-hand steps above — <code>clone()</code> with new namespace flags, <code>pivot_root</code> onto the overlay rootfs, mount a fresh <code>/proc</code>, create a cgroup and write the limits from your <code>--memory</code>/<code>--cpus</code> flags, apply the default seccomp profile and drop capabilities, then <code>execve("nginx")</code>. Everything you'll do by hand in the labs, runc does programmatically from a JSON spec. There is no extra magic — <code>docker run</code> is a friendly front-end over the same five syscalls.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>You need a Linux host with privileges to create namespaces and cgroups. A privileged container gives you that safely on your laptop:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>docker run --rm -it --privileged ubuntu:24.04 bash
+apt-get update &amp;&amp; apt-get install -y util-linux iproute2 cgroup-tools</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — create namespaces and see them</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p><code>unshare</code> creates new namespaces and runs a shell in them. Build the isolating walls of a container — everything but the resource limits — in one command, then look at what you got.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># --user lets us do this unprivileged; --fork+--pid gives a real new PID ns</span>
+unshare --user --map-root-user --mount --uts --ipc --pid --net --fork bash
+<span class="c"># now inside the new namespaces:</span>
+hostname sandbox                 <span class="c"># UTS ns: set our own hostname</span>
+ls -l /proc/self/ns/             <span class="c"># the namespace inodes we now belong to</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>ipc -&gt; ipc:[4026532368]
+mnt -&gt; mnt:[4026532366]
+net -&gt; net:[4026532370]
+pid -&gt; pid:[4026532369]
+user -&gt; user:[4026532365]
+uts -&gt; uts:[4026532367]</code></div>
+        <p>Each line is a namespace this process now belongs to, identified by an inode number. High numbers like <code>4026532368</code> are freshly created ones — they differ from the host's. You just built the "frosted-glass walls" of a container. The <code>--user</code> + <code>--map-root-user</code> flags are what let an ordinary user do this: the user namespace maps your unprivileged host UID to root <em>inside</em>, so you're root in the sandbox but powerless outside it.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — PID isolation, felt directly</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>The PID namespace is the most vivid wall. Inside the shell from Lab 1, mount a fresh <code>/proc</code> and look at the process list.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>mount -t proc proc /proc      <span class="c"># show THIS namespace's processes, not the host's</span>
+echo "I am PID $$"
+ps -e                          <span class="c"># how many processes can I see?</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>I am PID 1
+  PID TTY          TIME CMD
+    1 pts/0    00:00:00 bash
+    7 pts/0    00:00:00 ps</code></div>
+        <p>Your shell is <b>PID 1</b> — the same number <code>init</code>/<code>systemd</code> has on a normal host — and <code>ps</code> sees a grand total of two processes. The host's hundreds are still running on the shared kernel; this namespace simply can't see them. From another shell on the host, <code>ps aux | grep bash</code> would show this exact process under its real host PID. One process, two identities. That is the whole idea of a container: not fewer processes, just a partitioned view.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Understand — give it its own filesystem with pivot_root</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>A container's filesystem is just some directory that becomes <code>/</code>. Grab a real minimal rootfs by exporting one from an image, then pivot into it. (Run this part from the <em>host</em> container shell where Docker is available, or use any small rootfs tarball.)</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Get a tiny real root filesystem (busybox/alpine userland) as a directory:</span>
+mkdir -p /tmp/rootfs
+docker export $(docker create alpine:3.20) | tar -C /tmp/rootfs -xf -
+
+<span class="c"># Now enter fresh namespaces and make that directory the new root:</span>
+unshare --user --map-root-user --mount --uts --ipc --pid --net --fork bash
+mount --bind /tmp/rootfs /tmp/rootfs        <span class="c"># pivot_root needs a mount point</span>
+cd /tmp/rootfs &amp;&amp; mkdir -p oldroot
+pivot_root . oldroot                        <span class="c"># /tmp/rootfs becomes /</span>
+mount -t proc proc /proc
+umount -l /oldroot                          <span class="c"># detach the host's old root — no way back</span>
+ls /                                        <span class="c"># the alpine rootfs, as the whole world</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>bin  dev  etc  home  lib  proc  root  sbin  tmp  usr  var</code></div>
+        <p>That's an Alpine filesystem the process now sees as its entire <code>/</code> — it cannot reach the host's files at all, because after <code>umount -l /oldroot</code> the old root is gone from this mount namespace. Combine this with Labs 1–2 and you have a container's three defining properties: isolated view (namespaces), own hostname (UTS), and own filesystem (pivot_root). All that's missing is the resource cap.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Break — cap the memory with a cgroup and watch it enforce</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Now the budget. cgroups v2 is a filesystem under <code>/sys/fs/cgroup</code>; you create a group, write a limit, and move a process in. Confirm you're on v2 and see the available controllers:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>stat -fc %T /sys/fs/cgroup                    <span class="c"># 'cgroup2fs' = v2</span>
+cat /sys/fs/cgroup/cgroup.controllers        <span class="c"># what can be limited</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>cgroup2fs
+cpuset cpu io memory hugetlb pids rdma misc</code></div>
+        <p>Create a group capped at 50&nbsp;MB, move the shell in, and try to allocate more. Predict what happens before you run it.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>mkdir /sys/fs/cgroup/demo
+echo "+memory" &gt; /sys/fs/cgroup/cgroup.subtree_control   <span class="c"># enable the controller</span>
+echo 50M &gt; /sys/fs/cgroup/demo/memory.max
+echo $$ &gt; /sys/fs/cgroup/demo/cgroup.procs               <span class="c"># move THIS shell into the group</span>
+<span class="c"># allocate ~200MB and watch the kernel step in:</span>
+python3 -c 'x = bytearray(200*1024*1024)'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>Killed
+<span class="c"># dmesg shows: Memory cgroup out of memory: Killed process ... (python3)</span></code></div>
+        <p>The kernel OOM-killed the process the moment it crossed <code>memory.max</code> — but only <em>this</em> cgroup was affected; the rest of the host never noticed. That is exactly what <code>docker run --memory=50m</code> does under the hood. Why does this matter? Think about a node with no limits before opening the reveal.</p>
+        <details class="recall"><summary>Reveal — the noisy-neighbour problem this prevents</summary>
+          <div class="body">
+            <p>Without a memory cgroup, one container with a leak allocates until the <em>host</em> runs out of memory, and the kernel's global OOM killer then picks a victim — often the wrong one, taking down an innocent neighbour or a critical daemon. With per-container <code>memory.max</code>, the blast radius is that one container: it gets killed, restarts, and its neighbours are untouched. This is why Kubernetes requires (or strongly wants) memory limits on every pod, and why "the node went down because one pod leaked" is a story about missing cgroup limits. cgroups turn a shared machine from a free-for-all into metered tenancy — the <a href="ch23-cgroups-v2-cpu-memory-io-limits.html">next-chapter</a> topic, and the foundation of pod resource requests/limits.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — prove it's the same as docker run, then reason about the shared kernel</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>You've built a container by hand. Now prove Docker does the same thing, and confront the consequence of the shared kernel.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Start a real container and inspect its namespaces + PID from the HOST:</span>
+docker run -d --name web --memory=64m nginx
+PID=$(docker inspect -f '{{.State.Pid}}' web)
+lsns -p $PID                       <span class="c"># the namespaces docker created — same kinds as our unshare</span>
+cat /proc/$PID/cgroup              <span class="c"># the cgroup docker put it in</span>
+readlink /proc/$PID/ns/uts         <span class="c"># a fresh UTS ns inode, just like Lab 1</span></code></pre></div>
+        <p>You'll see nginx sitting in its own mount/PID/net/UTS/IPC namespaces and a cgroup with the 64&nbsp;MB limit — the exact primitives you assembled. Docker added tooling, an image, and a network setup, but the kernel objects are identical. Now the senior question: given that all these containers share one kernel, what is the actual security posture, and when is a container <em>not</em> enough? Think before revealing.</p>
+        <details class="recall"><summary>Reveal — the shared-kernel security reality</summary>
+          <div class="body">
+            <p>Because every container calls into the <em>same</em> kernel, the kernel's syscall surface is the attack surface. A kernel vulnerability reachable from a container's syscalls (Dirty COW, Dirty Pipe, various namespace/overflow bugs) can let a process break its isolation and affect the host or other containers — the isolation is only as strong as the kernel is bug-free. This is why the container security model layers defences on top: drop <a href="ch05-users-groups-permissions-capabilities.html">capabilities</a> to a minimum, apply a seccomp filter to shrink the reachable syscall set, run as a non-root user via user namespaces, and never run <code>--privileged</code> in production (it removes most of these protections). And when you truly need VM-grade isolation — hostile multi-tenant workloads, untrusted code — you reach for a sandbox that gives each container its own kernel or a thin hypervisor: gVisor or Kata Containers / Firecracker microVMs. The trade-off is the whole point of the chapter: containers buy density and speed by sharing the kernel, and you pay for that with a weaker boundary, so you harden it or, when the stakes are high enough, put a real kernel back between tenants. This sets up all of <a href="ch27-container-security-and-process-to-container-to.html">Chapter 27</a>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · the node dies because one container leaked</div>
+      <p><b>Symptom:</b> a whole node goes unhealthy and unrelated workloads get OOM-killed. <b>First cut:</b> check whether the offending container had a <code>memory.max</code> (a Kubernetes memory <em>limit</em>). <b>Confirm:</b> no limit, so its leak consumed host memory and the global OOM killer fired on the host, hitting innocent processes. <b>Cause:</b> missing cgroup memory limit. The fix is per-workload limits so the blast radius is one container, not the node.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · PID 1 and zombie processes</div>
+      <p><b>Symptom:</b> a container accumulates defunct (zombie) processes over days. <b>First cut:</b> what's PID 1 in the container? <b>Confirm:</b> the app is PID 1 but doesn't reap children, so orphaned processes never get cleaned up — PID 1 has special reaping duties that a normal app doesn't perform. <b>Cause:</b> running an app directly as PID 1 without an init. The fix is a tiny init (<code>tini</code>, or <code>docker run --init</code>) as PID 1 to reap zombies.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · "it works privileged, fails without"</div>
+      <p><b>Symptom:</b> a container works with <code>--privileged</code> and fails otherwise with <code>EPERM</code> or "operation not permitted" on some syscall. <b>First cut:</b> which syscall/capability is being denied. <b>Confirm:</b> the default seccomp profile or dropped capabilities block it. <b>Cause:</b> the workload needs a specific capability (e.g. <code>NET_ADMIN</code>) — grant that one capability, never blanket <code>--privileged</code>, which disables the whole shared-kernel defence layer.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Density vs. isolation is the core trade.</b> Containers win on density and startup because there's no per-workload kernel — that's why a node runs hundreds of pods and a container starts in milliseconds. You pay for it with a shared kernel, which means the isolation is software isolation enforced by one kernel, not hardware isolation between two. For most workloads that's the right trade; for hostile multi-tenant or untrusted code it isn't, and you add a VM-boundary sandbox (gVisor, Kata/Firecracker) to get a kernel back between tenants.</p>
+    <p><b>Harden the boundary you chose.</b> Because the kernel is the boundary, production containers should run as non-root (user namespaces), drop all capabilities and add back only what's needed, keep the default seccomp profile, and never use <code>--privileged</code>. A container that's root with all capabilities and no seccomp is barely isolated at all — it's one kernel bug away from the host. These aren't optional extras; they're what makes the shared-kernel model safe enough to use.</p>
+    <p><b>Common mistakes:</b> running without resource limits and being surprised when one workload takes the node; running the app as PID 1 with no init and collecting zombies; treating a container as equivalent to a VM for security and putting untrusted tenants on a shared kernel; and reaching for <code>--privileged</code> to fix a permission error instead of granting the one capability actually needed. Every one of these follows from not internalising "it's a process on a shared kernel."</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>The container is the unit everything above it is built from. Kubernetes schedules pods, but a pod is a set of containers sharing some namespaces (network and IPC) while keeping others separate — a direct consequence of namespaces being independent bricks, which is why a sidecar can share the pod's network but not its filesystem. The economics of the whole platform — how many pods per node, how fast you can scale out, how cheap a deploy is — come straight from the shared-kernel density this chapter explains. And the isolation ceiling shapes multi-tenancy architecture: a SaaS running its own code can pack tenants into shared-kernel containers, but one running customers' arbitrary code needs stronger isolation per tenant, which is why serverless platforms that run untrusted functions (AWS Lambda) sit each on a Firecracker microVM rather than a bare container. When you design a compute platform, you're choosing where on the density-vs-isolation line to sit — and that choice is exactly the container-vs-VM picture from this chapter, at scale (<a href="ch56-compute-and-data-services-for-sres.html">Chapter 56</a>).</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What is a container, really?</summary>
+        <div class="a"><p>A container is an ordinary Linux process that the kernel has given an isolated view of the system through namespaces, a capped share of resources through cgroups, and usually its own root filesystem via pivot_root. There's no container object in the kernel — just a process with those properties on the shared host kernel. That's the difference from a VM: a VM runs its own kernel on a hypervisor, while a container reuses the host's kernel and only partitions what the process can see and use. That shared kernel is why containers are cheap and fast and also why they're a weaker security boundary.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>How would you build a container by hand?</summary>
+        <div class="a"><p>Three ingredients combined with plain syscalls. First, namespaces: I'd use <code>unshare</code> or <code>clone</code> to create new mount, PID, network, UTS, IPC, and user namespaces, which isolate the process's view — it sees itself as PID 1, gets its own hostname, its own network interfaces, and can't see host processes. Second, the filesystem: inside the mount namespace I'd <code>pivot_root</code> onto the image's directory so it becomes <code>/</code>, then mount a fresh <code>/proc</code> so tools see only this namespace's processes. Third, cgroups v2: create a cgroup, write limits like <code>memory.max</code> and <code>cpu.max</code>, and move the process in by writing its PID to <code>cgroup.procs</code>, so the kernel enforces the budget. I'd also drop capabilities and apply a seccomp profile to harden the shared-kernel boundary, then <code>execve</code> the actual workload. That sequence is exactly what runc does from an OCI spec — <code>docker run</code> is a front-end over these same steps.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Why is a container a weaker security boundary than a VM, concretely?</summary>
+        <div class="a"><p>Because a container shares the host kernel, the boundary between a container and the host <em>is</em> the kernel's syscall interface, and that interface is huge and occasionally buggy. Every container makes syscalls into the same kernel, so a vulnerability reachable through those syscalls — Dirty COW, Dirty Pipe, namespace or eBPF bugs — can let a process escape its isolation and read or write outside its walls. A VM doesn't share the boundary this way: the guest talks to its <em>own</em> kernel, and only a much smaller, hardware-assisted hypervisor interface separates guests, so the same class of kernel bug is contained inside one guest. That's why we harden containers with least-privilege capabilities, seccomp, and user namespaces, and why for untrusted or hostile-multi-tenant workloads we put a real kernel back with gVisor or Kata/Firecracker. The concrete framing I'd give: a container is one kernel CVE away from a bad day; a VM makes the attacker defeat the hypervisor too.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A container is OOM-killed repeatedly but the node has plenty of free memory. Why?</summary>
+        <div class="a"><p>Because the kill is happening at the <em>cgroup</em> level, not the host level. The container has a <code>memory.max</code> (a Kubernetes memory limit), and when its own usage crosses that cap the kernel OOM-kills a process inside that cgroup regardless of how much memory the node has free — the limit is the container's private ceiling. So the fix isn't adding node memory; it's either raising the container's limit if the workload legitimately needs more, or fixing the workload's memory use if it's leaking or over-allocating. I'd confirm by reading the cgroup's <code>memory.max</code> and <code>memory.current</code> and checking <code>dmesg</code> for "Memory cgroup out of memory," which names the cgroup. It's a good illustration that cgroups enforce per-container budgets independent of host capacity — which is the entire point of them.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>What's the relationship between a container and a Kubernetes pod?</summary>
+        <div class="a"><p>A pod is one or more containers that share <em>some</em> namespaces while keeping others separate — which only makes sense once you know namespaces are independent bricks. Specifically, the containers in a pod share a network namespace (so they reach each other on localhost and share one IP) and usually the IPC namespace, but keep their own mount and PID namespaces (their own filesystems and process views, in the common configuration). Kubernetes implements this with a "pause" container that holds the shared namespaces, and the app containers join them. So a pod isn't a new primitive — it's a specific way of composing the same namespaces and cgroups from this chapter, which is exactly why a sidecar can share the main container's network to proxy its traffic but can't see its files. Everything Kubernetes does with pods is namespaces and cgroups underneath.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>A container is an ordinary process on the shared host kernel, given an isolated view via <b>namespaces</b>, a resource budget via <b>cgroups v2</b>, and its own root filesystem via <b>pivot_root</b> — there is no container object in the kernel. You build one with plain syscalls: <code>unshare</code>/<code>clone</code> for namespaces (PID makes it think it's PID 1, mount/net/UTS give it its own filesystem/network/hostname), <code>pivot_root</code> onto the image, a cgroup with <code>memory.max</code>/<code>cpu.max</code> to cap it, and capabilities+seccomp to harden the boundary — which is exactly what runc does for <code>docker run</code>. Sharing the kernel is why containers are cheap, fast, and dense, and equally why they're a weaker security boundary than a VM: the kernel is the boundary, so a kernel bug can breach it. Harden with least privilege; for truly untrusted tenants, use a VM-grade sandbox. A pod is just a particular composition of these same namespaces.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>A container is a process with namespaces + cgroups + its own rootfs — not a kernel object.</li>
+      <li>Namespaces isolate the <em>view</em>; cgroups limit the <em>resources</em>; pivot_root sets the <em>root filesystem</em>. Independent bricks.</li>
+      <li>There are 8 namespaces: mount, PID, network, UTS, IPC, user, cgroup, time.</li>
+      <li>A container shares the host kernel — no second kernel — which is why it starts in milliseconds and packs densely.</li>
+      <li>Same shared kernel = weaker isolation: a kernel CVE can breach the boundary a VM would contain.</li>
+      <li>Inside a container the app is PID 1 and sees only its own processes; the host sees it under its real PID.</li>
+      <li>cgroup <code>memory.max</code> OOM-kills inside the cgroup only — the fix for noisy-neighbour node deaths.</li>
+      <li><code>docker run</code> = containerd + runc doing clone/pivot_root/cgroup/seccomp/exec from an OCI spec.</li>
+      <li>Harden the shared kernel: non-root (user ns), drop capabilities, keep seccomp, never <code>--privileged</code> in prod.</li>
+      <li>For untrusted multi-tenant workloads, get a kernel back: gVisor or Kata/Firecracker microVMs.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds toward:</span>
+      <a href="ch01-kernel-and-system-calls.html"><b>Ch 1</b> Kernel &amp; syscalls</a>
+      <a href="ch22-linux-namespaces.html"><b>Ch 22</b> Namespaces deep</a>
+      <a href="ch23-cgroups-v2-cpu-memory-io-limits.html"><b>Ch 23</b> cgroups v2</a>
+      <a href="ch24-container-filesystems-overlayfs-and-image-layers.html"><b>Ch 24</b> overlayfs &amp; images</a>
+      <a href="ch26-docker-containerd-runc-and-the-oci-model.html"><b>Ch 26</b> Docker, containerd, runc</a>
+      <a href="ch27-container-security-and-process-to-container-to.html"><b>Ch 27</b> Container security</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man7/namespaces.7.html">namespaces(7)</a>, <a href="https://man7.org/linux/man-pages/man7/cgroups.7.html">cgroups(7)</a>, <a href="https://man7.org/linux/man-pages/man1/unshare.1.html">unshare(1)</a>, and <a href="https://man7.org/linux/man-pages/man2/pivot_root.2.html">pivot_root(2)</a>.</li>
+      <li>The Linux Kernel documentation — <a href="https://docs.kernel.org/admin-guide/cgroup-v2.html">Control Group v2</a>: the authoritative cgroups v2 interface.</li>
+      <li>Open Container Initiative — <a href="https://github.com/opencontainers/runtime-spec/blob/main/spec.md">the OCI Runtime Specification</a>: what a runtime like runc actually implements.</li>
+      <li>Open Container Initiative — <a href="https://opencontainers.org/">opencontainers.org</a> and <a href="https://github.com/opencontainers/runc">runc</a>, the reference low-level runtime.</li>
+      <li>Docker — <a href="https://docs.docker.com/engine/security/">Docker security</a> and the <a href="https://docs.docker.com/reference/cli/docker/container/run/">docker run reference</a> (the <code>--memory</code>, <code>--cpus</code>, capability, and seccomp flags).</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch20-the-network-troubleshooting-toolkit.html"><span class="dir">← Prev</span><div class="ti">Ch 20 — The network troubleshooting toolkit</div></a>
+      <a class="nx" href="ch22-linux-namespaces.html"><span class="dir">Next →</span><div class="ti">Ch 22 — Linux namespaces</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 21 of 121 · Part III · Containers &amp; Container Internals. Build one by hand once, and every container you ever run is legible.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Process vs container vs VM</a>
+    <a href="#internals">Building one by hand</a>
+    <a href="#components">The components</a>
+    <a href="#flow">What docker run does</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 2 — Processes, Threads, Scheduling &amp; Signals</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part I · Linux &nbsp;·&nbsp; Chapter 2</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part I · Linux &amp; OS Foundations · Chapter 2</div>
+      <h1>Processes, threads, scheduling &amp; signals</h1>
+      <p class="tagline">One CPU, hundreds of programs, and every one of them thinks it owns the machine. The kernel keeps that illusion running by tracking each program, sharing the CPU fairly, and passing notes between them. When the illusion cracks, you get a zombie pileup, a process wedged in D, or one greedy job starving the box.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~40 min read · Linux lab (Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain how a new process is born — <code>fork()</code> then <code>execve()</code> — and why it's two calls, not one.</li>
+          <li>Read a process's state letter (R/S/D/Z/T) in <code>ps</code> and say exactly what the kernel is doing to it.</li>
+          <li>Describe how the scheduler shares one CPU fairly, what <code>nice</code> actually changes, and what a context switch costs.</li>
+          <li>Tell a process apart from a thread, and know what they share and what they don't.</li>
+          <li>Send and trap signals, and know which two signals can never be caught.</li>
+          <li>Diagnose the three classics: a zombie pileup, a process stuck in D, and one runaway job starving the rest.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem: one CPU, many programs</h2>
+    <p>A CPU core does exactly one thing at a time. Yet right now your laptop is "running" a browser, a music player, a dozen background daemons, and your shell — hundreds of programs, on maybe eight cores. Nobody is waiting in line for their turn in any way you can feel. How?</p>
+    <p>The kernel fakes it, very fast. It runs one program for a few milliseconds, freezes it mid-instruction, saves everything about it, loads the next one, and runs that for a few milliseconds. Do this thousands of times a second and every program appears to run continuously. That trick has a name — <b>time-sharing</b> — and it forces the kernel to answer three questions constantly: <em>what am I running, whose turn is it next, and how do these programs signal each other and me?</em></p>
+    <p>To answer the first, the kernel keeps a record for every running program — a <b>process</b>. To answer the second, it runs a <b>scheduler</b> that picks who gets the CPU. To answer the third, it delivers <b>signals</b> — tiny, fixed messages like "please stop" or "your child just died." Get these three right in your head and the whole zoo of <code>ps</code> output, load average, <code>kill</code>, and "why is this pod pegged at 100%" stops being folklore.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>A process is not a program. The program is the file on disk (<code>/bin/ls</code>). A process is a <em>running instance</em> of it — with its own memory, its own open files, its own place in the scheduler's queue. Run <code>ls</code> twice at once and you have one program and two processes.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a shared workshop</h2>
+    <p>Carry this picture through the chapter.</p>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Imagine a workshop with a single workbench — that's your <b>CPU core</b>. Many <b>workers</b> (processes) all need the bench, but only one can use it at a time. A <b>supervisor</b> (the scheduler) rotates them: you get the bench for a short slice, then step aside so the next worker gets a turn. To keep it fair, the supervisor keeps a ledger of how much bench time each worker has already used, and always calls up whoever has used the <em>least</em>.</p>
+      <p>A new worker doesn't appear from nowhere. An existing worker <b>clones themselves</b> (that's <code>fork</code>), and the clone usually immediately swaps their toolbox and instructions for a completely different job (<code>exec</code>). Some workers step away from the bench to wait for a delivery — a phone call, a part from the store — and doze in the break room until it arrives (<b>sleeping</b>). One kind of wait is nastier: a worker signs for a delivery and is frozen at the loading dock until the truck shows, unable to even hear the fire alarm (that's the dreaded <b>D state</b>).</p>
+      <p>The workshop has a PA system for short, fixed announcements: "worker 42, phone call," "please pack up and leave" (SIGTERM), or the one nobody can ignore — the evacuation order (SIGKILL). And when a worker finishes, they don't just vanish: they leave a completed timecard that their <b>manager</b> (the parent process) must collect. A finished worker whose timecard hasn't been collected yet is a <b>zombie</b> — done working, but still on the roster.</p>
+    </div>
+    <p>Every term maps onto something real:</p>
+    <table class="t">
+      <tr><th>In the workshop</th><th>In Linux</th></tr>
+      <tr><td>The single workbench</td><td>A CPU core (one instruction stream at a time)</td></tr>
+      <tr><td>A worker</td><td>A process (or thread) — a schedulable task</td></tr>
+      <tr><td>The supervisor rotating workers</td><td>The scheduler (CFS / EEVDF), giving out time slices</td></tr>
+      <tr><td>The bench-time ledger</td><td><code>vruntime</code> — virtual runtime the scheduler balances</td></tr>
+      <tr><td>A worker cloning themselves</td><td><code>fork()</code> — duplicate the calling process</td></tr>
+      <tr><td>Swapping toolbox &amp; instructions</td><td><code>execve()</code> — replace the program image</td></tr>
+      <tr><td>Dozing in the break room, wakeable</td><td>State <b>S</b> — interruptible sleep</td></tr>
+      <tr><td>Frozen at the loading dock, deaf to the alarm</td><td>State <b>D</b> — uninterruptible sleep</td></tr>
+      <tr><td>PA announcements</td><td>Signals (<code>SIGTERM</code>, <code>SIGINT</code>, <code>SIGCHLD</code>…)</td></tr>
+      <tr><td>The un-ignorable evacuation order</td><td><code>SIGKILL</code> (9) and <code>SIGSTOP</code> (19) — can't be caught</td></tr>
+      <tr><td>A finished worker, timecard uncollected</td><td>State <b>Z</b> — a zombie awaiting <code>wait()</code></td></tr>
+      <tr><td>The manager collecting the timecard</td><td>The parent calling <code>wait()</code> / <code>waitpid()</code> — "reaping"</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>The process, its states, and the run queue</h2>
+    <p>Everything the kernel knows about a process lives in one big struct — the <b>process control block</b>. In Linux it's called <code>task_struct</code>, and there's one per task. It holds the process ID, the parent's ID, the current state, the register snapshot from the last time it was paused, pointers to its memory map and its open-file table, its scheduling weight, and its set of pending signals. When people say "the kernel context-switches," they mean it saves the CPU registers into one <code>task_struct</code> and restores them from another.</p>
+    <p>A task is always in exactly one <b>state</b>, and <code>ps</code> prints that state as a single letter. These five are the ones you'll read every day:</p>
+    <ul>
+      <li><b>R — running or runnable.</b> Either on the CPU right now, or sitting on the run queue ready to go the instant the scheduler picks it. <code>ps</code> shows <code>R</code> for both.</li>
+      <li><b>S — interruptible sleep.</b> Waiting for something (a timer, a socket, a keypress) and can be woken early by a signal. Most processes on a healthy box are in <code>S</code> almost all the time.</li>
+      <li><b>D — uninterruptible sleep.</b> Blocked inside a syscall, usually on I/O, and <em>will not respond to signals</em> — not even <code>SIGKILL</code>. A process wedged in <code>D</code> is the one that ruins your afternoon.</li>
+      <li><b>Z — zombie (defunct).</b> Finished executing, but its exit status hasn't been collected by the parent yet. It holds no memory or CPU — just a slot in the process table.</li>
+      <li><b>T — stopped.</b> Suspended by job control or a debugger (<code>SIGSTOP</code>/<code>SIGTSTP</code>), frozen until <code>SIGCONT</code>.</li>
+    </ul>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 420" role="img" aria-label="Process state transitions between new, running, sleeping S and D, stopped T, and zombie Z">
+        <defs>
+          <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+          <marker id="ard" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--deep)"/></marker>
+          <marker id="arm" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--muted)"/></marker>
+        </defs>
+        <!-- fork -->
+        <rect x="20" y="30" width="170" height="58" rx="9" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="105" y="55" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">fork() / clone()</text>
+        <text x="105" y="74" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">a new task is born</text>
+        <!-- R -->
+        <rect x="275" y="24" width="180" height="70" rx="9" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="365" y="52" text-anchor="middle" style="fill:var(--ink);font:700 14px sans-serif">R — running / runnable</text>
+        <text x="365" y="72" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">on the CPU, or on the run queue</text>
+        <!-- S -->
+        <rect x="520" y="118" width="180" height="66" rx="9" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="610" y="145" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">S — interruptible</text>
+        <text x="610" y="164" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">sleeping; a signal wakes it</text>
+        <!-- D -->
+        <rect x="520" y="250" width="180" height="66" rx="9" style="fill:var(--panel);stroke:var(--deep);stroke-width:1.5"/>
+        <text x="610" y="277" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">D — uninterruptible</text>
+        <text x="610" y="296" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">stuck in I/O; deaf to signals</text>
+        <!-- T -->
+        <rect x="20" y="200" width="180" height="66" rx="9" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="110" y="227" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">T — stopped</text>
+        <text x="110" y="246" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">SIGSTOP / debugger</text>
+        <!-- Z -->
+        <rect x="275" y="320" width="180" height="70" rx="9" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="365" y="348" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">Z — zombie</text>
+        <text x="365" y="368" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">exited; awaiting parent wait()</text>
+        <!-- arrows -->
+        <line x1="190" y1="59" x2="271" y2="59" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#ar)"/>
+        <text x="230" y="50" text-anchor="middle" style="fill:var(--accent2);font:600 10px sans-serif">enqueue</text>
+        <!-- R <-> S -->
+        <line x1="455" y1="70" x2="524" y2="130" style="stroke:var(--muted);stroke-width:1.6" marker-end="url(#arm)"/>
+        <text x="512" y="98" text-anchor="middle" style="fill:var(--muted);font:600 10px sans-serif">blocks (sleep, socket)</text>
+        <line x1="524" y1="160" x2="455" y2="86" style="stroke:var(--accent2);stroke-width:1.6" marker-end="url(#ar)"/>
+        <text x="470" y="150" text-anchor="middle" style="fill:var(--accent2);font:600 10px sans-serif">wake</text>
+        <!-- R <-> D -->
+        <line x1="455" y1="82" x2="524" y2="262" style="stroke:var(--deep);stroke-width:1.6" marker-end="url(#ard)"/>
+        <text x="560" y="205" text-anchor="middle" style="fill:var(--deep);font:600 10px sans-serif">disk / NFS I/O</text>
+        <line x1="530" y1="288" x2="458" y2="92" style="stroke:var(--accent2);stroke-width:1.6" marker-end="url(#ar)"/>
+        <text x="430" y="235" text-anchor="middle" style="fill:var(--accent2);font:600 10px sans-serif">I/O done</text>
+        <!-- R <-> T -->
+        <line x1="278" y1="80" x2="150" y2="198" style="stroke:var(--muted);stroke-width:1.6" marker-end="url(#arm)"/>
+        <text x="185" y="150" text-anchor="middle" style="fill:var(--muted);font:600 10px sans-serif">SIGSTOP</text>
+        <line x1="175" y1="200" x2="300" y2="90" style="stroke:var(--accent2);stroke-width:1.6" marker-end="url(#ar)"/>
+        <text x="270" y="180" text-anchor="middle" style="fill:var(--accent2);font:600 10px sans-serif">SIGCONT</text>
+        <!-- R -> Z -->
+        <line x1="365" y1="94" x2="365" y2="318" style="stroke:var(--muted);stroke-width:1.6" marker-end="url(#arm)"/>
+        <text x="374" y="210" style="fill:var(--muted);font:600 10px sans-serif">exit()</text>
+        <text x="474" y="360" style="fill:var(--muted);font:600 10px sans-serif">→ parent wait() → gone</text>
+      </svg>
+      <figcaption>A task lives in one state at a time. The scheduler moves it between R and the CPU; blocking drops it to S or D; exit leaves a zombie until the parent reaps it.</figcaption>
+    </figure>
+
+    <p>The run queue is where the "whose turn is next" decision happens. Each CPU has its own run queue holding the runnable (R) tasks. Sleeping tasks (S, D) aren't on it — they sit on <b>wait queues</b> attached to whatever they're waiting for, and get moved back onto a run queue when that event fires. So a busy-looking <code>ps</code> with fifty processes might have only two on a run queue and forty-eight asleep. Load average, which people misread constantly, counts the R <em>and</em> D tasks — which is why heavy disk I/O drives load average up even when CPUs are idle.</p>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>Every alert you'll ever get about "high load" or "CPU pegged" or "the app is hung" resolves to a question about states and the run queue. Is load high because forty threads are genuinely runnable and fighting for eight cores (a real CPU problem), or because ten threads are stuck in <b>D</b> waiting on a slow EBS volume (a storage problem wearing a CPU costume)? Same load number, completely different fix. This chapter is how you tell them apart in thirty seconds.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>How a process is born, run, and reaped</h2>
+    <p>The lifecycle has three machines you should be able to narrate: creation, scheduling, and teardown.</p>
+
+    <h3>Creation: fork, then exec</h3>
+    <p>Unix creates processes with two separate calls, and the separation is the clever part.</p>
+    <ol class="steps">
+      <li><b><code>fork()</code> clones the caller.</b> The kernel makes a near-identical copy of the calling process: same memory, same open file descriptors, same code. The original is the <em>parent</em>, the copy is the <em>child</em>. <code>fork()</code> returns twice — the child sees <code>0</code>, the parent sees the child's PID — which is how each figures out who it is.</li>
+      <li><b>The copy is cheap, thanks to copy-on-write.</b> The kernel doesn't duplicate the parent's memory up front. Parent and child share the same physical pages, marked read-only; only when one of them <em>writes</em> a page does the kernel copy that page. So forking a 2&nbsp;GB process costs kilobytes, not gigabytes — until something is written.</li>
+      <li><b><code>execve()</code> replaces the program.</b> The child usually immediately calls <code>execve("/bin/ls", …)</code>, which throws away the copied memory image and loads a completely different program into the same process. The PID stays the same; the contents are new. This is why it's two calls: <code>fork</code> gives you a new process you control, and in the gap before <code>exec</code> you can redirect its file descriptors (that's exactly how a shell wires up <code>ls &gt; out.txt</code>).</li>
+      <li><b>The scheduler takes over.</b> The new task is placed on a run queue in state R, and from here it's just another mouth to feed.</li>
+    </ol>
+    <p>Modern glibc actually implements <code>fork</code> on top of a more general call, <code>clone()</code>, which takes flags for exactly what to share. <code>fork</code> shares almost nothing (separate memory); creating a <b>thread</b> uses the same <code>clone()</code> with flags that say "share the address space, the file descriptors, and the signal handlers." That single difference — shared address space or not — is the entire distinction between a thread and a process.</p>
+
+    <h3>Scheduling: sharing the CPU fairly</h3>
+    <p>For over fifteen years Linux's default scheduler was <b>CFS</b>, the Completely Fair Scheduler. Its idea is simple and worth internalising: give every runnable task a <b>virtual runtime</b> (<code>vruntime</code>) that ticks up as it runs, and always run the task with the <em>lowest</em> vruntime. Tasks that have run a lot fall to the back; tasks that just woke up have low vruntime and get the CPU quickly. CFS keeps the runnable tasks in a red-black tree ordered by vruntime and picks the leftmost node — an O(log n) decision it makes thousands of times a second.</p>
+    <p><b><code>nice</code></b> tilts this. A task's vruntime advances in proportion to real time <em>divided by its weight</em>, and weight comes from the nice value. Nice ranges from <code>-20</code> (greediest) to <code>+19</code> (most generous), and each step is roughly a 1.25× change in CPU share. So a <code>nice -5</code> task next to a <code>nice 0</code> task gets a bigger slice — its vruntime rises more slowly, so the scheduler keeps picking it. Nice doesn't set a hard percentage; it sets a <em>ratio</em> against whoever else is competing.</p>
+    <div class="box keypoint"><div class="h">CFS, EEVDF, and not getting caught out</div>
+      <p>As of kernel 6.6 (late 2023) the default fair scheduler is <b>EEVDF</b> (Earliest Eligible Virtual Deadline First), which replaced CFS. The mental model barely changes: it still tracks per-task virtual time and fairness, but it adds a notion of a virtual <em>deadline</em> so latency-sensitive tasks get served promptly. The concepts here — fairness, vruntime, nice as a weight — carry over, and most production hosts you touch today still run kernels with CFS. If an interviewer says "CFS," answer in CFS terms and mention EEVDF is the current successor. Neither is a real-time scheduler; for hard timing you use the separate <code>SCHED_FIFO</code>/<code>SCHED_RR</code> classes.</p>
+    </div>
+    <p>A <b>context switch</b> is what happens between two tasks: the kernel saves the outgoing task's registers into its <code>task_struct</code>, restores the incoming task's registers, and — if the incoming task is a different process — switches the page tables to its address space. That last step can flush the TLB (the cache of virtual-to-physical mappings), which is why switching between two <em>threads</em> of one process is cheaper than switching between two processes: same address space, no TLB flush. A switch is on the order of a microsecond, but a box doing hundreds of thousands per second is spending real CPU just shuffling tasks — a pattern you'll spot in the labs.</p>
+
+    <h3>Teardown: exit, zombie, reap</h3>
+    <p>When a process calls <code>exit()</code> (or returns from <code>main</code>, or is killed), the kernel tears down its memory and closes its files — but it can't fully remove the process yet, because the exit status (did it succeed? was it killed, and by what signal?) has to survive until the parent asks for it. So the kernel keeps a husk: the <b>zombie</b>. It's a nearly empty <code>task_struct</code> holding just the exit status and a PID.</p>
+    <p>The parent collects it by calling <code>wait()</code> or <code>waitpid()</code> — "reaping." Reaping frees the last of the process and the PID goes back into circulation. If the parent never reaps, the zombie lingers forever, holding a PID. Pile up enough of them and you exhaust the PID space (default max is in <code>/proc/sys/kernel/pid_max</code>, often 4&nbsp;million on modern kernels but historically 32768) and the box can't <code>fork</code> anything new — including your shell to log in and fix it.</p>
+    <p>What if the parent dies first? The child becomes an <b>orphan</b>, and the kernel <em>reparents</em> it to PID 1 (init, or systemd). PID 1's job includes reaping orphans, so on a normal host orphans get cleaned up automatically. This is exactly why zombies famously accumulate in containers: the container's PID 1 is often the application itself, which never expects to be a reaper and ignores <code>SIGCHLD</code> — so adopted children pile up as zombies. The fix is a tiny init like <code>tini</code> (that's what <code>docker run --init</code> gives you), which we'll meet again in <a href="ch26-docker-containerd-runc-and-the-oci-model.html">Chapter 26</a>.</p>
+
+    <details class="recall"><summary>Think first: why does <code>fork()</code> return two different values in what looks like one function call?</summary>
+      <div class="body">
+        <p>Because after <code>fork()</code> there are <em>two</em> processes, and each returns from the call independently. The kernel arranges the child to see <code>0</code> and the parent to see the child's PID. There's no magic — both processes resume at the instruction after <code>fork()</code>, each with its own copy of everything, each with a different value sitting in the return register. The idiom <code>if (fork()==0) { …child… } else { …parent… }</code> is just each process reading its own return value and taking the branch meant for it.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, and what each owns</h2>
+    <ul>
+      <li><b><code>task_struct</code> — the process control block.</b> One per task. Owns the PID/PPID, state, register snapshot, memory map pointer, open-file table, scheduling weight and vruntime, and the signal state. Everything else here is a field or a list hanging off this.</li>
+      <li><b>The scheduler and run queues.</b> One run queue per CPU, holding the runnable (R) tasks. The scheduler picks the next task and performs context switches. Sleeping tasks live on wait queues, not the run queue.</li>
+      <li><b>Threads vs processes.</b> A process is one or more threads sharing an address space. Each thread is a schedulable task with its own <b>TID</b> (thread ID); the shared identifier is the <b>TGID</b>, which is what <code>getpid()</code> returns and what you see as "the PID." Threads share memory, file descriptors, and the working directory; they do <em>not</em> share the CPU register set or the stack. <code>ps -eLf</code> shows one line per thread (the <code>LWP</code> column).</li>
+      <li><b>Signals.</b> A fixed set of numbered messages (<code>kill -l</code> lists them). Each has a default action — terminate, terminate-and-dump-core, ignore, stop, or continue — and a process can install a <b>handler</b> to run its own code instead, or <b>block</b> a signal to defer it. Two are special: <code>SIGKILL</code> (9) and <code>SIGSTOP</code> (19) can never be caught, blocked, or ignored, because they're the kernel's guaranteed lever over any process.</li>
+      <li><b>PID 1 (init / systemd).</b> The ancestor of everything, started by the kernel at boot. Adopts orphans and reaps them. In a container, whatever you set as the entrypoint <em>is</em> PID 1, with all of PID 1's reaping responsibilities whether it knows it or not.</li>
+      <li><b><code>/proc/&lt;pid&gt;/</code>.</b> The live window into a task's <code>task_struct</code>: <code>status</code> (state, PPid, thread count, context-switch counts), <code>stat</code>, <code>wchan</code> (what it's sleeping on), <code>fd/</code> (open descriptors), and <code>task/</code> (its threads).</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one command from prompt to reap</h2>
+    <p>Type <code>ls</code> at a bash prompt and press Enter. Here's the whole life of that command:</p>
+    <ol class="steps">
+      <li>Bash parses the line and calls <code>fork()</code>. Now there are two bashes — the parent (your shell) and a child clone.</li>
+      <li>The child (still bash) sets up any redirections, then calls <code>execve("/bin/ls", …)</code>. Its memory image is replaced by <code>ls</code>. Same PID, new program.</li>
+      <li>The kernel puts the new task on a run queue in state R. The scheduler gives it the CPU when its vruntime comes up.</li>
+      <li><code>ls</code> runs — mostly it's blocked in <code>S</code> waiting on <code>getdents</code>/<code>write</code> syscalls, occasionally R when it has work. It prints the directory and calls <code>exit()</code>.</li>
+      <li><code>ls</code> becomes a <b>zombie</b> (Z) holding its exit status. Meanwhile the parent bash was blocked in <code>wait()</code> the whole time (state S) — that's why your prompt didn't come back yet.</li>
+      <li>The kernel delivers <code>SIGCHLD</code> to bash; bash's <code>wait()</code> returns the child's exit status; the zombie is reaped and its PID freed. Bash prints the next prompt.</li>
+    </ol>
+    <p>That six-step dance happens every single time you run a command. When you background a job with <code>&amp;</code>, the only change is that bash doesn't block in <code>wait()</code> — it prints the prompt immediately and reaps the child later when <code>SIGCHLD</code> arrives.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>Everything runs in a throwaway Linux container, same as Chapter 1. Start it once and install the tools:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># --pid=host is NOT used — we want an isolated PID namespace to play in.</span>
+docker run --rm -it --cap-add=SYS_PTRACE ubuntu:24.04 bash
+
+<span class="c"># Inside the container:</span>
+apt-get update &amp;&amp; apt-get install -y procps psmisc strace stress-ng python3</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — see processes, threads, and states</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Start a couple of processes and read the process table. <code>ps</code> with an explicit format is worth memorising — the defaults hide the columns you actually need.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>sleep 300 &amp;                    <span class="c"># a process that just sleeps (state S)</span>
+ps -eo pid,ppid,stat,ni,wchan:16,comm</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>  PID  PPID STAT  NI WCHAN            COMMAND
+    1     0 Ss     0 do_wait          bash
+   14     1 S      0 hrtimer_nanosle  sleep
+   15     1 R+     0 -                ps</code></pre></div>
+        <p>Read the STAT column. <code>bash</code> is <code>Ss</code> — sleeping (S) and a session leader (s). <code>sleep</code> is <code>S</code>, parked in <code>hrtimer_nanosleep</code> — the <code>WCHAN</code> tells you the exact kernel function it's blocked in. <code>ps</code> itself is <code>R+</code> — running, in the foreground (+). Now look at threads. A single process can hold many; <code>ps -eLf</code> shows one row per thread:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># A multi-threaded stand-in: 4 CPU workers in ONE process.</span>
+stress-ng --cpu 4 --timeout 60s &amp;
+ps -o pid,tid,nlwp,comm -L -p $(pgrep -n stress-ng)</code></pre></div>
+        <div class="out"><span class="ol">Output</span>  PID   TID NLWP COMMAND
+  30    30    5 stress-ng-cpu
+  30    31    5 stress-ng-cpu
+  30    32    5 stress-ng-cpu
+  30    33    5 stress-ng-cpu
+  30    34    5 stress-ng-cpu</code></pre></div>
+        <p>One PID (30), five TIDs (30–34): the main thread plus four workers. They share the PID and the address space; each is scheduled independently. That's the whole thread story on one screen. Look at its live state in <code>/proc</code>:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>grep -E 'State|Threads|VmRSS' /proc/$(pgrep -n stress-ng)/status</code></pre></div>
+        <div class="out"><span class="ol">Output</span>State:	R (running)
+Threads:	5
+VmRSS:	   4210 kB</code></pre></div>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — signals, handlers, and the two you can't catch</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Signals are how you (and the kernel) talk to a running process. First, list them, then trap one in bash and prove that <code>SIGKILL</code> ignores your handler.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kill -l | tr ' ' '\n' | head       <span class="c"># the signal names/numbers</span>
+
+<span class="c"># A script that catches SIGTERM(15) and SIGINT(2) but not SIGKILL(9):</span>
+cat &gt; /tmp/catcher.sh &lt;&lt;'EOF'
+trap 'echo "caught SIGTERM — cleaning up, ignoring the request"' TERM
+trap 'echo "caught SIGINT (Ctrl-C)"' INT
+echo "pid $$ running; try to kill me"
+while true; do sleep 1; done
+EOF
+bash /tmp/catcher.sh &amp;
+PID=$!</code></pre></div>
+        <p>Now send it signals and watch what it does:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kill -TERM $PID     <span class="c"># delivers SIGTERM -> handler runs, process SURVIVES</span>
+kill -TERM $PID     <span class="c"># again — still alive, still trapped</span>
+kill -KILL $PID     <span class="c"># SIGKILL(9) -> no handler possible, process dies now</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>caught SIGTERM — cleaning up, ignoring the request
+caught SIGTERM — cleaning up, ignoring the request
+[1]+  Killed                  bash /tmp/catcher.sh</code></pre></div>
+        <p>This is the exact reason <code>kill</code> defaults to <code>SIGTERM</code>, not <code>SIGKILL</code>: <code>SIGTERM</code> is a polite "please shut down" that a well-behaved program traps to flush buffers and close connections cleanly. <code>SIGKILL</code> is the kernel yanking the plug — no cleanup, no handler. This is also why Kubernetes sends <code>SIGTERM</code> first and only escalates to <code>SIGKILL</code> after the grace period; your app should catch <code>SIGTERM</code> and drain. Try stopping and continuing a process, too:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>sleep 300 &amp; P=$!
+kill -STOP $P ; ps -o pid,stat,comm -p $P   <span class="c"># STAT shows T (stopped)</span>
+kill -CONT $P ; ps -o pid,stat,comm -p $P   <span class="c"># back to S</span></code></pre></div>
+      </div>
+    </div>
+
+    <details class="recall"><summary>Think first: your app "ignores" <code>SIGTERM</code> from <code>kill</code>, so you reach for <code>kill -9</code>. What might you be breaking, and what should you check first?</summary>
+      <div class="body">
+        <p><code>kill -9</code> (SIGKILL) gives the process zero chance to flush writes, commit a transaction, or deregister from a load balancer — you can corrupt state or drop in-flight requests. Before escalating, check whether the process is actually <em>ignoring</em> the signal or is simply <b>stuck in D state</b>, where no signal (not even KILL) is delivered until the I/O completes. Run <code>ps -o pid,stat,wchan,comm -p &lt;pid&gt;</code>. If STAT is <code>D</code>, <code>kill -9</code> won't work either — the problem is downstream I/O, and you have to fix that. If STAT is <code>S</code>/<code>R</code> and it truly ignores SIGTERM, that's an application bug: it either installed a no-op handler or is wedged in its own signal-handling code. Reaching for <code>-9</code> reflexively hides both of those.</p>
+      </div>
+    </details>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — a zombie pileup</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Zombies happen when a parent forks children that exit but never calls <code>wait()</code>. Manufacture 200 of them, then investigate as if you found them in production.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Parent forks 200 children that exit immediately, then sleeps</span>
+<span class="c"># WITHOUT ever reaping them. Each dead child becomes a zombie.</span>
+python3 -c '
+import os, time
+for _ in range(200):
+    if os.fork() == 0:
+        os._exit(0)      # child exits right away
+time.sleep(600)          # parent never calls os.wait()
+' &amp;
+sleep 1</code></pre></div>
+        <p>Now look. Don't assume — count and classify what you see:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>ps -eo pid,ppid,stat,comm | awk '$3 ~ /Z/'   | head
+ps -eo stat | grep -c '^Z'                    <span class="c"># how many zombies?</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>   47    31 Z    python3 &lt;defunct&gt;
+   48    31 Z    python3 &lt;defunct&gt;
+   49    31 Z    python3 &lt;defunct&gt;
+   ...
+200</code></pre></div>
+        <p>Two hundred processes marked <code>Z</code> and <code>&lt;defunct&gt;</code>, all with the same PPID (31). That shared parent is the whole story. Before reading the cause, answer for yourself: they show up in <code>ps</code> — are they using CPU or RAM? And how do you clear them?</p>
+        <details class="recall"><summary>Reveal the cause and the fix</summary>
+          <div class="body">
+            <p>Zombies use <b>no CPU and no memory</b> — they're finished. Each holds exactly one thing: a PID slot. So the damage isn't resource starvation, it's <b>PID exhaustion</b>. Enough of them and the kernel can't <code>fork</code> anything new (you'll see "resource temporarily unavailable" / <code>EAGAIN</code>), and you can't even start a shell to fix it.</p>
+            <p>You <em>cannot</em> kill a zombie — it's already dead; <code>kill -9</code> on a zombie does nothing. The only cure is to make the <b>parent reap</b> them, or kill the parent so the zombies are reparented to PID 1, which reaps immediately:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>PARENT=$(ps -eo ppid,stat | awk '$2 ~ /Z/ {print $1; exit}')
+kill "$PARENT"          <span class="c"># parent dies; zombies reparent to PID 1 and vanish</span>
+ps -eo stat | grep -c '^Z'</code></pre></div>
+            <p>In the real world the parent is your app, and the fix is in code: reap children (call <code>wait()</code>, or handle <code>SIGCHLD</code>), or run under a proper init. In containers this is the classic "why do I have thousands of zombies" — the app is PID 1 and doesn't reap. <code>docker run --init</code> (or a real init in the image) fixes it; see <a href="ch26-docker-containerd-runc-and-the-oci-model.html">Chapter 26</a>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — a process stuck in D</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>The <b>D state</b> is uninterruptible sleep: a task blocked inside the kernel on I/O that won't return signals until the I/O finishes. Force some heavy synchronous disk I/O and catch a worker in D. In a container disk can be fast, so sample quickly in a loop.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># stress-ng --hdd hammers the disk with synchronous writes.</span>
+stress-ng --hdd 4 --hdd-bytes 512m --timeout 40s &amp;
+
+<span class="c"># Sample fast and print only tasks currently in D:</span>
+for i in $(seq 1 60); do
+  ps -eo pid,stat,wchan:20,comm | awk '$2 ~ /D/'
+  sleep 0.3
+done | sort -u</code></pre></div>
+        <div class="out"><span class="ol">Output (varies)</span>  92 D    folio_wait_bit_common  stress-ng-hdd
+  93 D    jbd2_log_wait_commit   stress-ng-hdd
+  94 D    balance_dirty_pages    stress-ng-hdd</code></pre></div>
+        <p>Those <code>WCHAN</code> values are the kernel functions the tasks are blocked in — waiting on page writeback and the filesystem journal. Now the senior move: given a task in D, <em>what is it waiting on, and can you kill it?</em> Investigate before revealing.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>PID=&lt;a D-state pid from above&gt;
+cat /proc/$PID/wchan; echo          <span class="c"># the blocking kernel function</span>
+sudo cat /proc/$PID/stack 2&gt;/dev/null || cat /proc/$PID/stack   <span class="c"># full kernel stack</span>
+kill -9 $PID; ps -o pid,stat,comm -p $PID   <span class="c"># does SIGKILL even work?</span></code></pre></div>
+        <details class="recall"><summary>Reveal what's happening and how to handle it</summary>
+          <div class="body">
+            <p>A task in <b>D</b> is blocked in the kernel and <b>does not receive signals</b> — so <code>kill -9</code> is queued but not delivered until the I/O completes. If the underlying storage answers (as our local disk does), the task leaves D in milliseconds and everything's fine. The nightmare version is when the storage <em>never</em> answers — a hung NFS mount, a detached EBS volume, a failing disk. Then the task is stuck in D indefinitely, unkillable, and it counts toward load average, so you see load climb to 20 with the CPUs idle.</p>
+            <p>Your job when you find a task wedged in D: don't try to kill it (you can't) and don't blame the app. Read <code>/proc/&lt;pid&gt;/stack</code> and <code>wchan</code> to see the I/O path, then find and fix the <b>storage</b> — remount the NFS share, reattach the volume, replace the disk. Sometimes the only way out is a reboot, because the task can't be reaped while the I/O is outstanding. This is why "load average is 30 but CPU is 2%" is almost always a storage incident, not a compute one.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — one job starving the rest</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>A batch job shares a box with your latency-sensitive service, and users start seeing slow responses. The batch job isn't "broken" — it's just greedy, and the scheduler is being fair to a fault. Reproduce the shape: saturate every core, then watch a would-be interactive task struggle.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>NPROC=$(nproc)
+stress-ng --cpu "$NPROC" --timeout 120s &amp;    <span class="c"># the greedy "batch job"</span>
+HOG=$!
+
+<span class="c"># A stand-in for your latency task: time how long a fixed unit of work takes.</span>
+time (for i in $(seq 1 3); do sha256sum /usr/bin/* &gt;/dev/null 2&gt;&amp;1; done)</code></pre></div>
+        <p>With every core pegged, that fixed work takes far longer than on an idle box — your "service" just got slow because the scheduler is splitting the CPU evenly between it and a job you care about less. The wrong fix is "add CPUs." The right question: how do you make the batch job yield to the important one, without killing it? Work it out, then reveal.</p>
+        <details class="recall"><summary>Reveal the investigation and the durable fix</summary>
+          <div class="body">
+            <p>First confirm it's a CPU-contention problem and find the hog:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>uptime                              <span class="c"># load avg &gt;&gt; nproc, and it's all R (not D)</span>
+ps -eo pid,ni,pri,pcpu,stat,comm --sort=-pcpu | head</code></pre></div>
+            <p>Everything runnable, no D — so it's genuine CPU contention, not I/O. The lightweight lever is <b>nice</b>: make the batch job more generous so the scheduler weights it lower.</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>renice +19 -p "$HOG"      <span class="c"># batch job now yields; re-run the timed work</span></code></pre></div>
+            <p>Re-run the timed loop and it finishes much closer to idle-box speed, because a <code>nice +19</code> task gets a small fraction of the CPU whenever anything else wants it. But <code>nice</code> is advisory and global; the durable, enforceable fix on a shared box or in Kubernetes is a <b>cgroup v2 CPU weight or quota</b> — <code>cpu.weight</code> for proportional share, <code>cpu.max</code> for a hard cap. That's exactly what a Kubernetes CPU <code>request</code>/<code>limit</code> compiles down to. We build cgroups from scratch in <a href="ch23-cgroups-v2-cpu-memory-io-limits.html">Chapter 23</a>; the point here is that the scheduler's fairness is per-task, and the only way to say "this whole job matters less than that one" is nice or, better, cgroups.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <p>Three incident shapes come straight out of this chapter. Learn them as reflexes.</p>
+    <div class="box realworld"><div class="h">Incident pattern · zombie accumulation → can't fork</div>
+      <p><b>Symptom:</b> new processes fail to start (<code>fork: retry: Resource temporarily unavailable</code> / <code>EAGAIN</code>); sometimes you can't even SSH in because login can't fork a shell. <b>First cut:</b> <code>ps -eo stat | grep -c '^Z'</code> and check <code>cat /proc/sys/kernel/pid_max</code> against total process count. <b>Confirm:</b> the zombies share one PPID — <code>ps -eo ppid,stat | awk '$2~/Z/'</code> — that parent is the non-reaper. <b>Usual cause:</b> an app that forks children (or an entrypoint that's PID 1 in a container) and never reaps them. <b>Fix:</b> make the parent reap (<code>wait</code>/handle <code>SIGCHLD</code>) or run a real init (<code>--init</code>/tini). Killing zombies directly does nothing; kill or fix the parent.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · D-state from stuck I/O</div>
+      <p><b>Symptom:</b> load average climbs to 15–30 while CPU utilisation sits near idle; processes are unkillable, even with <code>-9</code>. <b>First cut:</b> <code>ps -eo pid,stat,wchan,comm | grep ' D'</code> — count the D tasks and read their <code>wchan</code>. <b>Confirm:</b> <code>cat /proc/&lt;pid&gt;/stack</code> shows a filesystem/network-storage path (NFS, EBS, a specific block device). <b>Usual cause:</b> storage that stopped answering — a hung NFS server, a detached or throttled EBS volume, a dying disk. <b>Fix:</b> repair the storage, not the process. Remember load average counts D, so this looks like a CPU emergency and isn't one.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · a runaway process starving others</div>
+      <p><b>Symptom:</b> everything on the box is slow, load is well above core count, and one process sits near 100% (or N×100% if multithreaded). <b>First cut:</b> <code>top</code> — is it high <code>%us</code> (its own code) and are tasks R, not D? <code>ps --sort=-pcpu</code> to name the hog. <b>Confirm:</b> nothing in D, load ≈ number of busy runnable tasks. <b>Usual cause:</b> an infinite loop, a runaway query, a missing backoff, or just a legitimate batch job co-scheduled with a latency service. <b>Fix:</b> <code>renice</code> to yield immediately; enforce durably with cgroup <code>cpu.weight</code>/<code>cpu.max</code> (K8s CPU limits). Only add capacity once you've ruled out a bug.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Signals are your shutdown contract.</b> Orchestrators (systemd, Kubernetes, Docker) all follow the same drill: send <code>SIGTERM</code>, wait a grace period, then <code>SIGKILL</code>. If your service doesn't trap <code>SIGTERM</code> to drain connections and flush state, every deploy and every autoscale event drops in-flight requests. Kubernetes' default grace period is 30 seconds — a number worth knowing, because a slow drain that exceeds it gets the hard kill anyway. Write the handler.</p>
+    <p><b>Reaping is not optional.</b> Any process that spawns children — a supervisor, a language runtime doing multiprocessing, a shell script with background jobs — must reap them or delegate to an init that does. This bites hardest in containers, where a naïve entrypoint becomes PID 1. Use <code>--init</code>, or an image with a real init, or handle <code>SIGCHLD</code> yourself.</p>
+    <p><b>Fairness is per-task, and that cuts both ways.</b> The scheduler will happily give a runaway thread its fair slice while your users wait. On multi-tenant boxes and in Kubernetes, express priority as cgroup weights and quotas, not hope. And watch <b>context-switch rate</b>: a box doing 500k+ switches/second (see <code>vmstat 1</code>'s <code>cs</code> column, or <code>/proc/&lt;pid&gt;/status</code> voluntary vs nonvoluntary counts) is thrashing — too many runnable threads for the cores, or lock contention forcing constant voluntary yields. More threads is not more throughput past the core count.</p>
+    <p><b>Common mistakes:</b> reaching for <code>kill -9</code> when the process is actually in D (it won't work, and it hides a storage fault); reading load average as a CPU metric when it also counts D; assuming threads scale past core count; and running a container without an init and then wondering where the zombies came from.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>The cost of context switches sets a real ceiling: past a few thousand threads on a box, you spend more CPU switching than working, which is precisely why high-concurrency servers (nginx, Envoy, Go's runtime) use a small pool of threads driving an event loop or lightweight goroutines instead of one OS thread per connection. When you design a service for 50k concurrent connections, you're really designing around this chapter.</p>
+    <p>"Send SIGTERM, drain, then SIGKILL" is the seed of <b>graceful shutdown</b> and <b>connection draining</b> behind every rolling deploy and blue/green cutover (<a href="ch73-ci-cd-and-progressive-delivery.html">Chapter 73</a>). The "blocked, not dead" reframe from D-state and sleeping processes is the origin of <b>timeouts, health checks, and circuit breakers</b> — in a distributed system most of your processes are asleep in a syscall waiting on someone else, so reliability engineering (<a href="ch88-reliability-engineering.html">Chapter 88</a>) is largely the art of not waiting forever. And scheduler fairness plus cgroup weights is the machinery under Kubernetes <b>requests and limits</b> and node-level noisy-neighbour isolation.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's the difference between a process and a thread?</summary>
+        <div class="a"><p>A process is a running program with its own private address space, its own open-file table, and its own PID. A thread is a unit of execution <em>inside</em> a process; threads of the same process share the address space, the file descriptors, and the working directory, but each has its own stack and registers. In Linux both are tasks created by <code>clone()</code> — the only real difference is which resources they share. Threads share memory (so communication is cheap but you need locks); processes are isolated (safer, but they must pass data through pipes, sockets, or shared memory).</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through what happens from <code>fork()</code> to a reaped child.</summary>
+        <div class="a"><p>A process calls <code>fork()</code>, and the kernel makes a copy of it — same memory (via copy-on-write, so it's cheap), same open files. <code>fork</code> returns twice: the child sees 0, the parent sees the child's PID. The child usually calls <code>execve()</code> immediately, which replaces its memory image with a new program while keeping the same PID; the gap between fork and exec is where a shell sets up redirections. The kernel puts the new task on a run queue in state R, and the scheduler runs it when its vruntime comes up. It runs, blocking in S while it waits on I/O, until it calls <code>exit()</code>. At that point it becomes a zombie (Z) holding just its exit status, and the kernel sends <code>SIGCHLD</code> to the parent. The parent calls <code>wait()</code>/<code>waitpid()</code>, collects the status, and the zombie is reaped — its PID freed. If the parent died first, the child was already reparented to PID 1, which reaps it. The headline: two calls for creation because you want a controllable process before you load the new program, and a mandatory reap so the exit status survives until someone reads it.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>How does CFS share one CPU fairly, and what does <code>nice</code> actually change?</summary>
+        <div class="a"><p>CFS gives each runnable task a virtual runtime, <code>vruntime</code>, that advances as the task runs, and it always schedules the task with the smallest vruntime — kept in a red-black tree so picking the leftmost node is O(log n). A task that has run a lot has high vruntime and drifts to the back; a task that just woke has low vruntime and gets the CPU quickly, which is what makes interactive work feel responsive. <code>nice</code> changes the task's <em>weight</em>: vruntime advances as real-time-run divided by weight, so a low-nice (high-priority) task's vruntime rises slowly and the scheduler keeps picking it. Each nice step is about a 1.25× change in CPU share, and it's a ratio against whatever else is competing, not a fixed percentage. So nice doesn't reserve CPU — it changes how the pie is split when there's contention. As of kernel 6.6 the default is EEVDF, which keeps this fairness model but adds a virtual deadline so latency-sensitive tasks are served sooner; the vocabulary an interviewer expects is still CFS/vruntime/weight. For hard real-time guarantees you'd leave the fair class entirely for <code>SCHED_FIFO</code>/<code>RR</code>.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>Load average is 25 on an 8-core box, but CPU utilisation is 5%. What's going on and how do you confirm?</summary>
+        <div class="a"><p>Load average counts both runnable (R) <em>and</em> uninterruptible (D) tasks, so a high load with idle CPUs almost always means tasks piled up in D — blocked on I/O that isn't completing. I'd run <code>ps -eo pid,stat,wchan,comm | grep ' D'</code> to count the D tasks and read what they're blocked in, then <code>cat /proc/&lt;pid&gt;/stack</code> to see the exact I/O path. Nine times out of ten the <code>wchan</code>/stack points at network storage — a hung NFS mount or a stalled/detached EBS volume — or a failing local disk. The fix is on the storage side, not the processes; those tasks are unkillable while the I/O is outstanding, so <code>kill -9</code> is pointless. I'd verify by checking <code>dmesg</code> for I/O errors and <code>iostat</code>/<code>mount</code> for the culprit device. The trap I'd avoid is treating this as a CPU emergency and adding compute — it's a storage incident.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>Why do containers accumulate zombies, and how do you stop it?</summary>
+        <div class="a"><p>On a normal host, orphaned children are reparented to PID 1 (init/systemd), whose job includes reaping, so zombies get cleaned up. In a container, PID 1 is whatever you set as the entrypoint — usually the application, which never expected to be an init and doesn't reap <code>SIGCHLD</code>. So any grandchild processes it spawns that outlive their immediate parent get reparented to the app-as-PID-1 and sit there as zombies, slowly eating PID slots. The fix is to give the container a real init as PID 1: <code>docker run --init</code> (which injects tini), a tini/dumb-init entrypoint in the image, or an app that installs a <code>SIGCHLD</code> handler and reaps. It's the same underlying rule as on a host — someone has to call <code>wait()</code> — just easy to forget when your app is unexpectedly PID 1.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>A process is a running instance of a program, tracked by the kernel in a <code>task_struct</code> (the PCB) and always in one state: R (runnable/running), S (interruptible sleep), D (uninterruptible sleep — deaf to signals), Z (zombie — exited, awaiting reap), or T (stopped). Processes are born by <code>fork()</code> (a copy-on-write clone) then <code>execve()</code> (replace the program); threads are the same <code>clone()</code> mechanism sharing the address space. The scheduler shares one CPU by running the task with the lowest vruntime, and <code>nice</code> tilts that share by changing weight — CFS historically, EEVDF since kernel 6.6. Signals are fixed messages: catch <code>SIGTERM</code> to shut down cleanly; <code>SIGKILL</code> and <code>SIGSTOP</code> can never be caught. Load average counts R and D, so high load with idle CPUs is a storage problem. And every dead child must be reaped, or you get a zombie pileup — the container classic.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>A process is a running instance with its own memory and files; a program is the file on disk.</li>
+      <li>Creation is two calls: <code>fork()</code> clones (copy-on-write, cheap), <code>execve()</code> replaces the program in place.</li>
+      <li>A thread is <code>clone()</code> sharing the address space and file descriptors; same PID/TGID, different TID.</li>
+      <li>States: R runnable, S interruptible sleep, D uninterruptible sleep, Z zombie, T stopped — read them in <code>ps</code>'s STAT.</li>
+      <li>The scheduler runs the lowest-vruntime task; <code>nice</code> (−20…+19) changes weight, i.e. the CPU ratio under contention.</li>
+      <li>A context switch saves/restores registers and switches page tables; thread-to-thread is cheaper (no TLB flush).</li>
+      <li>Signals are fixed messages; catch <code>SIGTERM</code> to drain and clean up — <code>SIGKILL</code>(9) and <code>SIGSTOP</code>(19) can't be caught.</li>
+      <li>A task in D ignores every signal, including <code>-9</code>; fix the underlying I/O, don't try to kill it.</li>
+      <li>Load average counts R <em>and</em> D — high load with idle CPUs means blocked I/O, not a CPU shortage.</li>
+      <li>Every child must be reaped via <code>wait()</code>; unreaped children become zombies — run a real init as PID 1 in containers.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Connects to:</span>
+      <a href="ch01-kernel-and-system-calls.html"><b>Ch 1</b> Syscalls &amp; the kernel boundary</a>
+      <a href="ch03-memory-virtual-memory-page-cache-swap-oom.html"><b>Ch 3</b> Memory &amp; the OOM killer</a>
+      <a href="ch04-filesystems-inodes-file-descriptors-disk-i-o.html"><b>Ch 4</b> File descriptors &amp; I/O</a>
+      <a href="ch06-systemd-journald-cron-service-lifecycle.html"><b>Ch 6</b> systemd &amp; service lifecycle</a>
+      <a href="ch23-cgroups-v2-cpu-memory-io-limits.html"><b>Ch 23</b> cgroups v2 — CPU limits</a>
+      <a href="ch104-compute-and-memory-runbooks.html"><b>Ch 104</b> Compute runbooks</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man2/fork.2.html">fork(2)</a>, <a href="https://man7.org/linux/man-pages/man2/execve.2.html">execve(2)</a>, <a href="https://man7.org/linux/man-pages/man2/clone.2.html">clone(2)</a>, and <a href="https://man7.org/linux/man-pages/man2/wait.2.html">wait(2)</a>.</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man7/signal.7.html">signal(7)</a> (dispositions, which signals can't be caught) and <a href="https://man7.org/linux/man-pages/man5/proc.5.html">proc(5)</a> (every <code>/proc/&lt;pid&gt;</code> field).</li>
+      <li>The Linux Kernel documentation — <a href="https://docs.kernel.org/scheduler/index.html">Scheduler</a> (CFS design and, on recent kernels, EEVDF).</li>
+      <li>The Open Group — <a href="https://pubs.opengroup.org/onlinepubs/9699919799/">POSIX.1-2017</a>: the standard for process creation, <code>wait</code>, and signal semantics.</li>
+      <li>Google — <a href="https://sre.google/sre-book/table-of-contents/"><i>Site Reliability Engineering</i></a> (first-party): how process health and graceful shutdown fit production practice.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch01-kernel-and-system-calls.html"><span class="dir">← Prev</span><div class="ti">Ch 1 — The kernel, user space &amp; system calls</div></a>
+      <a class="nx" href="ch03-memory-virtual-memory-page-cache-swap-oom.html"><span class="dir">Next →</span><div class="ti">Ch 3 — Memory: virtual memory, page cache, swap, OOM</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 2 of 121 · Part I · Linux &amp; OS Foundations. Run the labs in a container; the reflexes are the point.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Process, states, run queue</a>
+    <a href="#internals">Born, run, reaped</a>
+    <a href="#components">The components</a>
+    <a href="#flow">Prompt to reap</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

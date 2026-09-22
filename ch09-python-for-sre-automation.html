@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 9 — Python for SRE automation</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part I · Linux &nbsp;·&nbsp; Chapter 9</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part I · Linux &amp; OS Foundations · Chapter 9</div>
+      <h1>Python for SRE automation</h1>
+      <p class="tagline">When the logic between your commands becomes the hard part, bash stops paying its way. Python is the ops lingua franca that picks up where it leaves off: real data structures, real error handling, and — the part that separates a script from a tool — something you can actually test.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~40 min read · Python 3 lab (Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Structure a Python CLI tool properly: <code>main()</code>, <code>argparse</code>, functions, and the <code>if __name__ == "__main__"</code> guard.</li>
+          <li>Call an HTTP API with a timeout and exit with meaningful, automation-friendly exit codes.</li>
+          <li>Run subprocesses safely — no <code>shell=True</code> injection, always a timeout, always a checked return code.</li>
+          <li>Handle errors deliberately, log to stderr, and never dump a raw traceback at an operator.</li>
+          <li>Write a <code>pytest</code> test by isolating the I/O boundary, and package the tool as an installable command.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem: automation that has to last</h2>
+    <p>Chapter 8 ended with a line: the moment the logic <em>between</em> your commands becomes the point, walk away from bash. This is where you walk to. The tasks that cross that line share a shape — they hold state in structures more complex than a flat list, they talk to APIs that return JSON and fail in a dozen ways, they need retries and timeouts and clear exit codes, and, above all, they're going to be run by other people for years after you write them. A 200-line bash script doing that is a liability; the same thing in Python is a tool.</p>
+    <p>Python won this job for boring, decisive reasons. It's already on every Linux box and in every base image. Its standard library covers the ops surface — HTTP, JSON, subprocesses, filesystem, logging, argument parsing — without a single dependency. It reads closely enough to pseudocode that the next on-call can understand it under pressure. And it has a real testing story, which is the thing that turns "a script that worked once on my laptop" into "automation the team trusts in production."</p>
+    <p>That last point is the whole reason this chapter exists. Anyone can make Python <em>do</em> a thing. The difference between a junior's script and a senior's tool is everything around the doing: the arguments are parsed and validated, the HTTP call has a timeout, the failure modes each map to a distinct exit code, the errors are logged instead of crashing, and there's a test that proves the logic without hitting the network. Get those right and your automation outlives you gracefully.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>The value of ops code isn't that it runs — it's that it keeps running correctly when you're not watching, and that the next person can change it without fear. That comes from structure, explicit error handling, and tests. Python gives you all three cheaply; use them, or you've just written slower bash.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a well-run service desk</h2>
+    <p>Think of a good CLI tool as a small, disciplined service desk, not a person frantically doing everything at once.</p>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>A request arrives at the desk. First it goes to the <b>intake clerk</b>, who checks the form is filled in correctly and rejects it politely if not — that's <code>argparse</code>, validating your arguments before any work starts. The clerk hands a clean request to the <b>back office</b>, which does the actual job in small, named steps — your functions. When the job needs something from another department, the desk uses the <b>phone line</b> — an HTTP call to an API, or a <b>runner</b> sent to fetch something — a subprocess — always with a rule: if there's no answer in thirty seconds, hang up (the timeout).</p>
+      <p>Everything the desk does goes in the <b>logbook</b> — <code>logging</code> to stderr — so there's a record separate from the actual result it hands back. And when the request is finished, the desk stamps it with a clear verdict: <em>done</em>, <em>couldn't do it</em>, <em>don't know</em> — the exit code, which the automation upstream reads to decide what happens next. Finally, a good desk has a <b>QA reviewer</b> who runs sample requests through it regularly to confirm it still behaves — your tests. A script without that reviewer is a desk nobody has checked since the day it opened.</p>
+    </div>
+    <table class="t">
+      <tr><th>At the service desk</th><th>In the Python tool</th></tr>
+      <tr><td>Intake clerk checking the form</td><td><code>argparse</code> — parse and validate arguments, reject bad input</td></tr>
+      <tr><td>The back office doing the work in steps</td><td>Functions, each with one job; <code>main()</code> coordinates them</td></tr>
+      <tr><td>Phone line to another department</td><td>An HTTP API call (<code>urllib</code>/<code>requests</code>), always with a timeout</td></tr>
+      <tr><td>A runner sent to fetch something</td><td><code>subprocess.run([...])</code> — call another program safely</td></tr>
+      <tr><td>The logbook</td><td><code>logging</code> to stderr — the record, kept apart from the result</td></tr>
+      <tr><td>The finished-request stamp</td><td>Exit code — <code>0</code> done, nonzero = which way it failed</td></tr>
+      <tr><td>The QA reviewer running samples</td><td><code>pytest</code> — tests that prove the logic without the network</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>The anatomy of a CLI tool</h2>
+    <p>Every well-structured ops tool has the same skeleton, and it's worth internalising because you'll type it hundreds of times. Arguments come in the top, get validated, flow through a coordinating <code>main()</code> into worker functions that talk to the outside world with timeouts, and a verdict comes out the bottom as an exit code — with a running commentary in the logs. Here's the runtime shape, including where it branches on failure.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 440" role="img" aria-label="Runtime flow of a Python CLI health-check tool: argv into argparse, into main and http_get with a timeout, branching to three exit codes, with stdout and stderr as separate channels">
+        <defs>
+          <marker id="pa" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--muted)"/></marker>
+        </defs>
+        <!-- argv -->
+        <rect x="222" y="16" width="276" height="42" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="360" y="36" text-anchor="middle" style="fill:var(--ink);font:600 11px monospace">python check.py --url … --timeout 5</text>
+        <text x="360" y="51" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">sys.argv</text>
+        <line x1="360" y1="58" x2="360" y2="80" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#pa)"/>
+        <!-- argparse -->
+        <rect x="250" y="82" width="220" height="46" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="360" y="104" text-anchor="middle" style="fill:var(--accent);font:700 12px sans-serif">argparse — validate</text>
+        <text x="360" y="120" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">required? right type?</text>
+        <!-- bad args branch -->
+        <line x1="470" y1="105" x2="516" y2="105" style="stroke:var(--muted);stroke-width:1.4" marker-end="url(#pa)"/>
+        <rect x="518" y="82" width="192" height="46" rx="8" style="fill:var(--panel);stroke:var(--deep)"/>
+        <text x="614" y="103" text-anchor="middle" style="fill:var(--deep);font:700 11px sans-serif">bad args →</text>
+        <text x="614" y="119" text-anchor="middle" style="fill:var(--ink);font:600 11px monospace">usage to stderr, exit 2</text>
+        <line x1="360" y1="128" x2="360" y2="150" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#pa)"/>
+        <!-- main / http_get -->
+        <rect x="240" y="152" width="240" height="50" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.6"/>
+        <text x="360" y="173" text-anchor="middle" style="fill:var(--accent);font:700 12px sans-serif">main() → http_get(url, timeout)</text>
+        <text x="360" y="190" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">the one call that can fail many ways</text>
+        <!-- three outcome arrows -->
+        <line x1="300" y1="202" x2="125" y2="286" style="stroke:var(--muted);stroke-width:1.3" marker-end="url(#pa)"/>
+        <line x1="360" y1="202" x2="360" y2="286" style="stroke:var(--muted);stroke-width:1.3" marker-end="url(#pa)"/>
+        <line x1="420" y1="202" x2="595" y2="286" style="stroke:var(--muted);stroke-width:1.3" marker-end="url(#pa)"/>
+        <!-- outcome boxes -->
+        <rect x="20" y="288" width="210" height="60" rx="8" style="fill:var(--chip);stroke:var(--accent2);stroke-width:1.8"/>
+        <text x="125" y="311" text-anchor="middle" style="fill:var(--accent2);font:700 11.5px sans-serif">HTTP 200</text>
+        <text x="125" y="329" text-anchor="middle" style="fill:var(--ink);font:600 11px monospace">log OK · exit 0</text>
+        <rect x="255" y="288" width="210" height="60" rx="8" style="fill:var(--chip);stroke:var(--deep);stroke-width:1.8"/>
+        <text x="360" y="311" text-anchor="middle" style="fill:var(--deep);font:700 11.5px sans-serif">HTTPError 4xx/5xx</text>
+        <text x="360" y="329" text-anchor="middle" style="fill:var(--ink);font:600 11px monospace">log CRIT · exit 2</text>
+        <rect x="490" y="288" width="210" height="60" rx="8" style="fill:var(--chip);stroke:var(--applied);stroke-width:1.8"/>
+        <text x="595" y="311" text-anchor="middle" style="fill:var(--applied);font:700 11.5px sans-serif">timeout / URLError</text>
+        <text x="595" y="329" text-anchor="middle" style="fill:var(--ink);font:600 11px monospace">log UNKNOWN · exit 3</text>
+        <!-- channels band -->
+        <rect x="20" y="372" width="680" height="52" rx="9" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="360" y="393" text-anchor="middle" style="fill:var(--muted);font:700 11px sans-serif;letter-spacing:.03em">THREE SEPARATE CHANNELS</text>
+        <text x="360" y="412" text-anchor="middle" style="fill:var(--ink);font:600 11px monospace">stdout = result for pipes · stderr = logs for humans · exit code = verdict for automation</text>
+      </svg>
+      <figcaption>Args in, validated, coordinated by <code>main()</code>, out through one fallible call that branches to distinct exit codes. The three channels — stdout, stderr, exit code — each have one job.</figcaption>
+    </figure>
+
+    <p>The three-channel discipline at the bottom is what makes a tool composable. Results go to stdout so another program can consume them; logs go to stderr so they don't pollute that output; and the exit code is the machine-readable verdict that lets a monitoring system, a CI step, or a shell <code>&amp;&amp;</code> chain decide what happens next. Mix these up — print logs to stdout, or always exit 0 — and your tool can't be automated against, which defeats the purpose.</p>
+
+    <h2 id="internals"><span class="beat">Internal working</span>What happens when you run it</h2>
+    <p>Understanding the runtime keeps you from being surprised by tracebacks, exit codes, and subprocess behaviour.</p>
+    <ol class="steps">
+      <li><b>The interpreter starts and builds <code>sys.argv</code>.</b> <code>python check.py --url x</code> launches the CPython interpreter, which reads your file and populates <code>sys.argv</code> with the command-line words. Running as <code>python -m tool</code> instead imports it as a module — the reason for the <code>if __name__ == "__main__"</code> guard, which runs your <code>main()</code> only when the file is executed directly, not when it's imported (by a test, say).</li>
+      <li><b><code>argparse</code> builds a parser and validates.</b> <code>parse_args()</code> matches your definitions against <code>sys.argv</code>. If something required is missing or the wrong type, argparse prints a usage message to <b>stderr</b> and exits with code <b>2</b> on its own — you don't write that logic, you get it for free.</li>
+      <li><b><code>main()</code> coordinates; functions do the work.</b> Control flows into your worker functions. Each returns a value or raises an exception on failure — Python's error channel is exceptions, not return codes, which is why you handle them with <code>try/except</code> rather than checking <code>$?</code> after every call.</li>
+      <li><b>The HTTP or subprocess call crosses the boundary.</b> <code>urllib.request.urlopen(req, timeout=5)</code> opens a socket and blocks until a response or the timeout — the same syscalls from <a href="ch01-kernel-and-system-calls.html">Chapter 1</a>, one layer up. <code>subprocess.run([...])</code> does a <code>fork()</code>+<code>exec()</code> exactly like the shell does, which is why you pass a list of arguments (no shell to word-split them) and why <code>shell=True</code> with untrusted input is an injection hole.</li>
+      <li><b>Exceptions propagate; the traceback is the default failure.</b> An unhandled exception unwinds the stack, prints a traceback to stderr, and exits with code <b>1</b>. That traceback is a gift to you and an insult to your operator — great for debugging, terrible as a user-facing failure. Handling errors means catching the specific exceptions you expect and turning them into a clear message plus a chosen exit code.</li>
+      <li><b>The exit code is the last word.</b> <code>sys.exit(main())</code> makes the interpreter exit with whatever integer <code>main()</code> returned. That integer is what every automation upstream actually reads. <code>0</code> is success; the meaning of nonzero is yours to define and document — and for check-style tools there's a widely-used convention: <code>0</code> OK, <code>1</code> WARNING, <code>2</code> CRITICAL, <code>3</code> UNKNOWN.</li>
+    </ol>
+    <div class="box gotcha"><div class="h">The two mistakes that make ops code untrustworthy</div>
+      <p><b>No timeout, and bare <code>except</code>.</b> A network call without a timeout can hang forever — your "health check" becomes the thing that never returns, and now you have two incidents. Always pass <code>timeout=</code> to every call that touches the network or another process. And <code>except:</code> (or <code>except Exception:</code>) that swallows everything will also swallow <code>KeyboardInterrupt</code> and the very bug you needed to see, then probably exit <code>0</code> as if all was well. Catch the specific exceptions you expect; let the ones you don't crash loudly.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: your Python check script hangs in production and never exits, wedging the monitoring that calls it. What's the most likely cause, and the one-line fix?</summary>
+      <div class="body">
+        <p>A network or subprocess call with no timeout, blocked on something that will never answer — a dead endpoint, a hung DNS lookup, a child process waiting on input. The fix is to pass an explicit timeout to <em>every</em> boundary call: <code>urlopen(req, timeout=5)</code>, <code>subprocess.run([...], timeout=10)</code>, and a socket-level default as a backstop. A check that can hang forever is worse than one that fails, because it takes the caller down with it and reports nothing. Timeouts turn "hangs silently" into "fails with a clear UNKNOWN," which is a state your automation can act on.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The stdlib ops toolbox</h2>
+    <p>You can build almost any ops tool from the standard library alone, which keeps your dependencies — and your supply-chain risk — near zero. The pieces, each filed by what it owns:</p>
+    <ul>
+      <li><b><code>argparse</code> — the front door.</b> Declares your arguments (required, typed, with defaults and help), validates them, and generates <code>--help</code> and usage errors. It's the intake clerk; nothing should reach your logic unvalidated.</li>
+      <li><b><code>subprocess</code> — calling other programs.</b> <code>subprocess.run([...], capture_output=True, text=True, timeout=10, check=True)</code>. Pass a list (never a string with <code>shell=True</code> on untrusted input), capture output, set a timeout, and let <code>check=True</code> raise on a nonzero exit. This is how Python does what bash does natively — carefully.</li>
+      <li><b><code>urllib.request</code> (or <code>requests</code>) — HTTP.</b> The stdlib <code>urllib</code> needs no install and is fine for straightforward calls; the third-party <code>requests</code> is friendlier for sessions, retries, and JSON. Either way: always a timeout, always handle the error classes, and check the status.</li>
+      <li><b><code>json</code> — structured data.</b> <code>json.loads</code>/<code>json.dumps</code>. The reason you left bash: parsing an API response into real dicts and lists and working with them, instead of wrestling <code>jq</code> and string-mangling.</li>
+      <li><b><code>logging</code> — the record.</b> <code>logging.basicConfig(level=…, stream=sys.stderr)</code> then <code>log.info/warning/error</code>. Structured, level-filtered output to stderr, separate from your result. Never <code>print()</code> your diagnostics into stdout.</li>
+      <li><b><code>pathlib</code> and <code>os</code> — the filesystem and environment.</b> <code>pathlib.Path</code> for clean, cross-platform path handling; <code>os.environ</code> for configuration and secrets passed by environment (never hard-code them).</li>
+      <li><b><code>sys</code> — the process interface.</b> <code>sys.argv</code>, <code>sys.exit(code)</code>, <code>sys.stdout</code>/<code>sys.stderr</code>. The direct line to the exit-code and channel discipline the whole design rests on.</li>
+      <li><b><code>pytest</code> — the QA reviewer.</b> Plain functions named <code>test_*</code> with <code>assert</code>. Combined with <code>monkeypatch</code> to replace the I/O boundary, it lets you test all your logic — including every failure branch — without a network. This is the component that makes the difference between a script and a tool.</li>
+      <li><b>Packaging — <code>pyproject.toml</code>.</b> A few lines that turn your file into an installable command with a real entry point, pinned dependencies, and a version. It's how the tool stops being "that script on the jump box" and becomes something the team installs and upgrades.</li>
+    </ul>
+
+    <details class="recall"><summary>Think first: your tool prints results <em>and</em> debug lines with <code>print()</code>. A colleague pipes its output into another script and it breaks. Why?</summary>
+      <div class="body">
+        <p>Because <code>print()</code> writes to <b>stdout</b>, so your debug chatter is now mixed into the same stream as the real results — and the downstream script, which expected only clean results on stdout, chokes on the noise. The fix is the three-channel discipline: results to stdout, diagnostics to stderr (that's what <code>logging</code> does by default, or <code>print(..., file=sys.stderr)</code>), and the verdict in the exit code. Then a consumer can do <code>yourtool | jq .</code> and get exactly the data, while a human still sees the logs on the terminal. Muddling stdout is the single most common reason an otherwise-working tool can't be composed with others — and composability is the whole point of a CLI.</p>
+      </div>
+    </details>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one invocation</h2>
+    <p>Trace a single run of the health-check tool you'll build. You run <code>healthcheck --url https://api.internal/health --timeout 5</code>. The interpreter starts and fills <code>sys.argv</code>; <code>argparse</code> confirms <code>--url</code> is present and <code>--timeout</code> is a float, and — had you fat-fingered the flag — it would have printed usage to stderr and exited 2 without any work happening. <code>main()</code> configures logging to stderr and calls <code>http_get(url, timeout)</code>. That opens a socket, sends the request, and blocks — but only for five seconds, because of the timeout. Three things can come back: a 200, which the tool logs as OK, prints a one-line result to stdout, and returns exit 0; an <code>HTTPError</code> for a 4xx/5xx, which it logs as CRITICAL and returns exit 2; or a timeout or connection error, which it logs as UNKNOWN and returns exit 3. Whatever happens, the operator sees a readable log line on stderr, any consumer sees a clean result on stdout, and the monitoring system that called it reads the exit code and decides whether to page. One invocation, three channels, every failure mode named — that's the tool you're about to write and test.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>Run everything in a Python container so your Mac stays clean:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>docker run --rm -it --name pylab python:3.12-slim bash
+pip install pytest        <span class="c"># the only dependency we'll add; everything else is stdlib</span>
+mkdir /app &amp;&amp; cd /app</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — scaffold the CLI tool</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Write the skeleton every tool shares: <code>argparse</code>, a <code>main()</code>, worker functions, and the guard. Save as <code>check.py</code>.</p>
+        <div class="codewrap"><span class="lang">python</span><pre><code>#!/usr/bin/env python3
+"""Check an HTTP endpoint and exit with a monitoring-style code."""
+import argparse, logging, sys
+import urllib.request, urllib.error
+
+OK, WARN, CRIT, UNKNOWN = 0, 1, 2, 3
+log = logging.getLogger("healthcheck")
+
+def http_get(url: str, timeout: float) -&gt; int:
+    """Return the HTTP status code, or raise. This is the I/O boundary."""
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.status
+
+def check(url: str, timeout: float) -&gt; int:
+    """Pure logic: turn the outcome into an exit code. Easy to test."""
+    try:
+        status = http_get(url, timeout)
+    except urllib.error.HTTPError as e:
+        log.error("%s returned HTTP %s", url, e.code)
+        return CRIT
+    except (urllib.error.URLError, TimeoutError) as e:
+        log.error("%s unreachable: %s", url, e)
+        return UNKNOWN
+    if status == 200:
+        log.info("%s OK (200)", url)
+        print(f"OK {url} 200")
+        return OK
+    log.warning("%s returned %s", url, status)
+    return WARN
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="HTTP health check")
+    p.add_argument("--url", required=True, help="endpoint to check")
+    p.add_argument("--timeout", type=float, default=5.0)
+    p.add_argument("-v", "--verbose", action="store_true")
+    return p.parse_args(argv)
+
+def main(argv=None) -&gt; int:
+    args = parse_args(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s", stream=sys.stderr)
+    return check(args.url, args.timeout)
+
+if __name__ == "__main__":
+    sys.exit(main())</code></pre></div>
+        <p>Run it against a real endpoint and inspect the exit code:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>python check.py --url https://example.com ; echo "exit=$?"</code></pre></div>
+        <div class="out"><span class="ol">Output</span>2024-... INFO https://example.com OK (200)
+OK https://example.com 200
+exit=0</div>
+        <p>Notice the split already working: the <code>INFO</code> line went to stderr, the <code>OK …</code> result to stdout, and the exit code is <code>0</code>. Three channels, each doing its job. The two functions are deliberately separated — <code>http_get</code> is the only part that touches the network, and <code>check</code> is pure logic. That separation is what makes Lab 5's test trivial.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — exit codes as an interface</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>The exit code is a contract with whatever runs your tool. Prove each branch produces the code you designed.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>python check.py --url https://example.com/nope ; echo "exit=$?"   <span class="c"># 404 → CRIT (2)</span>
+python check.py --url https://10.255.255.1 --timeout 2 ; echo "exit=$?"  <span class="c"># unroutable → UNKNOWN (3)</span>
+python check.py ; echo "exit=$?"                                  <span class="c"># missing --url → argparse exits 2</span></code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>2024-... ERROR https://example.com/nope returned HTTP 404
+exit=2
+2024-... ERROR https://10.255.255.1 unreachable: &lt;urlopen error timed out&gt;
+exit=3
+usage: check.py [-h] --url URL [--timeout TIMEOUT] [-v]
+check.py: error: the following arguments are required: --url
+exit=2</div>
+        <p>Now you can chain it: <code>python check.py --url X &amp;&amp; ./deploy.sh</code> only deploys if the check passes. That composability is the entire reason to be strict about exit codes. The convention here — 0/1/2/3 as OK/WARN/CRIT/UNKNOWN — is the one Nagios-style monitoring expects, so this tool drops straight into a monitoring pipeline.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — the traceback and the hang</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>See what bad error handling looks like from the operator's chair. Temporarily break <code>check</code> by removing the <code>except</code> clauses (just call <code>http_get</code> directly) and hit a dead host with no timeout:</p>
+        <div class="codewrap"><span class="lang">python</span><pre><code><span class="c"># A deliberately bad version — no timeout, no handling:</span>
+import urllib.request
+urllib.request.urlopen("http://10.255.255.1")   <span class="c"># hangs... then, eventually:</span></code></pre></div>
+        <div class="out"><span class="ol">Output (after a long wait)</span>Traceback (most recent call last):
+  File "&lt;stdin&gt;", line 1, in &lt;module&gt;
+  ...
+urllib.error.URLError: &lt;urlopen error [Errno 113] No route to host&gt;</div>
+        <p>Two failures at once: it hung with no timeout, and when it finally died it vomited a traceback with an exit code of <code>1</code> — no distinction between "endpoint down" and "your code has a bug." Why is a raw traceback the wrong thing to show an operator, and what should the tool do instead? Decide before revealing.</p>
+        <details class="recall"><summary>Reveal — what good error handling gives you</summary>
+          <div class="body">
+            <p>A raw traceback is a debugging artifact aimed at <em>you</em>, the author. To the operator at 3am it's noise that buries the one fact they need — <em>what</em> failed and what to do about it. And because every unhandled exception exits <code>1</code>, automation can't tell a real outage from a typo in your code. The fix is exactly what Lab 1 already does: catch the <em>specific</em> exceptions you expect (<code>HTTPError</code>, <code>URLError</code>, <code>TimeoutError</code>), log a one-line human message, and return a distinct exit code per failure class. Let exceptions you <em>didn't</em> expect crash with their traceback — those are bugs you want to see loudly, not swallow. "Handle what you predicted; crash on what you didn't" is the rule.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — subprocess done wrong</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>A teammate's tool shells out to <code>ping</code> to check a host. It works in the demo and is a security hole in production. Run it and see the problem.</p>
+        <div class="codewrap"><span class="lang">python</span><pre><code>import subprocess
+def ping_bad(host):
+    <span class="c"># DANGER: shell=True + string interpolation = injection</span>
+    return subprocess.run(f"ping -c1 {host}", shell=True).returncode
+
+ping_bad("example.com")                 <span class="c"># works...</span>
+ping_bad("example.com; echo PWNED")     <span class="c"># ...and runs arbitrary commands</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>PING example.com ...
+PWNED</div>
+        <p>The injected <code>echo PWNED</code> ran — with an attacker-controlled host that could be <code>rm -rf</code> or worse. There are three separate problems here: injection, no timeout, and no check of the result. What does the safe version look like? Work it out, then reveal.</p>
+        <details class="recall"><summary>Reveal — the safe subprocess pattern</summary>
+          <div class="body">
+            <p>Pass arguments as a <b>list</b> so there's no shell to interpret them, add a <b>timeout</b>, and <b>check the return code</b> deliberately:</p>
+            <div class="codewrap"><span class="lang">python</span><pre><code>import subprocess
+def ping(host: str) -&gt; bool:
+    try:
+        r = subprocess.run(
+            ["ping", "-c1", "-W2", host],   <span class="c"># list = no shell, no injection</span>
+            capture_output=True, text=True, timeout=5, check=True)
+        return True
+    except subprocess.CalledProcessError:   <span class="c"># ping exited nonzero (host down)</span>
+        return False
+    except subprocess.TimeoutExpired:       <span class="c"># didn't finish in 5s</span>
+        return False</code></pre></div>
+            <p>With a list, <code>"example.com; echo PWNED"</code> is passed to <code>ping</code> as a single (invalid) hostname — <code>ping</code> just fails, nothing executes. This is the same lesson as bash quoting in <a href="ch08-bash-and-shell-scripting-for-automation.html">Chapter 8</a>: untrusted input must never become executable syntax. Reach for <code>shell=True</code> only with fully-trusted, static strings, and even then, prefer the list.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — test it, then package it</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>The thing that turns a script into a tool: a test that proves the logic without touching the network, and a package that installs as a real command. Because Lab 1 kept the I/O in <code>http_get</code> and the logic in <code>check</code>, you can replace the boundary and test every branch. Save as <code>test_check.py</code>:</p>
+        <div class="codewrap"><span class="lang">python</span><pre><code>import urllib.error
+import check
+
+def test_ok(monkeypatch):
+    monkeypatch.setattr(check, "http_get", lambda url, timeout: 200)
+    assert check.check("http://x", 1) == check.OK
+
+def test_500_is_critical(monkeypatch):
+    def boom(url, timeout):
+        raise urllib.error.HTTPError(url, 500, "err", {}, None)
+    monkeypatch.setattr(check, "http_get", boom)
+    assert check.check("http://x", 1) == check.CRIT
+
+def test_timeout_is_unknown(monkeypatch):
+    def boom(url, timeout):
+        raise TimeoutError("timed out")
+    monkeypatch.setattr(check, "http_get", boom)
+    assert check.check("http://x", 1) == check.UNKNOWN</code></pre></div>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>pytest -q</code></pre></div>
+        <div class="out"><span class="ol">Output</span>...                                                            [100%]
+3 passed in 0.03s</div>
+        <p>Three failure branches proven in 30 milliseconds, offline. Now package it so it's an installable command, not a loose file. Create <code>pyproject.toml</code>:</p>
+        <div class="codewrap"><span class="lang">toml</span><pre><code>[project]
+name = "healthcheck"
+version = "0.1.0"
+requires-python = "&gt;=3.9"
+dependencies = []
+
+[project.scripts]
+healthcheck = "check:main"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"</code></pre></div>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>pip install -e .
+healthcheck --url https://example.com ; echo "exit=$?"   <span class="c"># now a real command on PATH</span></code></pre></div>
+        <p>Now the senior question: which one design choice in Lab 1 made this test possible, and how would you argue for it in code review? Think it through.</p>
+        <details class="recall"><summary>Reveal — the choice that makes ops code testable</summary>
+          <div class="body">
+            <p><b>Isolating the I/O at a single boundary.</b> <code>http_get</code> is the <em>only</em> function that touches the network; <code>check</code> is pure decision logic over its result. That one seam lets a test swap <code>http_get</code> for a stub and exercise every branch — OK, CRITICAL, UNKNOWN — deterministically and offline. If the HTTP call had been buried inside a 60-line <code>main()</code>, you could only test it by hitting a real (or faked) server, which is slow, flaky, and often skipped. The review argument is simple and it's the core of testable ops code: <em>push side effects to the edges and keep the logic pure in the middle</em>. Everything hard to test — network, disk, subprocess, clock — goes behind a thin function you can replace. Do that and your automation earns the trust to run unattended.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · the automation that hangs</div>
+      <p><b>Symptom:</b> a scheduled job or health check stops returning; the thing meant to detect problems is now itself stuck, and nothing pages. <b>First cut:</b> <code>strace -p &lt;pid&gt;</code> or <code>py-spy dump --pid &lt;pid&gt;</code> — it's parked in a socket read or a <code>wait</code>. <b>Cause is usually:</b> a network call or <code>subprocess</code> with no timeout, blocked on a dead endpoint or a child waiting for input. The fix is a timeout on every boundary call, plus an overall wall-clock guard.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · the tool that always exits 0</div>
+      <p><b>Symptom:</b> a check reports healthy while the thing it checks is broken, so no alert fires. <b>First cut:</b> read for a bare <code>except:</code> that swallows the error and falls through to a <code>return 0</code>, or a <code>main()</code> with no <code>sys.exit(...)</code>. <b>Cause is usually:</b> over-broad exception handling hiding the failure, or forgetting that returning from <code>main()</code> without <code>sys.exit</code> exits 0. Catch specific exceptions and map each to a real exit code.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · works on my machine, breaks in the pod</div>
+      <p><b>Symptom:</b> a tool runs on the author's laptop and crashes in production with an import error or wrong behaviour. <b>First cut:</b> compare Python versions and installed packages; check whether it relied on a globally-installed dependency. <b>Cause is usually:</b> no pinned dependencies and no virtualenv — the laptop had a package the container doesn't, or a different Python. The fix is packaging with pinned deps (a lockfile or exact versions) and running in a clean environment, so "it worked here" means "it works everywhere."</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Stdlib first, dependencies deliberately.</b> Every third-party package is a version to track and a supply-chain risk to own. For most ops tools, <code>urllib</code>, <code>json</code>, <code>subprocess</code>, and <code>logging</code> are enough. When you do add a dependency — <code>requests</code>, <code>boto3</code>, a Kubernetes client — pin it exactly and install into a virtualenv or a locked container image, never against the system Python. "Works on my machine" is almost always an unpinned-dependency story.</p>
+    <p><b>Timeouts and exit codes are non-negotiable.</b> Every call that leaves the process — HTTP, subprocess, DNS, database — gets an explicit timeout, because a tool that can hang is worse than one that fails. And every exit path returns a documented code, because that's the only thing your monitoring and CI can act on. These two habits, more than any clever code, are what make automation safe to run unattended.</p>
+    <p><b>Security.</b> Never build a shell command from untrusted input — pass argument lists to <code>subprocess</code> and keep <code>shell=True</code> away from anything a user or an API can influence. Read secrets from the environment or a secrets manager, never from source or command-line arguments (which land in <code>ps</code> and shell history). Validate and constrain inputs at the <code>argparse</code> boundary. The injection lesson from bash is identical here; the language changed, the discipline didn't.</p>
+    <p><b>Test the logic, log the actions.</b> Push side effects to thin boundary functions so the decision logic stays pure and testable, and write tests for the failure branches specifically — the happy path rarely breaks, the error paths do. Log to stderr at sensible levels so an operator can see what the tool did and a machine can still consume stdout. Add type hints and run <code>mypy</code> if the tool grows; it catches a class of bugs before runtime.</p>
+    <p><b>Know Python's ceiling too.</b> Python is close to perfect for ops glue and control-plane logic, but it's slow for hot loops and its threading is limited by the GIL for CPU-bound work. When you need a single static binary, heavy concurrency, or predictable low-latency performance — a high-throughput controller, a network proxy, a CLI shipped to thousands of machines — that's the argument for Go (<a href="ch121-go-for-sre-optional-language-track.html">Chapter 121</a>). Most of the time Python is right; know when it isn't.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>Python is the layer just above the glue — where a platform's operational intelligence lives. The custom Prometheus exporter that scrapes a system's metrics (<a href="ch75-prometheus.html">Chapter 75</a>), the ChatOps bot that runs runbooks, the CI helper that gates a deploy, the internal CLI every engineer uses to talk to your platform, the small controller that reconciles some resource Kubernetes doesn't natively know about — these are overwhelmingly Python. The design principle that carries over is the one from the labs: isolate side effects at the edges, keep logic pure and tested in the middle. That's not just a testing trick; it's the same boundary thinking that separates a stateless service from its datastore, or a controller's reconcile logic from the API calls it makes. Tools built this way are the ones a platform team can hand off, extend, and trust — and untested automation that touches production is, in the end, just a faster way to cause an incident. The reliability of your automation is part of the reliability of your system.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>Why <code>if __name__ == "__main__"</code>?</summary>
+        <div class="a"><p>It makes the block run only when the file is executed directly, not when it's imported as a module. That matters because it lets a test import your tool to call its functions without triggering the whole program to run, and it lets other code reuse your functions cleanly. The idiom is <code>if __name__ == "__main__": sys.exit(main())</code> — so the script's behaviour is in <code>main()</code>, importable and testable, and the guard just wires it to the command line.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>How do you structure a production CLI tool in Python?</summary>
+        <div class="a"><p>A fixed skeleton. <code>argparse</code> at the front to declare, validate, and document arguments — it handles usage errors and exits 2 on bad input for free. A <code>main(argv=None)</code> that configures logging to stderr and coordinates the work, returning an integer exit code. The actual work split into small functions, with the I/O — HTTP, subprocess, filesystem — isolated behind thin boundary functions so the logic in the middle stays pure and testable. Every external call gets an explicit timeout. Errors are handled by catching the specific exceptions I expect and mapping each to a distinct, documented exit code, while unexpected exceptions crash loudly. Output discipline: results to stdout, logs to stderr, verdict in the exit code. Then a <code>pytest</code> suite that stubs the boundaries to test every branch offline, and a <code>pyproject.toml</code> so it installs as a real command with pinned dependencies. That structure is what makes it safe to run unattended and easy for the next person to change.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Why is <code>subprocess.run(f"cmd {x}", shell=True)</code> dangerous, and what's the right way?</summary>
+        <div class="a"><p>With <code>shell=True</code>, Python hands the whole string to <code>/bin/sh</code>, which interprets shell metacharacters — so if <code>x</code> is attacker- or user-controlled, a value like <code>"host; rm -rf /"</code> runs a second command. It's shell injection, the same class as SQL injection. The right way is to pass a <em>list</em> of arguments — <code>subprocess.run(["cmd", x], ...)</code> — with no <code>shell=True</code>; then there's no shell to interpret anything, and <code>x</code> is passed as a single literal argument no matter what it contains. I'd also always add a <code>timeout</code> so it can't hang, and either <code>check=True</code> to raise on failure or an explicit check of <code>returncode</code>. Reserve <code>shell=True</code> for fully-static, trusted strings where you actually need a pipe or a glob — and even then a list is usually cleaner.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>Your monitoring calls a Python check script, and one day it stops reporting entirely — no OK, no alert. What happened and how do you prevent it?</summary>
+        <div class="a"><p>The script is almost certainly hung on a boundary call with no timeout — an HTTP request or subprocess blocked on a dead dependency — so it never returns an exit code, and the monitoring is stuck waiting on it. I'd confirm by looking at the process: it'll be parked in a socket read (<code>strace -p</code> or a Python stack dump shows it). Two failures compound here: the missing timeout, and often a bare <code>except</code> that would have hidden a related error. Prevention is a timeout on every external call, an overall wall-clock budget for the whole check, and mapping every outcome — including "couldn't tell" — to a real exit code, so the worst case is a fast UNKNOWN the monitoring can act on rather than an indefinite hang. A health check that can hang is an outage generator.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>When would you write ops automation in Go instead of Python?</summary>
+        <div class="a"><p>When Python's weaknesses become the bottleneck. Three cases mainly: I need a single static binary with no runtime or dependency to install — a CLI shipped to thousands of hosts, or a tool that has to run in a scratch container; I need heavy concurrency or CPU-bound throughput, where Python's GIL and interpreter overhead hurt and Go's goroutines and compilation win; or I'm building something latency-sensitive and long-running, like a controller or proxy in the request path, where predictable performance matters. For the vast majority of ops work — glue, API calls, report generation, one-shot tools — Python's speed of writing and its stdlib make it the right default, and the runtime cost is irrelevant. I switch to Go deliberately when distribution, concurrency, or performance is the actual requirement, not by habit.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>Python takes over from bash when the logic between commands becomes the point — data structures, JSON, HTTP with error handling, and code that must be tested and maintained for years. A well-built tool has one skeleton: <code>argparse</code> validates and documents the arguments and exits 2 on bad input; <code>main()</code> configures logging to stderr and coordinates small functions; the I/O — HTTP, subprocess, filesystem — is isolated behind thin boundary functions with explicit timeouts on every call; errors are handled by catching the specific exceptions you expect and mapping each to a distinct exit code, while unexpected ones crash loudly. Keep the three channels separate: results to stdout, logs to stderr, verdict in the exit code. Call subprocesses with argument lists, never <code>shell=True</code> on untrusted input. The move that makes ops code trustworthy is isolating side effects at the edges so the middle stays pure and testable — then a <code>pytest</code> suite proves every failure branch offline, and a <code>pyproject.toml</code> ships it as a real, pinned, installable command. Reach for Go only when distribution, concurrency, or latency demands it.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>The skeleton is always the same: <code>argparse</code> → <code>main()</code> → small functions → <code>if __name__ == "__main__": sys.exit(main())</code>.</li>
+      <li>Three channels, three jobs: stdout = result, stderr = logs, exit code = machine-readable verdict.</li>
+      <li>Define exit codes deliberately; for checks, 0/1/2/3 = OK/WARN/CRIT/UNKNOWN is the standard convention.</li>
+      <li>Every network or subprocess call gets an explicit timeout — a tool that can hang is worse than one that fails.</li>
+      <li>Catch the specific exceptions you expect and map each to an exit code; let unexpected ones crash loudly. Never bare <code>except</code>.</li>
+      <li>Call subprocesses with an argument <em>list</em>, not <code>shell=True</code> + string — that's injection, the same bug as bash quoting.</li>
+      <li>Isolate I/O behind thin boundary functions so the decision logic stays pure — that's what makes it testable.</li>
+      <li>Write <code>pytest</code> tests for the failure branches specifically, stubbing the boundary so they run offline in milliseconds.</li>
+      <li>Stdlib first (<code>urllib</code>, <code>json</code>, <code>subprocess</code>, <code>logging</code>); pin any dependency and install into a clean environment.</li>
+      <li>Package with <code>pyproject.toml</code> and an entry point so it's a real command; reach for Go only for distribution, concurrency, or latency.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on and toward:</span>
+      <a href="ch01-kernel-and-system-calls.html"><b>Ch 1</b> fork/exec under subprocess</a>
+      <a href="ch08-bash-and-shell-scripting-for-automation.html"><b>Ch 8</b> Where bash stops</a>
+      <a href="ch75-prometheus.html"><b>Ch 75</b> Custom exporters</a>
+      <a href="ch92-incident-management-postmortems-and-the-sre-operating.html"><b>Ch 92</b> Reliable operations</a>
+      <a href="ch118-timed-scripting-and-log-wrangling-sre-coding.html"><b>Ch 118</b> SRE coding</a>
+      <a href="ch121-go-for-sre-optional-language-track.html"><b>Ch 121</b> Go for SRE</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Python — <a href="https://docs.python.org/3/library/argparse.html">argparse</a> and <a href="https://docs.python.org/3/library/subprocess.html">subprocess</a> (official docs): the front door and the safe way to call other programs, including the <code>shell=True</code> security note.</li>
+      <li>Python — <a href="https://docs.python.org/3/library/logging.html">logging</a> and <a href="https://docs.python.org/3/howto/logging.html">Logging HOWTO</a>: levels, handlers, and logging to stderr.</li>
+      <li>Python — <a href="https://docs.python.org/3/library/urllib.request.html">urllib.request</a> and <a href="https://docs.python.org/3/library/json.html">json</a>: HTTP calls and structured data from the standard library, no dependencies.</li>
+      <li>pytest — <a href="https://docs.pytest.org/">docs.pytest.org</a> (first-party): writing tests, fixtures, and <code>monkeypatch</code> for isolating boundaries.</li>
+      <li>Python Packaging Authority — <a href="https://packaging.python.org/">packaging.python.org</a> (official): <code>pyproject.toml</code>, entry points, and pinning dependencies.</li>
+      <li>Python — <a href="https://peps.python.org/pep-0008/">PEP 8</a> (official style guide): the conventions that keep ops code readable for the next on-call.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch08-bash-and-shell-scripting-for-automation.html"><span class="dir">← Prev</span><div class="ti">Ch 8 — Bash and shell scripting for automation</div></a>
+      <a class="nx" href="ch10-osi-vs-tcp-ip-encapsulation-the-layered.html"><span class="dir">Next →</span><div class="ti">Ch 10 — OSI vs TCP/IP, encapsulation, the layered model</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 9 of 121 · Part I · Linux &amp; OS Foundations. The difference between a script and a tool is structure, error handling, and a test.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Anatomy of a CLI tool</a>
+    <a href="#internals">What happens when you run it</a>
+    <a href="#components">The stdlib toolbox</a>
+    <a href="#flow">Following one invocation</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

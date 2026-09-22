@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 74 — Observability Foundations</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part VIII · Observability &nbsp;·&nbsp; Chapter 74</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part VIII · Observability · Chapter 74</div>
+      <h1>Observability foundations</h1>
+      <p class="tagline">A dashboard says CPU is at 40% and nothing looks wrong. A customer says checkout just hung for eleven seconds. Both of those can be true at once — the gap between them is exactly what this chapter, and the rest of Part VIII, is for.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~38 min read · demo app on kind</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain the real difference between metrics, logs, and traces — not the marketing version.</li>
+          <li>Pick the right lens for what to measure: RED, USE, or the four Golden Signals.</li>
+          <li>Say exactly what each signal is bad at, not just what it's good at.</li>
+          <li>Follow one slow request across all three signals instead of guessing from one.</li>
+          <li>Recognize the "we have dashboards but nobody trusts them" failure mode before you build it yourself.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>Monitoring told you something's wrong. It won't tell you why.</h2>
+    <p>By this point in the book you've shipped something onto a cluster. Pods are <code>Ready</code>, the load balancer's health checks are green, <code>kubectl get pods</code> shows nothing red. Then a support ticket lands: checkout has been slow for the last ten minutes, and only for some customers. You look at the CPU graph. 40%. You look at memory. Fine. You look at the node dashboard someone built eight months ago. All green.</p>
+    <p>None of that tells you why one customer's checkout hung for eleven seconds. A CPU-and-memory dashboard answers "is the machine okay," which is a completely different question from "why did this one request take eleven seconds." You can have a perfectly healthy fleet of machines and a badly broken user experience at the same time — a slow downstream dependency, a lock held too long, a retry loop with no backoff, a single bad database query plan. The machine is fine. The <em>request</em> is not.</p>
+    <p>This is the difference between <b>monitoring</b> and <b>observability</b>, and it's worth being precise about it instead of treating them as synonyms. Monitoring is watching a fixed set of things you already decided to watch, and alerting when they cross a threshold — it answers questions you thought of in advance. Observability is having enough detail recorded, in a form you can slice arbitrarily, to answer a question you <em>didn't</em> think of in advance — "why was it slow, for this customer, on this endpoint, at 2:14pm, and nowhere else." You get there with three complementary kinds of telemetry, not one: metrics, logs, and traces. Each one is cheap in a different way and blind in a different way. This chapter is about knowing which one to reach for, and what it will and won't tell you.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>A green dashboard is not the same claim as "users are happy." It's the claim that the specific numbers someone chose to watch are inside the range someone chose to accept. Both of those choices can be wrong without any graph turning red.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a hospital, not a car dashboard</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Picture a hospital ward instead of a single car dashboard, because you're watching many patients, not one engine. Each bed has a <b>vitals monitor</b> — heart rate, blood pressure, oxygen, sampled continuously and plotted as a number over time. That's a <b>metric</b>: cheap, continuous, aggregate, and it never tells you a story, only a value. Next to the bed is the <b>patient's chart</b> — discrete notes a nurse writes down at specific moments: "10:14, gave 5mg, patient reports pain." That's a <b>log</b>: rich, specific, but only about one moment, written in whatever words the nurse chose.</p>
+      <p>Now picture one patient's entire visit — the ambulance ride, triage, the ER doctor, the referral to radiology, the specialist, the discharge — as a single connected path with a patient ID stapled to every step. That's a <b>trace</b>: not a snapshot and not a note, but the causal shape of one journey through every department it touched, with the time spent in each one. The vitals monitor tells you the whole ward's average heart rate is fine. The chart tells you what happened at 10:14 for one patient. Only the connected visit record tells you this <em>specific</em> patient spent four of their six hours waiting on a radiology machine that was double-booked.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In an observability system</th></tr>
+      <tr><td>The vitals monitor — a number, sampled continuously</td><td>A metric (counter, gauge, histogram)</td></tr>
+      <tr><td>The nurse's chart note — one moment, in detail</td><td>A log line</td></tr>
+      <tr><td>The patient's full visit path, department to department</td><td>A trace — a tree of spans</td></tr>
+      <tr><td>The patient ID stapled to every department's paperwork</td><td>A trace ID / correlation ID carried through every signal</td></tr>
+      <tr><td>The ward's daily rounds summary board</td><td>A dashboard (Chapter 76)</td></tr>
+      <tr><td>"Call me if oxygen drops below 90"</td><td>An alerting rule (Chapter 77)</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>Three signals, one request, and how they correlate</h2>
+    <p>Treat metrics, logs, and traces as three different lossy compressions of the same underlying reality — everything your system actually did. Each compression throws away almost everything, on purpose, to stay affordable, and each throws away a <em>different</em> part. A metric throws away which specific request it was, keeping only the count and the shape. A log line keeps one moment in full detail but throws away its causal neighbors. A trace keeps the causal shape of one request but is too expensive to keep for every single one. None of the three is "the real data" — the real data doesn't exist anywhere in a form you could query. What exists is three deliberately different views, and the value comes from moving between them.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 400" role="img" aria-label="Metrics, logs, and traces as three different views of the same request, correlated by a shared trace ID">
+        <defs>
+          <marker id="ob1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="ob2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--muted)"/></marker>
+        </defs>
+        <text x="360" y="18" text-anchor="middle" style="fill:var(--muted);font:700 11px sans-serif;letter-spacing:.05em">ONE REQUEST PRODUCES THREE DIFFERENT VIEWS OF ITSELF</text>
+
+        <rect x="18" y="34" width="210" height="150" rx="9" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.4"/>
+        <text x="123" y="58" text-anchor="middle" style="fill:var(--accent);font:700 13px sans-serif">METRICS</text>
+        <text x="123" y="80" text-anchor="middle" style="fill:var(--ink);font:11px sans-serif">aggregate numbers over time</text>
+        <text x="123" y="98" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">cheap · low cardinality</text>
+        <text x="123" y="116" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">no memory of one request</text>
+        <text x="123" y="140" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">answers: how much,</text>
+        <text x="123" y="156" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">how often, how slow on average</text>
+
+        <rect x="255" y="34" width="210" height="150" rx="9" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="360" y="58" text-anchor="middle" style="fill:var(--ink);font:700 13px sans-serif">LOGS</text>
+        <text x="360" y="80" text-anchor="middle" style="fill:var(--ink);font:11px sans-serif">discrete timestamped events</text>
+        <text x="360" y="98" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">rich detail, one line at a time</text>
+        <text x="360" y="116" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">no causal link, unless you add one</text>
+        <text x="360" y="140" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">answers: what exactly</text>
+        <text x="360" y="156" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">happened, right here</text>
+
+        <rect x="492" y="34" width="210" height="150" rx="9" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.4"/>
+        <text x="597" y="58" text-anchor="middle" style="fill:var(--accent2);font:700 13px sans-serif">TRACES</text>
+        <text x="597" y="80" text-anchor="middle" style="fill:var(--ink);font:11px sans-serif">causally-linked spans</text>
+        <text x="597" y="98" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">expensive per-request detail</text>
+        <text x="597" y="116" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">usually sampled, not kept whole</text>
+        <text x="597" y="140" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">answers: where did THIS</text>
+        <text x="597" y="156" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">request spend its time</text>
+
+        <rect x="150" y="320" width="420" height="58" rx="9" style="fill:var(--chip);stroke:var(--violet);stroke-width:1.4"/>
+        <text x="360" y="343" text-anchor="middle" style="fill:var(--violet);font:700 11.5px sans-serif">ONE HTTP REQUEST</text>
+        <text x="360" y="362" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">trace_id = 4bf92f3577b34da6a3ce929d0e0e4736</text>
+
+        <line x1="220" y1="320" x2="150" y2="186" style="stroke:var(--accent);stroke-width:1.6" marker-end="url(#ob1)"/>
+        <text x="130" y="255" text-anchor="middle" style="fill:var(--accent);font:600 10px sans-serif" transform="rotate(-58 130 255)">+1 to a counter</text>
+
+        <line x1="360" y1="320" x2="360" y2="186" style="stroke:var(--muted);stroke-width:1.6" marker-end="url(#ob2)"/>
+        <text x="392" y="255" style="fill:var(--muted);font:600 10px sans-serif">carries trace_id</text>
+
+        <line x1="500" y1="320" x2="565" y2="186" style="stroke:var(--accent2);stroke-width:1.6" marker-end="url(#ob1)"/>
+        <text x="600" y="255" text-anchor="middle" style="fill:var(--accent2);font:600 10px sans-serif" transform="rotate(58 600 255)">becomes the trace</text>
+
+        <line x1="228" y1="110" x2="252" y2="110" style="stroke:var(--muted);stroke-width:1.3;stroke-dasharray:4 3"/>
+        <line x1="465" y1="110" x2="489" y2="110" style="stroke:var(--muted);stroke-width:1.3;stroke-dasharray:4 3"/>
+        <text x="240" y="102" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">exemplar</text>
+        <text x="477" y="102" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">shared ID</text>
+      </svg>
+      <figcaption>The same request becomes a data point in a counter, a set of log lines, and a trace — all three carrying (or leading back to) the same identifier, which is what makes correlation possible.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>Every incident review eventually asks "how long did it take us to find the cause." Almost every slow investigation traces back to having only one of these three signals, or having all three but with nothing linking them. A metric spike with no trace tells you <em>when</em>; a trace with no logs tells you <em>where</em> but not the error message; logs with no correlation ID force someone to reconstruct a request's path by squinting at timestamps. Fast incident response is mostly a data-modeling problem you solved weeks earlier, not a debugging-skill problem you demonstrate live.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>Choosing a lens: RED, USE, and the four Golden Signals</h2>
+    <p>Having three signal types doesn't tell you <em>what</em> to measure with them. Left unguided, teams either measure everything (expensive, and mostly noise) or measure whatever was easy to add (CPU and memory, because the platform gives you those for free, even when the real problem is somewhere else entirely). Three lenses, each narrower than "measure everything," fix that:</p>
+    <ol class="steps">
+      <li><b>The four Golden Signals — the broadest lens, for any user-facing system.</b> From Google's SRE book: <b>latency</b> (time to serve a request — track successful and failed requests' latency separately, because a fast error is not a fast success), <b>traffic</b> (demand on the system — requests/second, or the closest equivalent), <b>errors</b> (rate of failed requests, including the ones that return HTTP 200 with the wrong content), and <b>saturation</b> — how full the most constrained resource is, since most systems degrade before they hit 100% of anything. If you can only watch four numbers for a service, these are the four.</li>
+      <li><b>RED — the narrow lens for a request-driven service.</b> <b>R</b>ate, <b>E</b>rrors, <b>D</b>uration. It's the Golden Signals minus saturation, because for a stateless service behind a load balancer, saturation is usually somebody else's problem (the node, the database) rather than this service's own. RED is what you put on a dashboard for an API, a microservice, anything that answers requests. You'll build exactly this dashboard shape in Chapter 76.</li>
+      <li><b>USE — the narrow lens for a resource.</b> <b>U</b>tilization, <b>S</b>aturation, <b>E</b>rrors. Where RED describes a service's behavior, USE describes a <em>thing</em> — a CPU, a disk, a network link, a connection pool. Utilization is how busy it is; saturation is how much work is queued waiting for it; errors are the resource-level failures (retries, dropped packets, rejected connections). Node-level dashboards are USE-shaped; service-level dashboards are RED-shaped. Mixing the two on one panel is how you end up with a dashboard that's technically full of data and answers nothing.</li>
+      <li><b>Apply the lens to the layer, not the whole system at once.</b> A checkout service gets a RED dashboard. The nodes it runs on get a USE dashboard. The database it calls gets both — RED for the queries it serves, USE for its own disk and connection pool. A system design is rarely one lens; it's RED at every service boundary and USE underneath every resource those services share.</li>
+    </ol>
+    <p>Golden Signals, RED, and USE all answer the same underlying question — "what's the smallest set of numbers that would tell me this thing is unhealthy" — for progressively narrower kinds of thing. None of them tell you to stop there forever; they tell you where to start, so your first dashboard has four to eight panels instead of forty.</p>
+
+    <details class="recall"><summary>Think first: your team's new service has one dashboard with 30 panels — CPU, memory, disk, network, JVM heap, GC pauses, thread pool size, and so on. Is that a RED dashboard?</summary>
+      <div class="body">
+        <p>No — that's a USE-flavored dashboard for the <em>machine</em> the service runs on, wearing a service's name. None of those 30 panels answer "is this service successfully serving requests, and how fast." A RED dashboard for that same service would have three panels: request rate, error rate, and duration (probably p50/p95/p99), sliced by endpoint. The 30-panel version isn't wrong to have — it's useful for a different question, "is the machine the bottleneck" — but if it's the <em>only</em> dashboard, nobody can answer "are users okay" without deriving it by eye from CPU graphs, which is exactly the gap this chapter opened with.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, named</h2>
+    <ul>
+      <li><b>Instrumentation.</b> The code (or an agent watching the code) that produces a signal in the first place — a client library incrementing a counter, a structured log statement, a tracer starting a span.</li>
+      <li><b>A collection path.</b> How the signal gets from the process that produced it to somewhere durable — Prometheus pulling metrics on a schedule (Chapter 75), an agent shipping log lines off the node (Chapter 78), a collector batching spans (Chapter 79). Each signal type has a different collection shape for good reasons you'll see chapter by chapter.</li>
+      <li><b>Storage.</b> A time-series database for metrics, an index-plus-object-store for logs, a trace store for spans. All three are optimized for very different access patterns, which is why one database rarely serves all three well.</li>
+      <li><b>A query layer and a human-facing view.</b> PromQL, LogQL-style log queries, a trace waterfall UI — and a dashboard or explorer sitting on top (Chapter 76).</li>
+      <li><b>A correlation key.</b> Whatever ties one request's presence in all three signals together — most commonly a trace ID, generated once at the edge and carried everywhere. Chapters 78 and 79 are largely about how to keep this thread from breaking.</li>
+      <li><b>Alerting.</b> The layer that decides which of these signals is worth waking a human up for, and which isn't (Chapter 77).</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one slow checkout across all three signals</h2>
+    <p>A customer reports checkout hanging. Here's the investigation this chapter is building toward, signal by signal. You open the RED dashboard for the checkout service (Chapter 76) and see p99 duration jump from 300ms to 9 seconds starting at 14:02 — that's the <b>metric</b> telling you <em>when</em> and <em>how bad</em>, across all requests, in aggregate. You don't yet know why, or whether it's every request or just some. You pull up traces for checkout requests in that window (Chapter 79) and open one of the slow ones: the waterfall shows the checkout service's own work took 40ms, then a child span into the payment service took 8.7 seconds — that's the <b>trace</b> telling you <em>where</em>, for one specific request, out of everything that request touched. Now you know it's payment, not checkout, and not the whole fleet — just calls that hit one particular downstream. You jump to logs for the payment service, filtered to that trace ID and that time window (Chapter 78), and find a line reading <code>connection pool exhausted, waited 8.6s for a free connection</code> — that's the <b>log</b> telling you exactly <em>why</em>, in the payment service's own words.</p>
+    <p>Notice what each signal contributed and what it couldn't have told you alone: the metric found the problem exists and roughly when; the trace found which hop and confirmed it wasn't the whole fleet; the log found the literal cause. Skip any one of the three and this investigation gets slower — skip the shared trace ID connecting them and it gets slower still, because now someone's matching timestamps by eye across two services' logs, which Lab 4 below will make you feel firsthand.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>These labs use real, official images only — no invented demo app yet, because the point here is to look at genuine metrics and genuine logs before Part VIII builds a full stack around them. Everything runs local-first on <code>kind</code>.</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>kind create cluster --name lab74</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — stand up one real metrics source and one real log source</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p><code>node_exporter</code> is Prometheus's own official host-metrics exporter — a genuine metrics signal with zero app code. Pair it with a plain container that just logs, so you have both signal types running side by side.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl create deployment node-exp --image=prom/node-exporter:v1.8.2
+kubectl expose deployment node-exp --port=9100
+kubectl run chatty --image=busybox --restart=Never -- \
+  sh -c 'i=0; while true; do echo "request $i handled in $((RANDOM % 500))ms"; i=$((i+1)); sleep 2; done'
+kubectl port-forward svc/node-exp 9100:9100 &amp;
+curl -s localhost:9100/metrics | head -5</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span># HELP node_cpu_seconds_total Seconds the CPUs spent in each mode.
+# TYPE node_cpu_seconds_total counter
+node_cpu_seconds_total{cpu="0",mode="idle"} 48291.02
+node_exporter_build_info{...} 1</code></div>
+        <p>That's a real metrics endpoint — the exact text format Chapter 75's Prometheus will scrape. Now look at the other signal:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl logs chatty --tail=5</code></pre></div>
+        <div class="out"><span class="ol">Output</span>request 12 handled in 211ms
+request 13 handled in 402ms
+request 14 handled in 87ms</code></div>
+        <p>Two completely different shapes of data, from two completely different collection mechanisms, already. One's a pull over HTTP on a schedule; the other's a stream of text you have to tail.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — classify what you're looking at through RED and USE</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p><code>node_exporter</code>'s metrics describe a <em>machine</em>, not a request. Confirm that, then ask what's missing.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>curl -s localhost:9100/metrics | grep -E '^node_(cpu|memory|filesystem)' | head -6</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>node_cpu_seconds_total{cpu="0",mode="idle"} 48291.02
+node_memory_MemAvailable_bytes 1.823e+09
+node_filesystem_avail_bytes{device="/dev/root"} 4.1e+10</code></div>
+        <p>Every one of those is USE-shaped: utilization (CPU busy time), saturation (memory pressure, filesystem headroom), errors (elsewhere in the same output, as <code>node_*_errors_total</code>). There is no request rate here, no error rate for a request, no duration — because <code>node_exporter</code> doesn't serve requests, it describes a resource. The <code>chatty</code> pod's log lines, meanwhile, <em>do</em> contain a duration ("handled in 211ms") — but it's trapped in unstructured text, not a queryable number, and there's no rate or error count anywhere. Neither signal you just stood up is RED-shaped yet. That gap is exactly what a real service's instrumentation (Chapter 75) exists to fill.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — take away the metric and ask "why," not just "what"</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Simulate the resource going away, then try to answer a "why" question using only what you have.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl scale deployment node-exp --replicas=0
+curl -s --max-time 3 localhost:9100/metrics</code></pre></div>
+        <div class="out"><span class="ol">Output</span>curl: (7) Failed to connect to localhost port 9100: Connection refused</code></div>
+        <p>You now know <em>that</em> the exporter is gone. Before reading on: using only this metrics signal and the <code>chatty</code> logs from Lab 1, can you determine <em>why</em> any single one of the "requests" in the chatty log took 400ms instead of 80ms?</p>
+        <details class="recall"><summary>Reveal why the answer is no</summary>
+          <div class="body">
+            <p>You can't, and it's not a tooling gap you can fix by looking harder — it's structural. <code>node_exporter</code>'s metrics have no concept of "a request" at all, so there's nothing to blame a specific slow one on. The <code>chatty</code> logs have a duration per line, but no request ID, no downstream call recorded, no error field — just a number a script made up. Neither signal here is capable of answering a per-request "why," because neither was built to represent one request's causal path. That capability is what a trace adds (Chapter 79), and it's why "we have metrics and logs" is not automatically the same claim as "we're observable."</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — correlate two pods' logs by timestamp alone, and watch it fail</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Run a second logger, then try to match "the same request" across both by eye — the way you would without a correlation ID.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl run chatty2 --image=busybox --restart=Never -- \
+  sh -c 'i=0; while true; do echo "downstream call $i in $((RANDOM % 500))ms"; i=$((i+1)); sleep 1; done'
+kubectl logs chatty --tail=4 --timestamps
+kubectl logs chatty2 --tail=4 --timestamps</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>2026-09-21T10:04:02.11Z request 40 handled in 340ms
+2026-09-21T10:04:04.09Z request 41 handled in 120ms
+---
+2026-09-21T10:04:02.30Z downstream call 88 in 200ms
+2026-09-21T10:04:02.95Z downstream call 89 in 90ms</code></div>
+        <p><code>chatty</code> logs every 2 seconds, <code>chatty2</code> every 1 second — so in any given 2-second window, <code>chatty2</code> has produced <em>two</em> log lines. Which one, if either, belongs to <code>chatty</code>'s request 40? Decide before opening the answer.</p>
+        <details class="recall"><summary>Reveal the problem with timestamp-only correlation</summary>
+          <div class="body">
+            <p>You genuinely can't tell — both of <code>chatty2</code>'s lines fall inside request 40's window, and nothing in either log says which call belongs to which request. In a real system with concurrent traffic, this ambiguity gets worse, not better: dozens of requests can be in flight on both services in the same one-second window, so "closest timestamp" silently picks the wrong pair a meaningful fraction of the time and nobody notices, because it still <em>looks</em> like an answer. This is precisely the failure mode a correlation ID removes — a single value, generated once and carried through every hop, that turns "probably this one" into "definitely this one." Chapter 78 makes this concrete; Chapter 79 formalizes it as a trace ID.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — design the signal set for a new service before writing it</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>Your team is about to build a new "order-pricing" service that other services call over HTTP. Before any code is written: what metrics, what log fields, and what do you deliberately leave for later? Think it through, then compare.</p>
+        <details class="recall"><summary>Reveal a strong answer</summary>
+          <div class="body">
+            <p><b>Metrics — RED, from day one:</b> a request counter labeled by route and status class (<code>2xx</code>/<code>4xx</code>/<code>5xx</code>, never the raw status code or the full path with IDs in it — that's Chapter 75's cardinality trap, arriving early), and a duration histogram with the same labels. That's the whole RED set for this service; USE-level node metrics come free from the platform.</p>
+            <p><b>Logs — structured, with a reserved field, from day one:</b> every log line as JSON with at minimum <code>timestamp</code>, <code>level</code>, <code>service</code>, <code>message</code>, and a <code>trace_id</code> field — even before a real tracer exists, reserve the field and populate it with whatever correlation value you already have (a request ID from the incoming header is fine as a placeholder scheme). Retrofitting a correlation field into a logging format after the fact, across every log line already written, is far more painful than reserving it up front.</p>
+            <p><b>Deliberately deferred:</b> full distributed tracing and its collector (Chapter 79) — not because it doesn't matter, but because it has real infrastructure cost, and a new service with low traffic gets more value per hour of engineering time from solid RED metrics and structured logs first. The trace ID field is reserved now specifically so plugging in real tracing later doesn't require touching every call site again.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · green dashboards, red customers</div>
+      <p><b>Symptom:</b> every panel on the team's dashboard is within normal range while users report real problems. <b>First cut:</b> check what lens the dashboard is actually built on — USE metrics for the node, not RED metrics for the service, is the single most common cause. <b>Confirm:</b> ask "does any panel here measure a request succeeding or failing," and if the answer is no, the dashboard cannot represent user pain by construction. <b>Usual fix:</b> add the missing RED panels; don't remove the USE ones, they answer a different, still-useful question.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · three signals, no shared thread</div>
+      <p><b>Symptom:</b> an incident takes 40 minutes to diagnose instead of 4, and most of that time is spent manually matching timestamps between a metrics graph, a log stream, and (if it exists at all) a trace tool. <b>First cut:</b> ask whether any signal carries a value that appears in another signal — a trace ID in a log line, an exemplar on a metric bucket. <b>Usual cause:</b> the three systems were adopted at different times by different teams, and nobody wired a shared identifier through all three. <b>Fix:</b> Chapters 78 and 79 exist specifically to close this gap; it's a data-modeling fix, not a new tool.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · measuring what's easy instead of what matters</div>
+      <p><b>Symptom:</b> a service has forty CPU/memory/JVM panels and zero panels about the requests it serves. <b>First cut:</b> this is almost always because the platform emits node and runtime metrics for free, while request-level metrics require the team to instrument their own code — so the free signal accumulates by default and the useful one never gets added. <b>Fix:</b> apply RED deliberately at every service boundary instead of accepting whatever the platform handed you as the whole picture.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Security.</b> All three signals leak sensitive data by the same mechanism: someone logs a request body, tags a metric with a customer ID, or attaches a full URL (with a token in the query string) as a span attribute. Treat "what fields are we allowed to record" as a design decision made before instrumentation is written, not a cleanup pass after a privacy incident.</p>
+    <p><b>Performance and cost.</b> Metrics are cheap per data point but you pay for cardinality — the number of distinct label combinations (Chapter 75). Logs are cheap per line but you pay for volume, and volume grows with traffic and with how chatty your DEBUG statements are (Chapter 78). Traces are the most expensive per unit and are almost always sampled rather than kept in full (Chapter 79). None of these costs show up on day one with a toy workload; all three show up eventually, and the fix is almost always "stop collecting what nobody queries," not "buy more storage."</p>
+    <p><b>Common mistakes.</b> Treating "we have Prometheus" as equivalent to "we're observable," when the actual metrics being collected are all USE-shaped node metrics with no RED coverage anywhere. Building a dashboard because a tool made it easy, not because it answers a specific question a specific person will have during an incident. And instrumenting the happy path in detail while leaving error paths logged as a single generic line — which is exactly backwards, since the error path is where you'll need the detail.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>Everything you measure here eventually becomes an input to a bigger decision. The Golden Signals you pick for a service are the raw material for its SLIs, and an SLI with a target attached is an SLO with an error budget (Chapter 80) — alerting on that budget, rather than on raw thresholds, is most of Chapter 77. The cost curve for metrics cardinality, log volume, and trace sampling you're seeing described here in the abstract becomes a real line item in capacity planning (Chapter 89) once traffic is no longer toy-sized. And "correlate by shared ID across signals" is the same design instinct you'll reuse anywhere a request crosses a trust or process boundary — it's not specific to observability tooling, it's specific to distributed systems, full stop.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's the difference between monitoring and observability?</summary>
+        <div class="a"><p>Monitoring watches a fixed set of things you decided to watch in advance and alerts when they cross a threshold — it answers questions you already thought of. Observability means you've recorded enough detail, in a queryable form, to answer a question you didn't think of ahead of time, like "why was this specific request slow for this specific customer." You get observability from three complementary signals — metrics, logs, and traces — not from any single tool, and not just from having "more monitoring."</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>How would you decide what to measure for a brand-new service?</summary>
+        <div class="a"><p>I'd start from the four Golden Signals as the broadest lens — latency, traffic, errors, saturation — then narrow depending on what the thing actually is. If it's a request-driven service sitting behind a load balancer, I'd apply RED: rate, errors, duration, sliced by endpoint and status class, because saturation for a stateless service is usually a property of the node or a downstream dependency, not the service itself. If it's a resource — a database, a queue, a connection pool, the node itself — I'd apply USE: utilization, saturation, errors, because that resource doesn't serve requests, it gets consumed by them. In practice a real system needs both lenses at once, RED at every service boundary and USE underneath every shared resource, and I'd resist the platform's default of only giving me USE-shaped node metrics for free and calling that sufficient.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Why can't logs alone give you causality across services, even with great log messages?</summary>
+        <div class="a"><p>A log line is a self-contained record of one moment in one process — it has no built-in concept of "which other log lines, in which other processes, happened because of the same triggering event." Two services logging independently will have plausible-looking, time-adjacent lines that you can eyeball into a story, but under real concurrent traffic, multiple in-flight requests produce multiple candidate matches in the same time window, and timestamp proximity stops being reliable — I walked through exactly this ambiguity in the chapter's fourth lab. What actually restores causality is a value that's generated once, early, and deliberately carried through every hop — a correlation ID or, formalized further, a trace ID with parent-child span relationships. That's not a logging feature; it's a propagation discipline the logging has to cooperate with, which is why Chapter 79 treats context propagation as its own topic rather than an afterthought of "add a field to the log format."</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A service's dashboard has been all-green for a week, but you just got three customer complaints about slowness. Walk through what you'd check.</summary>
+        <div class="a"><p>First I'd look at what the dashboard actually measures — if it's node CPU/memory/disk, that's a USE view of the machine, and it can be perfectly healthy while a specific code path is slow for reasons that don't show up as resource pressure at all: a slow downstream call, lock contention, an N+1 query only certain accounts trigger. So the absence of a RED-shaped panel — request duration and error rate for this service's own endpoints — would be my first finding, before I even look at data. If RED panels do exist and are also green, I'd suspect the complaints are about a slice the aggregate hides — a specific endpoint, a specific customer segment, or a tail latency problem invisible at p50 — and I'd pull traces for requests matching what the customers described (their account, roughly their timeframe) rather than trusting an aggregate that's already told me it looks fine.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>How do metrics, logs, and traces actually correlate in a working system — mechanically?</summary>
+        <div class="a"><p>Two mechanisms, both needing a shared identifier by design, not by accident. Logs correlate with traces by literally carrying the same trace ID as a field on every log line written during that request's handling, so you can filter logs to exactly the requests you already found interesting from a trace. Metrics correlate with traces through exemplars — a metric data point (say, one bucket of a latency histogram) can carry a sample trace ID for a request that landed in that bucket, so from an aggregate spike you can jump straight to one concrete example trace instead of guessing. Neither mechanism does anything on its own; both require the trace ID to have been generated and propagated in the first place, which is the actual hard part, and the actual subject of Chapters 78 and 79.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>Monitoring answers questions you thought of in advance; observability answers ones you didn't, because enough detail was recorded to slice arbitrarily. Metrics are cheap, aggregate, and blind to any one request. Logs are detailed about one moment and blind to causality across moments. Traces show the causal shape of one request but are too expensive to keep for every request. RED (rate, errors, duration) is the lens for a request-driven service; USE (utilization, saturation, errors) is the lens for a resource; the four Golden Signals (latency, traffic, errors, saturation) are the broadest version of the same idea. None of the three signals is complete alone, and without a shared correlation ID running through all three, moving between them during an incident is slow and error-prone. Apply the right lens to the right layer — RED at service boundaries, USE underneath shared resources — rather than measuring whatever the platform gave you for free.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>Monitoring answers questions you already thought of; observability answers ones you didn't.</li>
+      <li>Metrics are cheap and aggregate, but have no memory of any single request.</li>
+      <li>Logs are detailed about one moment but carry no causal link to other moments unless you add one.</li>
+      <li>Traces carry the causal shape of one request across services, but are expensive and usually sampled.</li>
+      <li>The four Golden Signals — latency, traffic, errors, saturation — are the broadest "what to measure" lens.</li>
+      <li>RED (rate, errors, duration) is the lens for a request-driven service.</li>
+      <li>USE (utilization, saturation, errors) is the lens for a resource — a node, a disk, a pool.</li>
+      <li>A dashboard full of node-level USE metrics can be all-green while users have a real, active problem.</li>
+      <li>Correlating signals requires a shared identifier (trace ID / correlation ID) propagated on purpose — timestamps alone are not reliable under concurrency.</li>
+      <li>Reserve a trace ID / correlation ID field in your log format from day one, even before real tracing exists — retrofitting it later is the expensive path.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds toward:</span>
+      <a href="ch75-prometheus.html"><b>Ch 75</b> Prometheus</a>
+      <a href="ch76-grafana-and-dashboard-design.html"><b>Ch 76</b> Grafana &amp; dashboards</a>
+      <a href="ch78-logging.html"><b>Ch 78</b> Logging</a>
+      <a href="ch79-distributed-tracing-and-opentelemetry.html"><b>Ch 79</b> Tracing &amp; OpenTelemetry</a>
+      <a href="ch80-sli-slo-sla-and-error-budgets.html"><b>Ch 80</b> SLIs, SLOs &amp; error budgets</a>
+      <a href="ch92-incident-management-postmortems-and-the-sre-operating.html"><b>Ch 92</b> Incident management</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Google — <a href="https://sre.google/sre-book/monitoring-distributed-systems/">Site Reliability Engineering, Chapter 6: Monitoring Distributed Systems</a>: the four Golden Signals, and symptoms vs. causes, first-party.</li>
+      <li>Prometheus — <a href="https://prometheus.io/docs/introduction/overview/">Overview</a>: what a metrics-first monitoring system is built to do and not do.</li>
+      <li>OpenTelemetry — <a href="https://opentelemetry.io/docs/concepts/signals/">Signals</a>: the project-level definition of traces, metrics, and logs as complementary telemetry.</li>
+      <li>Grafana Labs — <a href="https://grafana.com/docs/grafana/latest/">Grafana documentation</a>: how the three signals are queried and visualized side by side in practice.</li>
+      <li>Grafana Labs — <a href="https://grafana.com/docs/loki/latest/">Loki documentation</a>: the logs pillar, and why its index is deliberately label-based rather than full-text.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch73-ci-cd-and-progressive-delivery.html"><span class="dir">← Prev</span><div class="ti">Ch 73 — CI/CD and progressive delivery</div></a>
+      <a class="nx" href="ch75-prometheus.html"><span class="dir">Next →</span><div class="ti">Ch 75 — Prometheus</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 74 of 121 · Part VIII · Observability. You now know which of the three signals to reach for. Next: the one that most Kubernetes shops build everything else on top of.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Three signals, correlated</a>
+    <a href="#internals">RED, USE, Golden Signals</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">One slow checkout</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

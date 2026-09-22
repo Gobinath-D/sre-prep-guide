@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 4 — Filesystems, Inodes, File Descriptors &amp; Disk I/O</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part I · Linux &nbsp;·&nbsp; Chapter 4</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part I · Linux &amp; OS Foundations · Chapter 4</div>
+      <h1>Filesystems, inodes, file descriptors &amp; disk I/O</h1>
+      <p class="tagline">A filename is just a label on a drawer. The file itself — its bytes, its owner, its size — lives somewhere else entirely, and it survives as long as one label or one open handle still points to it. Miss that one fact and you'll stare at "disk full" while <code>df</code> swears there's space, or delete a 40&nbsp;GB log and watch the disk not budge.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~40 min read · Linux lab (Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Separate the three things people call "a file": the name, the inode, and the data blocks.</li>
+          <li>Explain the file-descriptor table, the open file description, and why an offset can be shared.</li>
+          <li>Describe the VFS and what buffered, direct, and <code>fsync</code>'d I/O each guarantee.</li>
+          <li>Diagnose "disk full but <code>df</code> shows space" — both inode exhaustion and deleted-but-open files.</li>
+          <li>Recover the contents of a deleted-but-open file from <code>/proc/&lt;pid&gt;/fd</code> without restarting the process.</li>
+          <li>Read <code>iowait</code> and <code>iostat</code> to tell a disk-bound box from a CPU-bound one.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem: turning a dumb block device into files</h2>
+    <p>A disk — spinning platter, SSD, cloud volume — knows nothing about files. It offers one thing: a huge array of fixed-size blocks you can read or write by number. Block 0, block 1, block 4,001,912. That's it. No names, no folders, no "this file is 3&nbsp;KB and belongs to user 1000."</p>
+    <p>Everything else is software the kernel layers on top. A <b>filesystem</b> is the scheme that carves those raw blocks into named files and directories, records who owns what and how big it is, and tracks which blocks belong to which file. And because there are many filesystems (ext4, xfs, btrfs), many device types (local SSD, NFS, a container's overlay), and thousands of programs that just want to call <code>open</code> and <code>read</code> without caring, the kernel puts one uniform layer in front of all of them: the <b>VFS</b>, the virtual filesystem. Your program calls the same five syscalls whether the bytes are on a local SSD, an NFS server three racks away, or a tmpfs that only exists in RAM.</p>
+    <p>The one idea that trips up more engineers than any other: the filesystem deliberately splits a file's <em>name</em> from its <em>identity</em>. The name is a label in a directory. The identity — the metadata and the pointers to the data — is a separate object called an <b>inode</b>. A name points to an inode; several names can point to the same inode; and the inode (and its disk blocks) lives until <em>zero</em> names point to it <em>and</em> no process holds it open. That single rule explains most of this chapter's incidents.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>Deleting a file does not delete its data. <code>rm</code> removes a <em>name</em> (a directory entry) and decrements the inode's link count. The data blocks are freed only when the link count reaches zero <b>and</b> no open file descriptor still references the inode. A process holding the file open keeps every byte on disk — nameless, invisible to <code>ls</code>, but very much still consuming space.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a library with a card catalog</h2>
+    <p>Carry this the whole way through.</p>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Picture a library. Each <b>book</b> sits on a shelf with a unique shelf ID stamped inside — but no title on the spine. The book <em>is</em> the content plus its record card: how many pages, who donated it, when. That book-plus-record is the <b>inode</b>, and the shelf ID is its <b>inode number</b>.</p>
+      <p>You find books through the <b>card catalog</b>. Each card shows a human title — "Moby Dick" — and the shelf ID it points to. Those cards are <b>directory entries</b> (dentries). Two cards can point to the same shelf ID: two titles, one physical book. That's a <b>hard link</b>. Pull one card and the book's still there, because the other card still points to it. The book is only sent to the incinerator when the <em>last</em> card is pulled — and even then, not while a reader is holding it at a desk.</p>
+      <p>To read, you fill a slip and the librarian hands you the book; your <b>library card</b> lists what you've currently got out, each on a numbered line. That numbered line is a <b>file descriptor</b>, and the slip that tracks which page you're on is the <b>open file description</b> with its offset. You never walk into the stacks yourself — the <b>front desk</b> (the VFS) takes your slip and deals with whichever room, branch, or off-site archive the book actually lives in. For speed, the desk keeps <b>photocopies</b> of recently requested pages up front (the page cache); insisting on the original from the deep archive every time is <b>direct I/O</b>; and getting a stamped receipt that your donation was truly filed in the permanent archive — not just left on the return cart — is <code>fsync</code>.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the library</th><th>In Linux</th></tr>
+      <tr><td>The physical book + its record card</td><td>The inode (data blocks + metadata)</td></tr>
+      <tr><td>The shelf ID stamped inside</td><td>The inode number</td></tr>
+      <tr><td>A catalog card (title → shelf ID)</td><td>A directory entry / dentry (name → inode)</td></tr>
+      <tr><td>Two cards for one book</td><td>Hard links (link count &gt; 1)</td></tr>
+      <tr><td>A card that just says "see this other card"</td><td>A symbolic link (its own inode holding a path)</td></tr>
+      <tr><td>Your library card's numbered lines</td><td>The file-descriptor table (per process)</td></tr>
+      <tr><td>The slip tracking which page you're on</td><td>The open file description (offset + flags)</td></tr>
+      <tr><td>The front desk that speaks one language</td><td>The VFS</td></tr>
+      <tr><td>Photocopies kept up front</td><td>The page cache (buffered I/O)</td></tr>
+      <tr><td>Insisting on the original every time</td><td>Direct I/O (<code>O_DIRECT</code>)</td></tr>
+      <tr><td>A stamped "filed in the archive" receipt</td><td><code>fsync()</code> — the durability barrier</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>Name, inode, blocks — and the descriptor chain</h2>
+    <p>Three levels of indirection sit between the name you type and the bytes on the platter, and every filesystem incident is really a question about one of the links in this chain.</p>
+    <ul>
+      <li>A <b>directory</b> is itself a file whose contents are a list of (name → inode number) pairs. Path resolution walks these, component by component.</li>
+      <li>An <b>inode</b> holds the file's identity: mode/permissions, owner uid/gid, size, timestamps, a <b>link count</b> (how many names point here), and pointers to the data blocks. It has no name.</li>
+      <li>The <b>data blocks</b> hold the actual bytes, scattered across the device wherever the filesystem found room.</li>
+    </ul>
+    <p>On the process side, an open file is a chain too: a small integer <b>file descriptor</b> indexes the process's fd table; that entry points to an <b>open file description</b> in the kernel (holding the current offset and the open flags); and that points to the <b>inode</b>. The middle object matters more than people expect — because <code>fork()</code> and <code>dup()</code> copy the fd but <em>share</em> the open file description, two descriptors can share one offset, which is exactly how a shell's <code>&gt;&gt;</code> append and pipelines behave sanely.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 430" role="img" aria-label="Two directory names and one file descriptor all pointing to a single inode, which points to data blocks on the device">
+        <defs>
+          <marker id="f1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="f2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+        </defs>
+        <!-- names -->
+        <rect x="26" y="26" width="210" height="50" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="131" y="47" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">/var/log/app.log</text>
+        <text x="131" y="65" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">directory entry (name → inode)</text>
+        <rect x="256" y="26" width="210" height="50" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="361" y="47" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">/var/log/app.log.1</text>
+        <text x="361" y="65" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">hard link — same inode</text>
+        <!-- fd chain -->
+        <rect x="492" y="20" width="206" height="62" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="595" y="42" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">process fd 3</text>
+        <text x="595" y="62" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">→ open file (offset=4096, O_WRONLY)</text>
+        <!-- inode -->
+        <rect x="200" y="168" width="320" height="118" rx="10" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.6"/>
+        <text x="360" y="192" text-anchor="middle" style="fill:var(--accent);font:700 13px sans-serif">inode 8213</text>
+        <text x="360" y="214" text-anchor="middle" style="fill:var(--ink);font:11.5px sans-serif">mode 0644 · uid 1000 · size 40 GB</text>
+        <text x="360" y="234" text-anchor="middle" style="fill:var(--ink);font:11.5px sans-serif">mtime/atime/ctime · <tspan style="fill:var(--deep);font-weight:700">link count = 2</tspan></text>
+        <text x="360" y="254" text-anchor="middle" style="fill:var(--ink);font:11.5px sans-serif">block pointers ↓</text>
+        <text x="360" y="274" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">(no name lives here)</text>
+        <!-- data blocks -->
+        <rect x="120" y="340" width="480" height="66" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="360" y="360" text-anchor="middle" style="fill:var(--muted);font:700 11px sans-serif;letter-spacing:.04em">DATA BLOCKS ON THE DEVICE</text>
+        <rect x="140" y="372" width="60" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+        <rect x="210" y="372" width="60" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+        <rect x="280" y="372" width="60" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+        <rect x="350" y="372" width="60" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+        <rect x="420" y="372" width="60" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+        <rect x="490" y="372" width="60" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+        <!-- arrows -->
+        <line x1="131" y1="76" x2="300" y2="166" style="stroke:var(--accent);stroke-width:1.8" marker-end="url(#f1)"/>
+        <line x1="361" y1="76" x2="360" y2="166" style="stroke:var(--accent);stroke-width:1.8" marker-end="url(#f1)"/>
+        <line x1="560" y1="82" x2="440" y2="166" style="stroke:var(--accent2);stroke-width:1.8" marker-end="url(#f2)"/>
+        <line x1="360" y1="286" x2="360" y2="338" style="stroke:var(--accent);stroke-width:1.8" marker-end="url(#f1)"/>
+        <text x="610" y="300" text-anchor="middle" style="fill:var(--deep);font:600 10.5px sans-serif">freed only when</text>
+        <text x="610" y="316" text-anchor="middle" style="fill:var(--deep);font:600 10.5px sans-serif">link count = 0 AND</text>
+        <text x="610" y="332" text-anchor="middle" style="fill:var(--deep);font:600 10.5px sans-serif">no open fd</text>
+      </svg>
+      <figcaption>Two names and one open descriptor all reference inode 8213. Remove both names and the link count hits 0 — but fd 3 keeps the 40&nbsp;GB alive and nameless until it's closed. That's the deleted-but-open file, drawn.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>Two of the most common "the disk is full" pages have nothing to do with a full disk. One is <b>inode exhaustion</b>: you ran out of inodes (names) while blocks are free, so <code>df -h</code> looks fine but every write fails with <code>ENOSPC</code>. The other is a <b>deleted-but-open file</b>: someone <code>rm</code>'d a giant log to reclaim space, but the process still has it open, so the blocks stay pinned and <code>df</code> doesn't move. Both are invisible unless you know the name/inode/fd split — and both are five-minute fixes once you do.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>What open, read, write, and fsync actually do</h2>
+    <p>Walk the four calls through the VFS. This is the machinery behind every log line and every database commit.</p>
+    <ol class="steps">
+      <li><b><code>open("/var/log/app.log", …)</code> — path resolution.</b> The kernel walks the path one component at a time, looking each name up in the <b>dentry cache</b> (or reading the directory from disk on a miss), checking execute/search permission on each directory as it goes, until it reaches the target inode. It creates a new <b>open file description</b> (offset 0, your flags), installs it in the process's fd table at the lowest free slot, and returns that fd number.</li>
+      <li><b><code>read(fd, buf, n)</code>.</b> fd → open file description → inode. The VFS asks the filesystem for the bytes at the current offset. If they're warm in the page cache, it's a fast copy into your buffer. If not, the block layer issues I/O to the device and the process sleeps in <b>D</b> until it lands (a major fault from Chapter 3). The offset in the open file description advances by the number of bytes read.</li>
+      <li><b><code>write(fd, buf, n)</code> — and here's the surprise.</b> By default it's <em>buffered</em>: the kernel copies your bytes into the page cache, marks those pages <b>dirty</b>, advances the offset, and returns success — <b>before anything reaches the disk</b>. The data is durable only once writeback (driven by the <code>vm.dirty_*</code> thresholds and a background flusher) pushes it out. A crash in that window loses the "written" data. This is why <code>write</code> returning is not a promise the bytes survived a power cut.</li>
+      <li><b><code>fsync(fd)</code> — the durability barrier.</b> It forces the dirty pages for this inode (and its metadata) out to the physical device and <em>waits</em> for the device to confirm. Only after <code>fsync</code> returns is the data truly persistent. <code>fdatasync</code> is a cheaper cousin that skips metadata-only updates. Databases <code>fsync</code> their write-ahead log on every commit for exactly this reason — and it's often their dominant latency cost.</li>
+      <li><b><code>close(fd)</code>.</b> Drops this descriptor's reference to the open file description. When the last reference closes and the inode's link count is already zero, <em>now</em> the filesystem frees the data blocks. Until then, the file lives on.</li>
+    </ol>
+    <p><b>Buffered vs direct.</b> The default page-cache path is great — reads get cached, writes get batched. Some workloads don't want it: a database that maintains its own carefully tuned cache doesn't want the kernel double-caching the same data, so it opens files with <code>O_DIRECT</code>, which bypasses the page cache and DMAs straight between the device and the app's buffer (with alignment requirements). Direct I/O trades the kernel's help for control and predictability.</p>
+    <p><b>iowait</b> is the metric that surfaces all of this. <code>%wa</code> in <code>top</code> is the fraction of time CPUs sat idle with at least one disk I/O outstanding — "we have nothing to do but wait for the disk." It's a symptom, not a diagnosis: high iowait with one saturated device is a storage bottleneck; high iowait with idle devices can just mean the CPU had nothing else to run. You confirm with <code>iostat</code>, not with <code>%wa</code> alone.</p>
+
+    <details class="recall"><summary>Think first: your app calls <code>write()</code>, it returns 0 errors, and one second later the box loses power. Is the data safe?</summary>
+      <div class="body">
+        <p>No. A successful <code>write()</code> only means the bytes made it into the kernel's page cache — they're marked dirty and scheduled for writeback, but they may not have touched the disk yet. A power loss in that window loses them. The only way to know data survived is to <code>fsync()</code> (or <code>fdatasync()</code>) the descriptor and have it return, which forces the dirty pages to the device and waits for confirmation. This is the whole reason databases pay the fsync cost on every commit, and why "we wrote it, why did we lose it after the crash?" is nearly always a missing fsync — or a storage layer that lied about honoring the flush.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, and what each owns</h2>
+    <ul>
+      <li><b>Inode.</b> The file's identity: mode, uid/gid, size, timestamps (mtime = content changed, ctime = inode changed, atime = last accessed), link count, and block pointers. Owns everything about the file <em>except</em> its name.</li>
+      <li><b>Directory entry (dentry) &amp; name.</b> A name lives only inside a directory as a (name → inode number) pair. The dentry cache makes repeated path lookups fast. Multiple dentries → one inode is a hard link; a symlink is a separate inode whose data is a path string.</li>
+      <li><b>File-descriptor table.</b> Per process. Maps small integers (0/1/2 = stdin/stdout/stderr, then 3+) to open file descriptions. Capped by <code>ulimit -n</code> and the kernel's <code>nr_open</code>.</li>
+      <li><b>Open file description.</b> The kernel object holding the current offset and status flags. Shared across <code>dup()</code> and inherited across <code>fork()</code>, which is why sharing an offset is possible and intentional.</li>
+      <li><b>VFS.</b> The uniform layer with four object types — superblock (a mounted filesystem), inode, dentry, and file — that each concrete filesystem implements. Gives every filesystem the same <code>open/read/write</code> surface.</li>
+      <li><b>Filesystems.</b> ext4 and xfs (the common server pair), plus tmpfs (RAM), overlayfs (container images, Chapter 24), procfs/sysfs (kernel windows), and network filesystems like NFS. A key difference: <b>ext4 fixes its inode count at format time</b>, while <b>xfs allocates inodes dynamically</b> — so ext4 can exhaust inodes and xfs almost never does.</li>
+      <li><b>Block layer + device.</b> Turns filesystem block requests into device I/O, with an I/O scheduler and queues. This is where <code>iostat</code> reads <code>%util</code>, <code>await</code>, and queue depth.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one appended log line</h2>
+    <p>Your app writes a line to <code>/var/log/app.log</code>. Here's the whole path:</p>
+    <ol class="steps">
+      <li>The app called <code>open("/var/log/app.log", O_WRONLY|O_APPEND|O_CREAT, 0644)</code> at startup. The kernel resolved the path, found (or created) the inode, and returned fd 3 with an open file description in append mode.</li>
+      <li>It calls <code>write(3, "…line…\n", 42)</code>. The kernel copies 42 bytes into the page cache, marks the page dirty, bumps the offset, and returns 42. The line is now visible to readers <em>and</em> would be lost on a power cut.</li>
+      <li>Seconds later, background writeback flushes the dirty page to the device — or, if this were a database WAL, an explicit <code>fsync</code> would force and confirm it immediately.</li>
+      <li>A log-rotation tool renames <code>app.log</code> to <code>app.log.1</code> and creates a fresh <code>app.log</code>. Crucially, the app still holds fd 3 pointing at the <em>old inode</em> — so it keeps writing to the rotated file unless it's told to reopen. That's the whole reason logrotate uses <code>copytruncate</code> or sends the process a signal to reopen its log.</li>
+      <li>On shutdown the app <code>close</code>s fd 3. If by then no name points at that inode and no other fd holds it, its blocks are freed.</li>
+    </ol>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>Some labs mount a small filesystem, so start the container with the capabilities for <code>strace</code> and <code>mount</code>:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># SYS_PTRACE for strace; SYS_ADMIN so we can mount a tiny tmpfs in Lab 3.</span>
+docker run --rm -it --cap-add=SYS_PTRACE --cap-add=SYS_ADMIN ubuntu:24.04 bash
+apt-get update &amp;&amp; apt-get install -y lsof strace procps sysstat python3</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — names, inodes, and links</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Prove that a name and a file are different things. Create a file, look at its inode, then give it a second name.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>echo "payload" &gt; /tmp/a.txt
+stat /tmp/a.txt                          <span class="c"># inode number, links, size, timestamps</span>
+ln /tmp/a.txt /tmp/b.txt                  <span class="c"># HARD link: a second name for the SAME inode</span>
+ln -s /tmp/a.txt /tmp/c.txt               <span class="c"># SOFT link: a new inode holding the path string</span>
+ls -li /tmp/a.txt /tmp/b.txt /tmp/c.txt</code></pre></div>
+        <div class="out"><span class="ol">Output</span>131074 -rw-r--r-- 2 root root 8 ... /tmp/a.txt
+131074 -rw-r--r-- 2 root root 8 ... /tmp/b.txt     # SAME inode 131074, link count 2
+131099 lrwxrwxrwx 1 root root 10 ... /tmp/c.txt -&gt; /tmp/a.txt   # different inode</code></pre></div>
+        <p><code>a.txt</code> and <code>b.txt</code> share inode 131074 and a link count of 2 — they are the same file with two names. <code>c.txt</code> is a symlink: its own inode whose contents are the text <code>/tmp/a.txt</code>. Now delete the original name and watch the data survive:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>rm /tmp/a.txt
+cat /tmp/b.txt        <span class="c"># still "payload" — the inode lives; link count is now 1</span>
+cat /tmp/c.txt        <span class="c"># error: symlink now dangles (points at a gone name)</span>
+stat -c '%h links' /tmp/b.txt</code></pre></div>
+        <p>Removing <code>a.txt</code> dropped the link count from 2 to 1; the data is untouched because <code>b.txt</code> still points at the inode. The symlink, which only ever held a <em>path</em>, is now broken. This is the entire hard-link vs symlink distinction, on one screen.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — the fd table, and buffered vs durable writes</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Look at a process's open descriptors, then prove that <code>write</code> is not durable but <code>fsync</code> is. First, the fd table via <code>/proc</code> and <code>lsof</code>:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>sleep 600 &lt; /etc/hostname &amp;   <span class="c"># a process with a file open on fd 0</span>
+PID=$!
+ls -l /proc/$PID/fd            <span class="c"># 0/1/2 plus anything opened</span>
+cat /proc/$PID/fdinfo/0        <span class="c"># the offset + flags of the open file description</span>
+lsof -p $PID</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>lr-x------ 1 root root ... 0 -&gt; /etc/hostname
+lrwx------ 1 root root ... 1 -&gt; /dev/pts/0
+pos:	0
+flags:	0100000</code></pre></div>
+        <p>Descriptor 0 points at <code>/etc/hostname</code>; <code>fdinfo</code> shows the offset (<code>pos</code>) and flags. That offset is the "which page am I on" slip from the analogy. Now watch a write's durability with <code>strace</code> — note that <code>write</code> returns instantly while <code>fsync</code> is the call that actually costs time and guarantees persistence:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>strace -T -e trace=openat,write,fsync python3 -c '
+import os
+fd = os.open("/tmp/durable", os.O_WRONLY|os.O_CREAT, 0o644)
+os.write(fd, b"a commit that must survive a crash\n")
+os.fsync(fd)          # the durability barrier
+os.close(fd)'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>openat(AT_FDCWD, "/tmp/durable", O_WRONLY|O_CREAT, 0644) = 3 &lt;0.000034&gt;
+write(3, "a commit that must survive a cra"..., 35) = 35 &lt;0.000021&gt;
+fsync(3)                                                 = 0 &lt;0.004180&gt;</code></pre></div>
+        <p>The <code>&lt;…&gt;</code> is each call's duration. <code>write</code> took 21&nbsp;microseconds — it just touched the page cache. <code>fsync</code> took 4.2&nbsp;<em>milliseconds</em> — 200× longer — because it drove the data to the physical device and waited. That gap is why fsync-per-commit dominates database latency, and why the durability question is always "did you fsync?"</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — "disk full" with plenty of space (inode exhaustion)</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Make a tiny filesystem with very few inodes, then run out of inodes while blocks stay free. A tmpfs lets you cap the inode count directly.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>mkdir -p /mnt/small
+<span class="c"># 200 MiB of space, but only 200 inodes allowed.</span>
+mount -t tmpfs -o size=200m,nr_inodes=200 tmpfs /mnt/small
+
+<span class="c"># Create empty files until it fails. Empty files use an inode, ~no blocks.</span>
+i=0
+while : &gt; /mnt/small/f$i 2&gt;/dev/null; do i=$((i+1)); done
+echo "stopped after creating $i files"</code></pre></div>
+        <p>It stops well before filling 200&nbsp;MB. Now look at the two <em>different</em> resources — blocks and inodes — and watch them disagree:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>df -h /mnt/small     <span class="c"># space: almost all FREE</span>
+df -i /mnt/small     <span class="c"># inodes: 100% used</span>
+: &gt; /mnt/small/one-more   <span class="c"># the error your app actually sees</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>Filesystem  Size  Used Avail Use% Mounted on
+tmpfs       200M   4.0K  200M   1% /mnt/small        # df -h: 1% used
+Filesystem  Inodes IUsed IFree IUse% Mounted on
+tmpfs          200   200     0  100% /mnt/small        # df -i: 100% used
+bash: one-more: No space left on device                # ENOSPC — despite free space!</code></pre></div>
+        <p><code>ENOSPC</code> ("No space left on device") with 200&nbsp;MB free. Before the reveal: which command told you the truth, and what's the real-world version of "200 empty files"?</p>
+        <details class="recall"><summary>Reveal the cause and the fix</summary>
+          <div class="body">
+            <p>Inodes are a <b>separate, finite resource</b> from blocks. Every file — even a zero-byte one — consumes exactly one inode, and on <b>ext4 the inode count is fixed at format time</b>. Run out of inodes and you can't create <em>any</em> new file, no matter how much space is free. <code>df -h</code> (blocks) says you're fine; <code>df -i</code> (inodes) shows the real problem. The real-world culprits are always the same: millions of tiny files — a mail queue, a session-file directory, a cache of small objects, per-request temp files never cleaned up, or a runaway job writing one file per event.</p>
+            <p><b>Fix:</b> find and delete the tiny-file swarm — <code>for d in /var/*; do echo "$(find "$d" -xdev 2>/dev/null | wc -l) $d"; done | sort -rn | head</code> points you at the directory holding the most entries. Longer term, ext4 needs a reformat with more inodes (<code>mkfs.ext4 -N</code> or a smaller bytes-per-inode ratio), or switch to <b>xfs</b>, which allocates inodes dynamically and effectively doesn't hit this wall. This is why "the disk is full" should always be two checks: <code>df -h</code> and <code>df -i</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — the deleted log that won't free space</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>The classic 2&nbsp;a.m. page: disk near full, someone deletes a huge log, and <code>df</code> doesn't move. Reproduce it — a writer that holds a large file open, then delete the file out from under it.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># A process that opens a file, writes 300 MiB, and keeps the fd open.</span>
+python3 - &lt;&lt;'EOF' &amp;
+import time
+f = open('/tmp/app.log', 'wb')
+f.write(b'x' * 300*1024*1024); f.flush()
+while True:
+    f.write(b'still writing\n'); f.flush(); time.sleep(1)
+EOF
+WRITER=$!
+sleep 1
+du -sh /tmp/app.log ; df -h /tmp | tail -1        <span class="c"># 300 MiB used</span>
+rm /tmp/app.log                                   <span class="c"># "reclaim" the space...</span>
+df -h /tmp | tail -1                               <span class="c"># ...but df DIDN'T drop. Why?</span></code></pre></div>
+        <p><code>ls /tmp</code> shows the file is gone, yet the space is still used. Investigate before revealing — where does a deleted-but-still-held file show up?</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>ls -l /proc/$WRITER/fd | grep -i deleted     <span class="c"># the fd still points at the gone inode</span>
+lsof -p $WRITER | grep -i deleted            <span class="c"># lsof marks it (deleted)</span>
+lsof +L1 2&gt;/dev/null | head                  <span class="c"># every file with link count &lt; 1, system-wide</span></code></pre></div>
+        <details class="recall"><summary>Reveal what happened, how to recover the data, and how to reclaim space without a restart</summary>
+          <div class="body">
+            <p><code>rm</code> removed the <em>name</em>, dropping the inode's link count to 0 — but the writer still holds fd 3 open, so the inode and its 300&nbsp;MB of blocks stay alive, nameless. <code>df</code> counts those blocks; <code>du</code> can't find them (no name to walk to). The space returns only when that fd is closed.</p>
+            <p>Two moves. First, you can still <b>recover the contents</b> — the data is right there behind the descriptor:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>FD=$(ls /proc/$WRITER/fd -l | awk '/deleted/{print $9}' | head -1)
+cp /proc/$WRITER/fd/$FD /tmp/app.log.recovered   <span class="c"># the "deleted" bytes, read straight back</span></code></pre></div>
+            <p>Second, <b>reclaim the space without killing the process</b> by truncating through the descriptor (keeps the process running, just empties the file):</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>: &gt; /proc/$WRITER/fd/$FD      <span class="c"># truncate the open file to 0 via its fd</span>
+df -h /tmp | tail -1          <span class="c"># space reclaimed now</span></code></pre></div>
+            <p>The durable fix is process hygiene: rotate logs with <code>copytruncate</code> or by signaling the process to reopen its log file (<code>SIGHUP</code> for many daemons), never by <code>rm</code>-ing a file a process still holds. Restarting the process also frees it — but now you know how to do it without the restart, and how to get the data back.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — is this box slow on CPU or on I/O?</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>A service feels slow, load is up, and <code>top</code> shows high <code>%wa</code>. The wrong move is to assume "slow disk" and file a ticket. Generate real I/O pressure, then diagnose it the way a senior does — find the device, find the process, and decide the actual fix.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># A synchronous-write workload: fsync after every block. This is fsync-bound.</span>
+( for i in $(seq 1 2000); do dd if=/dev/zero of=/tmp/sync.dat bs=1M count=1 \
+    conv=fdatasync status=none; done ) &amp;
+IO=$!
+iostat -x 1 3        <span class="c"># %util, await (latency), aqu-sz (queue depth) per device</span>
+top -b -n1 | head -5 <span class="c"># confirm the CPU is idle-waiting, not computing (%wa high, %us low)</span></code></pre></div>
+        <p>Now the senior question: <code>%wa</code> is high, but is the disk actually the bottleneck, and which process is responsible? Investigate, then reveal.</p>
+        <details class="recall"><summary>Reveal the method and the decision</summary>
+          <div class="body">
+            <p><code>%wa</code> alone doesn't prove a storage problem — it only says CPUs were idle with I/O outstanding. Confirm with <code>iostat -x</code>: if a device shows <code>%util</code> near 100 with high <code>await</code>, that device is genuinely saturated. Then attribute it to a process — you don't need root-only tools; <code>/proc/&lt;pid&gt;/io</code> shows real block I/O:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>pidstat -d 1 3 2&gt;/dev/null || cat /proc/$IO/io   <span class="c"># write_bytes = actual device writes</span>
+strace -T -f -e trace=fdatasync,fsync,write -p $IO 2&gt;&amp;1 | head   <span class="c"># where the time goes</span></code></pre></div>
+            <p>The <code>strace -T</code> timings will show each <code>fdatasync</code> taking milliseconds — the workload is <b>fsync-bound</b>, not throughput-bound. That changes the fix entirely: throwing bandwidth at it won't help; you need fewer, batched fsyncs (group commits), a faster-latency device (NVMe / provisioned-IOPS volume), or moving the sync-heavy component off the shared box. If instead <code>iostat</code> showed high throughput and moderate <code>await</code>, it'd be a bandwidth problem with a different fix. The discipline: <code>%wa</code> raises the question, <code>iostat</code> + <code>/proc/&lt;pid&gt;/io</code> + <code>strace -T</code> answer it, and only then do you choose between "batch the writes," "faster storage," or "separate the workload." Storage runbooks live in <a href="ch104-compute-and-memory-runbooks.html">Chapter 104</a>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · inode exhaustion</div>
+      <p><b>Symptom:</b> writes fail with <code>ENOSPC</code> / "No space left on device," but <code>df -h</code> shows free space. <b>First cut:</b> <code>df -i</code> — inodes at 100%. <b>Confirm:</b> find the directory with the most entries (a mail spool, session dir, tiny-object cache, uncleaned temp files). <b>Usual cause:</b> a flood of small or empty files on an ext4 filesystem whose inode count was fixed at format time. <b>Fix:</b> delete the tiny-file swarm; longer term, reformat with more inodes or move to xfs (dynamic inodes). Always check <code>df -h</code> <em>and</em> <code>df -i</code>.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · deleted-but-open file eating the disk</div>
+      <p><b>Symptom:</b> disk near full; someone deleted a big log; <code>df</code> didn't drop; <code>du</code> can't find the space. <b>First cut:</b> <code>lsof +L1</code> (files with link count &lt; 1) or <code>lsof | grep deleted</code>. <b>Confirm:</b> a process holds a large "(deleted)" file open — see it in <code>/proc/&lt;pid&gt;/fd</code>. <b>Usual cause:</b> log rotation by <code>rm</code> instead of truncate/reopen, or a crashed rotation. <b>Fix:</b> truncate through the fd (<code>: &gt; /proc/&lt;pid&gt;/fd/&lt;n&gt;</code>) or restart/signal the process to reopen; recover contents from the fd first if needed. Prevent with <code>copytruncate</code> or a reopen signal.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · iowait latency</div>
+      <p><b>Symptom:</b> broad slowness, load up, <code>top</code> shows high <code>%wa</code> and low <code>%us</code>. <b>First cut:</b> <code>iostat -x 1</code> — look for a device at <code>%util</code> ≈ 100 with high <code>await</code>. <b>Confirm:</b> attribute the I/O with <code>pidstat -d</code> or <code>/proc/&lt;pid&gt;/io</code>; check whether it's fsync-bound with <code>strace -T</code>. <b>Usual cause:</b> a saturated volume, an fsync-per-op pattern (database WAL, sync logging), or a noisy neighbour on shared storage. <b>Fix:</b> depends on the shape — batch/group commits for fsync-bound, faster/higher-IOPS storage for throughput-bound, or isolate the workload. Don't conclude "slow disk" from <code>%wa</code> alone.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Durability is a decision, not a default.</b> A returned <code>write</code> means "in the page cache," not "on the disk." Anything that must survive a crash — a payment record, a WAL entry, a critical checkpoint — needs an <code>fsync</code> whose return you actually wait for, and a storage stack that honors the flush (some virtualized and consumer devices have lied about this, which is how "we fsync'd and still lost data" happens). Everything else can stay buffered for speed. Know which of your writes are which.</p>
+    <p><b>Watch both dimensions of "full."</b> Monitor free blocks <em>and</em> free inodes; alert on both. A filesystem at 100% inodes is just as down as one at 100% blocks, and it's the one people forget. Prefer xfs for workloads that create huge numbers of small files.</p>
+    <p><b>File descriptors are a finite resource too.</b> Every open file, socket, and pipe is an fd against a per-process limit (<code>ulimit -n</code>) and a system limit. Leaks surface as <code>EMFILE</code> ("too many open files") and look like a service mysteriously refusing connections while otherwise healthy — the same shape you met in Chapter 1. <code>ls /proc/&lt;pid&gt;/fd | wc -l</code> versus <code>/proc/&lt;pid&gt;/limits</code> is the check.</p>
+    <p><b>Common mistakes:</b> rotating logs by <code>rm</code> instead of truncate-or-reopen (hello, deleted-but-open); trusting <code>%wa</code> as a diagnosis instead of a hint; assuming <code>write</code> is durable; forgetting <code>df -i</code>; and using <code>du</code> to hunt space that only <code>df</code> and <code>lsof</code> can see because it has no name.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>The fsync cost is a load-bearing number in data-system design. It's why databases batch commits into group-fsyncs, why write-ahead logs exist (turn many random durable writes into one sequential one), and why the durability tier of a system — how many fsync'd copies before you acknowledge a write — is a core reliability trade-off you'll make again in <a href="ch82-consistency-replication-partitioning.html">Chapter 82</a> and <a href="ch86-the-data-layer-mysql-and-postgresql.html">Chapter 86</a>. The name/inode split is exactly how container image layers and overlayfs present one merged filesystem from many read-only layers (<a href="ch24-container-filesystems-overlayfs-and-image-layers.html">Chapter 24</a>). And the "buffered vs durable" line is the seed of every write-back cache, every "eventually persisted" queue, and every debate about whether an acknowledgement means "received" or "safe."</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's the difference between a filename and an inode?</summary>
+        <div class="a"><p>The inode is the file's actual identity — its metadata (permissions, owner, size, timestamps, link count) and the pointers to its data blocks. It has no name. A filename is a separate thing: an entry in a directory that maps a human-readable name to an inode number. Several names can point to one inode (hard links), which is why the inode tracks a link count. Deleting a name just removes the directory entry and decrements that count; the file's data is freed only when the count hits zero and nothing holds it open. So "the file" and "the name of the file" are genuinely different objects, and most filesystem surprises come from conflating them.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through what the kernel does for <code>open()</code> then <code>read()</code>.</summary>
+        <div class="a"><p>On <code>open</code>, the kernel resolves the path one component at a time, looking each name up in the dentry cache or reading the directory from disk, and checking search permission on each directory along the way, until it reaches the target inode. It then creates an open file description — a kernel object holding the current offset and the open flags — installs a pointer to it in the process's file-descriptor table at the lowest free slot, and returns that integer as the fd. On <code>read(fd, buf, n)</code>, the fd indexes the table to the open file description, which points at the inode; the VFS asks the concrete filesystem for the bytes at the current offset. If they're warm in the page cache it's a fast copy into the user buffer; if not, the block layer issues device I/O and the process sleeps in D state until it completes. Then the kernel copies the bytes out and advances the offset in the open file description. The three-level chain — fd → open file description → inode — is the part worth stressing, because it's why <code>dup</code> and <code>fork</code> can share an offset and why two names can share one inode.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Does a successful <code>write()</code> mean the data is safe? Explain buffered vs direct I/O and <code>fsync</code>.</summary>
+        <div class="a"><p>No. A successful <code>write</code> in the default buffered mode only means the bytes were copied into the page cache and the pages marked dirty; they're durable only once writeback flushes them to the device, which a crash in between will lose. To make a write durable you call <code>fsync</code> (or <code>fdatasync</code>, which skips pure-metadata updates) and wait for it to return — that forces the dirty pages to the physical device and confirms. This is why fsync-per-commit is usually a database's dominant latency cost; in a lab you'll see <code>write</code> take microseconds and <code>fsync</code> take milliseconds. Direct I/O (<code>O_DIRECT</code>) is the other mode: it bypasses the page cache entirely and DMAs between the device and the application's own buffer, with alignment constraints. Databases use it when they maintain their own cache and don't want the kernel double-caching the same data — they trade the kernel's help for predictable control. The mental model: buffered is fast and forgiving but not durable until fsync; direct is unbuffered and self-managed; and durability is always an explicit fsync you waited on, not a side effect of write returning.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span><code>df -h</code> says 40% used, but every write fails with "No space left on device." What's going on?</summary>
+        <div class="a"><p>Two prime suspects, and I'd check both fast. First, inode exhaustion: <code>df -i</code>. Blocks and inodes are independent resources, and on ext4 the inode count is fixed at format time — a flood of tiny or empty files (a session directory, a mail queue, uncleaned temp files) can use every inode while blocks stay free, and then no new file can be created regardless of space. The fix is to find and delete the tiny-file swarm, and longer term add inodes or move to xfs. Second, if inodes are also fine, I'd look for a mount subtlety — for example writing to a path that's actually on a different, full filesystem, or a reserved-blocks setting — but inode exhaustion is by far the most common answer to this exact phrasing. The reflex I want is: "disk full" is always two checks, <code>df -h</code> and <code>df -i</code>, because the second one is the one everybody forgets.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>You deleted a 40&nbsp;GB log but the disk didn't free up. Why, and how do you fix it live?</summary>
+        <div class="a"><p>Because a process still has the file open. <code>rm</code> removed the name and dropped the inode's link count to zero, but the open file descriptor keeps the inode and its 40&nbsp;GB of blocks alive — nameless, so <code>du</code> can't see it, but <code>df</code> still counts it. I'd confirm with <code>lsof +L1</code> or <code>lsof | grep deleted</code>, which shows the process holding a "(deleted)" file, and I'd see the descriptor under <code>/proc/&lt;pid&gt;/fd</code>. To fix it live without a restart, I truncate through that descriptor — <code>: &gt; /proc/&lt;pid&gt;/fd/&lt;n&gt;</code> — which empties the file and returns the space while the process keeps running; if I need the contents first I can <code>cp /proc/&lt;pid&gt;/fd/&lt;n&gt;</code> to recover them. Restarting the process would also release it, but truncating the fd avoids the disruption. The real fix is to stop rotating logs with <code>rm</code>: use <code>copytruncate</code> or signal the process to reopen its log file.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>A disk is just numbered blocks; a filesystem turns them into named files, and the VFS gives every filesystem one uniform <code>open/read/write/close</code> interface. A file is three separate things: the <b>name</b> (a directory entry), the <b>inode</b> (identity — metadata, link count, block pointers), and the <b>data blocks</b>. Data is freed only when the link count is 0 <em>and</em> no fd holds it open — the rule behind deleted-but-open files. On the process side, fd → open file description (offset + flags) → inode, and that middle object can be shared. Writes are buffered into the page cache and durable only after an <code>fsync</code> you waited on; direct I/O bypasses the cache for self-caching apps. "Disk full" is two checks — <code>df -h</code> for blocks and <code>df -i</code> for inodes — and iowait is a hint that <code>iostat</code> and <code>/proc/&lt;pid&gt;/io</code> turn into a diagnosis.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>A file is a name (directory entry), an inode (identity + block pointers), and data blocks — three separate things.</li>
+      <li>Hard links are multiple names for one inode; a symlink is its own inode holding a path string.</li>
+      <li>Data is freed only when link count = 0 <em>and</em> no open fd references the inode.</li>
+      <li>The chain is fd → open file description (offset, flags) → inode; <code>fork</code>/<code>dup</code> share the description, so they share the offset.</li>
+      <li>The VFS gives ext4, xfs, tmpfs, overlayfs, and NFS one uniform syscall interface.</li>
+      <li>Buffered <code>write</code> only reaches the page cache; data is durable only after an <code>fsync</code> (or <code>fdatasync</code>) that returned.</li>
+      <li>Direct I/O (<code>O_DIRECT</code>) bypasses the page cache — for databases that manage their own cache.</li>
+      <li>"Disk full" is two checks: <code>df -h</code> (blocks) and <code>df -i</code> (inodes); ext4 fixes inode count at format time, xfs is dynamic.</li>
+      <li>A deleted-but-open file keeps its blocks; find it with <code>lsof +L1</code>, reclaim via <code>: &gt; /proc/&lt;pid&gt;/fd/&lt;n&gt;</code>, recover by copying that fd.</li>
+      <li>High <code>%wa</code> is a hint, not a verdict — confirm with <code>iostat -x</code> and <code>/proc/&lt;pid&gt;/io</code>, and check whether it's fsync-bound.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Connects to:</span>
+      <a href="ch01-kernel-and-system-calls.html"><b>Ch 1</b> Syscalls &amp; file descriptors</a>
+      <a href="ch03-memory-virtual-memory-page-cache-swap-oom.html"><b>Ch 3</b> The page cache</a>
+      <a href="ch05-users-groups-permissions-capabilities.html"><b>Ch 5</b> Permissions on inodes</a>
+      <a href="ch24-container-filesystems-overlayfs-and-image-layers.html"><b>Ch 24</b> overlayfs &amp; image layers</a>
+      <a href="ch86-the-data-layer-mysql-and-postgresql.html"><b>Ch 86</b> Databases &amp; the WAL</a>
+      <a href="ch104-compute-and-memory-runbooks.html"><b>Ch 104</b> Storage runbooks</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man2/open.2.html">open(2)</a> (flags, <code>O_DIRECT</code>, <code>O_APPEND</code>), <a href="https://man7.org/linux/man-pages/man2/fsync.2.html">fsync(2)</a>, and <a href="https://man7.org/linux/man-pages/man2/link.2.html">link(2)</a>.</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man7/inode.7.html">inode(7)</a> (metadata, timestamps, link count) and <a href="https://man7.org/linux/man-pages/man5/proc.5.html">proc(5)</a> (<code>/proc/&lt;pid&gt;/fd</code>, <code>fdinfo</code>, <code>io</code>).</li>
+      <li>The Linux Kernel documentation — <a href="https://docs.kernel.org/filesystems/vfs.html">Overview of the Linux Virtual File System</a> (superblock, inode, dentry, file objects).</li>
+      <li>The Linux Kernel documentation — <a href="https://docs.kernel.org/filesystems/ext4/index.html">ext4</a> and <a href="https://docs.kernel.org/admin-guide/xfs.html">xfs</a> admin guides (inode allocation, on-disk layout).</li>
+      <li>The Open Group — <a href="https://pubs.opengroup.org/onlinepubs/9699919799/">POSIX.1-2017</a>: the standard for the file API, offsets, and durability semantics.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch03-memory-virtual-memory-page-cache-swap-oom.html"><span class="dir">← Prev</span><div class="ti">Ch 3 — Memory: virtual memory, page cache, swap, OOM</div></a>
+      <a class="nx" href="ch05-users-groups-permissions-capabilities.html"><span class="dir">Next →</span><div class="ti">Ch 5 — Users, groups, permissions, capabilities</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 4 of 121 · Part I · Linux &amp; OS Foundations. Run the labs in a container; the reflexes are the point.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Name, inode, blocks</a>
+    <a href="#internals">open/read/write/fsync</a>
+    <a href="#components">The components</a>
+    <a href="#flow">One log line's path</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

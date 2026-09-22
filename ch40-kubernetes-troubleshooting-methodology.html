@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 40 — Kubernetes troubleshooting methodology</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part IV · Kubernetes &nbsp;·&nbsp; Chapter 40</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part IV · Kubernetes — Architecture &amp; Internals · Chapter 40</div>
+      <h1>Kubernetes troubleshooting methodology</h1>
+      <p class="tagline">CrashLoopBackOff, ImagePullBackOff, Pending, OOMKilled, NotReady — five words that cover most of what pages you, and every one of them is a symptom, not a diagnosis. Memorizing "I've seen this error before, here's the fix" runs out the first time the cause is new. A reasoning loop doesn't.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~50 min read · kind + kubectl lab</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>State the five-step reasoning loop — symptom, hypotheses, evidence, isolate, root cause — and default to it instead of guessing.</li>
+          <li>Read a Pod's phase, conditions, container states, and events as a structured trail of evidence, not just a red/green signal.</li>
+          <li>Diagnose CrashLoopBackOff, ImagePullBackOff, Pending, OOMKilled, and NotReady from <code>kubectl</code> output alone, and explain why each is a status word, not a cause.</li>
+          <li>Tell a pod-level failure from a node-level one in the first thirty seconds — because they demand completely different search spaces.</li>
+          <li>Apply the same method to a failure mode you've never seen before, instead of freezing because it isn't in a lookup table.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>Five words, and none of them tell you what's wrong</h2>
+    <p>Open <code>kubectl get pods</code> during an incident and Kubernetes hands you one of a short list of words: <code>Pending</code>, <code>CrashLoopBackOff</code>, <code>ImagePullBackOff</code>, <code>OOMKilled</code>, <code>NotReady</code>. Chapter 33 already made the point for one of these directly — CrashLoopBackOff is a symptom, not a cause, and the same is true of all five. Each one describes a <em>shape</em> of failure the platform observed, and each shape has a genuinely short list of mechanically possible causes behind it. The word alone never tells you which.</p>
+    <p>The tempting shortcut is pattern matching: "I've seen ImagePullBackOff before, it was always a bad tag, so it's a bad tag." That shortcut works until the day it isn't a bad tag — a private registry rotated its credentials, or a node's disk filled up and the pull itself failed for a reason that has nothing to do with the tag. Pattern matching against your own memory has no mechanism for the case you haven't seen yet, and production will eventually hand you that case at the worst possible time.</p>
+    <p>What scales instead is a small, boring loop you run every time, on purpose, regardless of how confident you feel: state the <b>symptom</b> precisely, list the <b>hypotheses</b> that could mechanically produce it, gather the specific <b>evidence</b> that would confirm or kill each one, <b>isolate</b> the one hypothesis the evidence actually supports, and only then commit to a <b>root cause</b>. It's slower than a lucky guess and faster than every wrong guess combined. This chapter applies it to the five words above, on purpose, so the loop itself — not the five answers — is what you walk away with. It's also the specific, Kubernetes-flavored instance of a general method that Part XI names outright: the universal troubleshooting framework of <a href="ch103-the-universal-troubleshooting-framework.html">Chapter 103</a> is this same loop with the Kubernetes vocabulary stripped back out.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>A status word tells you the <em>shape</em> of the failure — where in the pod's life it got stuck. It never tells you <em>why</em>. Treat every one of these five words as the start of an investigation, never the end of one.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: differential diagnosis</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>A patient walks into an ER and says "chest pain." A bad doctor hears that and immediately treats the one condition they saw most recently. A good doctor treats "chest pain" as a <b>symptom</b> and opens a <b>differential diagnosis</b> — a short, specific list of conditions that could actually produce chest pain: a muscle strain, acid reflux, a cardiac event, a handful of others. Nobody orders every test in the hospital; they order the tests that would separate those specific possibilities — an ECG, bloodwork, a chest X-ray. That's <b>evidence</b>, chosen because of what it rules in or out, not because it's routine.</p>
+      <p>As results come back, the doctor <b>isolates</b>: the ECG is clean, bloodwork shows nothing cardiac, but the pain tracks exactly with meals — reflux is now the best-supported explanation, and the others are ruled out by specific evidence, not by feel. That's the <b>root cause</b>, and only now does treatment start. Notice what didn't happen: nobody treated "chest pain" directly. You cannot treat a symptom; you can only treat what's causing it — and <code>kubectl</code> gives you a stethoscope, not a diagnosis.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In Kubernetes troubleshooting</th></tr>
+      <tr><td>"Chest pain" — the patient's complaint</td><td>The status word: <code>Pending</code>, <code>CrashLoopBackOff</code>, <code>OOMKilled</code>...</td></tr>
+      <tr><td>The differential diagnosis — a short list of real possibilities</td><td>Your hypothesis list for that specific status word</td></tr>
+      <tr><td>Ordering an ECG, bloodwork, an X-ray</td><td><code>kubectl describe</code>, <code>logs</code>, <code>get events</code>, <code>get -o yaml</code></td></tr>
+      <tr><td>Ruling conditions in or out from the results</td><td>Isolating: which hypothesis the evidence actually supports</td></tr>
+      <tr><td>The confirmed diagnosis</td><td>The root cause, specific enough to know the fix</td></tr>
+      <tr><td>Treatment, then checking vitals stabilize</td><td>The fix, then confirming the status word actually goes away and stays away</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>The decision path from symptom to search space</h2>
+    <p>Before you can pick hypotheses, you have to know which <em>space</em> you're searching. The single question that matters most in the whole framework is the very first branch: is this <em>one workload</em> misbehaving, or is it <em>everything on one node</em>? Those are different investigations with almost no overlap, and picking the wrong one burns the most valuable minutes of an incident on the wrong search space entirely.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 800 540" role="img" aria-label="A decision tree starting from a symptom, branching first into a node-wide failure versus a single pod failure, then into the five canonical status words each with its first command and usual causes">
+        <defs>
+          <marker id="tt-ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--muted)"/></marker>
+        </defs>
+        <text x="400" y="18" text-anchor="middle" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">SYMPTOM → WHICH SEARCH SPACE → WHICH STATUS WORD</text>
+
+        <rect x="300" y="28" width="200" height="42" rx="9" style="fill:var(--panel);stroke:var(--ink);stroke-width:1.5"/>
+        <text x="400" y="53" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">Symptom observed</text>
+
+        <rect x="270" y="100" width="260" height="44" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="400" y="126" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">kubectl get pods -A -o wide · get nodes</text>
+        <line x1="400" y1="70" x2="400" y2="98" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#tt-ar)"/>
+
+        <rect x="30" y="182" width="270" height="52" rx="8" style="fill:var(--panel);stroke:var(--violet);stroke-width:1.5"/>
+        <text x="165" y="204" text-anchor="middle" style="fill:var(--violet);font:600 11.5px sans-serif">Several/all pods on ONE node</text>
+        <text x="165" y="222" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">fail alike, unrelated services</text>
+
+        <rect x="340" y="182" width="430" height="52" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="555" y="204" text-anchor="middle" style="fill:var(--accent);font:600 11.5px sans-serif">One pod (or a few), any node — STATUS column says…</text>
+        <text x="555" y="222" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">read the exact word before hypothesizing</text>
+
+        <g style="stroke:var(--muted);stroke-width:1.5">
+          <line x1="330" y1="144" x2="165" y2="180" marker-end="url(#tt-ar)"/>
+          <line x1="470" y1="144" x2="555" y2="180" marker-end="url(#tt-ar)"/>
+        </g>
+
+        <rect x="30" y="270" width="270" height="46" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="165" y="298" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">kubectl get nodes → STATUS</text>
+        <line x1="165" y1="234" x2="165" y2="268" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#tt-ar)"/>
+
+        <rect x="30" y="342" width="270" height="120" rx="9" style="fill:var(--panel);stroke:var(--violet);stroke-width:2"/>
+        <text x="165" y="366" text-anchor="middle" style="fill:var(--violet);font:700 13px sans-serif">NotReady (node)</text>
+        <text x="165" y="386" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">kubelet heartbeat lost · runtime down</text>
+        <text x="165" y="402" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">CNI DaemonSet crashed · disk pressure</text>
+        <text x="165" y="422" text-anchor="middle" style="fill:var(--accent);font:600 10px sans-serif">→ Ch 30 kubelet · Ch 41 CNI</text>
+        <line x1="165" y1="316" x2="165" y2="340" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#tt-ar)"/>
+
+        <g style="stroke:var(--muted);stroke-width:1.2">
+          <line x1="400" y1="234" x2="360" y2="268" marker-end="url(#tt-ar)"/>
+          <line x1="490" y1="234" x2="480" y2="268" marker-end="url(#tt-ar)"/>
+          <line x1="600" y1="234" x2="605" y2="268" marker-end="url(#tt-ar)"/>
+          <line x1="710" y1="234" x2="735" y2="268" marker-end="url(#tt-ar)"/>
+        </g>
+
+        <rect x="340" y="270" width="120" height="90" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="400" y="292" text-anchor="middle" style="fill:var(--accent);font:700 12px sans-serif">Pending</text>
+        <text x="400" y="310" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">describe → Events</text>
+        <text x="400" y="326" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">Insufficient cpu/mem</text>
+        <text x="400" y="340" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">affinity/taint · no PVC (Ch 38)</text>
+
+        <rect x="470" y="270" width="120" height="90" rx="8" style="fill:var(--panel);stroke:var(--applied);stroke-width:1.5"/>
+        <text x="530" y="292" text-anchor="middle" style="fill:var(--applied);font:700 11.5px sans-serif">ImagePullBackOff</text>
+        <text x="530" y="310" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">describe → Events</text>
+        <text x="530" y="326" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">bad tag · registry auth</text>
+        <text x="530" y="340" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">network to registry</text>
+
+        <rect x="600" y="270" width="130" height="90" rx="8" style="fill:var(--panel);stroke:var(--deep);stroke-width:1.5"/>
+        <text x="665" y="292" text-anchor="middle" style="fill:var(--deep);font:700 11.5px sans-serif">CrashLoopBackOff</text>
+        <text x="665" y="310" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">logs --previous +</text>
+        <text x="665" y="324" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">describe → Last State</text>
+        <text x="665" y="342" text-anchor="middle" style="fill:var(--deep);font:600 9px sans-serif">↓ same word, two causes</text>
+
+        <rect x="740" y="270" width="52" height="90" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="766" y="292" text-anchor="middle" style="fill:var(--ink);font:700 10px sans-serif">0/1</text>
+        <text x="766" y="304" text-anchor="middle" style="fill:var(--ink);font:700 10px sans-serif">Ready</text>
+        <text x="766" y="322" text-anchor="middle" style="fill:var(--muted);font:8px sans-serif">Conditions:</text>
+        <text x="766" y="334" text-anchor="middle" style="fill:var(--muted);font:8px sans-serif">readiness probe</text>
+        <text x="766" y="346" text-anchor="middle" style="fill:var(--muted);font:8px sans-serif">(Ch 33)</text>
+
+        <line x1="640" y1="360" x2="600" y2="398" style="stroke:var(--deep);stroke-width:1.5" marker-end="url(#tt-ar)"/>
+        <line x1="690" y1="360" x2="720" y2="398" style="stroke:var(--deep);stroke-width:1.5" marker-end="url(#tt-ar)"/>
+
+        <rect x="530" y="404" width="130" height="70" rx="8" style="fill:var(--panel);stroke:var(--deep);stroke-width:1.5"/>
+        <text x="595" y="426" text-anchor="middle" style="fill:var(--deep);font:700 11px sans-serif">Reason: OOMKilled</text>
+        <text x="595" y="444" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">Exit Code 137 →</text>
+        <text x="595" y="458" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">memory limit too low</text>
+
+        <rect x="670" y="404" width="130" height="70" rx="8" style="fill:var(--panel);stroke:var(--deep);stroke-width:1.5"/>
+        <text x="735" y="426" text-anchor="middle" style="fill:var(--deep);font:700 11px sans-serif">Reason: Error</text>
+        <text x="735" y="444" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">Exit ≠ 0 →</text>
+        <text x="735" y="458" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">app/config bug, read logs</text>
+
+        <rect x="14" y="494" width="772" height="34" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="30" y="516" style="fill:var(--ink);font:11px sans-serif">CrashLoopBackOff and OOMKilled can show the identical word at <code style="font-family:ui-monospace,monospace">get pods</code> — the split only appears one command deeper, at <code style="font-family:ui-monospace,monospace">describe</code>.</text>
+      </svg>
+      <figcaption>The first branch — one node's worth of pods versus one pod anywhere — decides your entire search space. Only after that does the status word narrow the hypothesis list, and even then, the word alone can hide two very different causes.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>Paging systems alert on symptoms — a failed check, a status word, an error-rate threshold — because that's what's cheap to detect automatically. Nobody pages you with the root cause already attached; if they could, there'd be no incident. The gap between "here's the alert" and "here's the fix" is exactly this framework, run under time pressure. Skipping straight to a fix without running it is how you get an incident that looks resolved and pages again an hour later.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>The five-step loop, in detail</h2>
+    <ol class="steps">
+      <li><b>State the symptom precisely, in the tool's own words.</b> "STATUS shows <code>CrashLoopBackOff</code>, RESTARTS is 14 and climbing, this started nine minutes ago" is a symptom. "The app is broken" is an interpretation wearing a symptom's clothes, and it already threw away information you'll want later — when it started, how fast it's recurring, whether it's one pod or many.</li>
+      <li><b>List hypotheses — the short, specific set the platform can mechanically produce.</b> Not "everything that could ever go wrong with software." For <code>CrashLoopBackOff</code> specifically, the container is exiting and restarting, which narrows things to: the process exits on its own (a bug, a missing config, a failed startup dependency check), or something outside the process kills it (the OOM killer, a liveness-probe-triggered kill, a node-level signal). That's a handful of concrete possibilities, not an open-ended search.</li>
+      <li><b>For each hypothesis, name the one piece of evidence that would confirm or kill it — then go get exactly that.</b> Exit code and Last State Reason from <code>describe</code> separate "the app exited itself" from "something killed it." The crashed container's own output, via <code>logs --previous</code>, separates "a bug" from "missing config" from "a failed dependency check" if it's the former. Resist the urge to run every command you know; run the one that actually discriminates between the hypotheses still standing.</li>
+      <li><b>Isolate: read the evidence against each hypothesis specifically.</b> This is the step most people skip under pressure — they see something alarming in the output and stop there, even if it doesn't actually explain the symptom. An old, unrelated warning in the events list is not your root cause just because it's the first scary-looking line. Ask, for each candidate: does this specific piece of evidence actually predict the symptom I started with?</li>
+      <li><b>Commit to a root cause specific enough that you know the fix.</b> "Networking issue" is not a root cause. "The image tag in the Deployment was bumped to a version that was never pushed to the registry" is — you know exactly what to change and exactly how to verify it. If your stated root cause doesn't imply an obvious next action, it's still a hypothesis, not a conclusion.</li>
+    </ol>
+    <div class="box keypoint"><div class="h">A symptom can be masked without being fixed</div>
+      <p>Restarting the pod, bumping the replica count, or deleting and recreating the object will often make the status word disappear for a while — and none of those touch a root cause you haven't found yet. If you skip straight from symptom to a generic remedy, the underlying condition (a leak, a bad config that only some replicas got, a node with the same fault) is still there, and it will page you again. The loop isn't bureaucracy; it's the difference between a fix and a snooze button.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: two pods, both showing <code>CrashLoopBackOff</code> with RESTARTS climbing at roughly the same rate. Are they necessarily the same problem?</summary>
+      <div class="body">
+        <p>Not necessarily — the status word only tells you the shape (exiting and restarting on a backoff), not the cause, and two unrelated causes can produce visually identical backoff curves. One pod might be OOMKilled every time it hits a memory spike; the other might be crashing on a missing environment variable that's always missing. Both show the exact same word, a similar restart cadence, and even similar-looking backoff timing, because the backoff behavior comes from the kubelet's restart policy, not from the cause. Treating them as "probably the same issue" because they look alike at a glance is exactly the pattern-matching shortcut this chapter argues against — each one needs its own pass through the loop, starting from its own <code>describe</code> and its own <code>logs --previous</code>.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>Where the evidence actually lives</h2>
+    <ul>
+      <li><b><code>kubectl get -o wide</code> / custom-columns.</b> The fast overview: STATUS, RESTARTS, AGE, NODE, in one line per pod. Good for triage — spotting whether a symptom is isolated to one pod or spread across one node — but too coarse to diagnose anything on its own.</li>
+      <li><b><code>kubectl describe</code>.</b> The richest single source. For a Pod: <b>Conditions</b> (the state-machine detail under the coarse phase), the per-container <b>State</b>/<b>Last State</b> with a <b>Reason</b> string and, for a terminated container, an <b>Exit Code</b>, and the <b>Events</b> list at the bottom — which is where most causes surface first, in plain English, and which most people read last or not at all.</li>
+      <li><b><code>kubectl logs</code> and <code>kubectl logs --previous</code>.</b> The crashed container's own stdout/stderr. The instant a container restarts, a normal <code>logs</code> call shows the <em>new</em> container's output, not the one that just died — <code>--previous</code> is the only way to see the crash itself, and it's only available for one generation back. This is why log shipping matters operationally (<a href="ch78-logging.html">Chapter 78</a>): fast-churning containers destroy their own evidence trail within minutes if nothing's collecting it off-box.</li>
+      <li><b><code>kubectl get events --sort-by=.lastTimestamp</code>.</b> A cluster- or namespace-wide event stream, useful when the symptom doesn't map cleanly to one object you already know about — a scheduling failure, an admission rejection, a volume problem, all land here too.</li>
+      <li><b>Pod phase versus conditions versus container state — three different layers, easy to conflate.</b> <b>Phase</b> (<code>Pending</code>/<code>Running</code>/<code>Succeeded</code>/<code>Failed</code>/<code>Unknown</code>) is the coarsest possible summary. <b>Conditions</b> (<code>PodScheduled</code>, <code>Initialized</code>, <code>ContainersReady</code>, <code>Ready</code>) are booleans underneath it that tell you exactly which stage of startup a pod has and hasn't cleared. <b>Container state</b> (<code>Waiting</code>/<code>Running</code>/<code>Terminated</code>, each with its own <code>Reason</code>) is where <code>ImagePullBackOff</code>, <code>CrashLoopBackOff</code>, and <code>OOMKilled</code> actually live — most of the five words in this chapter's title are container-state reasons, not pod phases, which is why <code>kubectl get pods</code>'s STATUS column is really reporting the most relevant of several layers, not one single field.</li>
+      <li><b>Node conditions.</b> <code>Ready</code>, <code>MemoryPressure</code>, <code>DiskPressure</code>, <code>PIDPressure</code>, <code>NetworkUnavailable</code> — and a deliberate delay (the <code>node-monitor-grace-period</code>, 40 seconds by default) between a real heartbeat loss and the node flipping <code>NotReady</code>, so a single missed heartbeat doesn't flap the whole node's workloads.</li>
+    </ul>
+
+    <details class="recall"><summary>Think first: <code>kubectl get pods</code> shows STATUS <code>Running</code> but READY <code>0/1</code>. Is the pod's phase actually "not running"?</summary>
+      <div class="body">
+        <p>No — its phase genuinely is <code>Running</code>; the container started and hasn't exited. What's false is one specific condition underneath that phase: <code>Ready</code>. The STATUS column you're reading is actually a blend of several layers — phase, conditions, and container state — collapsed into one word for convenience, and here it's showing you the phase while READY is showing you the <code>ContainersReady</code>/<code>Ready</code> condition separately. Treating "Running" as "healthy" is the mistake: a pod can run indefinitely while correctly reporting itself unfit for traffic, which is exactly what a readiness probe is designed to let it do. The fix for this specific shape is never in the phase — it's always one layer down, in Conditions and Events.</p>
+      </div>
+    </details>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one ambiguous page through the loop</h2>
+    <p>The page says: "myapp is failing health checks." <code>kubectl get pods -o wide</code> shows <code>myapp-7f9d</code>: STATUS <code>Running</code>, RESTARTS <code>0</code>, READY <code>0/1</code>. Stop and actually read those three numbers before hypothesizing anything — <code>Running</code> with <code>0</code> restarts already rules out the entire crash-and-OOM branch of the tree; whatever this is, the container itself is alive and hasn't been killed once. That single line just cut the hypothesis space by more than half.</p>
+    <p>Hypotheses narrow to: the readiness probe itself is misconfigured (wrong path, wrong port), or the probe is correctly configured and the app is correctly reporting that it isn't ready. <code>kubectl describe pod myapp-7f9d</code> shows <code>Conditions: Ready False</code> and an Events line: <code>Readiness probe failed: HTTP probe failed with statuscode: 503</code>. That's evidence, and it discriminates cleanly: a misconfigured probe usually shows a connection error or a 404, not a clean <code>503</code> from the app's own handler. A <code>503</code> means the app is up, is answering, and is <em>telling you itself</em> that it isn't ready.</p>
+    <p><code>kubectl logs myapp-7f9d</code> shows the app's own log line: <code>WARN: database connection pool exhausted, marking unready</code>. Root cause isolated — and notice where it actually is: not in this pod at all. The pod is behaving exactly as designed, correctly refusing traffic because a downstream dependency is unhealthy. Fixing this pod (restarting it, redeploying it) would do nothing, because it was never broken — the same "blocked, not crashed" reflex from <a href="ch01-kernel-and-system-calls.html">Chapter 1</a> and the "check the endpoints, not the pod" reflex from <a href="ch43-services-and-the-datapath-pod-to-service.html">Chapter 43</a>, both showing up again here. The loop's job wasn't to fix <code>myapp</code>; it was to prove that <code>myapp</code> wasn't where the fix belonged.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>Five labs, five status words, all on one <code>kind</code> cluster:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>kind create cluster --name diag
+kubectl create namespace demo</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — walk the loop explicitly on ImagePullBackOff</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Deploy a tag that doesn't exist, and this time, write out every step of the loop instead of jumping to the fix.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl -n demo create deployment web --image=nginx:1.99.99
+kubectl -n demo get pods</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME                   READY   STATUS             RESTARTS   AGE
+web-6b8f7c9d5-x2z4p    0/1     ImagePullBackOff   0          45s</code></div>
+        <p><b>Symptom:</b> STATUS <code>ImagePullBackOff</code>, RESTARTS <code>0</code> — the container has never even started once. <b>Hypotheses:</b> a nonexistent tag, a private image needing credentials we didn't provide, or a network path to the registry that's down. <b>Evidence:</b> the Events list names the exact pull attempt and the exact response from the registry:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl -n demo describe pod -l app=web | grep -A4 Events</code></pre></div>
+        <div class="out"><span class="ol">Output</span>Warning  Failed     ...  Failed to pull image "nginx:1.99.99": rpc error: ...
+                                 nginx:1.99.99: not found
+Warning  BackOff    ...  Back-off pulling image "nginx:1.99.99"</code></div>
+        <p><b>Isolate:</b> the registry answered — it didn't time out, it didn't reject credentials, it said the tag doesn't exist. That rules out "network down" and "bad credentials" with the same piece of evidence. <b>Root cause:</b> the tag <code>1.99.99</code> was never published for this image. Fix and confirm the word actually clears, not just that the pod exists:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl -n demo set image deployment/web web=nginx:1.27
+kubectl -n demo rollout status deployment/web --timeout=60s</code></pre></div>
+        <p>Five short steps, written down, took less time than the retry backoff you'd have waited through by just staring at the pod.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — Pending is not one thing</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Request more CPU than any node in the cluster has:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl -n demo apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: Pod
+metadata: { name: hungry }
+spec:
+  containers:
+  - name: c
+    image: busybox:1.36
+    command: ["sleep", "3600"]
+    resources: { requests: { cpu: "100" } }
+EOF
+kubectl -n demo get pod hungry</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME     READY   STATUS    RESTARTS   AGE
+hungry   0/1     Pending   0          20s</code></div>
+        <p><b>Symptom:</b> <code>Pending</code> — the same word Chapter 38 used for a PVC that hadn't bound yet, and a completely different mechanism. That's the whole point of treating the word as a symptom: two different root causes, one shared vocabulary. <b>Hypotheses:</b> insufficient resources, a node-affinity/taint mismatch, or (per Chapter 38) an unbound volume. <b>Evidence:</b>:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl -n demo describe pod hungry | grep -A3 Events</code></pre></div>
+        <div class="out"><span class="ol">Output</span>Warning  FailedScheduling  ...  0/1 nodes are available: 1 Insufficient cpu.
+preemption: 0/1 nodes are available: 1 No preemption victims found for incoming pod.</code></div>
+        <p><b>Isolate:</b> the scheduler considered every node and rejected all of them for the same stated reason, <code>Insufficient cpu</code> — not a volume, not an affinity rule. <b>Root cause:</b> the requested <code>100</code> CPU is larger than any node's allocatable capacity, full stop; no amount of waiting fixes it. Confirm the ceiling and then stop asking for more than it:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl describe node -l node-role.kubernetes.io/control-plane!= 2&gt;/dev/null | grep -A5 Allocatable
+kubectl -n demo delete pod hungry</code></pre></div>
+        <p>The event line did all the work here — it named the resource and the exact node count. Reading Events first, before forming a theory, would have saved a hypothesis or two.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — CrashLoopBackOff with the cause hidden</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>This one you diagnose yourself before reading further.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl -n demo apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: Pod
+metadata: { name: flaky }
+spec:
+  containers:
+  - name: c
+    image: busybox:1.36
+    command: ["sh", "-c", "if [ -z \"$REQUIRED_CONFIG\" ]; then echo 'FATAL: REQUIRED_CONFIG not set' &gt;&amp;2; exit 1; fi; sleep 3600"]
+EOF
+kubectl -n demo get pod flaky -w</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME    READY   STATUS               RESTARTS      AGE
+flaky   0/1     CrashLoopBackOff     3 (25s ago)   84s</code></div>
+        <p>Run the loop yourself: state the symptom precisely, list the hypotheses a container that exits and restarts could actually have, and pick the one command that would separate them fastest. Then check.</p>
+        <details class="recall"><summary>Reveal the evidence and the cause</summary>
+          <div class="body">
+            <p>A plain <code>kubectl logs flaky</code> may come back empty or racy — by the time you run it, the container that logged the error may already have been replaced by the next restart. <code>--previous</code> is what actually catches it:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl -n demo logs flaky --previous
+kubectl -n demo describe pod flaky | grep -A6 "Last State"</code></pre></div>
+            <div class="out"><span class="ol">Output</span>FATAL: REQUIRED_CONFIG not set
+
+Last State:     Terminated
+  Reason:       Error
+  Exit Code:    1</code></div>
+            <p><code>Reason: Error</code> with a non-zero exit code means the process exited <em>on its own</em> — nothing killed it. Combined with the log line, the root cause is specific and actionable: the container requires an environment variable it was never given. Not "the container crashes" — that's still the symptom restated. Fix it at the actual cause:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl -n demo delete pod flaky
+kubectl -n demo run flaky --image=busybox:1.36 --env="REQUIRED_CONFIG=set" \
+  --command -- sh -c 'sleep 3600'
+kubectl -n demo get pod flaky</code></pre></div>
+            <p>RESTARTS stops climbing and STATUS settles on <code>Running</code> — confirmation the loop closed on the right cause, not just that the symptom went quiet for a moment.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — the same word, a different cause</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Run this one without looking back at Lab 3 for the answer — that's exactly the trap it's testing.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl -n demo apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: Pod
+metadata: { name: piggy }
+spec:
+  containers:
+  - name: c
+    image: busybox:1.36
+    command: ["sh", "-c", "dd if=/dev/zero of=/dev/shm/fill bs=1M count=100; sleep 3600"]
+    resources:
+      limits: { memory: "20Mi" }
+    volumeMounts: [{ name: shm, mountPath: /dev/shm }]
+  volumes:
+  - name: shm
+    emptyDir: { medium: Memory }
+EOF
+kubectl -n demo get pod piggy -w</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME    READY   STATUS               RESTARTS      AGE
+piggy   0/1     CrashLoopBackOff     2 (30s ago)   50s</code></div>
+        <p>Read that STATUS column again. It is the <em>identical word</em> to Lab 3 — <code>CrashLoopBackOff</code> — with a similar restart cadence. If the word alone told the whole story, these would be the same incident. Go one command deeper before you decide what happened here.</p>
+        <details class="recall"><summary>Reveal the evidence and the cause</summary>
+          <div class="body">
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl -n demo describe pod piggy | grep -A6 "Last State"</code></pre></div>
+            <div class="out"><span class="ol">Output</span>Last State:     Terminated
+  Reason:       OOMKilled
+  Exit Code:    137</code></div>
+            <p><code>Reason: OOMKilled</code>, exit code <code>137</code> — 128 plus signal 9, SIGKILL. Nothing about the app decided to exit; the kernel's cgroup memory controller killed it the instant it crossed the 20Mi limit, exactly the mechanism from <a href="ch03-memory-virtual-memory-page-cache-swap-oom.html">Chapter 3</a>, just triggered by a container limit instead of whole-system memory pressure. You can see the kernel's own account of it on the node:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>docker exec diag-worker dmesg 2&gt;/dev/null | grep -i "killed process" | tail -3</code></pre></div>
+            <div class="out"><span class="ol">Output</span>[...] Memory cgroup out of memory: Killed process ... (dd) total-vm:..., anon-rss:20308kB</code></div>
+            <p>Same STATUS word as Lab 3, opposite mechanism, and opposite fix. Lab 3's process chose to exit — the fix was giving it what it needed to keep running. This process was forcibly killed by the kernel for exceeding a limit — the fix is either raising the limit to match real usage, or fixing the workload to use less, never just "restart it and see." Confirming <code>Reason</code> and <code>Exit Code</code> before touching anything is the one habit that keeps these two labs from being misdiagnosed as the same incident. Clean up: <code>kubectl -n demo delete pod piggy</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — half the fleet pages at once</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>Stop the kubelet on one node directly, the way a real crash or a bad node-level change would:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker exec diag-worker systemctl stop kubelet
+<span class="c"># wait for the node-monitor-grace-period (default 40s) to elapse</span>
+sleep 45
+kubectl get nodes</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME            STATUS     ROLES           AGE   VERSION
+diag-control-plane   Ready      control-plane   4m    v1.31.0
+diag-worker          NotReady   &lt;none&gt;          4m    v1.31.0</code></div>
+        <p>Now the senior question, framed exactly the way a page would frame it: several unrelated services' alerts fire within the same minute, all showing different symptoms — one CrashLooping, one failing readiness, one just not responding. What's the very first command you run, and why is it not <code>kubectl describe pod</code> on any of them? Reason it out before revealing.</p>
+        <details class="recall"><summary>Reveal the reasoning</summary>
+          <div class="body">
+            <p><b>Widen the aperture before you narrow it.</b> Several unrelated services failing in different-looking ways, in the same minute, is far more likely to share one cause than to be several coincident, unrelated bugs. Chasing the first pod's <code>describe</code> output commits you to the pod-level search space before you've ruled out the node-level one — exactly the wrong-branch mistake the decision tree above warns about. The first command is the top of that tree, not the bottom of it:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl get nodes
+kubectl get pods -A -o wide | awk '{print $8}' | sort | uniq -c   <span class="c"># pods per node, eyeball the skew</span></code></pre></div>
+            <p>If the failing services all happen to have a pod scheduled on <code>diag-worker</code>, you've just explained every one of them with a single root cause instead of three separate investigations. Confirm what a NotReady node actually does to its existing pods — and notice it is deliberately <em>not</em> instant:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl describe node diag-worker | grep -A4 Conditions
+kubectl get pods -A --field-selector spec.nodeName=diag-worker -o wide</code></pre></div>
+            <p>Pods already running on the node keep running physically — the container runtime doesn't know the kubelet died — but the node stops reporting fresh status, and after the separate <code>pod-eviction-timeout</code> (five minutes by default) the control plane starts evicting them, which it can't fully confirm without a live kubelet to acknowledge it. That multi-minute gap is deliberate: a single missed heartbeat shouldn't trigger a mass reschedule. The practical read for an on-call engineer: a NotReady node explains degraded-but-not-instantly-dead pods on it, and the fix is restoring the kubelet (or replacing the node), not chasing each symptom pod individually.</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>docker exec diag-worker systemctl start kubelet
+sleep 15
+kubectl get nodes   <span class="c"># diag-worker back to Ready</span></code></pre></div>
+            <p>The lesson generalizes past this one lab: correlated, differently-shaped symptoms across unrelated services is itself evidence, and it points up a layer — node, control plane, or a shared dependency — before it points at any single pod's YAML.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How investigations themselves go wrong</h2>
+    <p>The five labs covered the failure modes. These three are about the investigation, not the workload — the mistakes that turn a five-minute diagnosis into a two-hour incident regardless of which status word started it.</p>
+    <div class="box realworld"><div class="h">Anti-pattern · treating the symptom as the cause</div>
+      <p><b>What it looks like:</b> a pod is unhealthy, someone deletes it or bumps the replica count, the alert clears, and everyone moves on without ever running <code>describe</code> or <code>logs</code>. <b>Why it bites later:</b> nothing about the underlying condition changed — a slow leak, a bad config on a subset of replicas, a node with a fault — so the same alert fires again, often worse, often at a worse time. <b>The fix</b> is procedural: no incident closes without a stated root cause, even a one-line one, and "restarted it" is never that line by itself.</p>
+    </div>
+    <div class="box realworld"><div class="h">Anti-pattern · tunnel vision on the first hypothesis</div>
+      <p><b>What it looks like:</b> someone has a pet theory ("it's always DNS," "it's always the last deploy") and keeps gathering evidence to confirm it while ignoring evidence that contradicts it. <b>Why it bites later:</b> the isolate step exists specifically to kill hypotheses the evidence doesn't support — skip it and you can talk yourself into the wrong root cause with real, if misread, evidence in hand, then "fix" something that was never broken while the actual cause keeps running. <b>The fix:</b> for every hypothesis still standing, ask what evidence would prove it <em>wrong</em>, not just what would confirm it.</p>
+    </div>
+    <div class="box realworld"><div class="h">Anti-pattern · pod-level thinking on a node-level problem</div>
+      <p><b>What it looks like:</b> forty minutes spent re-reading one Deployment's YAML while three other, unrelated services degrade in the background on the same node. <b>Why it bites later:</b> every minute spent in the wrong search space is a minute the real cause — and its blast radius — kept growing. <b>The fix:</b> make "is this one workload or one node (or the whole control plane)" the very first check, every time, before opening a single pod's details, exactly as Lab 5 forces you to.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Encode the loop into runbooks, not just into memory.</b> A good runbook for "pod stuck Pending" doesn't say "check resources" — it lists the specific hypotheses, the specific command that discriminates between them, and what each possible result means, so any on-call engineer reproduces a senior engineer's reasoning under pressure at 3 a.m., not just their own best guess. Chapter 107's Kubernetes runbooks are this chapter's method, pre-written for the cases you can predict in advance.</p>
+    <p><b>Evidence has a shelf life.</b> A crashed container's logs survive exactly until the next restart evicts them from <code>--previous</code>, and a deleted pod's events survive only as long as the API server's event TTL. If your incident review keeps hitting "we don't actually know why it crashed" as the final answer, the fix isn't better memory — it's shipping logs and events off-box before they age out, which is Chapter 78's job, not this chapter's.</p>
+    <p><b>Which status word is trending is itself a signal.</b> One OOMKilled incident is an app problem; a rising rate of OOMKilled incidents across many unrelated services is a capacity or right-sizing problem — the VPA and resource-request discipline of <a href="ch37-autoscaling-and-governance-hpa-vpa-cluster-autoscaler.html">Chapter 37</a> is the systemic fix, not five individual app fixes. <b>Common mistakes:</b> reading RESTARTS as itself meaningful without ever checking the Reason behind it; assuming Pending always means "add capacity" when it's frequently a scheduling constraint that more capacity won't touch; treating a policy or admission rejection (<a href="ch39-security-rbac-admission-policy-securitycontext.html">Chapter 39</a>) as if it were a runtime failure, when it never even reached a pod; and forgetting to check node health when several unrelated services misbehave at once.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>This loop is the same one incident response runs at a larger scale, just with fewer Kubernetes-specific nouns: symptom, hypotheses, evidence, isolate, root cause is the skeleton underneath the postmortem process in <a href="ch92-incident-management-postmortems-and-the-sre-operating.html">Chapter 92</a>, and it's exactly what Part XI generalizes past Kubernetes entirely, starting with <a href="ch103-the-universal-troubleshooting-framework.html">Chapter 103</a>. At a platform-engineering level, the design decision is where you spend the effort: alerting on symptoms is cheap and necessary, but a mature platform also invests in making the evidence-gathering step fast — structured logs, long event retention, dashboards that already show the node/pod correlation Lab 5 made you compute by hand. The method doesn't change; what a platform team builds is the tooling that makes step three (evidence) take seconds instead of minutes, every time, for everyone on call — not just the person who's internalized this chapter.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first, then open it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's your framework for debugging an unfamiliar Kubernetes failure?</summary>
+        <div class="a"><p>A five-step loop: state the symptom precisely using the tool's own words, list the small set of hypotheses that could mechanically produce that specific symptom, gather the one piece of evidence that would confirm or kill each hypothesis, isolate the one the evidence actually supports rather than the first thing that looks alarming, and only then commit to a root cause specific enough to imply the fix. It works on failure modes I've never seen before, because it never depended on recognizing the pattern in the first place — it depends on the platform's own vocabulary of status, conditions, and events, which is always there.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through diagnosing a pod stuck in CrashLoopBackOff.</summary>
+        <div class="a"><p>The symptom is precise: the container is starting and exiting repeatedly, on a growing backoff. That narrows hypotheses to two families — the process exits on its own, from a bug, missing config, or a failed startup dependency check, or something external kills it, most commonly the OOM killer or a liveness probe. The discriminating evidence is the per-container Last State: a Reason of Error with a small, deliberate-looking exit code points at the first family, and I'd pull logs with --previous immediately, before the next restart evicts them, to see what the process itself said on the way out. A Reason of OOMKilled with exit code 137 points at the second family entirely — that's the kernel's cgroup OOM killer, and no amount of reading application logs will explain it, because the process never got a chance to log anything; I'd check the container's memory limit against what it actually needs. I isolate on that Reason and exit code specifically, not on how alarming the pod looks, because CrashLoopBackOff itself looks identical either way, and confirm the fix by watching RESTARTS actually stop climbing, not just checking that the pod exists again.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Why is "just restart the pod" often the wrong first move, even when it makes the symptom go away?</summary>
+        <div class="a"><p>Restarting resets the object Kubernetes is watching, not the condition that caused the failure. If the cause was a transient blip — a one-off network hiccup during startup — a restart genuinely fixes it, and that's fine. But if the cause is a leak that takes an hour to reappear, a config that's wrong for a subset of replicas, or a node with a hardware or disk fault, a restart clears the visible symptom while leaving the actual condition fully intact, and it will resurface, usually at a less convenient time and sometimes worse, because whatever was accumulating (a leak, disk fill, a queue backing up) kept accumulating on every other replica the whole time you thought it was resolved. The deeper cost is informational: every restart-without-diagnosis throws away the evidence — logs, exit codes, events — that would have let you find the real cause cheaply, so the next occurrence starts from zero again instead of building on what you learned. Restarting is a legitimate mitigation to buy time during an active incident; it's never a substitute for finishing the loop afterward.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>Multiple unrelated services start failing at the same time, in different-looking ways. How does your approach change from a single failing pod?</summary>
+        <div class="a"><p>It changes at the very first step. A single failing pod puts me straight into the pod-level branch — describe, logs, events for that one object. Several unrelated services failing together, especially in different-looking ways, is a strong prior that the shared cause sits above any individual pod: one node, the control plane, a shared dependency like DNS or a Service with no endpoints, or a cluster-wide change like a new admission policy. So my first command is scoped wider, not narrower — kubectl get nodes, and a quick pass over which node each affected pod is scheduled on, before I open a single pod's details. If the affected services cluster on one node or share one recent change, I've explained all of them with one root cause instead of running the loop three separate times and probably missing the correlation. Jumping straight into the first pod's YAML is the classic version of this mistake — it commits you to the wrong search space before you've even confirmed which space you're in.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>How does this framework generalize beyond Kubernetes?</summary>
+        <div class="a"><p>The five steps never mention a pod, a status word, or kubectl — those are just where the evidence happens to live in this particular system. The same loop debugs a slow database query, a flaky CI pipeline, or a networking issue on a bare VM: state the symptom precisely, list the mechanically possible causes for that specific symptom, gather the evidence that discriminates between them, isolate the one the evidence actually supports, commit to a root cause specific enough to act on. What changes from system to system is only the vocabulary — Kubernetes gives you phases, conditions, container states, and events; a database gives you slow-query logs and lock waits; a network gives you packet captures. That's exactly why Part XI treats this as a universal framework and spends this chapter's worth of pages just teaching Kubernetes's particular vocabulary for it.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>Every Kubernetes status word — Pending, ImagePullBackOff, CrashLoopBackOff, OOMKilled, NotReady — describes the shape of a failure, never its cause. The reasoning loop that closes that gap has five steps: state the symptom precisely, list the mechanically possible hypotheses, gather the evidence that discriminates between them, isolate the one the evidence actually supports, and commit to a root cause specific enough to imply the fix. The first branch of any investigation is scope: one workload, or everything on one node — get the wrong branch and you burn the incident on the wrong search space. Pod phase, conditions, and container state are three different layers of the same object; most of the five words live in container-state Reasons, not the coarse phase. CrashLoopBackOff and OOMKilled can look identical at kubectl get pods and only diverge at describe's Last State and exit code — the status word alone cannot be trusted to distinguish them. Restarting a pod can mask a symptom without touching its cause, and correlated failures across unrelated services point up a layer, toward the node or the control plane, before they point at any single pod.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>A status word is a symptom, not a diagnosis — every one of the five in this chapter hides more than one possible cause.</li>
+      <li>The loop: symptom → hypotheses → evidence → isolate → root cause. Skip isolate and you'll fix the wrong thing.</li>
+      <li>The first branch is scope: one pod, or everything on one node — decide that before opening any pod's details.</li>
+      <li>Phase (coarse) → Conditions (state machine) → container State + Reason (where most of these five words actually live).</li>
+      <li><code>kubectl describe</code>'s Events list is the single richest source and the one most people read last.</li>
+      <li><code>kubectl logs --previous</code> is the only way to see a crashed container's own output — it's evicted on the next restart.</li>
+      <li>CrashLoopBackOff can mean Reason: Error (the process exited itself) or Reason: OOMKilled (the kernel killed it) — same word, opposite fix.</li>
+      <li>Exit code 137 = SIGKILL, almost always the cgroup OOM killer; a small nonzero exit code is usually the app exiting on purpose.</li>
+      <li>A NotReady node doesn't instantly kill its pods — there's a deliberate grace period, then a separate eviction timeout, by design.</li>
+      <li>Correlated, differently-shaped failures across unrelated services are evidence of a shared cause one layer up — check node/control-plane health first.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch33-workloads-i-pod-replicaset-deployment.html"><b>Ch 33</b> Pod lifecycle &amp; probes</a>
+      <a href="ch03-memory-virtual-memory-page-cache-swap-oom.html"><b>Ch 3</b> The OOM killer</a>
+      <a href="ch30-the-node-kubelet-kube-proxy-runtime-cri.html"><b>Ch 30</b> kubelet &amp; node health</a>
+      <a href="ch38-storage-volumes-pv-pvc-storageclass-csi.html"><b>Ch 38</b> Pending PVCs</a>
+      <a href="ch103-the-universal-troubleshooting-framework.html"><b>Ch 103</b> The general framework</a>
+      <a href="ch107-kubernetes-runbooks.html"><b>Ch 107</b> Kubernetes runbooks</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/">Pod Lifecycle</a>: phases, conditions, container states, and restart policy, precisely defined.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/tasks/debug/debug-application/debug-pods/">Debug Pods</a> and <a href="https://kubernetes.io/docs/tasks/debug/debug-application/debug-running-pod/">Debug Running Pods</a>: the official first-response checklist this chapter builds on.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/tasks/debug/debug-cluster/">Troubleshooting Clusters</a>: node-level and control-plane-level diagnosis, including node conditions.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/architecture/nodes/">Nodes</a>: node conditions, heartbeats, and the grace periods behind <code>NotReady</code> and pod eviction.</li>
+      <li>Google — <a href="https://sre.google/sre-book/table-of-contents/"><i>Site Reliability Engineering</i></a> (first-party): the hypothesis-driven troubleshooting model this chapter specializes for Kubernetes.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch39-security-rbac-admission-policy-securitycontext.html"><span class="dir">← Prev</span><div class="ti">Ch 39 — Security: RBAC, admission policy, securityContext</div></a>
+      <a class="nx" href="ch41-the-kubernetes-network-model-and-cni.html"><span class="dir">Next →</span><div class="ti">Ch 41 — The Kubernetes network model and CNI</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 40 of 121 · Part IV · Kubernetes — Architecture &amp; Internals. The status word is where the investigation starts, never where it ends.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">The decision path</a>
+    <a href="#internals">The five-step loop</a>
+    <a href="#components">Where evidence lives</a>
+    <a href="#flow">Following a page</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Investigation anti-patterns</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

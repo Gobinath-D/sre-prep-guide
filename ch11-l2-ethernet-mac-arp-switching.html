@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 11 — L2: Ethernet, MAC, ARP, switching</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part II · Networking &nbsp;·&nbsp; Chapter 11</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part II · Networking from First Principles · Chapter 11</div>
+      <h1>L2: Ethernet, MAC, ARP, switching</h1>
+      <p class="tagline">Chapter 10 left a packet holding a destination IP and a question: which box on this wire do I physically hand it to? Layer 2 is the answer — the hardware handoff on one segment. Get it, and stale-ARP blackholes and duplicate-IP mysteries stop being magic.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~45 min read · Linux lab (Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain what a MAC address is, how it differs from an IP, and why one is hop-local and the other end-to-end.</li>
+          <li>Trace an ARP request and reply, and read the Linux neighbour table and its states.</li>
+          <li>Describe how a switch learns MAC-to-port mappings and when it floods versus forwards.</li>
+          <li>Diagnose a stale-ARP blackhole and a duplicate-IP conflict from the symptoms alone.</li>
+          <li>Explain why big flat L2 networks don't scale, and how gratuitous ARP moves a VIP during failover.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem: the last-metre handoff</h2>
+    <p>Layer 3 gives you a plan — "send this packet toward <code>10.0.0.2</code>" — but a plan isn't delivery. At some point the packet has to become electrical signals on an actual wire, handed to an actual network card. And here's the catch: the machines on a local network segment don't know each other by IP address at all. IP is a software idea, assigned and reassigned by administrators. The network card only knows its own burned-in hardware address and how to send a frame to another hardware address on the same wire. So there's a gap: you have an IP, you need the hardware address that currently owns it, and nobody handed you a phone book.</p>
+    <p>On top of that, a wire is shared. Twenty machines on one segment can't all shout at once and expect anyone to hear. Early networks (hubs) really did just copy every signal to every port — a shared party line where everyone heard everything, which wasted bandwidth and leaked traffic to machines it wasn't meant for. Something had to learn who sits where and deliver each frame only to the port that needs it.</p>
+    <p>Layer 2 solves both problems. <b>ARP</b> is the phone book: given an IP on your segment, it finds the hardware address that answers to it, by asking everyone at once and letting the owner reply. The <b>switch</b> is the smart delivery: it watches which hardware address lives behind which port and forwards each frame only where it belongs. Together they turn "I have an IP and a shared wire" into "the right box got the frame." Every packet you'll ever send crosses this layer on its first metre and its last — and when it goes wrong, it goes wrong in ways that look, deceptively, like higher-layer problems.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>IP routing decides the <em>next hop</em>; L2 delivers the frame <em>to</em> that next hop. Every hop in a route is really "resolve the next box's hardware address, then hand it a frame." ARP does the resolving; the switch does the handing. A fault in either drops traffic that looks perfectly correct at L3.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: name badges in a big room</h2>
+    <p>Picture a large open-plan office full of people, all in one room.</p>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Everyone wears a permanent <b>name badge</b> printed at the factory — that's the <b>MAC address</b>, burned into the network card and globally unique. Separately, everyone has a <b>desk number</b> that gets reassigned as people move teams — that's the <b>IP address</b>, assigned by admins. You've been told to deliver a note to whoever is at desk <code>10.0.0.2</code>, but you only know the desk, not the face.</p>
+      <p>So you stand up and shout to the whole room: "Who is at desk 10.0.0.2? Tell me your name badge!" Everyone hears it (it's a <b>broadcast</b>), but only the person at that desk answers, quietly and directly to you: "That's me — badge <code>bb:bb:bb</code>." That call-and-answer is <b>ARP</b>, and you write the desk→badge mapping on a sticky note so you don't have to shout next time — your <b>ARP cache</b>. Now the note itself goes to a <b>mail clerk</b> in the middle of the room — the <b>switch</b> — who has quietly learned, by watching who sends mail, which door each badge sits behind. The clerk hands your note straight to <code>bb:bb:bb</code>'s desk and nobody else's. If the clerk hasn't seen a badge yet, it hedges by slipping a copy under every door (flooding) until it learns. And "the whole room that can hear your shout" is the <b>broadcast domain</b> — make the room too big and the constant shouting drowns out real work.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the room</th><th>On the network</th></tr>
+      <tr><td>Factory-printed name badge (permanent, unique)</td><td>MAC address — 48-bit, burned into the NIC</td></tr>
+      <tr><td>Desk number (reassigned as people move)</td><td>IP address — assigned in software</td></tr>
+      <tr><td>Shouting "who's at desk X? tell me your badge!"</td><td>ARP request — broadcast to <code>ff:ff:ff:ff:ff:ff</code></td></tr>
+      <tr><td>The quiet direct answer "that's me, badge bb:bb"</td><td>ARP reply — unicast back to the asker</td></tr>
+      <tr><td>Your sticky note of desk→badge</td><td>The ARP / neighbour cache (<code>ip neigh</code>)</td></tr>
+      <tr><td>The mail clerk who learned who's behind each door</td><td>The switch and its MAC/CAM table</td></tr>
+      <tr><td>Slipping a copy under every door when unsure</td><td>Flooding an unknown-unicast or broadcast frame</td></tr>
+      <tr><td>Everyone who can hear the shout</td><td>The broadcast domain (one L2 segment / VLAN)</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>ARP resolution, then frame delivery</h2>
+    <p>Here's the whole L2 story on one LAN: Host A wants to reach the IP <code>10.0.0.2</code>, discovers it belongs to Host B via ARP, and the switch delivers the frame to B's port and no one else's. Watch the three steps and the switch's table filling up.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 410" role="img" aria-label="Host A broadcasts an ARP request that reaches B and C; B replies unicast; then A sends a data frame that the switch forwards only to B's port.">
+        <defs>
+          <marker id="mr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" style="fill:var(--deep)"/></marker>
+          <marker id="mg" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+          <marker id="mb" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+        </defs>
+        <!-- legend -->
+        <rect x="18" y="14" width="684" height="86" rx="9" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="30" y="33" style="fill:var(--ink);font:700 12px sans-serif">ARP resolves an IP to a next-hop MAC; then the switch delivers the frame.</text>
+        <circle cx="38" cy="52" r="5" style="fill:var(--deep)"/>
+        <text x="50" y="56" style="fill:var(--ink);font:11.5px sans-serif">① REQUEST — broadcast to ff:ff:ff:ff:ff:ff: &quot;who has 10.0.0.2? tell 10.0.0.1&quot; (reaches A, B, C)</text>
+        <circle cx="38" cy="72" r="5" style="fill:var(--accent2)"/>
+        <text x="50" y="76" style="fill:var(--ink);font:11.5px sans-serif">② REPLY — unicast from B: &quot;10.0.0.2 is-at bb:bb:bb:bb:bb:bb&quot;</text>
+        <circle cx="38" cy="92" r="5" style="fill:var(--accent)"/>
+        <text x="50" y="96" style="fill:var(--ink);font:11.5px sans-serif">③ DATA — frame to dst bb:bb…; switch forwards to B's port ONLY, not C</text>
+        <!-- hosts + switch -->
+        <rect x="18" y="126" width="150" height="66" rx="8" style="fill:var(--chip);stroke:var(--accent);stroke-width:1.4"/>
+        <text x="93" y="147" text-anchor="middle" style="fill:var(--ink);font:700 12px sans-serif">Host A</text>
+        <text x="93" y="164" text-anchor="middle" style="fill:var(--muted);font:10.5px monospace">10.0.0.1</text>
+        <text x="93" y="180" text-anchor="middle" style="fill:var(--muted);font:10px monospace">aa:aa:aa:aa:aa:aa</text>
+        <rect x="300" y="134" width="160" height="82" rx="8" style="fill:var(--panel);stroke:var(--violet);stroke-width:1.6"/>
+        <text x="380" y="156" text-anchor="middle" style="fill:var(--violet);font:700 12px sans-serif">SWITCH</text>
+        <text x="380" y="174" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">learns MAC → port</text>
+        <text x="380" y="192" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">from every source MAC</text>
+        <text x="380" y="208" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">aging timer ~5 min</text>
+        <rect x="592" y="126" width="150" height="66" rx="8" style="fill:var(--chip);stroke:var(--accent2);stroke-width:1.4"/>
+        <text x="667" y="147" text-anchor="middle" style="fill:var(--ink);font:700 12px sans-serif">Host B</text>
+        <text x="667" y="164" text-anchor="middle" style="fill:var(--muted);font:10.5px monospace">10.0.0.2</text>
+        <text x="667" y="180" text-anchor="middle" style="fill:var(--muted);font:10px monospace">bb:bb:bb:bb:bb:bb</text>
+        <rect x="305" y="300" width="150" height="60" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="380" y="322" text-anchor="middle" style="fill:var(--ink);font:700 12px sans-serif">Host C</text>
+        <text x="380" y="339" text-anchor="middle" style="fill:var(--muted);font:10.5px monospace">10.0.0.3</text>
+        <text x="380" y="353" text-anchor="middle" style="fill:var(--muted);font:10px monospace">cc:cc:cc:cc:cc:cc</text>
+        <!-- static link hints -->
+        <line x1="168" y1="176" x2="300" y2="176" style="stroke:var(--line);stroke-width:6;opacity:.5"/>
+        <line x1="460" y1="176" x2="592" y2="176" style="stroke:var(--line);stroke-width:6;opacity:.5"/>
+        <line x1="380" y1="216" x2="380" y2="300" style="stroke:var(--line);stroke-width:6;opacity:.5"/>
+        <!-- step 1: A->switch (solid), switch->B and switch->C (dashed) -->
+        <line x1="172" y1="164" x2="298" y2="164" style="stroke:var(--deep);stroke-width:1.8" marker-end="url(#mr)"/>
+        <line x1="462" y1="164" x2="590" y2="164" style="stroke:var(--deep);stroke-width:1.8;stroke-dasharray:5 4" marker-end="url(#mr)"/>
+        <line x1="392" y1="218" x2="392" y2="298" style="stroke:var(--deep);stroke-width:1.8;stroke-dasharray:5 4" marker-end="url(#mr)"/>
+        <!-- step 2: B->switch->A (green, pointing left) -->
+        <line x1="590" y1="188" x2="462" y2="188" style="stroke:var(--accent2);stroke-width:1.8" marker-end="url(#mg)"/>
+        <line x1="298" y1="188" x2="172" y2="188" style="stroke:var(--accent2);stroke-width:1.8" marker-end="url(#mg)"/>
+        <!-- step 3: A->switch->B (blue) -->
+        <line x1="172" y1="176" x2="298" y2="176" style="stroke:var(--accent);stroke-width:1.8" marker-end="url(#mb)"/>
+        <line x1="462" y1="176" x2="590" y2="176" style="stroke:var(--accent);stroke-width:1.8" marker-end="url(#mb)"/>
+        <!-- MAC table -->
+        <rect x="500" y="248" width="220" height="150" rx="9" style="fill:var(--code-bg);stroke:var(--code-dim)"/>
+        <text x="514" y="270" style="fill:var(--code-dim);font:700 10px monospace">SWITCH MAC/CAM TABLE</text>
+        <text x="514" y="292" style="fill:var(--code-green);font:10.5px monospace">aa:aa:… → port 1</text>
+        <text x="514" y="312" style="fill:var(--code-green);font:10.5px monospace">bb:bb:… → port 2</text>
+        <text x="514" y="332" style="fill:var(--code-green);font:10.5px monospace">cc:cc:… → port 3</text>
+        <text x="514" y="356" style="fill:var(--code-dim);font:9.5px monospace">learned from source MACs</text>
+        <text x="514" y="374" style="fill:var(--code-amber);font:9.5px monospace">unknown/broadcast → flood</text>
+        <text x="514" y="390" style="fill:var(--code-amber);font:9.5px monospace">known unicast → one port</text>
+      </svg>
+      <figcaption>① A broadcasts, the switch floods it to everyone; ② only B replies, unicast; ③ A's data frame is delivered by the switch to B's port alone. The switch learned every MAC by reading source addresses.</figcaption>
+    </figure>
+
+    <p>Notice the asymmetry that defines L2. The <b>request</b> is a broadcast — one-to-everyone — because A has no idea who owns that IP yet, so it has to ask the whole room. The <b>reply</b> is a unicast — B knows exactly who asked. And the switch turns the initially-dumb medium into targeted delivery by learning: every frame's <em>source</em> MAC teaches it "this address lives behind this port," so over time it forwards precisely instead of flooding. Broadcasts and unknown addresses are the only things it still floods — which is exactly why a network with too many machines, or too much broadcast traffic, bogs down.</p>
+
+    <h2 id="internals"><span class="beat">Internal working</span>ARP, the cache, and switch learning</h2>
+    <p>Break the mechanism into its moving parts.</p>
+    <ol class="steps">
+      <li><b>A cache miss triggers ARP.</b> When the kernel needs to send a frame to a next-hop IP and has no MAC for it, it queues the packet and emits an <b>ARP request</b>. ARP rides directly on Ethernet (EtherType <code>0x0806</code>, not inside IP), with opcode <code>1</code> and the destination MAC set to the broadcast address <code>ff:ff:ff:ff:ff:ff</code> so every card on the segment receives it. The payload says, in effect, "who has <code>10.0.0.2</code>? tell <code>10.0.0.1</code> at <code>aa:aa:…</code>."</li>
+      <li><b>Only the owner replies.</b> Every host inspects the request, but only the one configured with <code>10.0.0.2</code> answers, with an <b>ARP reply</b> (opcode <code>2</code>) sent as a <em>unicast</em> straight back to A's MAC: "<code>10.0.0.2</code> is-at <code>bb:bb:…</code>." As a bonus, B also learns A's mapping from the request — ARP populates both ends.</li>
+      <li><b>Both sides cache the mapping.</b> A stores <code>10.0.0.2 → bb:bb:…</code> in its neighbour table so it won't have to broadcast again for a while. On Linux this table has states you can watch: <code>INCOMPLETE</code> (request sent, no reply yet), <code>REACHABLE</code> (confirmed recently), <code>STALE</code> (old but usable, will be re-verified on next use), <code>DELAY</code>/<code>PROBE</code> (re-checking), and <code>FAILED</code>. Entries expire, which is what lets the network heal after a NIC or IP moves — but also what causes a window of staleness when something changes.</li>
+      <li><b>The switch learns from source MACs.</b> Independently, the switch reads the <em>source</em> MAC of every frame that arrives and records "MAC X is behind port N" in its MAC/CAM table, with an aging timer (commonly ~5 minutes). It never needs to be told; it learns by observing traffic. This is the one line that separates a switch from a dumb hub.</li>
+      <li><b>Forward or flood.</b> To send a frame, the switch looks up the <em>destination</em> MAC. Known → send out that one port. Unknown (an <b>unknown unicast</b>) or a broadcast/multicast → flood to every port except the one it came in on, and keep flooding until it learns the location from a reply. Flooding is the safety net; learning is what makes it rare.</li>
+      <li><b>The frame itself.</b> An Ethernet frame is destination MAC (6 bytes), source MAC (6), an optional 4-byte <b>802.1Q VLAN tag</b>, an EtherType/length field (2), the payload (46–1500 bytes), and a 4-byte FCS checksum. The VLAN tag matters: it lets one physical switch carry several isolated broadcast domains, so a "VLAN" is really "a separate room that happens to share the building's wiring."</li>
+    </ol>
+    <div class="box gotcha"><div class="h">ARP is only for the local segment</div>
+      <p>You never ARP for a machine on a different network — you can't, because the broadcast doesn't leave the segment. When the destination IP is remote, the kernel ARPs for the <b>gateway's</b> MAC instead, wraps the frame for the gateway, and lets the router take it from there. So the destination IP in the packet is the far-away server, but the destination MAC is your local router. This is the concrete mechanism behind Chapter 10's "IP is end-to-end, MAC is hop-by-hop": at each hop, the sender ARPs for the next hop and rewrites the frame. Misreading this — expecting to see the server's MAC on your local capture — confuses a lot of first-time packet readers.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: you ping a server three subnets away and capture on your host. Whose MAC address is in the destination field of the frame that leaves your NIC?</summary>
+      <div class="body">
+        <p>Your <b>default gateway's</b> MAC — not the server's. Because the server is on a different subnet, your kernel knows it can't deliver directly; it looks up the route, finds the next hop is the gateway, and ARPs for the <em>gateway's</em> MAC. The frame's destination MAC is the gateway; the packet's destination IP is still the far server. The gateway strips your frame, and forwards the packet on with a new frame addressed to <em>its</em> next hop. You'll only ever see a remote server's MAC if it's on your own segment. This is why "MAC changes every hop, IP doesn't" is not a slogan — it's literally what ARP does at each router.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, named</h2>
+    <ul>
+      <li><b>The MAC address.</b> 48 bits, six hex bytes. The first three are the <b>OUI</b>, an IEEE-assigned vendor prefix; the last three identify the device. Two flag bits in the first byte matter: the low bit of the first octet marks broadcast/multicast (all-ones <code>ff:ff:ff:ff:ff:ff</code> is broadcast), and the next bit marks a <b>locally-administered</b> address — which is why virtual NICs (Docker, VMs) start with <code>02:</code> instead of a real vendor prefix. Meant to be globally unique and permanent, though software can override it.</li>
+      <li><b>The Ethernet frame.</b> The L2 envelope: dst MAC, src MAC, optional VLAN tag, EtherType, payload, FCS. Minimum 64 bytes on the wire, maximum payload 1500 (the standard MTU). The FCS lets the receiver drop corrupted frames silently.</li>
+      <li><b>ARP.</b> The IP-to-MAC resolver: broadcast request, unicast reply, cached result. Includes <b>gratuitous ARP</b> — announcing your own mapping unsolicited — used to update everyone's caches after a change and to detect duplicates.</li>
+      <li><b>The neighbour cache.</b> Linux's ARP table, viewed and edited with <code>ip neigh</code>. Holds the learned mappings and their states, with garbage-collection thresholds (<code>gc_thresh1/2/3</code>) that cap its size — a limit that bites on dense container hosts.</li>
+      <li><b>The switch and its MAC/CAM table.</b> Learns MAC→port from source addresses, ages entries out, forwards known unicast to one port and floods the unknown. A pure L2 device: it reads MACs, never IPs.</li>
+      <li><b>The broadcast domain.</b> The set of devices a broadcast reaches — one L2 segment. It's bounded by routers (L3) and split by VLANs. Its size is the thing that makes or breaks L2 scalability, because broadcasts touch everyone in it.</li>
+      <li><b>VLANs (802.1Q).</b> A tag in the frame that partitions one physical switch into several independent broadcast domains, so tenants or tiers stay isolated at L2 without separate hardware.</li>
+    </ul>
+
+    <details class="recall"><summary>Think first: a switch receives a frame for a destination MAC it has never seen. What does it do, and what does that cost?</summary>
+      <div class="body">
+        <p>It <b>floods</b> the frame — sends a copy out every port except the one it arrived on — because it has no idea which port that MAC lives behind. This is "unknown-unicast flooding," and it's the same behaviour as a broadcast. The cost is twofold: bandwidth wasted on every port that didn't need the frame, and the frame reaching machines it wasn't meant for (a small privacy/security leak). Normally it's momentary — the reply teaches the switch the port and future frames are delivered precisely. But it stops being momentary if the destination never answers (a silent or dead host), or if the domain is huge, or if MAC entries keep aging out and re-flooding. That's another reason large flat L2 domains hurt: more hosts and more churn means more flooding, and flooding scales with the size of the broadcast domain, not with the traffic that actually needed to be delivered.</p>
+      </div>
+    </details>
+
+    <h2 id="flow"><span class="beat">Data flow</span>First contact on a LAN</h2>
+    <p>Follow the very first packet between two hosts that have never spoken. Host A runs <code>ping 10.0.0.2</code>. The kernel builds an ICMP echo inside an IP packet with destination <code>10.0.0.2</code>, checks the routing table, and sees the destination is on its own subnet — so the next hop is the destination itself. It needs B's MAC, checks the neighbour cache, and misses. The packet is parked and an ARP request goes out as a broadcast: "who has <code>10.0.0.2</code>?" The switch, not knowing where the broadcast should go, floods it to B and C. C ignores it; B recognises its own IP and unicasts a reply, "is-at <code>bb:bb:…</code>," which the switch — having just learned B's port from that reply's source MAC — delivers straight to A. A writes <code>10.0.0.2 → bb:bb:…</code> into its neighbour cache as <code>REACHABLE</code>, un-parks the waiting ICMP packet, wraps it in a frame addressed to B's MAC, and sends it. The switch forwards it to B's port only. B replies, the echo comes back the same way, and every future frame between them skips ARP entirely until the cache entry ages out. One ping, and you've exercised the entire layer: cache miss, broadcast, reply, learning, cached delivery. You're about to watch each of those events in <code>tcpdump</code>.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>Two containers on one Docker bridge give you a real L2 segment with real MACs and ARP. Build it:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>docker network create labnet
+docker run -d --name web  --network labnet nginx:alpine
+docker run --rm -it --network labnet --name box --cap-add=NET_ADMIN ubuntu:24.04 bash
+<span class="c"># inside box:</span>
+apt-get update &amp;&amp; apt-get install -y iproute2 iputils-ping iputils-arping tcpdump</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — see MACs and an empty cache fill up</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Look at your own hardware address, then watch the neighbour cache go from empty to populated.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>ip link show eth0 | grep link/ether     <span class="c"># your MAC — note the 02: (locally administered)</span>
+ip neigh                                <span class="c"># neighbour cache — likely empty at first</span>
+ping -c1 web                            <span class="c"># forces resolution of web's IP</span>
+ip neigh                                <span class="c"># now there's an entry</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>link/ether 02:42:ac:12:00:03 brd ff:ff:ff:ff:ff:ff
+...
+172.18.0.2 dev eth0 lladdr 02:42:ac:12:00:02 REACHABLE</div>
+        <p>Two things to register. Your MAC starts <code>02:</code> — the locally-administered bit, because Docker made it up rather than using a vendor OUI. And the ping turned an empty cache into a <code>REACHABLE</code> mapping of <code>web</code>'s IP to its MAC. That entry is the "sticky note" — the next frame to <code>web</code> won't need ARP at all.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — watch the ARP exchange</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>See the request and reply on the wire. Flush the cache first so resolution happens fresh, and sniff ARP while you ping.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>ip neigh flush all                       <span class="c"># forget everything</span>
+tcpdump -ni eth0 -e arp -c 2 &amp;           <span class="c"># capture the next 2 ARP frames</span>
+sleep 1; ping -c1 web &gt;/dev/null; wait</code></pre></div>
+        <div class="out"><span class="ol">Output</span>02:42:ac:12:00:03 &gt; ff:ff:ff:ff:ff:ff, ARP, Request who-has 172.18.0.2 tell 172.18.0.3, length 28
+02:42:ac:12:00:02 &gt; 02:42:ac:12:00:03, ARP, Reply 172.18.0.2 is-at 02:42:ac:12:00:02, length 28</div>
+        <p>There's the whole protocol in two lines. The request goes to <code>ff:ff:ff:ff:ff:ff</code> — the broadcast MAC, so everyone hears "who-has 172.18.0.2 tell 172.18.0.3." The reply is a unicast from <code>web</code> straight back to you: "is-at 02:42:ac:12:00:02." Now peek at the cache states as an entry ages — use it, wait, and watch it drift from <code>REACHABLE</code> toward <code>STALE</code>:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>ping -c1 web &gt;/dev/null; ip neigh        <span class="c"># REACHABLE right after use</span>
+sleep 40; ip neigh                       <span class="c"># later: STALE — will re-verify on next send</span></code></pre></div>
+        <p><code>STALE</code> isn't broken — it's "probably still right, I'll confirm when I next use it." That distinction is what makes the cache both fast and self-healing.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — the stale/wrong ARP entry</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Poison your own cache with a wrong MAC and watch traffic vanish — even though the IP, the route, and the host are all fine. This is a stale-ARP blackhole, reproduced on purpose.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>ping -c1 web &gt;/dev/null                   <span class="c"># confirm it works</span>
+<span class="c"># Pin a bogus MAC for web's IP (a MAC nobody owns):</span>
+ip neigh replace 172.18.0.2 lladdr de:ad:de:ad:de:ad dev eth0 nud permanent
+ip route get 172.18.0.2                   <span class="c"># routing still says: go direct, it's on-link</span>
+ping -c2 -W2 web ; echo "exit=$?"         <span class="c"># ...and yet</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>172.18.0.2 dev eth0 src 172.18.0.3 uid 0
+PING web (172.18.0.2) ...
+2 packets transmitted, 0 received, 100% packet loss
+exit=1</div>
+        <p>Routing is perfect, the host is up, the IP is right — and every packet disappears. Why, and how would you find this if you hadn't caused it? Reason it through before revealing.</p>
+        <details class="recall"><summary>Reveal — the frame is being sent to a MAC that doesn't exist</summary>
+          <div class="body">
+            <p>Your cache maps <code>172.18.0.2</code> to <code>de:ad:de:ad:de:ad</code>, a MAC no card owns. So the kernel dutifully builds frames addressed to that MAC and hands them to the switch, which floods them looking for a port that never answers. The packets are physically leaving your NIC and going nowhere — a <b>blackhole</b>. Nothing at L3 is wrong, which is exactly why this fools people: <code>ping</code> shows loss, <code>ip route</code> looks fine, the remote host is healthy. The tell is at L2: <code>ip neigh</code> shows the mapping, and a <code>tcpdump</code> shows your frames going out to a MAC that never replies. The fix is to drop the bad entry and let ARP re-resolve:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>ip neigh show 172.18.0.2                  <span class="c"># the smoking gun: de:ad:de:ad:de:ad PERMANENT</span>
+ip neigh del 172.18.0.2 dev eth0          <span class="c"># or: ip neigh flush all</span>
+ping -c1 web                              <span class="c"># re-ARPs, learns the real MAC, works again</span></code></pre></div>
+            <p>In the real world this happens without your help: a server's NIC is swapped, or a VIP moves to a different machine, and hosts keep sending to the <em>old</em> MAC until their cache entry ages out or a gratuitous ARP corrects it. That aging window is the outage.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — the duplicate IP</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Two machines claiming one IP is one of the most maddening intermittent faults in networking. Simulate the detection tooling and reason about the symptom. First, use ARP-based duplicate detection to check whether an address is already in use before you claim it:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># -D = duplicate-address-detection: probe and see if anyone already answers.</span>
+arping -D -c2 -I eth0 172.18.0.2 ; echo "in-use? exit=$?"   <span class="c"># web owns it → conflict</span>
+arping -D -c2 -I eth0 172.18.0.99 ; echo "free? exit=$?"    <span class="c"># nobody owns it → free</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>ARPING 172.18.0.2 ... Unicast reply from 172.18.0.2 [02:42:AC:12:00:02]
+in-use? exit=1
+ARPING 172.18.0.99 ... (no reply)
+free? exit=0</div>
+        <p>Now the scenario: users report a service is up sometimes and dead other times, seemingly at random, and someone notices the server's MAC in <code>ip neigh</code> keeps <em>changing</em> between two values. What's happening, and which command confirms it? Think first.</p>
+        <details class="recall"><summary>Reveal — two hosts are answering for one IP</summary>
+          <div class="body">
+            <p>Two machines are configured with the same IP, so <em>both</em> answer every ARP request for it. Whichever reply arrives last wins the cache, and since that races differently each time, clients flip between the two hosts' MACs — hence connectivity that works or fails depending on which box happened to win, and a neighbour entry that keeps changing MAC. The confirmations: <code>arping -D</code> reports the address in use (as above), the kernel logs a duplicate (<code>dmesg | grep -i 'duplicate address'</code>), and repeated <code>ip neigh show &lt;ip&gt;</code> shows the <code>lladdr</code> flipping. The fix is to find and re-address one of the two hosts — this is why address management (DHCP leases, IPAM, static assignment discipline) exists. On a well-run L2, RFC 5227 address-conflict detection is what stops a host from claiming an address that's already answering. The signature to remember: <b>intermittent by-chance connectivity plus a MAC that changes underneath a stable IP equals duplicate IP.</b></p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — gratuitous ARP and VIP failover</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>High availability at L2 rests on one trick: when a virtual IP (VIP) moves from a dead node to a live one, the new node shouts a <b>gratuitous ARP</b> so every host and switch updates its cache to the new MAC immediately, instead of waiting minutes for entries to age out. Watch a gratuitous ARP and reason about the failure it prevents. Add a VIP to your box and announce it:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>ip addr add 172.18.0.50/16 dev eth0       <span class="c"># claim the VIP on this node</span>
+<span class="c"># -U = unsolicited/gratuitous: tell the whole segment &quot;.50 is now at MY mac&quot;</span>
+tcpdump -ni eth0 -e arp -c1 &amp;
+sleep 1; arping -U -c1 -I eth0 172.18.0.50; wait</code></pre></div>
+        <div class="out"><span class="ol">Output</span>02:42:ac:12:00:03 &gt; ff:ff:ff:ff:ff:ff, ARP, Reply 172.18.0.50 is-at 02:42:ac:12:00:03, length 28</div>
+        <p>That's a gratuitous ARP: an unsolicited reply, broadcast to everyone, mapping the VIP to <em>this</em> node's MAC — nobody asked, but everyone updates. Now the senior question: a VIP fails over, the new node sends its gratuitous ARP, and yet some clients keep hitting the dead node for a while. Give at least two reasons this happens and how you'd reduce the failover window. Work it fully.</p>
+        <details class="recall"><summary>Reveal — why failover isn't instant, and how to tighten it</summary>
+          <div class="body">
+            <p>Several things stretch the window. <b>A lost gratuitous ARP:</b> it's a single broadcast with no acknowledgement — if it's dropped, caches don't update until they age out on their own (which is why HA tools send several GARPs, not one). <b>Stale caches with long timers:</b> a host that has the VIP as <code>REACHABLE</code> may not re-verify for its full timeout; some devices honour a gratuitous update, some don't. <b>The switch's MAC table:</b> it also has to relearn that the VIP's MAC now lives behind a different port, which happens when the new node sends traffic, but a silent new node leaves the switch pointing at the old port. <b>Long-lived TCP connections:</b> existing flows to the old node don't magically move; they reset and must reconnect. To tighten it: send multiple gratuitous ARPs on failover (keepalived/VRRP do this), keep neighbour and MAC-table timers sane, ensure the new node emits traffic promptly so the switch relearns, and design clients to retry on connection reset rather than hang. And the deeper lesson driving modern design: this L2 failover dance is fragile and doesn't cross subnets, which is a big reason clouds and Kubernetes prefer L3 mechanisms — moving a route or reprogramming a load balancer — over ARP-based VIP moves. You'll see the L3 version of this all through Parts V and VI.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · the stale-ARP blackhole after a move</div>
+      <p><b>Symptom:</b> a host, VIP, or NIC was replaced, and some clients can reach it while others silently can't — with no L3 error. <b>First cut:</b> compare <code>ip neigh show &lt;ip&gt;</code> on a broken client against the target's actual MAC. <b>Confirm:</b> a <code>tcpdump</code> shows frames leaving to a MAC that never answers. <b>Cause is usually:</b> a stale cache entry pointing at the old MAC, not yet aged out and not corrected by a gratuitous ARP. Flush the neighbour entry, and on the server side send gratuitous ARPs on any address move.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · duplicate IP</div>
+      <p><b>Symptom:</b> connectivity that works intermittently and seemingly at random, sometimes tied to which client you test from. <b>First cut:</b> watch <code>ip neigh show &lt;ip&gt;</code> for a <code>lladdr</code> that flips between two MACs. <b>Confirm:</b> <code>arping -D</code> reports the address in use; <code>dmesg</code> logs "duplicate address detected." <b>Cause is usually:</b> two hosts configured with the same IP — a static-assignment mistake or a DHCP/IPAM gap. Re-address one; add conflict detection to prevent a repeat.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · neighbour table overflow on dense hosts</div>
+      <p><b>Symptom:</b> a busy container host starts dropping traffic and <code>dmesg</code> fills with "neighbour table overflow." <b>First cut:</b> <code>ip neigh | wc -l</code> against the kernel's <code>gc_thresh3</code>. <b>Confirm:</b> the count is pinned near the threshold. <b>Cause is usually:</b> far more neighbours (many pods, many peers) than the default cap of ~1024. Raise <code>net.ipv4.neigh.default.gc_thresh1/2/3</code>. A very real Kubernetes-node problem at pod density — L2 limits leaking into an L3-heavy world.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Keep broadcast domains small.</b> Every broadcast — every ARP, every unknown-unicast flood — touches every device in the domain, so a big flat L2 network spends more and more of its capacity on noise and takes longer to converge when something changes. Broadcast storms (often a cabling loop without spanning-tree protection) can melt a whole segment. The industry answer is to bound L2 domains tightly with VLANs and routers, and, at scale, to route at L3 all the way to the host so the L2 domains are tiny. This is precisely why modern datacenter and cloud fabrics are L3-routed rather than one giant switched network, and it's the backdrop for how Kubernetes and cloud VPCs are built.</p>
+    <p><b>L2 has no security, so don't trust it.</b> ARP has no authentication whatsoever: any machine on the segment can send a forged reply claiming to be the gateway and quietly become a man-in-the-middle (ARP spoofing/poisoning). Switch defences exist — Dynamic ARP Inspection, port security, DHCP snooping — and help on managed networks. But the durable answer, the one that assumes the network is hostile, is to encrypt and authenticate above L2: TLS end to end, mTLS between services, a service mesh. "The network is a trust boundary" is a mistake; treat the LAN as untrusted and the ARP-spoofing threat mostly evaporates.</p>
+    <p><b>Failover and address moves need a plan.</b> When a VIP or an IP moves, caches across the segment must be corrected fast, or you get a stale-ARP outage lasting until entries age out. Gratuitous ARP is the mechanism, and HA tooling (keepalived/VRRP) sends several on failover for exactly the reliability reasons in Lab 5. But because ARP-based failover is fragile and confined to one subnet, prefer L3 mechanisms — moving a route, reprogramming a load balancer, updating DNS with a short TTL — wherever the design allows.</p>
+    <p><b>Watch the neighbour-table limits on dense hosts.</b> The Linux ARP cache has hard size thresholds, and container hosts with hundreds of pods and peers blow past the ~1024 default, dropping traffic with "neighbour table overflow." Tuning <code>gc_thresh</code> is a standard part of preparing a node for high pod density — an L2 detail that becomes an L4/L7 outage if ignored.</p>
+    <p><b>Common mistakes</b> to retire: assuming a correct IP and route means delivery will work (a stale MAC blackholes it); treating the LAN as a trust boundary; expecting a single gratuitous ARP to fail over instantly; and building large flat L2 domains because "it's simpler," then meeting broadcast storms and slow convergence in production.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>The limits of L2 shape how large systems are built. Because broadcast domains don't scale and ARP-based failover is fragile and subnet-bound, serious fabrics push routing (L3) as close to the host as possible and keep each L2 segment small — the design principle behind cloud VPCs and behind the way Kubernetes networks pods. Inside a single node, pod-to-pod traffic still leans on L2 and a virtual switch (a Linux bridge) with the same ARP and learning you just watched; across nodes, the cluster deliberately switches to L3 routing or an overlay to avoid one enormous broadcast domain spanning the whole cluster (Part V). High availability inherits the same tension: the classic on-prem VIP-plus-gratuitous-ARP pattern gives way, in the cloud, to moving an elastic IP or reprogramming a load balancer's targets — the L3 answer to the same "the active node died, send traffic elsewhere" problem. Even the neighbour-table limits reach up into design: they cap how many peers a node can hold, which is a real constraint on pod density. Every one of those choices is someone having internalised what this chapter shows — that L2 is fast and simple in the small and fragile and noisy in the large — and designing to stay in the small.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's the difference between a MAC address and an IP address?</summary>
+        <div class="a"><p>A MAC address is a 48-bit hardware address burned into the network card, unique and permanent, and it only has meaning on the local segment — it's how frames are delivered hop by hop. An IP address is assigned in software, can change, and is meaningful end-to-end across the whole internet — it's how packets are routed. The key operational consequence: the destination IP in a packet stays constant from source to final host, while the destination MAC is rewritten at every hop to name just the next device. ARP is what bridges the two, resolving a local IP to the MAC that currently owns it.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through ARP resolving an address, and what the switch does.</summary>
+        <div class="a"><p>When a host needs to send a frame to a next-hop IP on its own segment and has no MAC for it, it broadcasts an ARP request — an Ethernet frame with EtherType 0x0806, destination MAC all-ones, asking "who has this IP? tell me." Every host on the segment receives it because it's a broadcast, but only the one owning that IP replies, with a unicast ARP reply sent straight back: "that IP is at this MAC." The asker caches the mapping in its neighbour table so it won't have to broadcast again, and the responder learns the asker's mapping from the request too. Meanwhile the switch is doing its own thing independently: it reads the source MAC of every frame and records which port each MAC lives behind, with an aging timer. To forward a frame it looks up the destination MAC — if it knows the port, it sends only there; if it's an unknown unicast or a broadcast, it floods to every port but the ingress. So ARP answers "what's the MAC for this IP," and the switch answers "which port is that MAC behind" — and if the destination IP is on a different subnet, the host ARPs for the gateway's MAC instead, not the far host's.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>A host has the right IP, right route, and the target is healthy, but every packet is lost. What's your L2 theory?</summary>
+        <div class="a"><p>A wrong or stale ARP entry — the frames are being addressed to a MAC that no longer owns that IP, or to no real card at all, so they're blackholed. This happens when a NIC is replaced or a VIP moves and clients keep the old mapping until it ages out. I'd confirm at L2, not L3: <code>ip neigh show &lt;ip&gt;</code> to see the cached MAC and compare it to the target's real one, and a <code>tcpdump</code> to watch frames leaving to a MAC that never answers. The fix is to drop the neighbour entry (<code>ip neigh del</code> or flush) so ARP re-resolves, and on the server side to send gratuitous ARPs whenever an address moves so caches update immediately rather than after the aging timeout. The reason this fools people is that everything at L3 looks perfect — the whole failure lives one layer down, which is exactly the layer-localisation habit from Chapter 10 paying off.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A service is intermittently reachable, and its MAC in the neighbour cache keeps changing. Diagnosis?</summary>
+        <div class="a"><p>A duplicate IP — two hosts configured with the same address, both answering ARP requests for it. Because whichever reply arrives last wins the cache, and that races differently each time, clients flip between the two hosts' MACs, so connectivity works or fails depending on which one they land on. The changing <code>lladdr</code> under a stable IP is the signature. I'd confirm with <code>arping -D</code> against the address (it'll report the address in use, with replies coming from more than one MAC), check <code>dmesg</code> for a "duplicate address detected" log, and watch <code>ip neigh show &lt;ip&gt;</code> flip. The fix is to find the second host and re-address it, and the prevention is disciplined address management — DHCP or IPAM with conflict detection — so two machines can't claim one IP. It's a pure L2 conflict that presents as a flaky application, which is why you have to reason down the layers to catch it.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>Why do large flat L2 networks not scale, and what do we do instead?</summary>
+        <div class="a"><p>Because L2 relies on broadcasts — ARP, and flooding of unknown unicast — and every broadcast reaches every device in the domain. As the domain grows, an increasing share of capacity goes to noise, convergence after a change slows down, and a loop can trigger a broadcast storm that saturates the whole segment. Failover is fragile too: it depends on gratuitous ARP updating everyone's caches, which is unacknowledged and confined to a single subnet. So at scale we bound L2 domains hard — VLANs to segment, routers to cap broadcast — and push L3 routing as close to the host as possible, so each L2 segment stays tiny and the heavy lifting is done by routing, which scales hierarchically. That's why cloud VPCs and Kubernetes network the way they do: small L2 domains, L3 or overlays between nodes, and load-balancer or route changes rather than ARP tricks for failover. Keep L2 in the small, where it's fast and simple, and let L3 handle the large.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>Layer 2 is the hardware handoff on one segment. A MAC address is a 48-bit, burned-in, segment-local hardware address; an IP is a software address that's meaningful end-to-end. ARP bridges them: to send to a next-hop IP on your segment, you broadcast "who has this IP?" to <code>ff:ff:ff:ff:ff:ff</code>, the owner unicasts "is-at this MAC," and both sides cache the mapping — with states like <code>REACHABLE</code> and <code>STALE</code> that make the cache fast and self-healing. If the destination is on another subnet, you ARP for the gateway's MAC, not the far host's, which is why the MAC changes every hop while the IP doesn't. A switch independently learns MAC→port from source addresses and forwards known unicast to one port while flooding the unknown and the broadcast; the set of devices a broadcast reaches is the broadcast domain, bounded by routers and split by VLANs. The failures that matter: a stale or wrong ARP entry blackholes traffic that's perfect at L3; a duplicate IP makes connectivity flaky with a MAC that flips; and dense hosts overflow the neighbour table. L2 is unauthenticated (ARP spoofing is trivial), so trust encryption above it, not the wire. And because broadcasts and ARP-based failover don't scale, real fabrics keep L2 domains small and route at L3 — gratuitous ARP moves a VIP in the small, route and load-balancer changes do it in the large.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>MAC = 48-bit hardware address, segment-local and hop-by-hop; IP = software address, end-to-end. ARP maps one to the other.</li>
+      <li>ARP request is a broadcast to <code>ff:ff:ff:ff:ff:ff</code>; the reply is a unicast; both ends cache the result.</li>
+      <li>You ARP for the destination only if it's on your subnet — otherwise you ARP for the gateway's MAC.</li>
+      <li>The neighbour cache has states (<code>REACHABLE</code>/<code>STALE</code>/<code>FAILED</code>); <code>STALE</code> means "probably fine, verify on next use."</li>
+      <li>A switch learns MAC→port from source MACs, forwards known unicast to one port, and floods unknown/broadcast frames.</li>
+      <li>The broadcast domain is everyone a broadcast reaches — one L2 segment/VLAN; routers bound it, VLANs split it.</li>
+      <li>A stale or wrong ARP entry blackholes traffic that looks perfect at L3 — check <code>ip neigh</code>, not just <code>ip route</code>.</li>
+      <li>Duplicate IP = intermittent connectivity plus a MAC that flips under a stable IP; detect with <code>arping -D</code> and <code>dmesg</code>.</li>
+      <li>Gratuitous ARP announces your own mapping to update caches on failover — sent several times because it's unacknowledged.</li>
+      <li>L2 is unauthenticated and doesn't scale big/flat: keep broadcast domains small, route at L3, and encrypt above the wire.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on and toward:</span>
+      <a href="ch10-osi-vs-tcp-ip-encapsulation-the-layered.html"><b>Ch 10</b> The layered model</a>
+      <a href="ch12-l3-ip-cidr-subnetting-routing-nat.html"><b>Ch 12</b> L3 — IP &amp; routing</a>
+      <a href="ch17-tls-and-pki.html"><b>Ch 17</b> Why we encrypt above L2</a>
+      <a href="ch20-the-network-troubleshooting-toolkit.html"><b>Ch 20</b> Network toolkit</a>
+      <a href="ch42-pod-networking-internals-pod-to-pod.html"><b>Ch 42</b> Pod networking &amp; bridges</a>
+      <a href="ch50-vpc-foundations-cidr-subnets-route-tables-igw.html"><b>Ch 50</b> VPC L2/L3 in the cloud</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc826">RFC 826, An Ethernet Address Resolution Protocol</a>: the original ARP specification — request, reply, and cache.</li>
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc5227">RFC 5227, IPv4 Address Conflict Detection</a>: ARP probes and announcements, duplicate-address detection, and gratuitous ARP.</li>
+      <li>IEEE 802 LAN/MAN Standards Committee — <a href="https://www.ieee802.org/">ieee802.org</a>: the 802.3 (Ethernet framing) and 802.1Q (VLAN tagging) standards.</li>
+      <li>IANA — <a href="https://www.iana.org/assignments/ethernet-numbers/ethernet-numbers.xhtml">Ethernet (IEEE 802) numbers</a>: EtherTypes and the address-bit conventions, including broadcast and locally-administered addresses.</li>
+      <li>The Linux man-pages / iproute2 — <a href="https://man7.org/linux/man-pages/man8/ip-neighbour.8.html">ip-neighbour(8)</a>: the neighbour (ARP) table, its states, and how to inspect and edit it.</li>
+      <li>The Linux Kernel documentation — <a href="https://docs.kernel.org/networking/">Networking</a>: the neighbour subsystem and the <code>gc_thresh</code> garbage-collection thresholds.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch10-osi-vs-tcp-ip-encapsulation-the-layered.html"><span class="dir">← Prev</span><div class="ti">Ch 10 — OSI vs TCP/IP, encapsulation, the layered model</div></a>
+      <a class="nx" href="ch12-l3-ip-cidr-subnetting-routing-nat.html"><span class="dir">Next →</span><div class="ti">Ch 12 — L3: IP, CIDR, subnetting, routing, NAT</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 11 of 121 · Part II · Networking from First Principles. When L3 looks perfect but nothing moves, drop to L2 and check who owns the MAC.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">ARP &amp; frame delivery</a>
+    <a href="#internals">ARP, cache &amp; switching</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">First contact on a LAN</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

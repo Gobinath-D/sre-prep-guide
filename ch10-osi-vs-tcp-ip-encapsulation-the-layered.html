@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 10 — OSI vs TCP/IP, encapsulation, the layered model</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part II · Networking &nbsp;·&nbsp; Chapter 10</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part II · Networking from First Principles · Chapter 10</div>
+      <h1>OSI vs TCP/IP, encapsulation, the layered model</h1>
+      <p class="tagline">Getting bytes from your app to a server across the planet is too big a problem to solve at once — so the internet doesn't. It splits the job into layers, each solving one thing and trusting the one below. Learn where the seams are and every network fault stops being "the network is down" and becomes "this layer owns this problem."</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~45 min read · Linux lab (Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain why networking is layered, and map the OSI 7-layer model onto the 4-layer TCP/IP model the internet actually runs.</li>
+          <li>Describe exactly what each header adds — ports, IP addresses, MAC addresses — and who reads and strips it.</li>
+          <li>Walk encapsulation on the way out and decapsulation on the way in, and say which addresses change at each hop and which don't.</li>
+          <li>Capture one real HTTP request with <code>tcpdump</code> and point at the Ethernet, IP, and TCP headers in the bytes.</li>
+          <li>Localise a fault by layer — the master reflex that the rest of Part II is built on.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem: one job too big to solve at once</h2>
+    <p>Say you type <code>curl https://api.example.com</code> on your laptop in a café and a server in another country answers. Think about everything that has to be true for that to work. Something has to know <em>which application</em> on that server the bytes are for. Something has to make sure none of the bytes are lost, duplicated, or reordered on a 10,000-kilometre trip over dozens of unreliable hops. Something has to figure out a <em>route</em> across networks owned by companies that have never heard of each other. Something has to actually put electrical or optical signals onto the café's Wi-Fi, then copper, then fibre. And all of it has to work between a MacBook, a Linux server, a Cisco router, and a phone — none of which share code.</p>
+    <p>Try to design one program that does all of that and you get a monster nobody can build, test, or replace. So the internet's designers did the only thing that scales: they cut the problem along its natural seams and stacked the pieces. Each layer solves exactly one concern and assumes the layer beneath it already solved the ones below. The application layer worries about "what does this request mean" and trusts that the bytes will arrive. The transport layer worries about "get these bytes there reliably, to the right app" and trusts that individual packets can be delivered. The network layer worries about "route this packet toward that address" and trusts the link below to move it one hop. The link layer worries about "put this on the wire to the next box" and trusts the physical layer to carry the signal.</p>
+    <p>That decomposition buys three things that made the modern internet possible. <b>Independent evolution</b>: IPv4 could give way to IPv6 without rewriting TCP or HTTP, because the layers only touch through a thin contract. <b>Interoperability</b>: any two machines that agree on the layer contracts can talk, regardless of vendor or OS. And, the one you'll use every single day, <b>fault isolation</b>: when something breaks, the layers tell you <em>where</em> to look, so "the network is broken" becomes a specific, answerable question.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>Layering is not academic. It is the single most useful troubleshooting tool in networking. Every fault lives at one layer, and the symptom tells you which. "Can I reach the host at all?" is a different layer from "is the right app answering?" — and mixing them up is why people waste hours restarting the wrong thing.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: nested envelopes in the post</h2>
+    <p>The mechanism that makes layering work on the wire is <b>encapsulation</b>: each layer wraps the layer above it in its own envelope, adding a header that only its counterpart on the far side will read.</p>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>You want to send a document to a specific colleague in a company across the country. You don't hand it to a courier and hope. You put the document — the actual content — inside an <b>inter-office envelope</b> marked with the colleague's name and desk number. That goes inside a <b>shipping parcel</b> addressed to the company's street address. The parcel goes into the courier's <b>mail sack</b> for the next depot on the route.</p>
+      <p>Now watch who reads what. The long-haul courier only reads the mail-sack tag — the next depot. It never opens the parcel; it doesn't care about the street address yet, and it certainly doesn't read your document. At each depot the sack tag is stripped and a new one added for the <em>next</em> depot, while the parcel's street address stays exactly the same the whole way. Only when the parcel reaches the destination building does someone open it, read the inter-office envelope, and walk the document to the right desk. Each label is read and removed by its own peer in the chain, and the innermost content is touched only by the two people who actually correspond.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the post</th><th>On the network</th></tr>
+      <tr><td>The document itself</td><td>Application data (the HTTP request, the DNS query)</td></tr>
+      <tr><td>Inter-office envelope with a desk number</td><td>TCP/UDP header — the <b>port</b> picks the app on the host</td></tr>
+      <tr><td>Parcel with the company's street address (unchanged all the way)</td><td>IP header — source and destination <b>IP addresses</b>, end-to-end</td></tr>
+      <tr><td>Mail-sack tag for the next depot (replaced at each depot)</td><td>Ethernet header — next-hop <b>MAC address</b>, rewritten every hop</td></tr>
+      <tr><td>The trucks, roads, and sorting belts</td><td>The physical layer — signals on Wi-Fi, copper, fibre</td></tr>
+      <tr><td>Each label read and stripped by its own peer</td><td>Each header read and stripped by the matching layer on the far host</td></tr>
+    </table>
+    <p>Hold onto the two addresses that behave differently, because it's the thing people forget: the <b>IP address is like the street address — it stays the same the entire journey</b>, source and destination fixed end to end. The <b>MAC address is like the mail-sack tag — it's replaced at every hop</b>, always naming just the next box along the way. That single fact explains most of L2 and L3 (Chapters 11 and 12).</p>
+
+    <h2 id="arch"><span class="beat">Architecture</span>Two models, one stack of headers</h2>
+    <p>There are two ways people name the layers. The <b>OSI model</b> (from ITU-T X.200 / ISO 7498) has seven layers and is the vocabulary everyone uses in conversation — "that's a layer 7 problem," "we need a layer 4 load balancer." The <b>TCP/IP model</b> (from RFC 1122) has four and is what the internet actually implements. They line up cleanly; OSI just splits the top into more pieces than the real stack bothers with.</p>
+    <table class="t">
+      <tr><th>OSI (7 layers)</th><th>TCP/IP (4 layers)</th><th>PDU &amp; address</th><th>Example</th></tr>
+      <tr><td>7 Application · 6 Presentation · 5 Session</td><td>Application</td><td>data / message</td><td>HTTP, DNS, TLS</td></tr>
+      <tr><td>4 Transport</td><td>Transport</td><td>segment (TCP) / datagram (UDP) — <b>port</b></td><td>TCP, UDP</td></tr>
+      <tr><td>3 Network</td><td>Internet</td><td>packet — <b>IP address</b></td><td>IPv4, IPv6, ICMP</td></tr>
+      <tr><td>2 Data Link · 1 Physical</td><td>Link</td><td>frame — <b>MAC address</b> · then bits</td><td>Ethernet, Wi-Fi, ARP</td></tr>
+    </table>
+    <p>Now the part that matters most: what happens to your data as it goes down the stack. Each layer prepends its own header, so by the time your HTTP request hits the wire it's wrapped in three envelopes. Here is that encapsulation, and the actual bytes it produces.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 470" role="img" aria-label="Left: data descending through Application, TCP, IP, and Ethernet layers, each adding a header. Right: the resulting frame on the wire, segmented into Ethernet, IP, and TCP headers, HTTP payload, and FCS trailer.">
+        <defs>
+          <marker id="dn" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--muted)"/></marker>
+        </defs>
+        <!-- LEFT: descending ladder -->
+        <text x="132" y="24" text-anchor="middle" style="fill:var(--muted);font:700 11px sans-serif;letter-spacing:.04em">SENDING — ENCAPSULATE ↓</text>
+        <rect x="16" y="34" width="232" height="52" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="132" y="55" text-anchor="middle" style="fill:var(--ink);font:700 12px sans-serif">L7 Application · HTTP</text>
+        <text x="132" y="73" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">GET / HTTP/1.1 …  (the data)</text>
+        <line x1="132" y1="86" x2="132" y2="102" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#dn)"/>
+        <rect x="16" y="104" width="232" height="52" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="132" y="125" text-anchor="middle" style="fill:var(--accent2);font:700 12px sans-serif">L4 Transport · TCP</text>
+        <text x="132" y="143" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">+ ports, seq/ack → segment</text>
+        <line x1="132" y1="156" x2="132" y2="172" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#dn)"/>
+        <rect x="16" y="174" width="232" height="52" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="132" y="195" text-anchor="middle" style="fill:var(--accent);font:700 12px sans-serif">L3 Internet · IPv4</text>
+        <text x="132" y="213" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">+ src/dst IP, TTL, proto=6 → packet</text>
+        <line x1="132" y1="226" x2="132" y2="242" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#dn)"/>
+        <rect x="16" y="244" width="232" height="52" rx="8" style="fill:var(--panel);stroke:var(--violet);stroke-width:1.5"/>
+        <text x="132" y="265" text-anchor="middle" style="fill:var(--violet);font:700 12px sans-serif">L2 Link · Ethernet</text>
+        <text x="132" y="283" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">+ MAC, EtherType, FCS → frame</text>
+        <line x1="132" y1="296" x2="132" y2="312" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#dn)"/>
+        <rect x="16" y="314" width="232" height="40" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="132" y="339" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">L1 Physical → bits on the wire</text>
+
+        <!-- RIGHT: the frame on the wire -->
+        <text x="480" y="24" text-anchor="middle" style="fill:var(--muted);font:700 11px sans-serif;letter-spacing:.04em">THE FRAME ON THE WIRE</text>
+        <!-- segmented bar -->
+        <rect x="286" y="40" width="58" height="60" style="fill:var(--violet);opacity:.85;stroke:var(--panel)"/>
+        <rect x="344" y="40" width="66" height="60" style="fill:var(--accent);opacity:.85;stroke:var(--panel)"/>
+        <rect x="410" y="40" width="66" height="60" style="fill:var(--accent2);opacity:.85;stroke:var(--panel)"/>
+        <rect x="476" y="40" width="182" height="60" style="fill:var(--chip);stroke:var(--line)"/>
+        <rect x="658" y="40" width="46" height="60" style="fill:var(--violet);opacity:.85;stroke:var(--panel)"/>
+        <text x="315" y="66" text-anchor="middle" style="fill:#fff;font:700 10.5px sans-serif">Eth</text>
+        <text x="315" y="80" text-anchor="middle" style="fill:#fff;font:9px sans-serif">hdr</text>
+        <text x="377" y="66" text-anchor="middle" style="fill:#fff;font:700 10.5px sans-serif">IP</text>
+        <text x="377" y="80" text-anchor="middle" style="fill:#fff;font:9px sans-serif">hdr</text>
+        <text x="443" y="66" text-anchor="middle" style="fill:#fff;font:700 10.5px sans-serif">TCP</text>
+        <text x="443" y="80" text-anchor="middle" style="fill:#fff;font:9px sans-serif">hdr</text>
+        <text x="567" y="70" text-anchor="middle" style="fill:var(--ink);font:700 11px sans-serif">HTTP payload</text>
+        <text x="681" y="66" text-anchor="middle" style="fill:#fff;font:700 9.5px sans-serif">FCS</text>
+        <!-- byte sizes -->
+        <text x="315" y="116" text-anchor="middle" style="fill:var(--muted);font:10px monospace">14 B</text>
+        <text x="377" y="116" text-anchor="middle" style="fill:var(--muted);font:10px monospace">20 B</text>
+        <text x="443" y="116" text-anchor="middle" style="fill:var(--muted);font:10px monospace">20 B</text>
+        <text x="567" y="116" text-anchor="middle" style="fill:var(--muted);font:10px monospace">≤ 1460 B</text>
+        <text x="681" y="116" text-anchor="middle" style="fill:var(--muted);font:10px monospace">4 B</text>
+        <!-- receiver note -->
+        <rect x="286" y="140" width="418" height="150" rx="9" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="300" y="162" style="fill:var(--accent);font:700 11.5px sans-serif">RECEIVING — decapsulate (strip outermost first):</text>
+        <text x="300" y="184" style="fill:var(--ink);font:600 11px monospace">NIC → check FCS + dst MAC, strip Eth</text>
+        <text x="300" y="204" style="fill:var(--ink);font:600 11px monospace">     → EtherType 0x0800 says &quot;IPv4&quot;, strip IP</text>
+        <text x="300" y="224" style="fill:var(--ink);font:600 11px monospace">     → proto 6 says &quot;TCP&quot;, strip TCP</text>
+        <text x="300" y="244" style="fill:var(--ink);font:600 11px monospace">     → dst port 80 says &quot;hand to nginx&quot;</text>
+        <text x="300" y="270" style="fill:var(--deep);font:700 10.5px sans-serif">MAC rewritten every hop · IP unchanged end-to-end · TTL −1 per hop</text>
+        <!-- MSS math -->
+        <rect x="286" y="300" width="418" height="52" rx="9" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="495" y="322" text-anchor="middle" style="fill:var(--ink);font:600 11px monospace">MTU 1500 − 20 (IP) − 20 (TCP) = MSS 1460</text>
+        <text x="495" y="340" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">headers are overhead — the reason overlays shrink the MTU</text>
+      </svg>
+      <figcaption>Going down, each layer wraps the one above in a header (right: the bytes that produces). Going up, the receiver strips them outermost-first, each header telling it who to hand the rest to.</figcaption>
+    </figure>
+
+    <p>Two structural details from that picture pay off constantly. First, each header carries a "what's inside me" field so the receiver knows who to hand the payload to next: Ethernet's <b>EtherType</b> (<code>0x0800</code> = IPv4, <code>0x0806</code> = ARP), IP's <b>protocol</b> number (<code>6</code> = TCP, <code>17</code> = UDP, <code>1</code> = ICMP), and TCP's <b>destination port</b> (<code>80</code>, <code>443</code>). Those are the values IANA registers so every implementation agrees. Second, the headers are pure overhead — every byte of header is a byte you didn't send of payload — which is why the maximum payload (the MSS) is the link's MTU minus the IP and TCP headers, and why anything that adds <em>another</em> layer of wrapping, like a VPN or a Kubernetes overlay, has to shrink the usable size to fit.</p>
+
+    <h2 id="internals"><span class="beat">Internal working</span>Encapsulation out, decapsulation in</h2>
+    <p>Follow the bytes through the kernel, step by step. On the way out, the stack builds the envelopes from the inside out.</p>
+    <ol class="steps">
+      <li><b>The app writes data.</b> <code>curl</code> calls <code>write()</code> on a socket with <code>GET / HTTP/1.1\r\nHost: …</code>. That's the innermost content — the document. The app has no idea about IP or MAC; it only knows the socket.</li>
+      <li><b>TCP makes a segment.</b> The transport layer prepends a TCP header: source and destination <b>ports</b> (which app on each end), a sequence number so the far side can reorder and detect loss, an acknowledgement number, and flags. If the data is bigger than the MSS, TCP splits it into multiple segments here. This is the layer that turns an unreliable packet service into an ordered, reliable byte stream (deep dive in <a href="ch13-l4-tcp-deep-and-udp.html">Chapter 13</a>).</li>
+      <li><b>IP makes a packet.</b> The internet layer prepends an IP header: source and destination <b>IP addresses</b>, a TTL (hop budget), and a protocol number (<code>6</code>) recording that TCP is inside. The destination IP is the final server, set once and — outside of NAT — never changed on the journey.</li>
+      <li><b>The stack decides the next hop and resolves its MAC.</b> The kernel consults its routing table: is the destination on my local network, or do I send it to a gateway? Either way it needs the <em>next hop's</em> hardware address, which it looks up with ARP (<a href="ch11-l2-ethernet-mac-arp-switching.html">Chapter 11</a>). This is where "which box do I physically hand this to" is answered.</li>
+      <li><b>Ethernet makes a frame.</b> The link layer prepends an Ethernet header — destination MAC (the next hop), source MAC (this NIC), and EtherType (<code>0x0800</code> for IPv4) — and appends a 4-byte FCS checksum trailer so the receiver can detect corruption. Now it's a complete frame.</li>
+      <li><b>The NIC serialises bits.</b> The physical layer clocks the frame out as electrical, optical, or radio signals to the next device on the wire.</li>
+      <li><b>Each hop rewrites only the outermost envelope.</b> A router that receives the frame checks the FCS, strips the Ethernet header, looks at the destination IP, decrements the TTL, decides the next hop, resolves <em>that</em> hop's MAC, wraps a <b>brand-new</b> Ethernet header, and sends it on. The IP and TCP headers ride untouched; only the L2 frame is replaced, hop after hop, until the packet reaches the destination's local network.</li>
+      <li><b>Decapsulation reverses it.</b> The destination NIC checks the FCS and that the destination MAC is its own, strips Ethernet, reads EtherType to hand the rest to IP; IP confirms the destination address is local and reads the protocol field to hand the payload to TCP; TCP reassembles segments in sequence order and uses the destination port to deliver the byte stream to the process listening there. The app reads exactly the bytes the sender wrote, with no knowledge of the three envelopes that carried them.</li>
+    </ol>
+    <p>The elegant part is the <b>peer-layer illusion</b>. Even though every byte physically travels all the way down one stack and up another, each layer behaves as if it's talking straight across to its counterpart. The sender's TCP acts like it has a direct line to the receiver's TCP; the two IP layers act like they're adjacent. Encapsulation is what makes that illusion real — each layer's header is a private message to its peer, invisible to the layers in between.</p>
+
+    <div class="box gotcha"><div class="h">The addresses that trip people up</div>
+      <p>Destination IP names the <em>final</em> machine and is constant across the whole path (NAT aside). Destination MAC names only the <em>next</em> device — your gateway, then the next router, then the next — and is rewritten at every single hop. So "I can see the packet leaving with the right destination IP" tells you nothing about whether the <em>next-hop MAC</em> is correct, and a stale or wrong MAC (an ARP problem) drops traffic that looks perfectly addressed at L3. Keep the two addresses in separate mental boxes.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: a packet crosses six routers between you and a server. How many times is the destination IP rewritten, and how many times is the destination MAC rewritten?</summary>
+      <div class="body">
+        <p>The destination IP is rewritten <b>zero</b> times — it names the final server and stays constant the whole way (ignoring NAT, which is a deliberate exception at a boundary). The destination MAC is rewritten at <b>every hop</b>: your host sets it to the first router's MAC, that router replaces it with the second router's MAC, and so on — so across six routers it's rewritten roughly six times, once per link, always naming the next box. This is the difference between end-to-end addressing (L3, the whole route) and hop-by-hop addressing (L2, one link). If you internalise only one thing from this chapter, make it this.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The layers, named</h2>
+    <p>Each layer, what it owns, and — the SRE-relevant bit — where its faults show up.</p>
+    <ul>
+      <li><b>L7 Application — HTTP, DNS, TLS, gRPC.</b> The meaning of the exchange: a request, a query, a response. This is where your services and their protocols live. Faults look like <code>500</code>s, bad payloads, TLS handshake failures, wrong DNS answers. Tools: <code>curl -v</code>, application logs, <code>dig</code>. (OSI splits this into session/presentation/application; TCP/IP doesn't bother — TLS and content encoding just live "in the app.")</li>
+      <li><b>L4 Transport — TCP and UDP.</b> Delivering to the right <b>application</b> via ports, and — for TCP — making delivery reliable and ordered with sequence numbers, acknowledgements, retransmission, and flow control. UDP skips all that for speed. Faults look like connection refused, resets, retransmit storms, ports exhausted. Tools: <code>ss</code>, <code>tcpdump</code> flags, <code>nc</code>.</li>
+      <li><b>L3 Internet — IP (v4/v6), ICMP.</b> Global <b>addressing</b> and <b>routing</b>: getting a packet from any network to any other, hop by hop, with a TTL to kill loops. ICMP is IP's control channel (<code>ping</code>, "time exceeded," "fragmentation needed"). Faults look like unreachable networks, no route, TTL-expired, blackholes. Tools: <code>ip route</code>, <code>ping</code>, <code>traceroute</code>, <code>mtr</code>.</li>
+      <li><b>L2 Data Link — Ethernet, Wi-Fi, ARP.</b> Moving a frame across <b>one</b> physical segment to the next device, using MAC addresses, plus the FCS integrity check. ARP is the glue that maps an IP to the next-hop MAC. Faults look like a down link, wrong VLAN, duplicate IP/ARP conflicts, a stale ARP cache. Tools: <code>ip link</code>, <code>ip neigh</code>, <code>arping</code>.</li>
+      <li><b>L1 Physical — cables, radio, optics, the NIC.</b> Actual signals and the electrical/optical standards for them. Faults look like a dead port, a bad cable, a flapping link, CRC errors. Tools: <code>ethtool</code>, link LEDs, interface error counters.</li>
+      <li><b>The registries that make it interoperate — IANA.</b> Not a layer, but the reason the layers agree: IANA assigns the numbers each header uses to say "what's inside me" — EtherTypes, IP protocol numbers, and well-known ports. When you write <code>0x0800</code> means IPv4 and <code>6</code> means TCP, that's an IANA registry, honoured by every stack on earth.</li>
+    </ul>
+
+    <details class="recall"><summary>Think first: <code>ping server</code> succeeds but <code>curl http://server</code> says "connection refused." Which layers are proven good, and which one owns the problem?</summary>
+      <div class="body">
+        <p>A successful ping proves L1 through L3 end-to-end: the cable/radio works, the frames are being delivered, and IP can route a packet to that host and get one back. So the link, the addressing, and the route are all fine. "Connection refused" is a TCP-level answer — the host actively sent back a reset because nothing is listening on that port. That's an <b>L4/L7</b> problem: the service is down, crashed, or bound to a different port. The fix is on the application, not the network — and the ping succeeding is exactly why "the network is fine, check the app" is the right call here. Reasoning by layer turned a vague outage into a precise one in two commands.</p>
+      </div>
+    </details>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one HTTP request down and up</h2>
+    <p>Put it together with a single <code>curl http://web/</code> from one container to another on the same Docker network. <code>curl</code> writes the HTTP request bytes to a socket. TCP wraps them with source port (some ephemeral number) and destination port <code>80</code>, plus a sequence number. IP wraps that with the source container's IP and the destination container's IP and protocol <code>6</code>. The kernel sees the destination is on the same subnet, so the next hop <em>is</em> the destination; it resolves the destination's MAC via ARP and Ethernet wraps the packet with that destination MAC, this NIC's source MAC, and EtherType <code>0x0800</code>, plus an FCS. The NIC sends the frame over the veth pair into the Docker bridge, which forwards it to the destination container's NIC. There, decapsulation runs in reverse: the NIC accepts the frame (MAC matches, FCS good) and strips Ethernet; IP sees the destination address is local and strips the IP header; TCP sees destination port <code>80</code>, reassembles, and hands the byte stream to nginx listening there; nginx reads the same <code>GET / HTTP/1.1</code> bytes <code>curl</code> wrote. The response makes the identical trip in reverse. You are about to watch exactly this happen, byte for byte, in the labs — and pointing at each header in the capture is the whole point.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>You need two hosts on a network so there's a real Ethernet header to see (loopback has none). Two containers on a user-defined Docker network is the cleanest local setup. Build it:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># A private bridge network, a web server, and a client box with the tools.</span>
+docker network create labnet
+docker run -d --name web --network labnet nginx:alpine
+
+docker run --rm -it --network labnet --name box ubuntu:24.04 bash
+<span class="c"># inside box:</span>
+apt-get update &amp;&amp; apt-get install -y tcpdump curl iproute2 tshark dnsutils</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — capture exactly one request</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Capture the frames of a single HTTP request. Start <code>tcpdump</code> in the background writing a pcap, make the request, then stop and read it back.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># -e prints the Ethernet header; -c 12 stops after 12 packets.</span>
+tcpdump -ni eth0 -e -c 12 -w /tmp/req.pcap 'tcp port 80' &amp;
+sleep 1
+curl -s http://web/ &gt;/dev/null
+wait
+tcpdump -nr /tmp/req.pcap -e -c 4        <span class="c"># read back the first few frames</span></code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>02:11:03.1 02:42:ac:12:00:03 &gt; 02:42:ac:12:00:02, ethertype IPv4 (0x0800), length 74:
+   172.18.0.3.45678 &gt; 172.18.0.2.80: Flags [S], seq 1234567, win 64240, length 0
+02:11:03.1 02:42:ac:12:00:02 &gt; 02:42:ac:12:00:03, ethertype IPv4 (0x0800), length 74:
+   172.18.0.2.80 &gt; 172.18.0.3.45678: Flags [S.], seq 998877, ack 1234568, length 0</div>
+        <p>Every layer is on that one line. <code>02:42:ac:12:00:03 &gt; 02:42:ac:12:00:02</code> is the <b>L2</b> Ethernet header — source and destination MAC. <code>ethertype IPv4 (0x0800)</code> is the field that says "IP is inside." <code>172.18.0.3 &gt; 172.18.0.2</code> is the <b>L3</b> IP header. <code>.45678 &gt; .80</code> and <code>Flags [S]</code> are the <b>L4</b> TCP header — the ports and the SYN that opens the connection. You've just seen encapsulation as raw output.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — point at each header in the bytes</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Now see it two ways: the full layered dissection, and the raw hex with the header boundaries. First, <code>tshark</code> spells out every layer:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>tshark -r /tmp/req.pcap -V -c 1 | grep -E 'Ethernet|Internet Protocol|Transmission Control|Type:|Protocol:|Src Port|Dst Port' </code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>Ethernet II, Src: 02:42:ac:12:00:03, Dst: 02:42:ac:12:00:02
+    Type: IPv4 (0x0800)
+Internet Protocol Version 4, Src: 172.18.0.3, Dst: 172.18.0.2
+    Protocol: TCP (6)
+Transmission Control Protocol, Src Port: 45678, Dst Port: 80</div>
+        <p>Read the "what's inside me" chain top to bottom: Ethernet <code>Type: IPv4 (0x0800)</code> → IP <code>Protocol: TCP (6)</code> → TCP <code>Dst Port: 80</code>. Each header names the next. Now the raw bytes, and count the boundaries yourself:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>tcpdump -nr /tmp/req.pcap -xx -c 1</code></pre></div>
+        <p>Bytes <code>0–13</code> are the 14-byte Ethernet header (6 dst MAC, 6 src MAC, 2 EtherType — the last two are <code>08 00</code>). Bytes <code>14–33</code> are the 20-byte IPv4 header (it starts with <code>45</code>: version 4, header length 5×4=20). Bytes <code>34–53</code> are the 20-byte TCP header. Everything after is payload. You can physically point at where one envelope ends and the next begins — that's encapsulation made concrete.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — same host, different layer</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Prove that "the host is up" and "the service works" are different layers. The web container is reachable, port 80 is open, port 81 is not:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>ping -c1 web              <span class="c"># L3: is the host reachable at all?</span>
+curl -s -m3 http://web/    &amp;&amp; echo OK-80    <span class="c"># L7 on an open port</span>
+curl -s -m3 http://web:81/ ; echo "exit=$?"   <span class="c"># L4 on a closed port</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>64 bytes from 172.18.0.2: icmp_seq=1 ttl=64 time=0.09 ms
+&lt;html&gt;... OK-80
+curl: (7) Failed to connect to web port 81: Connection refused
+exit=7</div>
+        <p>Same host, three different answers. What does each one tell you about which layers are healthy, and why can't a successful ping ever prove your service is up? Reason it out before revealing.</p>
+        <details class="recall"><summary>Reveal — read the layers off the symptoms</summary>
+          <div class="body">
+            <p>The ping succeeding proves <b>L1–L3</b> are fine end-to-end: the link carries frames, and IP can route a packet to <code>web</code> and back. Port 80 answering proves <b>L4 and L7</b> are healthy <em>for that service</em>. Port 81 returning "connection refused" is a clean <b>L4</b> signal: the host is up and reachable (L3 fine, or you'd get "no route"/timeout), but no process is listening on 81, so TCP replied with a reset. The lesson that drives all of Part II: <b>a working ping only proves the network can carry packets to the host — it says nothing about whether the right app is listening.</b> "Refused" means the host is there but the door is shut (L4/L7); a <em>timeout</em>, by contrast, usually means a firewall is silently dropping (L3/L4) or the host is gone. Different symptoms, different layers, different fixes.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — walk the ladder</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>When something's unreachable and you don't know why, don't guess — walk the layers bottom-up, one command each. Run the ladder against <code>web</code> and read what each rung proves:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>ip link show eth0                 <span class="c"># L2: is the interface UP?</span>
+ip addr show eth0                 <span class="c"># L3: do I have an IP on the right subnet?</span>
+ip route                          <span class="c"># L3: do I have a route to the destination?</span>
+ip neigh                          <span class="c"># L2: has ARP resolved the next hop's MAC?</span>
+ping -c1 web                      <span class="c"># L3: end-to-end reachability</span>
+getent hosts web                  <span class="c"># L7: does the name resolve?</span>
+ss -tnp                           <span class="c"># L4: my connection states</span>
+curl -v -m3 http://web/           <span class="c"># L7: does the app actually answer?</span></code></pre></div>
+        <p>Now a scenario: a colleague says "the app is down." <code>getent hosts web</code> returns an address, <code>ping</code> works, but <code>curl</code> hangs until the 3-second timeout with no "refused." Which layer owns this, and how is it different from the Lab 3 failure? Think, then reveal.</p>
+        <details class="recall"><summary>Reveal — timeout vs refused is the whole clue</summary>
+          <div class="body">
+            <p>Name resolves (L7 DNS fine) and ping works (L1–L3 fine), so the network path and addressing are healthy. The difference from Lab 3 is <b>hang vs refused</b>. "Refused" is an active TCP reset — the host said "no." A <b>silent hang to timeout</b> means the SYN is going into a void: nothing is sending back either a SYN-ACK <em>or</em> a reset. That points at <b>L3/L4 filtering</b> — a firewall or security group dropping the packets — or an app that accepted the connection but never responds (an L7 stall). Your next moves: <code>tcpdump</code> to see whether the SYN even leaves and whether anything comes back (if the SYN leaves and nothing returns, it's being dropped in the path, not refused at the host); and check firewall rules between you and the service. The reflex — <em>refused means the door is shut, timeout means the letter is being intercepted</em> — tells you which layer to chase without touching the app at all.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — encapsulation on top of encapsulation (MTU)</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>Real overlays wrap an entire frame inside <em>another</em> IP/UDP packet — VXLAN, the technology under most Kubernetes networks, does exactly this. That extra envelope steals bytes from the payload, and getting the MTU wrong causes one of the nastiest, most layer-confusing bugs there is. See the overhead and reason about the failure. First, confirm your link's MTU and compute the room a normal frame leaves:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>ip link show eth0 | grep -o 'mtu [0-9]*'      <span class="c"># usually mtu 1500</span>
+<span class="c"># Force a large, do-not-fragment ping to probe the real path MTU:</span>
+ping -c1 -M do -s 1472 web    <span class="c"># 1472 + 8 ICMP + 20 IP = 1500 → fits exactly</span>
+ping -c1 -M do -s 1500 web    <span class="c"># too big to fragment → should fail on a 1500 link</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>1480 bytes from 172.18.0.2: icmp_seq=1 ttl=64 time=0.1 ms
+ping: local error: message too long, mtu=1500</div>
+        <p>Now the senior question. A team reports: small API calls and <code>ping</code> work perfectly, TLS handshakes complete, but any response larger than ~1.4&nbsp;KB hangs and eventually fails — and only for pods on <em>different</em> nodes. Which layer owns this, what's the mechanism, and why does the layered model make it hard to spot? Work it fully before revealing.</p>
+        <details class="recall"><summary>Reveal — a path-MTU blackhole, and why layering hides it</summary>
+          <div class="body">
+            <p>This is a classic <b>PMTU blackhole</b> at <b>L3</b>, caused by an overlay adding an envelope. When pods sit on different nodes, their traffic is wrapped in VXLAN — an extra ~50 bytes of outer IP/UDP/VXLAN header. If the overlay interface still claims a 1500 MTU, a full-size inner packet becomes a 1550-byte outer packet that won't fit on the physical 1500 link. The router should send back an ICMP "fragmentation needed" so the sender shrinks — but ICMP is very often filtered, so that message never arrives. The result: small packets (handshakes, tiny requests) sail through, and the first big packet vanishes with no error. It looks maddening because <em>every layer reports healthy</em> — ping is fine (small), TCP connects (small), TLS handshakes (small), and only bulk data dies. The layered model, which usually helps, here hides the fault <em>between</em> layers: the symptom is at L7 (big responses hang) but the cause is L3 (MTU) triggered by an encapsulation you can't see from inside the pod. The fix is to set the overlay MTU correctly (e.g. 1450) so inner packets always fit after wrapping, or to allow the ICMP that lets PMTU discovery work. Recognising this from the "small works, big hangs, only cross-node" signature is a genuinely senior move — and it's the exact trap Part V will disarm.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · asking the wrong layer</div>
+      <p><b>Symptom:</b> "the service is down," and everyone starts restarting the app. <b>First cut:</b> walk the ladder — <code>ping</code> for L3, <code>ss</code>/"refused vs timeout" for L4, <code>curl -v</code> for L7 — before touching anything. <b>Confirm:</b> which is the lowest layer that's <em>unhealthy</em>; that's where the fault is. <b>Cause is usually:</b> the fix was at a different layer than the panic. Ping works, so it was never a network problem; the app was bound to the wrong port. Layer-first reasoning would have found it in 30 seconds.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · the MTU blackhole</div>
+      <p><b>Symptom:</b> small requests and pings succeed; large transfers or big responses hang, frequently only across a VPN, tunnel, or overlay. <b>First cut:</b> a "small works, big hangs" pattern is an MTU story until proven otherwise. <b>Confirm:</b> <code>ping -M do -s &lt;size&gt;</code> to find the real path MTU; check the overlay interface's MTU against the physical link minus encapsulation overhead. <b>Cause is usually:</b> an extra encapsulation layer plus filtered ICMP, so PMTU discovery blackholes. Fix the MTU or allow the ICMP.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · right IP, wrong hop</div>
+      <p><b>Symptom:</b> traffic to a host that just moved, or whose NIC was replaced, fails even though the routing and IP look correct. <b>First cut:</b> <code>ip neigh</code> — is the ARP entry for that IP stale or pointing at an old MAC? <b>Confirm:</b> flush it (<code>ip neigh flush</code>) and watch it re-resolve. <b>Cause is usually:</b> a stale L2 mapping — the L3 address is right but the frame is being sent to a MAC that no longer owns it. A perfect example of a fault that's invisible at L3 and obvious at L2 (all of <a href="ch11-l2-ethernet-mac-arp-switching.html">Chapter 11</a>).</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Layer-first is the master reflex.</b> Every network incident you'll ever work reduces to "which layer owns this?" Find the lowest unhealthy layer and fix there — fixing above it is treating a symptom. The whole rest of Part II is you getting fast and precise at this, layer by layer, until "the network is down" is a phrase you never say because you always know which layer it actually is. Ping proves L1–L3, "refused vs timeout" splits L4 from filtering, <code>curl -v</code> and logs cover L7. Bottom-up when nothing works, top-down when it's slow or flaky.</p>
+    <p><b>Encapsulation overhead is real and compounding.</b> Every layer's header is payload you didn't send, and every extra layer of wrapping — a VPN, a service mesh's mTLS, a Kubernetes overlay — adds more and shrinks the usable MTU. Get the MTU math wrong and you get blackholes that masquerade as application bugs. This is why overlay networks run at 1450 rather than 1500, and why "small works, big hangs" should ring an MTU bell immediately.</p>
+    <p><b>Security lives at specific layers, and so do the controls.</b> A firewall or a cloud security group filters at L3/L4 (addresses and ports). TLS encrypts at the top of the stack, so everything below it still sees IP and TCP headers in the clear — which is how load balancers and network policy work without decrypting. A WAF inspects L7. Knowing which layer a control operates at tells you what it can and can't see: a security group can't block a URL path, and a WAF can't stop a SYN flood. Match the control to the layer of the threat.</p>
+    <p><b>The OSI vocabulary is worth keeping even though the internet is TCP/IP.</b> People say "L3 vs L7 load balancer," "layer 2 adjacency," "a layer 4 proxy" constantly, and they mean the OSI numbers. You'll pick a network load balancer (L4) or an application load balancer (L7) based on which layer you need to make routing decisions at (<a href="ch52-load-balancing-alb-nlb-target-groups-health.html">Chapter 52</a>). Speak both models fluently.</p>
+    <p><b>Common mistakes</b> this chapter should end: treating a successful ping as proof the service works; confusing "connection refused" (L4, host up, no listener) with a timeout (dropped in the path); forgetting that the destination MAC changes every hop while the IP doesn't; and ignoring encapsulation overhead until an MTU blackhole eats a production transfer.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>Layering isn't just how packets move; it's how the whole networked world is allowed to change without coordination. IPv4 gave way to IPv6 at L3 while every L4 and L7 protocol above kept working, because the layers meet only at a thin contract — the same reason HTTP could go from 1.1 to 2 to 3 (even swapping TCP for QUIC underneath) without touching IP. When you design systems you make layer choices constantly: an L4 load balancer is cheap, fast, and protocol-blind because it only reads IP and ports; an L7 load balancer can route by URL, terminate TLS, and retry requests because it reads the application layer — and it costs more to do so (<a href="ch52-load-balancing-alb-nlb-target-groups-health.html">Chapter 52</a>). A service mesh inserts an L7 proxy beside every workload precisely to make application-layer decisions the network layer can't (<a href="ch66-service-mesh-foundations.html">Chapter 66</a>). Kubernetes networking is layers stacked on layers — pods on an overlay on the node network on the VPC — and almost every hard cluster-networking bug is really a "which layer, and what did the encapsulation change" question (all of Part V). The layered model is the map you'll use to reason about every one of them; the rest of Part II fills in each layer so the map becomes a place you can navigate under pressure.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>Why is networking layered at all?</summary>
+        <div class="a"><p>Because getting bytes from one app to another across the world is too big a problem to solve in one piece. Layering splits it into independent concerns — the application's meaning, reliable delivery to the right app, global routing, and moving a frame across one link — where each layer solves one thing and trusts the layer below. That buys three things: independent evolution (you can replace IPv4 with IPv6 without touching TCP or HTTP), interoperability (any two machines that agree on the contracts can talk), and fault isolation, which is the one I use daily — every problem lives at one layer, so the symptom tells me where to look.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through what happens to an HTTP request as it goes down the stack and out the wire.</summary>
+        <div class="a"><p>The app writes the HTTP bytes to a socket — that's the payload. TCP prepends a header with the source and destination ports, so the far side knows which app, plus a sequence number for reliable, ordered delivery; that's a segment. IP prepends the source and destination IP addresses, a TTL, and a protocol number saying TCP is inside; that's a packet, and the destination IP is set once and stays constant the whole trip. The kernel then decides the next hop from its routing table and resolves that hop's MAC with ARP, and Ethernet prepends the destination MAC (the next hop), the source MAC, and an EtherType saying IPv4, with an FCS checksum appended; that's a frame. The NIC clocks it out as signals. At each router the outermost Ethernet header is stripped and rebuilt for the next hop — MAC changes every hop, TTL drops by one — while the IP and TCP headers ride untouched. At the destination it's decapsulated in reverse: strip Ethernet, IP confirms it's local, TCP reassembles by sequence and uses the destination port to hand the byte stream to the listening process. Each header is a private note from one layer to its peer on the other side.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Across ten routers, which addresses in the packet change and which stay the same, and why?</summary>
+        <div class="a"><p>The source and destination <b>IP</b> addresses stay the same the entire way — barring NAT, which is a deliberate exception at a boundary — because IP is end-to-end addressing: it names the final machine, and routing's whole job is to move that unchanged packet toward it. The source and destination <b>MAC</b> addresses change at every hop, because Ethernet is hop-by-hop: a MAC only has meaning on one link, and each router rewrites the frame's destination MAC to the next hop and the source MAC to its own outgoing interface. The <b>TTL</b> in the IP header decrements by one at each router, which is the loop-killer — if it hits zero the packet is dropped and an ICMP "time exceeded" comes back, which is exactly how <code>traceroute</code> maps the path. So the L3 envelope is constant and travels the whole route, while the L2 envelope is torn off and rebuilt on every link. That distinction is why an ARP/L2 fault can drop traffic that looks perfectly addressed at L3.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A service is "unreachable." How do you localise it by layer?</summary>
+        <div class="a"><p>I walk the ladder bottom-up. <code>ip link</code> — is the interface up (L2)? <code>ip addr</code> and <code>ip route</code> — do I have an address on the right subnet and a route to the destination (L3)? <code>ping</code> — end-to-end reachability (L3); if that works, L1 through L3 are healthy. Then the key split at L4: does <code>curl</code>/<code>nc</code> get "connection refused" or a timeout? Refused means the host is up but nothing's listening — an app or wrong-port problem, L4/L7. A silent timeout means packets are being dropped in the path — a firewall or security group at L3/L4 — or the app accepted and stalled at L7. I'd confirm with <code>tcpdump</code>: if the SYN leaves and nothing comes back, it's being dropped, not refused. And I'd check DNS with <code>getent hosts</code> in case the name resolves to the wrong place entirely. The discipline is to find the <em>lowest</em> unhealthy layer and fix there, because fixing above it just treats a symptom.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>Small requests work but large responses hang, only across the overlay. What is it?</summary>
+        <div class="a"><p>That signature is a path-MTU blackhole caused by encapsulation. The overlay — VXLAN in most Kubernetes clusters — wraps each frame in an extra outer IP/UDP header, roughly 50 bytes. If the overlay interface still advertises a 1500 MTU, a full-size inner packet becomes an oversize outer packet that won't fit on the physical link. The router should send ICMP "fragmentation needed" so the sender shrinks, but ICMP is commonly filtered, so the big packets just disappear with no error. Small packets fit, so pings, handshakes, and tiny requests all succeed — which is why it looks like an application bug even though it's an L3 MTU problem triggered by an encapsulation you can't see from inside the pod. The fix is to set the overlay MTU correctly, typically 1450, so inner packets always fit after wrapping, or to permit the ICMP that makes PMTU discovery work. I'd confirm with a do-not-fragment ping sweep to find the real path MTU.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>Networking is layered because the end-to-end job is too big to solve at once: each layer owns one concern and trusts the one below, which buys independent evolution, interoperability, and — the daily win — fault isolation. OSI names seven layers as the shared vocabulary; TCP/IP implements four (Application, Transport, Internet, Link). Encapsulation is the mechanism: going down, each layer wraps the one above in a header — TCP adds ports and sequencing (segment), IP adds end-to-end addresses and a TTL (packet), Ethernet adds next-hop MACs and an FCS (frame) — and each header names what's inside it (EtherType, protocol number, port). Going up, the receiver strips them outermost-first, each header telling it who to hand the rest to. The destination IP is constant end-to-end while the destination MAC is rewritten every hop and the TTL drops by one. Every header is overhead, so extra wrapping (VPN, overlay) shrinks the MTU and can blackhole large packets. And the reflex the whole of Part II rests on: localise faults by layer — ping proves L1–L3, refused-vs-timeout splits L4 from filtering, <code>curl -v</code> and logs cover L7 — then fix the lowest unhealthy layer.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>Layering exists to break one impossible problem into independent ones — and its daily payoff is telling you which layer a fault lives at.</li>
+      <li>OSI has 7 layers (the vocabulary), TCP/IP has 4 (the implementation): Application, Transport, Internet, Link.</li>
+      <li>Encapsulation = each layer wraps the one above in a header; decapsulation strips outermost-first on receive.</li>
+      <li>TCP header adds ports (which app) and sequencing (reliable order); it's a segment.</li>
+      <li>IP header adds end-to-end source/destination addresses and a TTL; it's a packet, and the destination IP never changes en route.</li>
+      <li>Ethernet header adds next-hop source/destination MACs and an FCS; it's a frame, and the destination MAC is rewritten every hop.</li>
+      <li>Each header names what's inside it — EtherType (0x0800 = IPv4), IP protocol (6 = TCP), destination port (80) — so the receiver knows who to hand it to.</li>
+      <li>A working ping proves L1–L3 only; it says nothing about whether the right app is listening (L4/L7).</li>
+      <li>"Refused" = host up, no listener (L4); a silent timeout = dropped in the path (filtering) or stalled app — different layers, different fixes.</li>
+      <li>Headers are overhead; extra encapsulation (VPN, VXLAN overlay) shrinks the MTU, and "small works, big hangs" means an MTU blackhole.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds toward the rest of Part II:</span>
+      <a href="ch11-l2-ethernet-mac-arp-switching.html"><b>Ch 11</b> L2 — Ethernet, MAC, ARP</a>
+      <a href="ch12-l3-ip-cidr-subnetting-routing-nat.html"><b>Ch 12</b> L3 — IP &amp; routing</a>
+      <a href="ch13-l4-tcp-deep-and-udp.html"><b>Ch 13</b> L4 — TCP &amp; UDP</a>
+      <a href="ch19-capstone-trace-curl-https-example-com.html"><b>Ch 19</b> Capstone packet trace</a>
+      <a href="ch20-the-network-troubleshooting-toolkit.html"><b>Ch 20</b> Network toolkit</a>
+      <a href="ch52-load-balancing-alb-nlb-target-groups-health.html"><b>Ch 52</b> L4 vs L7 load balancing</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc1122">RFC 1122, Requirements for Internet Hosts — Communication Layers</a>: the document that defines the TCP/IP 4-layer model.</li>
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc791">RFC 791 (IP)</a> and <a href="https://www.rfc-editor.org/rfc/rfc9293">RFC 9293 (TCP)</a>: the L3 and L4 header formats you saw in the capture, from the source.</li>
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc894">RFC 894, A Standard for the Transmission of IP Datagrams over Ethernet Networks</a>: how IP is encapsulated in Ethernet frames, including the EtherType.</li>
+      <li>ITU-T — <a href="https://www.itu.int/rec/T-REC-X.200">Recommendation X.200, the OSI Reference Model</a> (equivalent to ISO/IEC 7498-1): the seven-layer model and its vocabulary.</li>
+      <li>IANA — <a href="https://www.iana.org/protocols">Protocol registries</a>: the assigned EtherTypes, IP protocol numbers, and ports that make the layers interoperate.</li>
+      <li>The Linux Kernel documentation — <a href="https://docs.kernel.org/networking/">Networking</a>: how the Linux stack implements these layers, including MTU and segmentation.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch09-python-for-sre-automation.html"><span class="dir">← Prev</span><div class="ti">Ch 9 — Python for SRE automation</div></a>
+      <a class="nx" href="ch11-l2-ethernet-mac-arp-switching.html"><span class="dir">Next →</span><div class="ti">Ch 11 — L2: Ethernet, MAC, ARP, switching</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 10 of 121 · Part II · Networking from First Principles. Stop saying "the network is down." Say which layer.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Two models, one stack</a>
+    <a href="#internals">Encapsulation &amp; decapsulation</a>
+    <a href="#components">The layers</a>
+    <a href="#flow">Following one request</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

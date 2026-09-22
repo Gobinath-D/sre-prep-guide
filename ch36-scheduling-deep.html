@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 36 — Scheduling deep</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part IV · Kubernetes &nbsp;·&nbsp; Chapter 36</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part IV · Kubernetes — Architecture &amp; Internals · Chapter 36</div>
+      <h1>Scheduling deep</h1>
+      <p class="tagline">"Just deploy it" hides a decision with real stakes: which of possibly thousands of nodes gets this pod, what happens when none of them will do, and which pods get sacrificed first when a node runs out of room. Get this layer wrong and you'll see it as a pod stuck Pending forever, or a node quietly killing the wrong workload at 3 a.m.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~45 min read · kind + kubectl</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain exactly what the scheduler looks at — requests, not limits — and why that single fact drives everything else in this chapter.</li>
+          <li>Name a pod's QoS class from its requests and limits, and say what order the kubelet evicts pods in when a node is short on resources.</li>
+          <li>Use node affinity, inter-pod (anti-)affinity, taints/tolerations, and topology spread constraints to place or repel pods deliberately.</li>
+          <li>Set a PodDisruptionBudget that actually protects availability during a drain, and know why the default policy can block that same drain forever.</li>
+          <li>Diagnose the two incidents this layer causes constantly: a pod stuck Pending with no fit, and a node's eviction order surprising an on-call engineer.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem: finite machines, competing demands</h2>
+    <p>A cluster is not infinite. It's some number of real machines, each with a fixed amount of CPU and memory, and every pod you create has to land on exactly one of them. Somebody has to decide which one — and that decision has to account for far more than "is there room." Some pods must never share a node with a certain other pod. Some nodes must be off-limits unless a pod explicitly asks for them. Some pods matter enough that they should evict a less important one rather than wait. And when a node genuinely runs low on memory, something has to decide, in real time, which pods die so the node — and everything else on it — survives.</p>
+    <p>Kubernetes splits this into two moments, and confusing them is the single biggest source of scheduling mysteries. The <b>kube-scheduler</b> makes a one-time placement decision when a pod is created: which node. After that, the pod is bound, and placement is done — the scheduler never revisits it. The <b>kubelet</b>, on the node the pod already landed on, makes ongoing, local, moment-to-moment decisions: is this node under memory or disk pressure right now, and if so, which of its pods die first. One component decides where; a completely different one decides who survives once it's there.</p>
+    <p>Everything in this chapter is either a rule you hand the scheduler for the first decision, or a consequence of how the kubelet makes the second one.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>The scheduler places a pod exactly once, based on <b>requests</b>, taints/tolerations, and affinity rules — never limits, and never what the pod actually ends up using. The kubelet separately decides, continuously, whether a node is under pressure and which pods to sacrifice if so — based on priority and whether a pod is exceeding its own requests. Two different components, two different moments, two different questions.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: move-in day at a full apartment building</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>The building manager rents apartments. Every incoming tenant states a <b>minimum space they need reserved</b> — that's their <b>request</b> — and, separately, a <b>maximum they're allowed to spread into</b> if a neighbor's unit sits empty — their <b>limit</b>. The manager only ever checks the minimum when deciding whether a new tenant fits in the building at all; what happens after move-in is a separate concern.</p>
+      <p>Tenants come in three lease tiers. A <b>Guaranteed</b> tenant's minimum and maximum are the same fixed number — a reserved unit, never touched unless they personally overrun it. A <b>Burstable</b> tenant reserved something smaller but is allowed to spill into empty space — comfortable most nights, first to be asked to pack up if the building overbooks. A <b>BestEffort</b> tenant reserved nothing at all — squatting in whatever's empty, and the very first one knocked on the door when the building runs short.</p>
+      <p>Some floors have a "staff only" sign — a <b>taint</b> — and only tenants holding the matching staff pass — a <b>toleration</b> — may move in there at all. Tenants have their own preferences too: "I require a floor with a loading dock" is <b>node affinity</b>; "put me near my team" or "never put us next to that other band" is <b>inter-tenant affinity and anti-affinity</b>. The manager also has a standing rule not to fill one floor with an entire team while others sit empty — that's <b>topology spread</b> — so one fire drill on one floor doesn't evacuate the whole team at once. A union contract caps how many members of one team can be asked to vacate at the same time for renovations — a <b>PodDisruptionBudget</b>. And when the building is completely full and a VIP tenant has nowhere else to go, they can bump a lower-tier tenant out of a room outright — <b>priority and preemption</b>.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In Kubernetes</th></tr>
+      <tr><td>Minimum space reserved / maximum allowed to use</td><td><b>Requests</b> (what the scheduler checks) / <b>limits</b> (what the kubelet enforces)</td></tr>
+      <tr><td>Reserved unit, min = max, never touched first</td><td><b>Guaranteed</b> QoS — evicted last</td></tr>
+      <tr><td>Comfortable but first asked to pack up</td><td><b>Burstable</b> QoS — evicted second, if over its request</td></tr>
+      <tr><td>Squatting with no reservation at all</td><td><b>BestEffort</b> QoS — evicted first</td></tr>
+      <tr><td>"Staff only" sign on a floor / the pass that lets you in</td><td>A <b>taint</b> on a node / a matching <b>toleration</b> on a pod</td></tr>
+      <tr><td>"I require a loading dock" / "put me near my team"</td><td><b>Node affinity</b> / <b>inter-pod affinity &amp; anti-affinity</b></td></tr>
+      <tr><td>Never fill one floor with an entire team</td><td><b>Topology spread constraints</b></td></tr>
+      <tr><td>The cap on how many may vacate for renovation at once</td><td><b>PodDisruptionBudget</b></td></tr>
+      <tr><td>A VIP bumping a lower-tier tenant when the building is full</td><td><b>Priority and preemption</b></td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>Two phases: Filter, then Score</h2>
+    <p>Every scheduling decision — one pod, one node, one time — runs through the same two-phase pipeline, formalized today as the <b>scheduling framework</b>, a chain of plugins with named extension points (<code>PreFilter</code>, <code>Filter</code>, <code>PostFilter</code>, <code>PreScore</code>, <code>Score</code>, <code>Reserve</code>, <code>Permit</code>, <code>PreBind</code>, <code>Bind</code>, <code>PostBind</code>). You rarely touch the framework directly, but the two phases it exists to run are the whole mental model:</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 460" role="img" aria-label="Top panel: a pod is scheduled by filtering out infeasible nodes based on taints, affinity, and resource fit, then scoring the survivors and binding to the highest score. Bottom panel: when a node is under pressure, BestEffort pods are evicted first, then Burstable pods exceeding their request, and Guaranteed pods only as a last resort.">
+        <defs>
+          <marker id="sc1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="sc2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--deep)"/></marker>
+        </defs>
+        <rect x="14" y="14" width="692" height="190" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="30" y="36" style="fill:var(--accent);font:700 12px sans-serif;letter-spacing:.05em">SCHEDULING ONE POD — a one-time decision</text>
+
+        <rect x="40" y="58" width="190" height="126" rx="8" style="fill:var(--panel);stroke:var(--deep);stroke-width:1.5"/>
+        <text x="135" y="82" text-anchor="middle" style="fill:var(--deep);font:700 13px sans-serif">Filter</text>
+        <text x="135" y="100" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">taints/tolerations</text>
+        <text x="135" y="115" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">required affinity/anti-affinity</text>
+        <text x="135" y="130" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">resource fit (requests only)</text>
+        <text x="135" y="145" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">spread: DoNotSchedule</text>
+        <text x="135" y="166" text-anchor="middle" style="fill:var(--deep);font:600 9.5px sans-serif">eliminates infeasible nodes</text>
+
+        <rect x="264" y="58" width="190" height="126" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="359" y="82" text-anchor="middle" style="fill:var(--accent);font:700 13px sans-serif">Score</text>
+        <text x="359" y="100" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">preferred affinity</text>
+        <text x="359" y="115" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">spread: ScheduleAnyway</text>
+        <text x="359" y="130" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">bin-packing / resource balance</text>
+        <text x="359" y="145" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">image locality</text>
+        <text x="359" y="166" text-anchor="middle" style="fill:var(--accent);font:600 9.5px sans-serif">ranks the survivors</text>
+
+        <rect x="488" y="58" width="190" height="126" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="583" y="82" text-anchor="middle" style="fill:var(--accent2);font:700 13px sans-serif">Bind</text>
+        <text x="583" y="100" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">highest score wins</text>
+        <text x="583" y="115" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">API server records</text>
+        <text x="583" y="130" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif"><code>nodeName</code></text>
+        <text x="583" y="166" text-anchor="middle" style="fill:var(--accent2);font:600 9.5px sans-serif">placement is now permanent</text>
+
+        <line x1="230" y1="120" x2="262" y2="120" style="stroke:var(--muted);stroke-width:1.6" marker-end="url(#sc1)"/>
+        <text x="246" y="112" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">feasible</text>
+        <line x1="454" y1="120" x2="486" y2="120" style="stroke:var(--muted);stroke-width:1.6" marker-end="url(#sc1)"/>
+        <text x="470" y="112" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">best</text>
+
+        <rect x="14" y="222" width="692" height="222" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="30" y="244" style="fill:var(--deep);font:700 12px sans-serif;letter-spacing:.05em">NODE UNDER PRESSURE — a continuous decision</text>
+
+        <rect x="40" y="266" width="190" height="150" rx="8" style="fill:var(--chip);stroke:var(--deep);stroke-width:1.5"/>
+        <text x="135" y="292" text-anchor="middle" style="fill:var(--deep);font:700 13px sans-serif">BestEffort</text>
+        <text x="135" y="312" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">no requests/limits set</text>
+        <text x="135" y="328" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">oom_score_adj = 1000</text>
+        <text x="135" y="348" text-anchor="middle" style="fill:var(--deep);font:700 11px sans-serif">evicted 1st</text>
+
+        <rect x="264" y="266" width="190" height="150" rx="8" style="fill:var(--chip);stroke:var(--applied);stroke-width:1.5"/>
+        <text x="359" y="292" text-anchor="middle" style="fill:var(--applied);font:700 13px sans-serif">Burstable</text>
+        <text x="359" y="312" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">some request/limit set</text>
+        <text x="359" y="328" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">oom_score_adj scales w/ request</text>
+        <text x="359" y="348" text-anchor="middle" style="fill:var(--applied);font:700 11px sans-serif">evicted 2nd, if &gt; request</text>
+
+        <rect x="488" y="266" width="190" height="150" rx="8" style="fill:var(--chip);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="583" y="292" text-anchor="middle" style="fill:var(--accent2);font:700 13px sans-serif">Guaranteed</text>
+        <text x="583" y="312" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">requests = limits</text>
+        <text x="583" y="328" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">oom_score_adj = −997</text>
+        <text x="583" y="348" text-anchor="middle" style="fill:var(--accent2);font:700 11px sans-serif">last resort only</text>
+
+        <line x1="230" y1="340" x2="262" y2="340" style="stroke:var(--deep);stroke-width:1.8" marker-end="url(#sc2)"/>
+        <line x1="454" y1="340" x2="486" y2="340" style="stroke:var(--applied);stroke-width:1.8" marker-end="url(#sc2)"/>
+        <text x="360" y="404" text-anchor="middle" style="fill:var(--muted);font:italic 10px sans-serif">within each tier: higher Priority survives longer</text>
+      </svg>
+      <figcaption>The scheduler runs Filter then Score exactly once per pod (top). The kubelet's node-pressure eviction is a completely separate, ongoing decision on the node the pod already landed on (bottom) — QoS class predicts the order, but the literal ranking is "exceeds request?" then Priority then magnitude of excess.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>Almost every "why is my pod Pending" ticket is the Filter phase rejecting every node for a specific, stated reason, and almost every "why did my pod suddenly disappear" ticket is the kubelet's eviction ordering, not the scheduler at all. Learning to tell these two apart — one produces an event on the pod before it runs, the other produces an event after — cuts triage time in half.</p>
+    </div>
+
+    <h2 id="steer"><span class="beat">Internal working</span>Requests, QoS, taints, affinity, spread, and preemption</h2>
+
+    <h4>1 · Requests are the scheduler's currency; limits never enter its math</h4>
+    <p>When the scheduler checks whether a pod fits on a node, it sums that pod's container <b>requests</b> and compares the total to the node's allocatable capacity minus what's already requested by other pods there. It never looks at <b>limits</b> during that check, and it never looks at what a pod is actually using at runtime. A node can be scheduled to 100% of its requests and still have most of its real CPU and memory sitting idle if every pod's limits are far above its requests — that's intentional overcommit, and it's also exactly how a node ends up unexpectedly out of room if enough of those pods burst toward their limits at once. Limits are enforced later and locally, by the kubelet through cgroups (CPU throttling, memory kill) — the mechanics are <a href="ch23-cgroups-v2-cpu-memory-io-limits.html">Chapter 23</a>. The scheduler's job ends at the placement decision; everything about a pod's behavior once it's running belongs to the node.</p>
+
+    <h4>2 · The three QoS classes — exact criteria, and what they actually control</h4>
+    <p>Kubernetes derives a QoS class for every pod from its requests and limits, and the rule is precise, not a rule of thumb:</p>
+    <ul>
+      <li><b>Guaranteed</b> — every container has a CPU request and limit, and a memory request and limit, and each request exactly equals its limit.</li>
+      <li><b>Burstable</b> — doesn't meet Guaranteed, but at least one container has some CPU or memory request or limit set.</li>
+      <li><b>BestEffort</b> — no container has any CPU or memory request or limit at all.</li>
+    </ul>
+    <p>QoS class is fixed at pod creation and never changes for that pod's life — even in-place resizing that would cross into a different class is rejected by admission outright. QoS class does two things: it sets each container's Linux <code>oom_score_adj</code>, and it's the practical predictor of node-pressure eviction order. The exact values are worth knowing cold: <b>Guaranteed = −997</b>, <b>BestEffort = 1000</b>, and <b>Burstable</b> scales with how small the request is relative to the node — <code>min(max(2, 1000 − 1000×requestBytes/machineMemoryCapacityBytes), 999)</code>. Lower means "less likely to be OOM-killed first"; the Linux kernel's <code>oom_killer</code> picks the highest score on the node when memory runs out at the kernel level, bypassing the kubelet entirely.</p>
+    <div class="box gotcha"><div class="h">The kubelet doesn't literally sort by QoS class</div>
+      <p>For its own (non-kernel-OOM) node-pressure eviction, the kubelet ranks candidate pods by three factors in order: whether the pod's usage exceeds its request, then Priority, then how far over the request it is. QoS class is not itself the sort key — it's a near-perfect predictor of the outcome, because a Guaranteed pod's request equals its limit and so is unlikely to exceed its request at all, while a BestEffort pod has no request and therefore is <em>always</em> "exceeding" a request of zero. The distinction matters in one real scenario: a low-priority Burstable pod that's genuinely staying under its request will not be evicted before a higher-priority one that's blown past its own — priority beats QoS the moment both pods are in the same "exceeding request" bucket.</p>
+    </div>
+    <p>The kubelet triggers this before the kernel OOM killer gets a say, when a hard eviction threshold is crossed — the built-in defaults are <code>memory.available&lt;100Mi</code>, <code>nodefs.available&lt;10%</code>, <code>imagefs.available&lt;15%</code>, and <code>nodefs.inodesFree&lt;5%</code> / <code>imagefs.inodesFree&lt;5%</code> on Linux, checked roughly every 10 seconds. On cgroups v2, the kubelet can also proactively throttle a Burstable container's memory via <code>memory.high</code> before it ever reaches its hard limit, and can reserve memory for Guaranteed/Burstable pods via <code>memory.min</code>/<code>memory.low</code> — QoS class deciding cgroup treatment directly, not just eviction order.</p>
+
+    <h4>3 · Taints and tolerations: nodes repel by default only if you tell them to</h4>
+    <p>A <b>taint</b> on a node (<code>key=value:effect</code>) repels pods that don't carry a matching <b>toleration</b>. Three effects, and they mean genuinely different things:</p>
+    <ul>
+      <li><b><code>NoSchedule</code></b> — new pods without a matching toleration won't be placed here. Pods already running are untouched.</li>
+      <li><b><code>PreferNoSchedule</code></b> — a soft version; the scheduler tries to avoid the node but will use it if there's no better option.</li>
+      <li><b><code>NoExecute</code></b> — repels new pods <em>and</em> evicts any already-running pod that doesn't tolerate it, immediately unless the toleration specifies <code>tolerationSeconds</code>, in which case the pod stays bound for that long before eviction.</li>
+    </ul>
+    <p>The control plane taints nodes automatically based on condition — <code>node.kubernetes.io/not-ready</code>, <code>unreachable</code>, <code>memory-pressure</code>, <code>disk-pressure</code>, <code>pid-pressure</code>, <code>network-unavailable</code>, <code>unschedulable</code> — and the scheduler only ever looks at these taints, never the raw node condition directly, which keeps scheduling decisions consistent with eviction ones. Kubernetes quietly adds a 300-second (5-minute) toleration for <code>not-ready</code> and <code>unreachable</code> to every pod that doesn't set one explicitly, which is why a pod doesn't vanish the instant its node has a five-second network blip — it has a 5-minute grace window before the taint-eviction controller acts. DaemonSet pods get <code>NoExecute</code> tolerations for <code>unreachable</code> and <code>not-ready</code> with <em>no</em> <code>tolerationSeconds</code> at all — they're never evicted for those reasons, which is exactly what a node agent needs.</p>
+
+    <h4>4 · Affinity and anti-affinity: what a pod requires or prefers</h4>
+    <p>Where taints are the node's decision, affinity is the pod's. <b>Node affinity</b> lets a pod require or prefer nodes with certain labels — a hard <code>requiredDuringSchedulingIgnoredDuringExecution</code> rule versus a soft <code>preferredDuringSchedulingIgnoredDuringExecution</code> one; the <code>IgnoredDuringExecution</code> half of that name means a label change on a running node never causes an already-placed pod to be evicted — affinity is checked at scheduling time only. <b>Inter-pod affinity and anti-affinity</b> do the same thing relative to <em>other pods</em>, matched via a <code>topologyKey</code> (commonly a hostname or zone label): affinity packs pods together (colocate a cache next to the service that hits it hardest), anti-affinity spreads them apart (never put two replicas of the same database on one node). Required inter-pod anti-affinity is the strongest spread guarantee available, and also the most expensive to schedule — it requires checking a pod against every other pod's labels across the cluster, which degrades noticeably past a few hundred nodes and heavily-replicated workloads. That cost is exactly why topology spread constraints exist as a lighter alternative for most "spread my replicas out" use cases.</p>
+
+    <h4>5 · Topology spread constraints: proportional, not absolute, spread</h4>
+    <p>A <code>topologySpreadConstraint</code> balances pods across a topology domain — zone, hostname, anything with a matching node label — using <code>maxSkew</code> (the maximum allowed difference between the fullest and emptiest eligible domain), a <code>topologyKey</code>, and <code>whenUnsatisfiable</code>: <code>DoNotSchedule</code> (the default — a hard constraint enforced in the Filter phase) or <code>ScheduleAnyway</code> (a soft preference scored, not enforced). <code>minDomains</code> (stable since 1.30) tells the scheduler to treat fewer-than-expected domains as if the missing ones existed with zero pods, which matters when a cluster autoscaler hasn't yet grown into every zone you expect to use. If you set no constraints at all, Kubernetes silently applies built-in defaults (stable since 1.24) to any pod belonging to a Service, ReplicaSet, StatefulSet, or ReplicationController — <code>maxSkew: 3</code> on <code>kubernetes.io/hostname</code> and <code>maxSkew: 5</code> on <code>topology.kubernetes.io/zone</code>, both <code>ScheduleAnyway</code> — which is why fleets often look reasonably spread even when nobody configured anything.</p>
+    <p>Two limitations worth knowing before they surprise you in production. First, the scheduler only knows about topology domains that currently have at least one node in them — if a zone has been scaled to zero nodes, it isn't counted as an eligible domain at all until a node actually exists there, which can fight directly with a cluster autoscaler that only adds a node once a pod is already unschedulable. Second, spread is enforced at scheduling time only — scaling a Deployment down doesn't rebalance what's left, so a fleet can drift lopsided over time with nothing enforcing the original constraint retroactively; a tool like the Descheduler exists specifically to fix that gap.</p>
+
+    <details class="recall"><summary>Think first: you set required pod anti-affinity so no two replicas of your database share a node, using topologyKey "kubernetes.io/hostname". A teammate asks why you didn't just use topology spread constraints instead. What's the real trade-off?</summary>
+      <div class="body">
+        <p>Required anti-affinity gives you an absolute guarantee — never, under any circumstance, two replicas on the same host — at the cost of an all-pairs check against every other pod's labels on every scheduling attempt, which scales poorly as replica count and cluster size grow, and which can leave a pod permanently unschedulable if the cluster ever has fewer eligible nodes than replicas. Topology spread constraints give you a <em>proportional</em> guarantee — never more than <code>maxSkew</code> apart — which is nearly as good for the realistic goal (don't lose all your replicas to one host failure) and is cheaper for the scheduler to evaluate, plus it degrades gracefully with <code>ScheduleAnyway</code> instead of leaving pods Pending. For most "spread my replicas for availability" use cases, topology spread is the better default; reach for required anti-affinity only when the guarantee genuinely must be absolute, like two replicas of the same primary-and-standby pair that must never share a failure domain under any circumstance.</p>
+      </div>
+    </details>
+
+    <h4>6 · PodDisruptionBudget: bounding voluntary disruption, not preventing it</h4>
+    <p>Kubernetes distinguishes <b>involuntary disruption</b> (hardware failure, a kernel panic, a node vanishing) from <b>voluntary disruption</b> (a drain for maintenance, a cluster-autoscaler consolidation, someone running <code>kubectl drain</code>). A PDB — <code>minAvailable</code> or <code>maxAvailable</code>, matched to pods by label selector — only constrains the voluntary kind, and only tools that go through the <b>Eviction API</b> respect it at all; <code>kubectl drain</code> uses that API, but a direct <code>kubectl delete pod</code> or a Deployment's own rolling update bypasses the PDB entirely — a rollout is governed by <code>maxUnavailable</code> on the Deployment itself, not by any PDB you've attached to the same pods. The control plane figures out each PDB's "intended" replica count by reading the owning workload's <code>ownerReferences</code>, so the budget tracks a Deployment's or StatefulSet's actual <code>spec.replicas</code> automatically.</p>
+    <p>The sharpest edge here is the default <b>unhealthy pod eviction policy</b>. Out of the box it's <code>IfHealthyBudget</code>: the control plane waits for pods to be healthy before allowing an eviction that would cross the budget, which sounds safe but means a node stuck with an already-crashlooping pod under a tight PDB can refuse to drain <em>forever</em> — the very case you most need to clear off a bad node. The documented fix is setting <code>AlwaysAllow</code>, which permits evicting unhealthy pods regardless of the budget so a drain can always make progress on the pods that were never going to recover anyway.</p>
+
+    <h4>7 · Priority and preemption: what happens when nothing fits</h4>
+    <p>A <code>PriorityClass</code> is a cluster-scoped object mapping a name to an integer from −2147483648 up to 1000000000 — higher schedules first and can preempt lower. Pods with no <code>priorityClassName</code> default to priority zero, unless exactly one <code>PriorityClass</code> has <code>globalDefault: true</code>. When a pending pod can't be scheduled anywhere, the scheduler looks for a node where evicting one or more <em>lower</em>-priority pods would make room; if it finds one, those victims are deleted, their <code>terminationGracePeriodSeconds</code> still applies, and only once they're actually gone does the pending pod get bound — there's a real time gap here, not an instant swap. Two built-in classes, <code>system-cluster-critical</code> and <code>system-node-critical</code>, exist specifically so core add-ons are never starved out by ordinary workloads. Setting <code>preemptionPolicy: Never</code> on a PriorityClass gives a pod queue priority without giving it the power to evict anyone — it waits for room to appear naturally rather than taking it.</p>
+    <p>Preemption respects PDBs only on a best-effort basis — the scheduler tries to pick victims that don't violate a budget, but if there's no other way to fit the pending pod, it will violate one anyway. And preemption never crosses nodes: if evicting a pod on a different node would also help, the scheduler doesn't consider it — only pods on the single node being evaluated for preemption are candidates. Because misusing priority is a way for one bad actor to starve everyone else, a cluster admin can and should cap who may use high-priority classes with a <code>ResourceQuota</code> scoped to specific <code>PriorityClass</code> names.</p>
+
+    <details class="recall"><summary>Think first: a node hits a hard memory eviction threshold. It's running one BestEffort pod using very little memory, and one Burstable pod using far more than its request. Which gets evicted?</summary>
+      <div class="body">
+        <p>The Burstable pod, and this is the exact detail that trips people up about QoS. The kubelet's real ordering starts with "is this pod exceeding its request," not "what QoS class is it." A BestEffort pod technically always counts as exceeding its (zero) request, but a BestEffort pod using almost no memory is a smaller, less urgent reclaim target than a Burstable pod that's ballooned well past what it asked for — and in practice the kubelet's pod-selection also weighs the magnitude of the overage, so the pod contributing more to the actual pressure is evicted first regardless of its class label. QoS class is an excellent prediction of eviction order in the common case precisely because a Guaranteed pod can't exceed its request at all and a BestEffort pod always technically does — but "Burstable is safer than BestEffort" is not a hard guarantee once you're comparing actual usage against actual requests rather than reading class labels off a chart.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, named</h2>
+    <ul>
+      <li><b>kube-scheduler</b> — runs the Filter/Score/Bind pipeline once per pod, via the scheduling framework's plugin extension points.</li>
+      <li><b>Requests &amp; limits</b> — the numbers on each container that the scheduler (requests only) and the kubelet/cgroups (limits) each act on, at different moments.</li>
+      <li><b>QoS class</b> — <code>Guaranteed</code>/<code>Burstable</code>/<code>BestEffort</code>, derived automatically from requests and limits; drives <code>oom_score_adj</code> and predicts eviction order.</li>
+      <li><b>Taint / Toleration</b> — a node-side repel rule (<code>NoSchedule</code>/<code>PreferNoSchedule</code>/<code>NoExecute</code>) and the pod-side key that matches it.</li>
+      <li><b>Node affinity / inter-pod affinity &amp; anti-affinity</b> — pod-side rules requiring or preferring certain nodes or certain co-located/separated pods.</li>
+      <li><b>Pod topology spread constraint</b> — <code>maxSkew</code>, <code>topologyKey</code>, <code>whenUnsatisfiable</code>, <code>minDomains</code>; proportional spread across a topology domain.</li>
+      <li><b>PodDisruptionBudget</b> — <code>policy/v1</code>; <code>minAvailable</code>/<code>maxAvailable</code>, respected only by the Eviction API, with a configurable unhealthy-pod eviction policy.</li>
+      <li><b>PriorityClass</b> — <code>scheduling.k8s.io/v1</code>; cluster-scoped integer priority driving queue order and preemption eligibility.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one pod from Pending to a drained node</h2>
+    <p>A new replica of a latency-sensitive service is created, into a busy, mixed-priority cluster:</p>
+    <ol class="steps">
+      <li>The API server admits the pod (Chapter 32's pipeline) with <code>status.phase: Pending</code> and no node assigned. It carries a required node-affinity rule (SSD-backed nodes only), a required anti-affinity rule against its own label (never double up on one host), and inherits the cluster's default topology spread across zones.</li>
+      <li>The scheduler's <b>Filter</b> phase walks every node: it drops any without the SSD label, drops any that already run this app's pod on the same host, drops any whose free allocatable capacity is smaller than this pod's requests, and drops any carrying a taint this pod doesn't tolerate.</li>
+      <li>Among what's left, <b>Score</b> ranks nodes — preferring the zone that's furthest from violating the spread constraint's <code>maxSkew</code>, then general bin-packing. The highest-scoring node wins and the scheduler posts a <code>Binding</code>; the pod's <code>nodeName</code> is now permanent.</li>
+      <li>The kubelet on that node pulls the image and starts the container. This pod happens to be Burstable — a request set, no limit — so its <code>oom_score_adj</code> lands well below a BestEffort neighbor also running there.</li>
+      <li>Weeks later, that node needs a kernel patch. An operator runs <code>kubectl drain</code>, which evicts pods through the Eviction API one at a time, checking each pod's PDB before removing it — this pod's PDB has headroom, so it's evicted, rescheduled elsewhere by its ReplicaSet, and the drain proceeds.</li>
+      <li>A different, unrelated node on the same cluster hits a memory eviction threshold under real load. The kubelet ranks its resident pods by exceeds-request, then priority, then magnitude of overage — a neighboring BestEffort pod with no request at all is evicted first, and the node recovers without ever touching this service's pod.</li>
+    </ol>
+    <p>Every step is a different mechanism from this chapter, and every one of them had to work for the pod to end up running, stay running, and survive both a planned drain and an unplanned squeeze.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>cat &lt;&lt;'EOF' | kind create cluster --name sched --config=-
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+- role: worker
+- role: worker
+EOF
+kubectl get nodes</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — see your own pods' QoS classes</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Create one pod of each class and read back what Kubernetes decided, not what you'd guess from the YAML alone.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: Pod
+metadata: { name: g-pod }
+spec:
+  containers:
+  - { name: c, image: busybox:1.36, command: ["sleep","1d"],
+      resources: { requests: {cpu: "200m", memory: "128Mi"}, limits: {cpu: "200m", memory: "128Mi"} } }
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: b-pod }
+spec:
+  containers:
+  - { name: c, image: busybox:1.36, command: ["sleep","1d"],
+      resources: { requests: {cpu: "100m", memory: "64Mi"}, limits: {cpu: "500m", memory: "256Mi"} } }
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: be-pod }
+spec:
+  containers:
+  - { name: c, image: busybox:1.36, command: ["sleep","1d"] }
+EOF
+for p in g-pod b-pod be-pod; do kubectl wait --for=condition=Ready pod/$p --timeout=60s; done
+for p in g-pod b-pod be-pod; do kubectl get pod $p -o jsonpath="$p: {.status.qosClass}{'\n'}"; done</code></pre></div>
+        <div class="out"><span class="ol">Output</span>g-pod: Guaranteed
+b-pod: Burstable
+be-pod: BestEffort</code></div>
+        <p>Nobody set a <code>qosClass</code> field anywhere — it doesn't exist as an input. Kubernetes derived it purely from the requests/limits pattern in each spec, exactly per the rules in this chapter.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — anti-affinity vs topology spread, side by side</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Run the same 3-replica spread goal two ways on a 2-worker cluster and see the cost difference directly.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl create deployment antiaff --image=nginx:1.27-alpine --replicas=3
+kubectl patch deployment antiaff --type=json -p='[{"op":"add","path":"/spec/template/spec/affinity","value":
+  {"podAntiAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":[
+    {"labelSelector":{"matchLabels":{"app":"antiaff"}},"topologyKey":"kubernetes.io/hostname"}]}}}]'
+kubectl get pods -l app=antiaff -o wide</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME                 READY   STATUS    NODE
+antiaff-6f9b-2kx     1/1     Running   sched-worker
+antiaff-6f9b-7mz     1/1     Running   sched-worker2
+antiaff-6f9b-9pl     0/1     Pending   &lt;none&gt;        <span class="c"># only 2 workers — the 3rd has nowhere it can go</span></code></pre></div>
+        <p>Required anti-affinity kept its promise so strictly that the third replica can never schedule on this 2-node pool — it isn't degraded, it's just permanently Pending. Now the softer version:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl create deployment spread --image=nginx:1.27-alpine --replicas=3
+kubectl patch deployment spread --type=json -p='[{"op":"add","path":"/spec/template/spec/topologySpreadConstraints","value":
+  [{"maxSkew":1,"topologyKey":"kubernetes.io/hostname","whenUnsatisfiable":"ScheduleAnyway",
+    "labelSelector":{"matchLabels":{"app":"spread"}}}]}]'
+kubectl get pods -l app=spread -o wide</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME                READY   STATUS    NODE
+spread-8c3f-a1b     1/1     Running   sched-worker
+spread-8c3f-c2d     1/1     Running   sched-worker2
+spread-8c3f-e3f     1/1     Running   sched-worker    <span class="c"># doubled up, but running — ScheduleAnyway degrades gracefully</span></code></pre></div>
+        <p>Same intent, two very different failure modes when the cluster can't fully satisfy it. Clean up the Pending replica's confusion for later labs: <code>kubectl delete deployment antiaff</code>.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — a taint that leaves a pod permanently Pending</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Taint every worker node the way a real "dedicated hardware" policy would, then deploy something ordinary and watch it fail to land — with a message that tells you exactly why, if you read it.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl taint nodes sched-worker sched-worker2 dedicated=gpu:NoSchedule
+kubectl create deployment ordinary --image=nginx:1.27-alpine --replicas=1
+sleep 5
+kubectl get pods -l app=ordinary</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME                     READY   STATUS    RESTARTS   AGE
+ordinary-5f7d-xyz1       0/1     Pending   0          5s</code></div>
+        <p><code>Pending</code> with no further detail in <code>get pods</code>. This is the exact "no fit" incident — go find the real reason before revealing it.</p>
+        <details class="recall"><summary>Reveal the diagnosis</summary>
+          <div class="body">
+            <p><code>kubectl describe</code> the pod and read its Events — this is where the scheduler explains its Filter-phase rejections in plain language:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl describe pod -l app=ordinary | grep -A3 Events</code></pre></div>
+            <div class="out"><span class="ol">Output</span>Warning  FailedScheduling  ...  0/3 nodes are available: 1 node(s) had untainted node affinity mismatch,
+2 node(s) had untolerated taint {dedicated: gpu}. preemption: 0/3 nodes are available: ...</code></pre></div>
+            <p>Read literally: 2 of 3 nodes are rejected on the taint, and the 3rd — the control-plane node — is rejected for its own separate reason (its own <code>NoSchedule</code> taint, which every ordinary pod fails to tolerate by design). Zero nodes remain, so the pod stays Pending indefinitely; no amount of waiting fixes it, because nothing changes. The fix is either add a matching toleration to workloads meant for that hardware, or — if this pod genuinely shouldn't be there — nothing to fix at all, since Pending-and-explained is the taint doing its job. Clean up: <code>kubectl taint nodes sched-worker sched-worker2 dedicated=gpu:NoSchedule-</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — a drain that never finishes</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Set a tight PDB, then try to drain a node holding those pods. This reproduces the single most common PDB support ticket.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl create deployment web --image=nginx:1.27-alpine --replicas=2
+kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: web-pdb }
+spec:
+  minAvailable: 2
+  selector: { matchLabels: { app: web } }
+EOF
+kubectl get pdb web-pdb</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME      MIN AVAILABLE   ALLOWED DISRUPTIONS
+web-pdb   2               0</code></div>
+        <p><code>ALLOWED DISRUPTIONS: 0</code> — with exactly 2 replicas and a floor of 2, this PDB permits zero voluntary evictions from the start, by construction. Now find whichever node holds one of these pods and drain it:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>NODE=$(kubectl get pod -l app=web -o jsonpath='{.items[0].spec.nodeName}')
+kubectl drain $NODE --ignore-daemonsets --delete-emptydir-data --timeout=30s</code></pre></div>
+        <div class="out"><span class="ol">Output</span>error when evicting pods/"web-..." -n default (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+error: unable to drain node "..." due to error:... timed out</code></pre></div>
+        <p>The drain is stuck, and it will stay stuck no matter how long you wait, because the budget has zero headroom by design. Before scaling your way out of it, work out the two genuinely different fixes and when each is right.</p>
+        <details class="recall"><summary>Reveal the two fixes and when to use each</summary>
+          <div class="body">
+            <p>The correctness fix: <code>minAvailable: 2</code> on a 2-replica Deployment leaves no room to ever evict one voluntarily — the budget as written doesn't tolerate a drain, full stop. Either scale to 3 replicas so one can go missing, or accept <code>minAvailable: 1</code> if brief single-replica operation is tolerable for this service. That's the fix for <em>this</em> case, where both pods are healthy and the budget is just mathematically too tight.</p>
+            <p>The other, sharper case is different: if one of the two pods were already crashlooping — genuinely unhealthy, never going to serve traffic again — the default <code>unhealthyPodEvictionPolicy: IfHealthyBudget</code> would refuse to evict it anyway, on the theory that letting it go might drop you below budget, even though it was never contributing to your availability in the first place. That's the case for explicitly setting <code>unhealthyPodEvictionPolicy: AlwaysAllow</code> on the PDB — it lets a drain clear out pods that were already broken regardless of the budget, since evicting something already down costs you nothing. Apply the capacity fix here and confirm the drain completes:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl scale deployment web --replicas=3
+sleep 15
+kubectl drain $NODE --ignore-daemonsets --delete-emptydir-data --timeout=30s
+kubectl uncordon $NODE</code></pre></div>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — reproduce real eviction order under memory pressure</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>Put a BestEffort memory-hungry pod on a node next to a Guaranteed one, squeeze the node, and watch the kubelet choose exactly who this chapter predicted. Reason about the outcome before you run it.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: Pod
+metadata: { name: safe-guaranteed }
+spec:
+  containers:
+  - { name: c, image: busybox:1.36, command: ["sleep","1d"],
+      resources: { requests: {memory: "64Mi", cpu: "100m"}, limits: {memory: "64Mi", cpu: "100m"} } }
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: hog-besteffort }
+spec:
+  containers:
+  - name: c
+    image: busybox:1.36
+    command: ["sh","-c","dd if=/dev/zero of=/dev/shm/fill bs=1M count=100000 2>/dev/null; sleep 1d"]
+EOF
+kubectl get pod safe-guaranteed hog-besteffort -o custom-columns=NAME:.metadata.name,QOS:.status.qosClass</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME               QOS
+safe-guaranteed    Guaranteed
+hog-besteffort     BestEffort</code></pre></div>
+        <p>Give the hog a minute to actually pressure the node, then check who's still standing:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>sleep 60
+kubectl get pods safe-guaranteed hog-besteffort
+kubectl describe node $(kubectl get pod hog-besteffort -o jsonpath='{.spec.nodeName}') | grep -A3 "MemoryPressure\|Evicted"</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME               READY   STATUS     RESTARTS   AGE
+safe-guaranteed    1/1     Running    0          90s
+hog-besteffort     0/1     Evicted    0          90s</code></pre></div>
+        <p>Exactly as predicted: the untethered BestEffort pod was sacrificed and the Guaranteed pod never noticed. Now the senior question — on a real production node running dozens of pods across all three QoS classes, how would you prevent a single BestEffort workload from ever being able to trigger this in the first place, rather than just surviving it once it happens?</p>
+        <details class="recall"><summary>Reveal the approach</summary>
+          <div class="body">
+            <p>The eviction order is a safety net, not a design goal — the actual fix is upstream of ever reaching pressure. Require requests on every pod in the namespace with a <code>LimitRange</code> providing sane defaults, so nothing can land as true BestEffort by accident (Chapter 37 covers this pairing in full). Use a <code>ResourceQuota</code> to cap total memory requested per namespace so no single team can overcommit a shared node pool. Reserve real headroom with <code>--system-reserved</code>/<code>--kube-reserved</code> on the kubelet so system daemons never compete with workload pods for the last few hundred megabytes. And size Guaranteed workloads' limits with enough margin above their steady-state usage that normal variance never touches the ceiling — a Guaranteed pod that's perpetually pinned at its own limit is one bad allocation spike away from being OOM-killed by its own limit, unrelated to any neighbor. Clean up: <code>kind delete cluster --name sched</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · a pod stuck Pending, no fit</div>
+      <p><b>Symptom:</b> a pod never leaves <code>Pending</code>; nothing crashed, nothing errored, it simply never starts. <b>First cut:</b> <code>kubectl describe pod</code> and read the <code>FailedScheduling</code> event — it names the exact reason per rejected node: insufficient CPU/memory, an untolerated taint, an unmet node affinity, an unmet pod anti-affinity. <b>Usual cause:</b> requests too large for any single node, a taint nobody added a toleration for, or a required anti-affinity rule with more replicas than eligible nodes. <b>Fix:</b> the event tells you which lever to pull — it's rarely a mystery once you actually read it instead of just re-applying and hoping.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · eviction order surprises on-call</div>
+      <p><b>Symptom:</b> under load, the "wrong" pod dies — a workload assumed to be safe gets evicted, or a supposedly low-priority one survives. <b>First cut:</b> check each pod's actual QoS class (<code>kubectl get pod -o jsonpath='{.status.qosClass}'</code>) rather than assuming from the YAML, and check <code>kubectl describe node</code> for <code>MemoryPressure</code>/<code>DiskPressure</code> conditions and recent <code>Evicted</code> pods. <b>Usual cause:</b> a pod believed to be Burstable is actually BestEffort because one container in a multi-container pod never got a request set — QoS is computed across <em>all</em> containers in the pod, and the weakest one drags the whole pod down. <b>Fix:</b> audit every container's requests, not just the "main" one; a sidecar with no request silently turns a Guaranteed-intended pod into Burstable or worse.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · a node drain hangs indefinitely</div>
+      <p><b>Symptom:</b> <code>kubectl drain</code> sits retrying forever, blocking a maintenance window. <b>First cut:</b> <code>kubectl get pdb -A</code> and look for <code>ALLOWED DISRUPTIONS: 0</code> among the pods on that node. <b>Usual cause:</b> a PDB with no slack (<code>minAvailable</code> equal to current replica count), often made worse by the default <code>IfHealthyBudget</code> policy refusing to evict an already-unhealthy pod on the same node. <b>Fix:</b> scale up before draining if the budget is just tight, or set <code>unhealthyPodEvictionPolicy: AlwaysAllow</code> if the blocker is a pod that was never going to recover anyway.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Every pod needs requests, full stop.</b> No requests means BestEffort, which means first in line for eviction and effectively invisible to the scheduler's bin-packing math — a fleet of unrequested pods schedules unpredictably and gets sacrificed unpredictably. Set requests near real observed usage (not a guess, not copy-pasted from another service) and give limits enough headroom that normal variance doesn't trigger throttling or an OOM kill; the mechanics of what a limit actually does at runtime are <a href="ch23-cgroups-v2-cpu-memory-io-limits.html">Chapter 23</a>'s territory, and the node-level machinery that carries out both scheduling's placement and the kubelet's local decisions is <a href="ch30-the-node-kubelet-kube-proxy-runtime-cri.html">Chapter 30</a>.</p>
+    <p><b>Reach for topology spread before required anti-affinity, by default.</b> Required inter-pod anti-affinity gives the strongest guarantee but scales the worst and can leave pods permanently Pending the moment replica count exceeds eligible nodes; topology spread constraints degrade gracefully with <code>ScheduleAnyway</code> and are cheaper for the scheduler to evaluate at fleet scale. Reserve required anti-affinity for the genuinely non-negotiable cases — primary/standby pairs, licensing constraints — not as the default spread mechanism for every Deployment.</p>
+    <p><b>A PodDisruptionBudget is only as good as its slack and its unhealthy-pod policy.</b> A PDB with zero slack doesn't protect availability, it just blocks maintenance — set <code>minAvailable</code> with real headroom above your steady-state floor, and set <code>unhealthyPodEvictionPolicy: AlwaysAllow</code> deliberately unless you have a specific reason to keep the safer default. Remember a PDB does nothing during a Deployment's own rolling update — that's governed by <code>maxUnavailable</code> on the Deployment (Chapter 33) — so don't assume a PDB is protecting you during your own deploys; it's only there for disruptions someone <em>else</em> initiates.</p>
+    <p><b>Common mistakes:</b> forgetting a sidecar container's requests and silently downgrading a pod's whole QoS class; using required pod anti-affinity at a scale where it starts leaving replicas Pending; sizing a PDB's <code>minAvailable</code> equal to current replica count, leaving zero room for any voluntary disruption ever; assuming Guaranteed means "never evicted" instead of "evicted only past its own limit or under genuine system-daemon starvation"; and granting broad <code>PriorityClass</code> usage to every team without a <code>ResourceQuota</code> capping who can use the highest tiers.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>Scheduling constraints are how you turn "we run three replicas" into an actual availability guarantee instead of a number on a slide. Topology spread and anti-affinity are what make a multi-AZ deployment genuinely resilient to losing one availability zone rather than accidentally piling every replica into whichever zone happened to have room first — the same reasoning that underlies every "no single point of failure" requirement in a system-design interview. PodDisruptionBudgets are the mechanism that lets a platform team run routine node maintenance and cluster upgrades without asking every application team for a change window — which is exactly the operational advantage that separates a platform that scales past a handful of services from one that needs a human in the loop for every node patch. Priority and preemption are what let a shared cluster host both latency-critical and best-effort batch work on the same hardware safely, which is the entire economic argument for multi-tenant clusters over one cluster per team. And the requests-vs-limits split connects straight into cost and capacity: it's the mechanism autoscaling (<a href="ch37-autoscaling-and-governance-hpa-vpa-cluster-autoscaler.html">Chapter 37</a>) and cluster-level bin-packing both depend on, since a cluster autoscaler's entire job is reacting to the Filter phase failing everywhere — a Pending pod with no fit — by adding exactly the node that would let it succeed.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Open each one only after you've answered it in your head.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>Does the Kubernetes scheduler consider a pod's limits when deciding where to place it?</summary>
+        <div class="a"><p>No — only requests. The scheduler sums a pod's container requests and checks that against each node's remaining allocatable capacity; limits are never part of that math and neither is actual runtime usage. Limits are enforced later and locally, by the kubelet through cgroups, entirely separate from the placement decision. This is also why a node can be scheduled to 100% of its requested capacity while still running well below its real resource ceiling — the gap between requests and limits is intentional overcommit, and it's also why a burst across many pods at once can squeeze a node that looked fine on paper.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Explain the three QoS classes and exactly how they affect eviction.</summary>
+        <div class="a"><p>QoS class is derived automatically from a pod's requests and limits, never set directly. Guaranteed means every container has a CPU and memory request and limit, and each request exactly equals its limit. Burstable means at least one container has some request or limit set, but the pod doesn't qualify as Guaranteed. BestEffort means no container has any request or limit at all. Kubernetes uses this to set each container's Linux oom_score_adj — Guaranteed gets −997, BestEffort gets 1000, and Burstable scales between them based on how small its request is relative to the node's total memory — so the kernel's OOM killer, if it ever fires, picks the highest score on the node. Separately, the kubelet's own node-pressure eviction — which acts before the kernel OOM killer, at configurable thresholds like memory.available under 100Mi by default — ranks candidate pods by whether they're exceeding their request, then by Priority, then by how far over they are. QoS class isn't literally the sort key there, but it's an extremely reliable predictor, because a Guaranteed pod's request equals its limit so it essentially can't exceed its request, while a BestEffort pod has no request and by definition always counts as exceeding one of zero.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Compare required pod anti-affinity with topology spread constraints, and explain when each is the right tool.</summary>
+        <div class="a"><p>Both spread pods apart, but with different guarantees and different costs. Required inter-pod anti-affinity, matched by topologyKey, gives an absolute guarantee — for example, never two replicas on the same host — enforced in the Filter phase, so a node that would violate it is eliminated outright. The cost is that evaluating it means checking a candidate pod against the labels of every other relevant pod across the cluster, which scales poorly with replica count and cluster size, and because it's a hard constraint, a replica count that exceeds the number of eligible nodes leaves pods permanently Pending with no graceful degradation. Topology spread constraints instead bound the difference between the fullest and emptiest eligible domain to maxSkew, and — this is the important part — offer whenUnsatisfiable: ScheduleAnyway, which turns an unsatisfiable spread into a scored preference rather than a hard failure — pods still schedule, just less evenly than ideal. They're also cheaper to evaluate because the scheduler is tracking counts per topology domain rather than doing pairwise pod comparisons. In practice, topology spread should be the default for "spread my replicas for availability," because it degrades gracefully and scales better; required anti-affinity is worth its cost only for the cases where the guarantee genuinely cannot bend, like ensuring a primary and its standby are never on the same failure domain.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A pod has been stuck in Pending for twenty minutes with no errors visible in a basic <code>kubectl get pods</code>. Walk through your diagnosis.</summary>
+        <div class="a"><p>Pending with no crash means the pod was accepted by the API server but the scheduler has never successfully bound it to a node, so I go straight to <code>kubectl describe pod</code> and read the Events section, specifically for a FailedScheduling event — that message names, per node, exactly why each one was rejected in the Filter phase. Common patterns: "Insufficient cpu/memory" means the pod's requests don't fit anywhere, which I'd check against actual node allocatable capacity and whatever else is already scheduled; "node(s) had untolerated taint" means a taint exists that this pod's tolerations don't match, which I'd compare directly against the pod spec and node taints; "didn't match pod affinity/anti-affinity rules" means a required affinity rule can't be satisfied, which I'd check against actual node and pod labels rather than what I assumed they were. I'd also check whether preemption was even attempted — the same event usually reports whether preemption could have helped and didn't. The core habit is that the scheduler always explains itself in that event; the failure mode isn't mysterious, it's just unread.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>Why can a PodDisruptionBudget completely fail to protect a service during a rollout, even with a generous <code>minAvailable</code>?</summary>
+        <div class="a"><p>Because a PDB only constrains voluntary disruptions carried out through the Eviction API — things like kubectl drain or a cluster autoscaler consolidating nodes. A Deployment's own rolling update doesn't go through that path at all; it's governed entirely by the Deployment's own maxUnavailable and maxSurge settings, and the Deployment controller deletes and creates pods directly as part of the rollout mechanism, not by requesting an eviction. So a PDB with minAvailable: 2 gives you zero protection against a badly configured rollout with maxUnavailable: 100% taking every pod down at once — those are two entirely separate knobs, owned by two different objects, and only one of them is active during a deploy. The practical takeaway is that a PDB protects you from disruptions someone else initiates against a stable workload — node drains, cluster maintenance — while rollout safety is a property you configure separately on the Deployment itself.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>The scheduler places a pod exactly once, using only requests — never limits, never real usage — through a Filter phase that eliminates infeasible nodes (taints, required affinity, resource fit) and a Score phase that ranks what's left. QoS class (Guaranteed/Burstable/BestEffort) is derived automatically from requests and limits and sets each container's <code>oom_score_adj</code>; it strongly predicts, but isn't literally, the kubelet's node-pressure eviction order, which really ranks by exceeds-request, then Priority, then magnitude of overage. Taints repel pods unless a toleration matches; node affinity and inter-pod affinity/anti-affinity let a pod require or prefer nodes or neighbors; topology spread constraints give proportional, gracefully-degrading spread that scales better than required anti-affinity. A PodDisruptionBudget bounds voluntary disruption through the Eviction API only — it does nothing during a Deployment's own rollout, and its default unhealthy-pod policy can block a drain on a pod that was never coming back. Priority and preemption let a pending pod evict lower-priority pods on the same node when nothing else fits, on a best-effort basis toward respecting PDBs.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>The scheduler places on requests only, one time; limits and real usage are the kubelet's problem, not the scheduler's.</li>
+      <li>QoS class is derived, not set: Guaranteed (requests=limits, all set), Burstable (something set), BestEffort (nothing set).</li>
+      <li><code>oom_score_adj</code> is exact: Guaranteed −997, BestEffort 1000, Burstable scaled by request size — lower survives longer.</li>
+      <li>Kubelet eviction order is really exceeds-request → Priority → magnitude of overage; QoS predicts it, doesn't define it.</li>
+      <li><code>NoSchedule</code> blocks new pods; <code>NoExecute</code> also evicts running ones, immediately unless <code>tolerationSeconds</code> is set.</li>
+      <li>Required pod anti-affinity is an absolute, expensive guarantee; topology spread is proportional, cheaper, and degrades gracefully.</li>
+      <li>Built-in topology spread defaults (hostname skew 3, zone skew 5, <code>ScheduleAnyway</code>) apply automatically if you set none.</li>
+      <li>A PDB only governs the Eviction API — node drains, autoscaler consolidation — never a Deployment's own rolling update.</li>
+      <li>Default <code>unhealthyPodEvictionPolicy: IfHealthyBudget</code> can block a drain forever on an already-broken pod; <code>AlwaysAllow</code> fixes that.</li>
+      <li>Preemption evicts lower-priority pods on one node to fit a pending pod, respects PDBs only best-effort, and never crosses nodes.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch23-cgroups-v2-cpu-memory-io-limits.html"><b>Ch 23</b> cgroups v2 &amp; limits</a>
+      <a href="ch30-the-node-kubelet-kube-proxy-runtime-cri.html"><b>Ch 30</b> The node &amp; kubelet</a>
+      <a href="ch35-config-and-identity-configmap-secret-serviceaccount-namespace.html"><b>Ch 35</b> Config &amp; identity</a>
+      <a href="ch37-autoscaling-and-governance-hpa-vpa-cluster-autoscaler.html"><b>Ch 37</b> Autoscaling &amp; governance</a>
+      <a href="ch33-workloads-i-pod-replicaset-deployment.html"><b>Ch 33</b> Rollouts &amp; readiness</a>
+      <a href="ch92-incident-management-postmortems-and-the-sre-operating.html"><b>Ch 92</b> Incident management</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/">Resource Management for Pods and Containers</a> and <a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/">Pod Quality of Service Classes</a>: requests/limits and the exact QoS criteria.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/">Node-pressure Eviction</a>: eviction signals, thresholds, and the real pod-selection order.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/">Assigning Pods to Nodes</a> and <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/">Taints and Tolerations</a>: affinity, anti-affinity, and taint effects.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/">Pod Topology Spread Constraints</a>: maxSkew, minDomains, and the built-in defaults.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/workloads/pods/disruptions/">Disruptions</a> and the <a href="https://kubernetes.io/docs/tasks/run-application/configure-pdb/">PodDisruptionBudget configuration task</a>: voluntary vs involuntary disruption, the Eviction API, unhealthy-pod policy.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/">Pod Priority and Preemption</a>: PriorityClass, preemption mechanics, and its limits.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/kube-scheduler/">kube-scheduler</a> and the <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/">Scheduling Framework</a>: the Filter/Score pipeline and its extension points.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch35-config-and-identity-configmap-secret-serviceaccount-namespace.html"><span class="dir">← Prev</span><div class="ti">Ch 35 — Config and identity: ConfigMap, Secret, ServiceAccount, Namespace</div></a>
+      <a class="nx" href="ch37-autoscaling-and-governance-hpa-vpa-cluster-autoscaler.html"><span class="dir">Next →</span><div class="ti">Ch 37 — Autoscaling and governance: HPA, VPA, Cluster Autoscaler, Karpenter</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 36 of 121 · Part IV · Kubernetes — Architecture &amp; Internals. You can now place pods deliberately and reason about who survives a squeeze. Next: matching capacity to demand automatically — HPA, VPA, and the node autoscalers.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Filter, then Score</a>
+    <a href="#steer">Requests to preemption</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">Following a pod</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

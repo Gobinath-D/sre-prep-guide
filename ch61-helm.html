@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 61 — Helm</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part VII · Platform Engineering &nbsp;·&nbsp; Chapter 61</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part VII · Platform Engineering — Packaging, IaC, GitOps, Mesh, Access · Chapter 61</div>
+      <h1>Helm</h1>
+      <p class="tagline">You've written a lot of raw YAML by now. Deploying "the same app" to dev, staging, and prod with nothing but copy-pasted manifests is how a team ends up with three quietly-diverging YAML trees and no real answer to "what did we actually ship last Tuesday." Helm is the package manager that fixes that — and the rollback it gives you is the reason this chapter exists at all.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~46 min read · Helm 3 on kind</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain what a chart, a release, and a revision actually are, and where Helm stores each one.</li>
+          <li>Predict exactly which value wins when the same key is set in three different places.</li>
+          <li>Use <code>helm template</code> and <code>helm lint</code> to catch problems before anything touches a cluster.</li>
+          <li>Break a real deployment with a bad value, then use <code>helm rollback</code> to recover it in seconds, not minutes.</li>
+          <li>Say why hook resources aren't cleaned up on uninstall, and what to do about it.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>A folder of YAML doesn't know what version it is</h2>
+    <p>Every Deployment, Service, ConfigMap, and Ingress you've written since Part IV has been a separate file, applied by hand or by a script. That works for one environment. It stops working the moment you need the same app running in dev, staging, and prod with slightly different replica counts, image tags, and resource limits — you either maintain three near-duplicate copies of every manifest, or you bolt on <code>sed</code>/<code>envsubst</code> scripts that nobody fully trusts. And when an upgrade goes wrong, "what did we have running five minutes ago, exactly" is a question raw <code>kubectl apply</code> has no good answer to.</p>
+    <p>An operating system solved this exact problem decades ago with a package manager: one versioned unit (a package), a way to install it with your own choices layered over sane defaults, and a record of what's installed so you can remove or upgrade it cleanly. <b>Helm is that, for Kubernetes.</b> A <b>chart</b> is the package — a set of templated manifests plus a default configuration. Installing a chart creates a <b>release</b> — one named, tracked instance of it running in your cluster — and every install or upgrade of that release is a numbered <b>revision</b> you can inspect, diff conceptually, or go back to.</p>
+    <div class="box keypoint"><div class="h">A version note, before we go further</div>
+      <p>Helm 4 shipped in 2026 with real changes — server-side apply by default for new installs, a WebAssembly-based plugin system, and renamed flags (<code>--atomic</code> is now <code>--rollback-on-failure</code>, <code>--force</code> is now <code>--force-replace</code>). This chapter teaches <b>Helm 3.x</b> deliberately: it's still what the overwhelming majority of production clusters run, it's what "no Tiller" refers to — the architectural change that actually matters — and every idea here (charts, values, releases, hooks) carries forward into v4 unchanged in spirit. Where a v4 rename matters, it's flagged.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a recipe card, not a plated dish</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>A chart is a <b>recipe card</b> — a set of instructions (templates) plus a default ingredient list (<code>values.yaml</code>). Cooking it for tonight's table (installing it into a specific cluster and namespace) lets you swap ingredients — more salt, a different cut of meat — without rewriting the recipe itself; that's overriding values. What actually lands on the table, the <b>plated dish</b>, is the rendered Kubernetes manifest Helm actually sends to the API server. The kitchen keeps an <b>order ticket</b> on file for every dish served — that's a release revision — so if tonight's version disappoints, you can tell the kitchen "make me exactly what you served last time" without re-explaining the whole recipe. That's <code>helm rollback</code>.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In Helm</th></tr>
+      <tr><td>The recipe card</td><td>A chart</td></tr>
+      <tr><td>The default ingredient list</td><td><code>values.yaml</code></td></tr>
+      <tr><td>Swapping ingredients for tonight only</td><td><code>-f</code> override file / <code>--set</code> flags</td></tr>
+      <tr><td>The plated dish actually served</td><td>The rendered Kubernetes manifests applied to the cluster</td></tr>
+      <tr><td>One order ticket on file, this specific dinner</td><td>A release — one named, tracked chart instance</td></tr>
+      <tr><td>The kitchen's whole order history for that table</td><td><code>helm history</code></td></tr>
+      <tr><td>"Make me exactly what you served last time"</td><td><code>helm rollback</code></td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>Values + templates → rendered manifests → release</h2>
+    <p>Helm 3 has no server-side component — no Tiller. It's two parts: a <b>client</b> (the CLI you run) and a <b>library</b> it calls into, and that library talks to the Kubernetes API server directly, using your own kubeconfig credentials. There is nothing else installed in your cluster just to make Helm work.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 380" role="img" aria-label="Values from three sources merge by precedence, feed templates to render manifests, which are applied to the cluster and recorded as a release revision Secret">
+        <defs>
+          <marker id="h1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+        </defs>
+        <text x="360" y="16" text-anchor="middle" style="fill:var(--muted);font:700 11px sans-serif;letter-spacing:.05em">HELM 3 — CLIENT + LIBRARY, NO TILLER, TALKS TO THE API SERVER DIRECTLY</text>
+
+        <rect x="20" y="34" width="150" height="46" rx="7" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="95" y="53" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">chart values.yaml</text>
+        <text x="95" y="68" text-anchor="middle" style="fill:var(--muted);font:8.5px sans-serif">lowest precedence</text>
+        <rect x="185" y="34" width="150" height="46" rx="7" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="260" y="53" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">-f override.yaml</text>
+        <text x="260" y="68" text-anchor="middle" style="fill:var(--muted);font:8.5px sans-serif">later -f wins over earlier</text>
+        <rect x="350" y="34" width="150" height="46" rx="7" style="fill:var(--chip);stroke:var(--accent)"/>
+        <text x="425" y="53" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">--set key=val</text>
+        <text x="425" y="68" text-anchor="middle" style="fill:var(--accent);font:8.5px sans-serif">highest precedence</text>
+
+        <line x1="95" y1="80" x2="270" y2="110" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#h1)"/>
+        <line x1="260" y1="80" x2="270" y2="110" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#h1)"/>
+        <line x1="425" y1="80" x2="290" y2="110" style="stroke:var(--accent);stroke-width:1.5" marker-end="url(#h1)"/>
+
+        <rect x="185" y="112" width="220" height="46" rx="7" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.4"/>
+        <text x="295" y="140" text-anchor="middle" style="fill:var(--ink);font:700 11.5px sans-serif">computed values</text>
+
+        <line x1="295" y1="158" x2="295" y2="182" style="stroke:var(--accent);stroke-width:1.8" marker-end="url(#h1)"/>
+        <rect x="185" y="184" width="220" height="46" rx="7" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="295" y="212" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">templates/*.yaml (Go templates)</text>
+
+        <line x1="295" y1="230" x2="295" y2="254" style="stroke:var(--accent);stroke-width:1.8" marker-end="url(#h1)"/>
+        <rect x="185" y="256" width="220" height="46" rx="7" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.4"/>
+        <text x="295" y="284" text-anchor="middle" style="fill:var(--accent2);font:700 11px sans-serif">rendered Kubernetes manifests</text>
+
+        <line x1="405" y1="279" x2="470" y2="279" style="stroke:var(--accent2);stroke-width:1.8" marker-end="url(#h1)"/>
+        <rect x="472" y="256" width="230" height="46" rx="7" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="587" y="278" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">applied to the API server</text>
+        <text x="587" y="293" text-anchor="middle" style="fill:var(--muted);font:8.5px sans-serif">no Tiller — your own kubeconfig</text>
+
+        <line x1="587" y1="302" x2="587" y2="326" style="stroke:var(--muted);stroke-width:1.6" marker-end="url(#h1)"/>
+        <rect x="440" y="328" width="264" height="42" rx="7" style="fill:var(--panel);stroke:var(--violet);stroke-width:1.4"/>
+        <text x="572" y="347" text-anchor="middle" style="fill:var(--violet);font:600 10.5px sans-serif">Release revision — a Secret</text>
+        <text x="572" y="362" text-anchor="middle" style="fill:var(--muted);font:8.5px sans-serif">sh.helm.release.v1.&lt;name&gt;.v&lt;N&gt;, in-cluster</text>
+      </svg>
+      <figcaption>No external database and no Tiller. Values merge by precedence into one computed set, templates render into plain Kubernetes YAML, that YAML is applied with your own credentials, and the whole record — chart, values, manifest — is kept as a Secret, one per revision, right in the release's namespace.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>Because there's no separate Helm server, there's no separate thing to compromise, upgrade, or lose — a real security and operability win over Helm 2's Tiller. It also means release state lives exactly where your cluster's own RBAC and backups already cover it. The trade-off: whoever runs <code>helm</code> commands needs Kubernetes API access with real permissions, not just "access to a Helm server" — so CI's Helm identity needs its own scoped RBAC, same as anything else that talks to the API server.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>Charts, values, releases, repos, dependencies, hooks</h2>
+
+    <h4>1 · Chart anatomy</h4>
+    <p>A chart is a directory: <code>Chart.yaml</code> (name, version, <code>apiVersion: v2</code>, an optional <code>appVersion</code> for the app's own version separate from the chart's), <code>values.yaml</code> (defaults), <code>templates/</code> (the actual manifests, plus a conventional <code>_helpers.tpl</code> for named template snippets and an optional <code>NOTES.txt</code> printed after install), and <code>charts/</code> (vendored subchart dependencies). A <code>crds/</code> directory holds CRDs that Helm installs first and never templates, upgrades, or deletes automatically — the replacement for a removed Helm 2 mechanism called <code>crd-install</code>.</p>
+
+    <h4>2 · The values hierarchy — who wins</h4>
+    <p>Values merge from several sources, in a fixed order of increasing precedence: the chart's own <code>values.yaml</code> (lowest) is overridden by a parent chart's values for a subchart, which is overridden by any <code>-f</code> file passed on the command line (and if you pass <code>-f</code> more than once, a later file wins over an earlier one), which is overridden by <code>--set</code> (and its siblings <code>--set-string</code>, <code>--set-json</code>, <code>--set-file</code> — highest of all). Keep values trees shallow where you can; deep nesting makes precedence harder to reason about, not easier.</p>
+    <p>One trick worth knowing cold: setting a key to <b>null</b> deletes it from the merged result instead of layering on top of it. That matters when a default sets one sub-key of a structure (say, a liveness probe's <code>httpGet</code>) and you need to switch to a different sub-key (<code>exec</code>) entirely — Kubernetes won't accept both on one probe, so you override with the new key <em>and</em> null out the old one, or the merge leaves both present and the manifest fails validation at the API server, not at render time.</p>
+
+    <h4>3 · Templates</h4>
+    <p>Templates are Go's <code>text/template</code> syntax plus the Sprig function library, with a handful of built-in objects: <code>.Values</code> (the merged values), <code>.Release</code> (name, namespace, revision, whether this is an install or upgrade), <code>.Chart</code> (the chart's own metadata), <code>.Files</code> (non-template files in the chart), and <code>.Capabilities</code> (what the target cluster supports). <code>helm template</code> renders everything locally with zero cluster contact — the fastest possible feedback loop — and <code>helm lint</code> checks structure, required fields, and common mistakes before you've even rendered anything.</p>
+
+    <h4>4 · Releases and revisions — where the state actually lives</h4>
+    <p>A release is one named installation of a chart. Install the same chart twice under two different release names and you get two fully independent releases — two Redis instances, say, each with its own history. Helm 3 stores each release's state — the chart, the computed values, the rendered manifest, and metadata — as a Kubernetes <b>Secret</b>, one per revision, named <code>sh.helm.release.v1.&lt;release&gt;.v&lt;revision&gt;</code>, sitting in the release's own namespace. No external database, nothing outside the cluster.</p>
+    <p><code>helm upgrade</code> creates a new revision. <code>helm history &lt;release&gt;</code> lists every one of them. <code>helm rollback &lt;release&gt; [revision]</code> — omit the revision, or pass <code>0</code>, for "the previous one" — re-applies an older revision's already-rendered manifest. That's a subtlety worth being precise about: <b>rollback creates a brand-new revision</b> that happens to match an old one's content. History only ever grows forward; there's no time travel that erases what happened in between. <code>--history-max</code> (default 10) caps how many old revisions stay retained per release.</p>
+
+    <h4>5 · Repositories</h4>
+    <p>The classic model is an <code>index.yaml</code> plus packaged <code>.tgz</code> charts served over plain HTTP(S) — added with <code>helm repo add</code>, refreshed with <code>helm repo update</code>, searched with <code>helm search repo</code>. The increasingly common model is an <b>OCI registry</b>: <code>helm push</code> a chart to <code>oci://...</code>, <code>helm pull</code> it back, <code>helm registry login</code> to authenticate. ECR itself can host Helm charts as OCI artifacts, which is why many teams have quietly stopped running a dedicated chart-repository server at all.</p>
+
+    <h4>6 · Dependencies</h4>
+    <p>A chart declares the other charts it needs in <code>Chart.yaml</code>'s <code>dependencies</code> list — name, version, repository, and optionally a <code>condition</code> or <code>tags</code> key that lets a values override toggle a whole subchart on or off. <code>helm dependency update</code> resolves that list, downloads the packaged subcharts into <code>charts/</code>, and writes a <code>Chart.lock</code> — a lockfile pinning exactly which versions were resolved, so a second <code>dependency update</code> six months later doesn't silently pull something newer. Subcharts see their own values under their own name in the parent's values file, and anything under a top-level <code>global:</code> key is visible to every subchart at once — the mechanism an umbrella chart uses to configure many services from one place.</p>
+
+    <h4>7 · Hooks</h4>
+    <p>A hook is a normal template with a special annotation — <code>helm.sh/hook: pre-install</code>, for instance — that pulls it out of the ordinary apply-and-move-on lifecycle. The defined hooks are <code>pre-install</code>, <code>post-install</code>, <code>pre-delete</code>, <code>post-delete</code>, <code>pre-upgrade</code>, <code>post-upgrade</code>, <code>pre-rollback</code>, <code>post-rollback</code>, and <code>test</code> (run only by <code>helm test</code>). Hooks of the same kind run in ascending order of <code>helm.sh/hook-weight</code> (a string-encoded integer, default effectively 0); if the hook resource is a Job or Pod, Helm blocks and waits for it to finish, and a failing hook fails the whole release operation.</p>
+    <div class="box gotcha"><div class="h">Hook resources are not part of the release</div>
+      <p>Once a hook resource reaches its ready state, Helm walks away from it — it's not tracked as part of the release, which means <code>helm uninstall</code> will not clean it up by default. If you need it removed, add a <code>helm.sh/hook-delete-policy</code> annotation: <code>before-hook-creation</code> (the default — delete the previous run's resource right before a new one is created), <code>hook-succeeded</code>, or <code>hook-failed</code>. Leaving a one-shot migration Job lying around forever, because nobody set a delete policy, is a very common source of cluster clutter.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: <code>helm upgrade</code> exits with a success message. Does that tell you the new pods are actually healthy?</summary>
+      <div class="body">
+        <p>No — by default it tells you only that the rendered manifest was accepted by the API server. Helm's default behavior doesn't wait to confirm the workload became <code>Ready</code>; a Deployment can be happily crash-looping while the CLI has already returned exit code 0 and printed "STATUS: deployed." Getting Helm's notion of success to match reality needs <code>--wait</code> (block until resources report ready) and, better, <code>--atomic</code> (wait, and automatically roll back if that wait fails) — neither of which is the default, which is exactly the gap the next lab walks straight into.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, named</h2>
+    <ul>
+      <li><b><code>Chart.yaml</code>.</b> Owns: the chart's identity — name, version, <code>apiVersion: v2</code>, dependency declarations.</li>
+      <li><b><code>values.yaml</code>.</b> Owns: the lowest-precedence defaults every override layers on top of.</li>
+      <li><b><code>templates/</code>.</b> Owns: the actual Go-templated manifests, helpers, and NOTES.</li>
+      <li><b><code>charts/</code> + <code>Chart.lock</code>.</b> Owns: resolved, pinned subchart dependencies.</li>
+      <li><b><code>crds/</code>.</b> Owns: CRDs installed once, up front, never templated or auto-removed.</li>
+      <li><b>A release (Secret per revision).</b> Owns: the full history of what was actually installed, in-cluster, with no external store.</li>
+      <li><b>A repository — index.yaml or OCI registry.</b> Owns: where charts are found, versioned, and pulled from.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one real <code>helm upgrade --install</code></h2>
+    <p>You run <code>helm upgrade --install myapp ./mychart -f prod-values.yaml --set image.tag=1.4.2</code>. The client loads the chart and merges values by the precedence just covered — <code>prod-values.yaml</code> over the chart's defaults, <code>--set</code> over that. It renders every template locally against the computed values, entirely offline so far. Because a release named <code>myapp</code> already exists, this becomes an upgrade: the library runs any <code>pre-upgrade</code> hooks first and waits for them to finish. It then applies the rendered resources to the API server — using your own credentials, still no Tiller anywhere — creates or patches whatever changed, runs any <code>post-upgrade</code> hooks, and (only if you passed <code>--wait</code> or <code>--atomic</code>) blocks until the new resources actually report ready. Finally it writes the new revision's Secret, bumps the release's revision number, and prints <code>NOTES.txt</code>. If <code>--atomic</code> was set and that final wait failed, this whole sequence runs again automatically in reverse — a rollback to the previous revision — before the command returns control to you.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>All five labs run on a local <code>kind</code> cluster — nothing here needs a cloud account.</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>kind create cluster --name lab61
+helm version   <span class="c"># confirm you're on Helm 3.x — no separate server to start</span></code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — scaffold, render, and install a chart</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p><code>helm create</code> scaffolds a working chart. Render it without touching the cluster first, then actually install it.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>helm create mychart
+helm template mychart | head -20
+helm install demo ./mychart
+helm list
+helm status demo</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME    NAMESPACE  REVISION  STATUS    CHART          APP VERSION
+demo    default    1         deployed  mychart-0.1.0  1.16.0</code></div>
+        <p><code>helm template</code> showed you the exact YAML before anything was applied — that render is deterministic and entirely local. <code>helm status</code> and <code>helm list</code> both read from the same place: the revision Secret Helm just wrote for this release.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — prove the values precedence with your own eyes</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Override the same key three ways and confirm which one actually won.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>echo 'replicaCount: 3' &gt; staging-values.yaml
+helm upgrade demo ./mychart -f staging-values.yaml --set replicaCount=5
+helm get values demo
+helm show values ./mychart | grep replicaCount</code></pre></div>
+        <div class="out"><span class="ol">Output</span>USER-SUPPLIED VALUES:
+replicaCount: 5
+---
+replicaCount: 1   <span class="c"># the chart's own untouched default</span></code></div>
+        <p><code>--set replicaCount=5</code> beat the <code>-f staging-values.yaml</code> file's <code>3</code>, which in turn overrode the chart's own default of <code>1</code> — exactly the precedence order, confirmed by two different commands that read two different things: <code>get values</code> shows what was actually applied for this release, <code>show values</code> shows the chart's untouched defaults.</p>
+      </div>
+    </div>
+
+    <details class="recall"><summary>Think first: you pass both <code>-f base.yaml -f override.yaml</code>. If both files set the same key, which one wins?</summary>
+      <div class="body">
+        <p><code>override.yaml</code> — with multiple <code>-f</code> flags, files are merged left to right and the last one given wins on any key they share. This is the part of the precedence rule people get backwards most often, because it's easy to assume "more specific filename" or "the one listed first" matters; only order matters. It's also why layering a base file and an environment-specific file works cleanly as long as you always pass the base file first and the environment override second, consistently, in your deploy tooling.</p>
+      </div>
+    </details>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — feed a value that breaks the app at runtime</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Not a YAML syntax error — a value that renders fine and fails only once Kubernetes tries to run it.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>helm upgrade demo ./mychart --set image.tag=does-not-exist
+kubectl rollout status deployment/demo --timeout=30s</code></pre></div>
+        <div class="out"><span class="ol">Output</span>Release "demo" has been upgraded. Happy Helming!
+Waiting for deployment "demo" rollout to finish: 0 of 1 updated replicas are available...
+error: timed out waiting for the condition</code></div>
+        <p><code>helm upgrade</code> printed "Happy Helming" and exited 0. The rollout never actually finished. Before revealing: what does Helm's own view of this release say right now, and why did the CLI not warn you?</p>
+        <details class="recall"><summary>Reveal what happened and why</summary>
+          <div class="body">
+            <div class="codewrap"><span class="lang">bash</span><pre><code>helm status demo
+kubectl describe pod -l app.kubernetes.io/instance=demo | grep -A2 Events</code></pre></div>
+            <div class="out"><span class="ol">Output</span>STATUS: deployed
+Warning  Failed  ... Failed to pull image "...:does-not-exist": not found</code></div>
+            <p>Helm's status still says <code>deployed</code> — because by default, applying the manifest successfully <em>is</em> Helm's whole definition of success, and this run had no <code>--wait</code> or <code>--atomic</code> flag telling it to check further. The pod is stuck in <code>ImagePullBackOff</code>, and nothing about the Helm CLI's own output told you that. This gap — "the manifest was accepted" versus "the workload is actually healthy" — is exactly what causes a broken upgrade to sit unnoticed in production until someone happens to check pods directly.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — the rollback that saves it</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Recover from Lab 3 the way you actually would in production: find the last good revision and go back to it.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>helm history demo</code></pre></div>
+        <div class="out"><span class="ol">Output</span>REVISION  STATUS      CHART          APP VERSION  DESCRIPTION
+1         superseded  mychart-0.1.0  1.16.0       Install complete
+2         superseded  mychart-0.1.0  1.16.0       Upgrade complete
+3         deployed    mychart-0.1.0  1.16.0       Upgrade complete</code></div>
+        <p>Revision 3 is marked <code>deployed</code>, but you know from Lab 3 that it's the broken one. Which revision would you actually roll back to, and what will <code>helm history</code> look like immediately afterward — a restored revision 2, or something else? Decide before opening the answer.</p>
+        <details class="recall"><summary>Reveal the rollback and what history actually shows next</summary>
+          <div class="body">
+            <div class="codewrap"><span class="lang">bash</span><pre><code>helm rollback demo 2
+kubectl rollout status deployment/demo --timeout=30s
+helm history demo | tail -1</code></pre></div>
+            <div class="out"><span class="ol">Output</span>deployment "demo" successfully rolled out
+4         deployed    mychart-0.1.0  1.16.0       Rollback to 2</code></div>
+            <p>Notice the new row: <b>revision 4</b>, not a return to revision 2. Rollback re-applies revision 2's rendered manifest as a brand-new entry in the history — the count only ever goes up, which is exactly why <code>helm history</code> is always the true, append-only story of a release, never something you can quietly rewrite. <code>deployed</code> on revision 3 the whole time was never a health signal — it only meant the manifest was accepted, which is the exact gap Lab 3 exposed.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — harden this so Lab 3 can't happen quietly again</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>Design a chart that catches this class of failure before it ever reaches the state Lab 3 did, before opening the answer.</p>
+        <details class="recall"><summary>Reveal the hardening</summary>
+          <div class="body">
+            <p>Three layers, cheapest first. <b>Make Helm's success check the truth:</b> run every upgrade with <code>--atomic</code> (which implies <code>--wait</code>) — Helm blocks until the Deployment actually reports ready, and automatically rolls back to the previous revision if it doesn't, all inside the one command, instead of leaving a broken release marked <code>deployed</code> for a human to notice. <b>Catch bad structure before install:</b> run <code>helm lint --strict</code> in CI so structural problems fail the pipeline, not the cluster; add a <code>values.schema.json</code> to the chart root so Helm validates the shape of <code>values.yaml</code> — wrong types, missing required keys — automatically on every install, upgrade, and even <code>template</code>. <b>Catch bad behavior, not just bad structure:</b> a <code>pre-upgrade</code> hook Job that smoke-tests the new image (even something as simple as confirming it exists and starts) before the real rollout ever begins, so a typo'd tag fails fast and loud in the hook instead of quietly inside a Deployment nobody's watching. None of these three replace the others — <code>--atomic</code> catches what lint can't, and lint catches what a smoke test would be too slow to run for.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · "helm upgrade succeeded" but the app is down</div>
+      <p><b>Symptom:</b> the release shows <code>STATUS: deployed</code>, the CLI exited 0, and the workload is unhealthy or crash-looping. <b>First cut:</b> check whether the upgrade was run with <code>--wait</code>/<code>--atomic</code> at all — without them, "deployed" only means the manifest was accepted. <b>Confirm:</b> <code>kubectl rollout status</code> and pod events tell the real story. <b>Fix now:</b> <code>helm rollback</code> to the last good revision. <b>Fix permanently:</b> make <code>--atomic</code> the standard for every upgrade going forward.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · values did something you didn't expect</div>
+      <p><b>Symptom:</b> a value you thought you set didn't take effect, or an unrelated field changed. <b>First cut:</b> <code>helm get values &lt;release&gt;</code> to see exactly what was actually applied, versus what you intended. <b>Usual cause:</b> a precedence surprise — multiple <code>-f</code> files in the wrong order, or a deep merge combining two sub-keys that should have been mutually exclusive (fixed with an explicit <code>null</code> override). <b>Fix:</b> flatten the values structure where you can, and be deliberate about <code>-f</code> file order in your deploy tooling.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · "works on my machine," fails in CI</div>
+      <p><b>Symptom:</b> a chart installs fine locally but fails to render or install in the pipeline. <b>First cut:</b> was <code>helm dependency update</code> run recently enough that <code>charts/</code> and <code>Chart.lock</code> actually match <code>Chart.yaml</code>? <b>Usual cause:</b> a subchart dependency resolved locally months ago and never refreshed, drifting from what CI resolves fresh every run — or a target-cluster Kubernetes version CI never validated against. <b>Fix:</b> commit <code>Chart.lock</code>, and run <code>helm lint --kube-version &lt;target&gt;</code> against the real target version in CI, not whatever version happens to be on a laptop.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Security.</b> Helm has no built-in secrets management — a value in <code>values.yaml</code> is just YAML, and if that file is in git, so is whatever you put in it. Keep real secrets out of values entirely; reference something that manages them separately. Because Helm acts with whatever identity ran the command, give CI's Helm identity scoped, namespaced RBAC rather than cluster-admin — the same rule that applies to any other client of the Kubernetes API.</p>
+    <p><b>Operability.</b> Make <code>--atomic</code> and <code>--wait</code> the default in your deploy tooling, not something an engineer remembers to type under pressure. Set <code>--history-max</code> deliberately rather than letting revision Secrets accumulate forever. Prefer OCI registries over standing up and maintaining your own chart-repository server.</p>
+    <p><b>Common mistakes:</b> treating a clean <code>helm template</code> render as proof the chart will actually run — rendering success and runtime success are unrelated claims; forgetting hook resources aren't garbage-collected on uninstall and leaving one-shot Jobs behind indefinitely; two teams maintaining conflicting values files for the same chart with no agreed precedence; and not pinning subchart versions, so a routine <code>dependency update</code> pulls in an unplanned breaking change.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>A chart plus a values file is already a declarative description of desired state — which is exactly the input <a href="ch65-argo-cd.html">Argo CD</a> will later reconcile continuously instead of you running <code>helm upgrade</code> by hand from a laptop, the subject of <a href="ch64-gitops-principles.html">Chapter 64</a>. The values-hierarchy pattern itself — layered defaults, environment overrides, and explicit last-mile overrides, each with a fixed precedence — isn't a Helm quirk; it's the same shape you'll meet in Terraform's variable precedence, application config profiles, and most serious configuration systems, because "defaults you can override, in a predictable order" is close to a universal requirement once more than one environment exists.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What is Helm, and why not just <code>kubectl apply -f</code> a folder of YAML?</summary>
+        <div class="a"><p>Helm is Kubernetes' package manager: a chart packages a set of templated manifests with default configuration, installing it creates a tracked release, and every install or upgrade is a numbered revision you can inspect or roll back to. Plain <code>kubectl apply</code> on a folder of YAML has no concept of versioning, no parameterization beyond what you script yourself, and no built-in way to answer "what did we have running before this change" — Helm gives you all three, on top of manifests you'd otherwise be maintaining by hand across every environment.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through exactly what happens when I run <code>helm upgrade --install</code>.</summary>
+        <div class="a"><p>The client loads the chart and merges values from every source in precedence order — chart defaults, parent chart values, any -f files in the order given, then --set flags last and highest. It renders every template locally against that computed value set, entirely offline. If a release by this name doesn't exist yet, this becomes an install; if it does, an upgrade — either way, any pre-install or pre-upgrade hooks run first and Helm waits for them to finish before touching the main resources. The library then applies the rendered manifests directly to the Kubernetes API server using your own credentials, since Helm 3 has no separate server component. Post-install or post-upgrade hooks run next. If you passed --wait or --atomic, Helm blocks until the new resources actually report ready, and with --atomic specifically, a failed wait triggers an automatic rollback to the previous revision. Finally, the new revision — chart, computed values, rendered manifest, metadata — is written as a Secret in the release's namespace, and NOTES.txt prints. Without --wait or --atomic, "success" only ever meant the manifest was accepted, which is the gap that causes most "upgrade succeeded but the app is broken" incidents.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Where does Helm store release state, and what changed from Helm 2's Tiller?</summary>
+        <div class="a"><p>Helm 3 stores every release revision as a Kubernetes Secret, named sh.helm.release.v1.&lt;release&gt;.v&lt;revision&gt;, in the same namespace as the release — no external database, nothing outside the cluster. Helm 2 instead ran a server-side component called Tiller inside the cluster, which held broad permissions to manage releases on behalf of any client that could reach it, and which itself needed installing, upgrading, and securing as a standing piece of infrastructure. Removing Tiller in Helm 3 meant the client and library talk to the API server directly using the caller's own Kubernetes credentials, so Helm's authorization model collapsed into "does this identity have RBAC to create these resources" — the exact same question you'd ask about any other API client — instead of a separate, additional trust boundary around Tiller itself. It's a real security simplification: one fewer privileged, always-on component to compromise.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>An upgrade just broke production. What do you do in the next two minutes?</summary>
+        <div class="a"><p>First, confirm it's actually this release and not something else entirely — helm history on the affected release to see the most recent revision and its description. If the previous revision was known-good, I run helm rollback with no revision argument, which defaults to the previous one, and that re-applies the last-good rendered manifest as a new revision immediately — I don't spend time diagnosing the root cause of the break before restoring service, because rollback doesn't require understanding why the new revision failed. Once traffic is healthy again, I'd check helm get values and helm get manifest on the bad revision to actually understand what changed, and only then dig into why the health check I should have had (--atomic, in hindsight) didn't catch it before it reached users. Restore first, diagnose second — the rollback is fast specifically because Helm already has the last-good manifest on file; there's nothing to reconstruct.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>Why aren't resources created by a hook cleaned up when you <code>helm uninstall</code>?</summary>
+        <div class="a"><p>Because Helm deliberately doesn't track hook-created resources as part of the release's managed set — once a hook resource reaches its ready state, Helm considers its job done and stops watching it. That's a design choice, not an oversight: hooks are meant for one-off actions (a migration Job, a pre-delete cleanup task) whose resources often shouldn't disappear the instant the hook finishes, and sometimes shouldn't disappear even when the whole release is later uninstalled — a backup Job's output, for instance. If you do want a hook's resource removed automatically, you set a helm.sh/hook-delete-policy annotation explicitly: before-hook-creation (the default, which deletes the previous run right before a new one starts), hook-succeeded, or hook-failed. Leaving that unset and then being surprised that helm uninstall left something behind is one of the most common Helm surprises in practice.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>A chart is a versioned, parameterized package of manifests; a release is one named, tracked instance of it; a revision is one numbered install or upgrade of that release. Helm 3 has no Tiller — client and library talk to the Kubernetes API server directly, and every revision is stored as a Secret in-cluster, nothing external. Values merge by precedence: chart defaults, then parent-chart values, then <code>-f</code> files in the order given, then <code>--set</code> highest — and a null override deletes rather than merges. <code>helm template</code>/<code>lint</code> catch problems before a cluster is ever touched, but a successful <code>helm upgrade</code> only proves the manifest was accepted, not that the workload is healthy, unless you pass <code>--wait</code> or <code>--atomic</code>. <code>helm rollback</code> re-applies an old revision's manifest as a brand-new revision — history only ever grows. Hooks run outside the normal resource lifecycle and are never cleaned up automatically unless you set a deletion policy. Dependencies resolve into <code>charts/</code> and a <code>Chart.lock</code> for reproducibility.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>A chart is a versioned, parameterized package of manifests; a release is one named, tracked instance of a chart running in a cluster.</li>
+      <li>Helm 3 has no Tiller — the client and library talk to the Kubernetes API server directly; release state lives in a Secret per revision, in-cluster.</li>
+      <li>Values merge by precedence: chart defaults &lt; parent chart values &lt; <code>-f</code> file(s) in order given &lt; <code>--set</code>/<code>--set-string</code>/<code>--set-json</code> (highest).</li>
+      <li>Setting a value to <code>null</code> deletes an inherited default instead of merging on top of it.</li>
+      <li><code>helm template</code>/<code>--dry-run</code> renders manifests locally with no cluster changes; <code>helm lint</code> catches structural problems before either.</li>
+      <li><code>helm upgrade</code> applying successfully only means the manifest was accepted — it says nothing about whether the workload became healthy.</li>
+      <li><code>helm rollback &lt;release&gt; [revision]</code> re-applies an older revision's rendered manifest as a brand-new revision — it moves history forward, it doesn't erase it.</li>
+      <li>Hooks (<code>helm.sh/hook: pre-install</code>, etc.) run outside the normal resource lifecycle and are not tracked by the release — they aren't deleted on uninstall unless you set a deletion policy.</li>
+      <li><code>Chart.yaml</code>'s <code>dependencies</code> block plus <code>helm dependency update</code> resolve subcharts into <code>charts/</code> and a <code>Chart.lock</code>, for reproducible installs.</li>
+      <li><code>--atomic</code> (auto-rollback on a failed upgrade) plus a real readiness probe is what makes Helm's "success" match the workload's actual health.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch28-why-kubernetes-the-declarative-reconciled-model.html"><b>Ch 28</b> The declarative model</a>
+      <a href="ch32-api-machinery-apply-path-admission-crds-and.html"><b>Ch 32</b> CRDs &amp; admission</a>
+      <a href="ch33-workloads-i-pod-replicaset-deployment.html"><b>Ch 33</b> Workloads I</a>
+      <a href="ch64-gitops-principles.html"><b>Ch 64</b> GitOps principles</a>
+      <a href="ch65-argo-cd.html"><b>Ch 65</b> Argo CD</a>
+      <a href="ch73-ci-cd-and-progressive-delivery.html"><b>Ch 73</b> CI/CD &amp; progressive delivery</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Helm docs — <a href="https://helm.sh/docs/v3/intro/introduction/">Introduction to Helm</a>: the client/library architecture and where release state lives.</li>
+      <li>Helm docs — <a href="https://helm.sh/docs/v3/topics/charts/">Charts</a>: chart anatomy, <code>Chart.yaml</code>, dependencies, and <code>crds/</code>.</li>
+      <li>Helm docs — <a href="https://helm.sh/docs/v3/chart_template_guide/values_files/">Values Files</a>: the precedence order and the null-delete trick.</li>
+      <li>Helm docs — <a href="https://helm.sh/docs/v3/topics/charts_hooks/">Chart Hooks</a>: the full hook list, weights, and deletion policies.</li>
+      <li>Helm docs — <a href="https://helm.sh/docs/v3/helm/helm_rollback/">helm rollback</a> and <a href="https://helm.sh/docs/v3/helm/helm_lint/">helm lint</a>: exact flags and behavior.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch60-end-to-end-synthesis-internet-to-alb.html"><span class="dir">← Prev</span><div class="ti">Ch 60 — End-to-end synthesis: Internet to ALB</div></a>
+      <a class="nx" href="ch62-terraform-i-model-resources-state-the-dependency.html"><span class="dir">Next →</span><div class="ti">Ch 62 — Terraform I</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 61 of 121 · Part VII · Platform Engineering — Packaging, IaC, GitOps, Mesh, Access. You can package, version, and roll back an application now. Next: doing the same for the infrastructure underneath it.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Values → templates → release</a>
+    <a href="#internals">Charts, values, releases, hooks</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">One upgrade end to end</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

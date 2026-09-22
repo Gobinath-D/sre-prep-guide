@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 25 — Container Networking</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part III · Containers &nbsp;·&nbsp; Chapter 25</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part III · Containers &amp; Container Internals · Chapter 25</div>
+      <h1>Container networking</h1>
+      <p class="tagline">A container has its own network stack, yet somehow reaches the internet, gets reached on a published port, and finds its neighbours by name. Four pieces do all of it — a virtual cable, a software switch, NAT, and a tiny DNS server — and they're the direct ancestor of every Kubernetes CNI.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~45 min read · Linux lab (Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Draw the bridge + veth + NAT datapath from a container to the internet and back.</li>
+          <li>Explain what a veth pair and the <code>docker0</code> bridge are, and trace a packet across them.</li>
+          <li>Say exactly what <code>-p 8080:80</code> does — the DNAT rule and where it lives.</li>
+          <li>Explain why containers resolve each other by name on a user-defined network but not on the default bridge.</li>
+          <li>Debug port-mapping and DNS problems with <code>docker network inspect</code>, <code>iptables</code>, and <code>tcpdump</code>.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem container networking solves</h2>
+    <p>From <a href="ch22-linux-namespaces.html">Chapter 22</a> you know a container has its own <b>network namespace</b>: its own interfaces, routing table, and port space, starting with nothing but a loopback that's down. That isolation is exactly what you wanted — two containers can both bind port 80 without colliding — but it creates an immediate problem. A namespace with only loopback is an island. The container can't reach the internet, nothing can reach it, and it can't talk to the container running next to it. Isolation without connectivity is useless.</p>
+    <p>So you need to wire the island back up, on your terms. Concretely: give each container an address and a path off the box (so <code>apt-get</code> and outbound API calls work); let containers on the same host talk to each other; let the outside world reach a chosen service on a chosen port; and let containers find each other by name instead of chasing IPs that change on every restart. And you have to do all of this without giving the container the host's real network interface, because that would throw away the isolation.</p>
+    <p>The standard answer — the one Docker ships by default and the one every Kubernetes CNI is a descendant of — is a <b>virtual switch</b> on the host with a <b>virtual cable</b> into each container, plus <b>NAT</b> to bridge the container's private address range to the real network, and a small <b>embedded DNS</b> server for names. Learn these four here on plain Docker and the Kubernetes datapath in Part V will feel familiar instead of alien.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>The container's <code>eth0</code> is not a real network card. It's one end of a virtual Ethernet cable (a <b>veth pair</b>); the other end lives on the host and plugs into a software bridge. Every packet in or out of a container crosses that cable and that bridge. Once you can see those two objects, container networking stops being magic.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: an office LAN behind a receptionist</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Think of the host as an office with one public phone number and an internal switchboard. Each container is a desk with an <b>internal extension</b> (its private IP like <code>172.17.0.2</code>). The desks are all wired to a small internal <b>switchboard</b> — that's the <code>docker0</code> bridge — so any desk can call any other desk directly by extension. The wire from a desk to the switchboard is the <b>veth pair</b>: one plug at the desk, one in the switchboard.</p>
+      <p>When someone at a desk calls <em>out</em> to the world, the switchboard hands the call to the <b>receptionist</b>, who places it from the office's single public number — the outside world sees the receptionist's number, never the desk extension. That's <b>NAT</b> (source NAT / masquerade): the container's private IP is rewritten to the host's IP on the way out. When a call comes <em>in</em> to the public number asking for "the web service on 8080," the receptionist has a rule: forward anything on 8080 to extension <code>172.17.0.2</code>, line 80. That forwarding rule is <b>port publishing</b> (destination NAT), and it only exists for ports you explicitly ask to publish.</p>
+      <p>Finally, nobody memorises extensions. There's an <b>internal directory</b> you can ask "what's the extension for <code>db</code>?" and it answers — that's the embedded DNS server. The catch: the directory only covers desks that joined the same named team room. Desks on the generic default floor don't get a directory and must dial extensions directly.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In container networking</th></tr>
+      <tr><td>A desk's internal extension</td><td>The container's private IP (e.g. <code>172.17.0.2</code>)</td></tr>
+      <tr><td>The wire from desk to switchboard</td><td>The <b>veth pair</b> — <code>eth0</code> inside, <code>vethXXXX</code> on the host</td></tr>
+      <tr><td>The internal switchboard</td><td>The <b>bridge</b> (<code>docker0</code> or a user-defined bridge)</td></tr>
+      <tr><td>The receptionist's outbound calls from one number</td><td><b>SNAT / MASQUERADE</b> for outbound traffic</td></tr>
+      <tr><td>"Forward 8080 to extension 172.17.0.2:80"</td><td><b>Port publishing</b> — a DNAT rule (<code>-p 8080:80</code>)</td></tr>
+      <tr><td>The internal directory (per team room)</td><td>Embedded <b>DNS</b> at <code>127.0.0.11</code> on user-defined networks</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>The bridge + veth + NAT datapath</h2>
+    <p>Here's the whole model on one page. A container's <code>eth0</code> is one end of a veth pair; the host end (<code>vethXXXX</code>) is enslaved to the <code>docker0</code> bridge, which also holds the gateway address <code>172.17.0.1</code>. Containers on the same bridge reach each other at layer 2, directly across the bridge, with no NAT. Traffic leaving the host is source-NATed to the host's IP; traffic arriving on a published port is destination-NATed into the container. Follow both directions:</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 440" role="img" aria-label="Packet flow: container to internet via veth, bridge and SNAT; inbound via DNAT on a published port">
+        <defs>
+          <marker id="ar" markerWidth="10" markerHeight="10" refX="7.5" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" style="fill:var(--accent)"/></marker>
+          <marker id="ar2" markerWidth="10" markerHeight="10" refX="7.5" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" style="fill:var(--accent2)"/></marker>
+        </defs>
+        <text x="360" y="20" text-anchor="middle" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">THE CONTAINER DATAPATH — BRIDGE · veth · NAT</text>
+
+        <!-- lane 1 outbound -->
+        <text x="12" y="44" style="fill:var(--accent);font:700 10.5px sans-serif;letter-spacing:.04em">OUTBOUND · container → internet (source NAT)</text>
+        <rect x="12" y="52" width="124" height="74" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="74" y="76" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">container</text>
+        <text x="74" y="93" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">eth0 172.17.0.2</text>
+        <text x="74" y="109" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">route → .1</text>
+        <rect x="152" y="52" width="104" height="74" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="204" y="82" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">veth pair</text>
+        <text x="204" y="99" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">eth0 ⇄ vethX</text>
+        <rect x="272" y="52" width="118" height="74" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="331" y="82" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">docker0 bridge</text>
+        <text x="331" y="99" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">gw 172.17.0.1</text>
+        <rect x="406" y="52" width="150" height="74" rx="8" style="fill:var(--panel);stroke:var(--applied);stroke-width:1.5"/>
+        <text x="481" y="76" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">iptables nat</text>
+        <text x="481" y="93" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">POSTROUTING</text>
+        <text x="481" y="109" text-anchor="middle" style="fill:var(--applied);font:10px sans-serif">MASQUERADE → host IP</text>
+        <rect x="572" y="52" width="136" height="74" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="640" y="82" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">host eth0</text>
+        <text x="640" y="99" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">10.0.0.5 → internet</text>
+        <g style="stroke:var(--accent);stroke-width:2">
+          <line x1="136" y1="89" x2="150" y2="89" marker-end="url(#ar)"/>
+          <line x1="256" y1="89" x2="270" y2="89" marker-end="url(#ar)"/>
+          <line x1="390" y1="89" x2="404" y2="89" marker-end="url(#ar)"/>
+          <line x1="556" y1="89" x2="570" y2="89" marker-end="url(#ar)"/>
+        </g>
+
+        <!-- lane 2 inbound -->
+        <text x="12" y="182" style="fill:var(--accent2);font:700 10.5px sans-serif;letter-spacing:.04em">INBOUND · published port -p 8080:80 (destination NAT)</text>
+        <rect x="12" y="190" width="124" height="74" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="74" y="220" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">internet</text>
+        <text x="74" y="237" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">→ host:8080</text>
+        <rect x="152" y="190" width="154" height="74" rx="8" style="fill:var(--panel);stroke:var(--applied);stroke-width:1.5"/>
+        <text x="229" y="214" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">iptables nat PREROUTING</text>
+        <text x="229" y="231" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">chain DOCKER</text>
+        <text x="229" y="247" text-anchor="middle" style="fill:var(--applied);font:10px sans-serif">DNAT :8080 → .2:80</text>
+        <rect x="322" y="190" width="118" height="74" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="381" y="224" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">docker0 bridge</text>
+        <text x="381" y="241" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">→ 172.17.0.2</text>
+        <rect x="456" y="190" width="88" height="74" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="500" y="224" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">veth</text>
+        <text x="500" y="241" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">→ eth0</text>
+        <rect x="560" y="190" width="148" height="74" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="634" y="220" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">container</text>
+        <text x="634" y="237" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">eth0:80 172.17.0.2</text>
+        <g style="stroke:var(--accent2);stroke-width:2">
+          <line x1="136" y1="227" x2="150" y2="227" marker-end="url(#ar2)"/>
+          <line x1="306" y1="227" x2="320" y2="227" marker-end="url(#ar2)"/>
+          <line x1="440" y1="227" x2="454" y2="227" marker-end="url(#ar2)"/>
+          <line x1="544" y1="227" x2="558" y2="227" marker-end="url(#ar2)"/>
+        </g>
+
+        <!-- notes -->
+        <rect x="12" y="300" width="696" height="70" rx="9" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="26" y="322" style="fill:var(--ink);font:11px sans-serif"><tspan style="fill:var(--accent);font-weight:700">Same-host, same-bridge:</tspan> container↔container is plain layer-2 across docker0 — no NAT, no published port needed.</text>
+        <text x="26" y="342" style="fill:var(--ink);font:11px sans-serif"><tspan style="fill:var(--accent2);font-weight:700">Names:</tspan> embedded DNS at 127.0.0.11 resolves container names on a user-defined network (the default bridge has none).</text>
+        <text x="26" y="362" style="fill:var(--ink);font:11px sans-serif"><tspan style="fill:var(--applied);font-weight:700">Your rules go in DOCKER-USER:</tspan> it's evaluated before Docker's own chains and survives daemon restarts.</text>
+      </svg>
+      <figcaption>Outbound traffic is source-NATed to the host IP; inbound traffic to a published port is destination-NATed into the container. Container-to-container on the same bridge skips NAT entirely.</figcaption>
+    </figure>
+
+    <p>Two addressing facts anchor everything. The default bridge network uses <code>172.17.0.0/16</code> with the bridge itself at <code>172.17.0.1</code>, and each container's default route points at that gateway. And the container's private IP is never seen on the real network — outbound, it's masqueraded to the host's IP; inbound, the world only ever talks to the host's IP and a published port. The container's address is a host-local detail.</p>
+
+    <h2 id="internals"><span class="beat">Internal working</span>What Docker does when a container starts</h2>
+    <ol class="steps">
+      <li><b>Create the network namespace and a veth pair.</b> The runtime makes the container's net namespace (empty but for loopback), then creates a veth pair — two linked virtual interfaces where whatever goes in one end comes out the other. One end is moved <em>into</em> the container's namespace and renamed <code>eth0</code>; the other stays on the host as <code>vethXXXX</code>.</li>
+      <li><b>Enslave the host end to the bridge.</b> The host-side <code>vethXXXX</code> is attached to the <code>docker0</code> bridge, so it becomes a port on that software switch. Now the container's <code>eth0</code> is, electrically, one drop on the bridge's LAN.</li>
+      <li><b>Assign an address and a route.</b> The runtime gives <code>eth0</code> an address from the bridge's subnet (<code>172.17.0.2/16</code>), brings <code>lo</code> and <code>eth0</code> up, and installs a default route via the bridge's gateway <code>172.17.0.1</code>. The container can now reach any other address on the bridge directly, and anything else via the gateway.</li>
+      <li><b>Install the NAT rules.</b> Docker programs <code>iptables</code>: a MASQUERADE rule in the <code>nat</code> table's POSTROUTING chain rewrites the source of outbound container traffic to the host's IP (so replies can find their way back), and IP forwarding is enabled on the host so it routes between the bridge and the outside. Without this, outbound packets would leave with a <code>172.17.x.x</code> source that the internet can't route back to.</li>
+      <li><b>For each published port, add a DNAT rule.</b> <code>-p 8080:80</code> inserts a rule in the <code>nat</code> table (Docker's <code>DOCKER</code> chain, reached from PREROUTING and OUTPUT) that rewrites the destination of packets arriving on host port 8080 to <code>172.17.0.2:80</code>. A small userspace helper, <code>docker-proxy</code>, also binds the host port to cover hairpin and localhost cases the iptables path doesn't. No <code>-p</code>, no rule — which is why an unpublished port is unreachable from outside the host even though the container is listening.</li>
+      <li><b>Wire up names on user-defined networks.</b> If the container is on a user-defined network, Docker points its <code>/etc/resolv.conf</code> at the embedded DNS server on <code>127.0.0.11</code>, which resolves other container and service names on that same network to their current IPs. On the default bridge this is absent — a deliberate legacy behaviour.</li>
+    </ol>
+
+    <div class="box keypoint"><div class="h">The distinction that trips everyone: default bridge vs user-defined bridge</div>
+      <p>Both are bridges and both do NAT and port publishing. The difference is name resolution. On a <b>user-defined</b> bridge (anything you <code>docker network create</code>, and every Compose network), containers get automatic DNS: <code>ping db</code> just works. On the <b>default</b> <code>bridge</code> network, there is no embedded DNS for container names — containers can only reach each other by IP. This is why the standing advice is "always put multi-container apps on a user-defined network," and why Compose does it for you.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: your container listens on port 3000 and you can <code>curl localhost:3000</code> from inside it, but not from your laptop. Nothing is wrong with the app. Why can't you reach it?</summary>
+      <div class="body">
+        <p>Because you never published the port. Listening inside the container's network namespace makes the service reachable <em>within that namespace</em> and to other containers on the same bridge — but the host has no DNAT rule sending its own <code>:3000</code> into the container, so from your laptop (which talks to the host) there's nothing routing the connection in. The container is healthy; the doorway just doesn't exist. Add <code>-p 3000:3000</code> and Docker installs the DNAT rule that forwards host <code>:3000</code> to the container. The tell is that <code>curl</code> from <em>inside</em> works while <code>curl</code> from the host or laptop gets connection-refused or times out — the app is fine, the publishing is missing.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces and what each owns</h2>
+    <ul>
+      <li><b>The veth pair</b> — a virtual Ethernet cable with two ends. One end is the container's <code>eth0</code>; the other is the host's <code>vethXXXX</code>. Packets are simply handed from one end to the other by the kernel.</li>
+      <li><b>The bridge</b> (<code>docker0</code> or a user-defined one) — a software layer-2 switch in the host kernel. Every container's host-side veth plugs into it, and it forwards frames between them by MAC, exactly like a physical switch. It also holds the gateway IP for its subnet.</li>
+      <li><b><code>iptables</code>/netfilter</b> — does the NAT. MASQUERADE (SNAT) for outbound in POSTROUTING; DNAT for published ports in the <code>DOCKER</code> chain; and the <code>DOCKER-USER</code> chain, evaluated first, where <em>your</em> custom rules belong so they survive daemon restarts and sit ahead of Docker's. Isolation between networks is enforced by the <code>DOCKER-ISOLATION</code> chains.</li>
+      <li><b>The embedded DNS server</b> at <code>127.0.0.11</code> — a resolver Docker runs for each user-defined network, answering container/service names with current IPs and forwarding everything else to the host's upstream resolvers.</li>
+      <li><b><code>docker-proxy</code></b> — a small userspace process per published port that binds the host port, covering hairpin/localhost paths the pure-iptables datapath misses. Mostly invisible until you see it in <code>ps</code> or a "port already in use" error.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one request in and one out</h2>
+    <p><b>Outbound:</b> a process in the container connects to <code>api.example.com</code>. The packet leaves <code>eth0</code> with source <code>172.17.0.2</code>, pops out the host-side veth into the <code>docker0</code> bridge, and hits the host routing table, which sends it toward the real interface. On the way out, POSTROUTING MASQUERADE rewrites the source to the host's IP <code>10.0.0.5</code> so the reply can come back. The reply arrives at the host, netfilter's connection tracking reverses the NAT, and the bridge delivers it back to <code>172.17.0.2</code>. <b>Inbound:</b> a request hits <code>10.0.0.5:8080</code>. PREROUTING sends it through the <code>DOCKER</code> chain, whose DNAT rule rewrites the destination to <code>172.17.0.2:80</code>; the host forwards it across the bridge and veth into the container, where the app on port 80 answers. Its reply is un-NATed on the way out so the client sees a response from <code>10.0.0.5:8080</code>, never learning a container was involved. <b>Container to container</b> on the same bridge skips all of this: it's a plain layer-2 frame across <code>docker0</code>, container IP to container IP. The labs let you watch each of these.</p>
+
+    <details class="recall"><summary>Think first: container A is on user-defined network <code>net1</code> and container B on <code>net2</code>, both on the same host. Can A reach B by its IP?</summary>
+      <div class="body">
+        <p>No, not by default. Each user-defined network is a separate bridge with its own subnet, and Docker's <code>DOCKER-ISOLATION</code> chains explicitly drop traffic between different bridges — that isolation is the reason to put unrelated apps on separate networks in the first place. Reachability isn't about whether the IP is routable; it's about whether the two containers share a bridge. To let them talk you'd attach one container to <em>both</em> networks with <code>docker network connect</code> (giving it an interface on each), or route between them deliberately. This is the same "same segment = reachable, different segment = blocked" logic that becomes NetworkPolicy in Kubernetes (<a href="ch47-networkpolicy-deep.html">Chapter 47</a>).</p>
+      </div>
+    </details>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>These run <code>docker</code> from your Mac terminal. For the packet-capture lab you'll use a privileged helper sharing the host network so you can watch <code>docker0</code> directly.</p>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — inspect a network and find the veth</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Create a user-defined bridge, attach a container, and look at both ends of its cable.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker network create appnet
+docker run -d --name web --network appnet nginx
+docker network inspect appnet --format \
+  '{{range .Containers}}{{.Name}} {{.IPv4Address}}{{"\n"}}{{end}}'
+docker exec web ip -brief addr           <span class="c"># the container's view: lo + eth0</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>web 172.18.0.2/16
+lo    UNKNOWN  127.0.0.1/8
+eth0  UP       172.18.0.2/16</code></div>
+        <p>The container has an <code>eth0</code> with an address from the network's subnet. That <code>eth0</code> is one end of a veth pair; the other end is on the host, enslaved to this network's bridge. On a real Linux host you'd see it with <code>ip link</code> as a <code>vethXXXX@ifN</code>. From a host-network helper you can confirm the pairing via the interface index:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker exec web cat /sys/class/net/eth0/iflink   <span class="c"># the host-side veth's index</span>
+docker run --rm --net=host ubuntu:24.04 sh -c 'apt-get -qq update; apt-get -qq install -y iproute2; ip -brief link | grep veth'</code></pre></div>
+        <p>The number from <code>iflink</code> matches the host-side veth's interface index — that's the two ends of the same virtual cable. One container, one veth pair, one drop on the bridge.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — container-to-container by name</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>On a user-defined network, containers find each other by name through the embedded DNS. Prove it, and see the resolver they're pointed at.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker run -d --name db  --network appnet nginx
+docker run --rm --network appnet busybox sh -c 'cat /etc/resolv.conf; echo ---; nslookup web; ping -c1 db'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>nameserver 127.0.0.11
+---
+Server:    127.0.0.11
+Name:      web
+Address 1: 172.18.0.2
+64 bytes from 172.18.0.3: seq=0 ttl=64 time=0.1 ms</code></div>
+        <p>Its <code>/etc/resolv.conf</code> points at <code>127.0.0.11</code> — Docker's embedded DNS for this network — and it resolves <code>web</code> and <code>db</code> to their current bridge IPs, then reaches <code>db</code> directly at layer 2 across the bridge. No NAT, no published port; two containers on one bridge just talk. This is exactly how services in a Compose file reach each other by service name, and the seed of Kubernetes service discovery in <a href="ch42-pod-networking-internals-pod-to-pod.html">Chapter 42</a> and <a href="ch45-coredns-and-service-discovery.html">Chapter 45</a>.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — names don't resolve on the default bridge</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Run two containers on the <em>default</em> bridge — no <code>--network</code> — and try to reach one from the other by name. It fails. The containers are up, on the same bridge, with routable IPs. Investigate before revealing.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker run -d --name a1 nginx          <span class="c"># default bridge (no --network)</span>
+docker run -d --name a2 nginx
+docker exec a2 cat /etc/resolv.conf     <span class="c"># what resolver is it using?</span>
+docker exec a2 getent hosts a1 || echo "name 'a1' did NOT resolve"
+A1_IP=$(docker inspect -f '{{.NetworkSettings.IPAddress}}' a1)
+docker exec a2 ping -c1 "$A1_IP" &amp;&amp; echo "but the IP is reachable"</code></pre></div>
+        <div class="out"><span class="ol">Output</span>nameserver 192.168.65.7        <span class="c"># the host's upstream resolver, NOT 127.0.0.11</span>
+name 'a1' did NOT resolve
+64 bytes from 172.17.0.3 ... but the IP is reachable</code></div>
+        <p>The IP is reachable but the name isn't. Why does the same <code>ping db</code> that worked in Lab 2 fail here? Reason it out, then check.</p>
+        <details class="recall"><summary>Reveal the cause</summary>
+          <div class="body">
+            <p>The default <code>bridge</code> network has <b>no embedded DNS for container names</b>. Notice <code>a2</code>'s resolver is the host's upstream (<code>192.168.65.7</code>), not <code>127.0.0.11</code> — Docker only points containers at the embedded DNS when they're on a <em>user-defined</em> network. On the default bridge, connectivity works (same subnet, layer-2 reachable by IP) but name resolution doesn't, which is a deliberate legacy behaviour kept for backward compatibility. The fix is not to add a resolver by hand; it's to put the containers on a user-defined network (<code>docker network create</code>, or just use Compose, which always does). This is the single most common "my containers can't talk to each other by name" support question, and the answer is almost always "you're on the default bridge — move to a user-defined network."</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — publish a port and trace the packet</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Publish a port, confirm the DNAT rule Docker installed, then watch a request cross <code>docker0</code> in real time.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker run -d --name pub -p 8080:80 nginx
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8080   <span class="c"># 200 from the host</span>
+
+<span class="c"># See the DNAT rule and capture traffic on the bridge, from a host-net helper:</span>
+docker run --rm --net=host --cap-add=NET_ADMIN ubuntu:24.04 sh -c '
+  apt-get -qq update &gt;/dev/null; apt-get -qq install -y iptables tcpdump &gt;/dev/null
+  echo "=== nat DOCKER chain ==="; iptables -t nat -S DOCKER
+  echo "=== capturing on docker0 (run a curl now) ==="; timeout 8 tcpdump -ni docker0 tcp port 80'</code></pre></div>
+        <p>While the capture runs, fire another <code>curl http://localhost:8080</code> from your Mac. You'll see the DNAT rule and the packets arriving at the container's port 80. If a published port ever "doesn't work," this is the investigation. Interpret before revealing.</p>
+        <details class="recall"><summary>Reveal how to read it</summary>
+          <div class="body">
+            <div class="out"><span class="ol">Output (trimmed)</span>=== nat DOCKER chain ===
+-A DOCKER -p tcp -m tcp --dport 8080 -j DNAT --to-destination 172.17.0.2:80
+=== capturing on docker0 ===
+IP 172.17.0.1.51524 &gt; 172.17.0.2.80: Flags [S] ...
+IP 172.17.0.2.80 &gt; 172.17.0.1.51524: Flags [S.] ...</code></div>
+            <p>The <code>DNAT --to-destination 172.17.0.2:80</code> rule is the entire meaning of <code>-p 8080:80</code>: host port 8080 is rewritten to the container's <code>:80</code>. On <code>docker0</code> you see the SYN arriving at <code>172.17.0.2:80</code> and the SYN-ACK coming back — the handshake completing inside the bridge. When a published port fails, the usual causes are: no <code>-p</code> at all (no rule exists — the Lab 3 <em>recall</em> shape); the app bound to <code>127.0.0.1</code> inside the container instead of <code>0.0.0.0</code>, so it rejects the forwarded connection that arrives on <code>eth0</code>; a host firewall ahead of the <code>DOCKER</code> chain dropping it; or publishing the wrong container port. Reading the <code>nat</code> table and capturing on the bridge tells you in seconds which one it is.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — outbound NAT and the CNI connection</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>Confirm the outbound masquerade, then reason about how all of this maps onto Kubernetes. First, watch the source address get rewritten:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># See the MASQUERADE rule that SNATs container traffic to the host IP:</span>
+docker run --rm --net=host --cap-add=NET_ADMIN ubuntu:24.04 sh -c '
+  apt-get -qq update &gt;/dev/null; apt-get -qq install -y iptables &gt;/dev/null
+  iptables -t nat -S POSTROUTING | grep -i masquerade'
+<span class="c"># From a container, the world sees the HOST ip, not 172.17.x.x:</span>
+docker run --rm curlimages/curl -s https://api.ipify.org; echo</code></pre></div>
+        <div class="out"><span class="ol">Output</span>-A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE
+&lt;your host's public IP&gt;</code></div>
+        <p>The rule masquerades anything from the bridge subnet leaving via a non-bridge interface. The senior question, no commands required: given this bridge + veth + NAT model, what does a Kubernetes CNI change and what does it keep — and why do pods, unlike Docker containers, <em>not</em> need NAT to talk to each other across nodes? Reason it through.</p>
+        <details class="recall"><summary>Reveal the reasoning</summary>
+          <div class="body">
+            <p><b>What's kept:</b> the per-container network namespace and the veth pair are identical — a pod's <code>eth0</code> is still one end of a veth whose other end lives in the node's root namespace. That much is the same object you just inspected. <b>What changes:</b> the CNI plugin owns IP address management and routing instead of Docker, and crucially the Kubernetes network model <em>requires</em> that every pod gets a real, cluster-routable IP and that any pod can reach any other pod <b>without NAT</b> (<a href="ch41-the-kubernetes-network-model-and-cni.html">Chapter 41</a>). So the pod-to-pod path drops the SNAT you saw here: instead of masquerading to the node IP, the fabric routes the pod's own IP across nodes (via an overlay, or by programming the real network, or — on AWS — by giving pods VPC IPs directly, <a href="ch58-vpc-cni-the-deep-one.html">Chapter 58</a>). NAT doesn't vanish entirely — pod-to-<em>external</em> traffic still gets masqueraded to the node, and Services layer their own DNAT-like translation on top (<a href="ch43-services-and-the-datapath-pod-to-service.html">Chapter 43</a>) — but the flat, NAT-free pod-to-pod space is the defining difference. Everything you built here is the ancestor; CNI is the same primitives with a routing policy that makes pod IPs first-class.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · "the published port doesn't work"</div>
+      <p><b>Symptom:</b> a container is up and healthy but a published port refuses connections from outside the host. <b>First cut:</b> <code>curl</code> the port from inside the container (works?) and from the host (fails?). <b>Confirm:</b> check for the DNAT rule (<code>iptables -t nat -S DOCKER</code>) and what address the app bound to. <b>Usual causes:</b> the port wasn't published (<code>-p</code> missing); the app bound to <code>127.0.0.1</code> inside the container instead of <code>0.0.0.0</code>, so it never accepts the forwarded connection; or a host firewall sits ahead of Docker's chains. The reflex "inside works, outside doesn't → it's publishing or bind address, not the app" saves the most time.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · containers can't resolve each other by name</div>
+      <p><b>Symptom:</b> service <code>A</code> can't reach service <code>B</code> by name; IPs work. <b>First cut:</b> <code>cat /etc/resolv.conf</code> in the container — is it <code>127.0.0.11</code> or the host's upstream? <b>Usual cause:</b> the containers are on the default <code>bridge</code>, which has no embedded DNS. <b>Fix:</b> put them on a user-defined network (or use Compose). In Compose specifically, remember names are the <em>service</em> names on the project network — a common gotcha when someone hard-codes IPs and they change on redeploy (<a href="ch42-pod-networking-internals-pod-to-pod.html">Chapter 42</a>).</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · bridge subnet collides with the corporate network</div>
+      <p><b>Symptom:</b> from inside containers, a specific range of real destinations is unreachable, or routing behaves strangely. <b>First cut:</b> compare the Docker bridge subnet (<code>172.17.0.0/16</code> or a custom pool) with the routes the host needs. <b>Usual cause:</b> Docker's address pool overlaps a subnet the host or VPN actually uses, so traffic meant for the real network gets delivered to the bridge instead. <b>Fix:</b> reconfigure Docker's default address pools to a range that doesn't collide. This is common on corporate VPNs that use <code>172.x</code> space.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Security.</b> Publishing a port opens a path from the host's network into a container, so publish deliberately and bind to a specific host interface (<code>-p 127.0.0.1:8080:80</code>) when a service should only be local. Put your own firewall rules in the <code>DOCKER-USER</code> chain — it's evaluated before Docker's rules and persists across daemon restarts, so it's the supported place to restrict who can reach published ports. Be aware that Docker's port publishing manipulates <code>iptables</code> directly and can bypass a naively configured host firewall, which surprises people who thought <code>ufw</code> was protecting them. Network segmentation between apps comes from putting them on separate user-defined networks (the <code>DOCKER-ISOLATION</code> chains keep those apart).</p>
+    <p><b>Performance.</b> The bridge + veth path adds a little overhead versus the host stack — an extra hop through the bridge and, for NATed traffic, connection-tracking state. For most services it's negligible; for very high packet-rate or latency-critical workloads it's measurable, which is why some run with <code>--network=host</code> (no namespace, no bridge, no NAT — but you lose isolation and port independence) or reach for faster datapaths. The NAT connection-tracking table (<code>conntrack</code>) is finite; a host doing huge numbers of short-lived NATed connections can exhaust it, which shows up as dropped connections and is a real capacity dimension you'll meet again with kube-proxy in Part V.</p>
+    <p><b>Common mistakes:</b> relying on the default bridge for multi-container apps and then wondering why DNS by name fails; binding services to <code>127.0.0.1</code> inside the container and expecting a published port to reach them; assuming an unpublished port is reachable from the host; and hard-coding container IPs, which change on restart — use names on a user-defined network instead.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>This chapter is the blueprint for the entire Kubernetes datapath. A pod's networking is the same veth-into-a-bridge-or-fabric idea, and Docker Compose's "reach services by name on a shared network" is the direct precursor of Kubernetes Services and cluster DNS. The big architectural leap Kubernetes makes — every pod gets a routable IP and pods talk without NAT — is best understood as a deliberate change to <em>this</em> model, keeping the veth pair and dropping the SNAT, so you already know what's being changed and why. The concepts you carry forward are exact: veth pairs (pod interfaces), bridges and routing (the CNI datapath, <a href="ch41-the-kubernetes-network-model-and-cni.html">Chapter 41</a>), DNAT (Service load-balancing, <a href="ch43-services-and-the-datapath-pod-to-service.html">Chapter 43</a>), SNAT (egress to the internet, <a href="ch48-pod-to-internet-and-the-full-synthesis.html">Chapter 48</a>), and embedded DNS (CoreDNS, <a href="ch45-coredns-and-service-discovery.html">Chapter 45</a>). When you design a platform's networking, these primitives set what's cheap (same-host, same-network traffic), what costs NAT state (egress and Services), and where names come from.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first, then open it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>How does a container reach the internet if it has its own network namespace?</summary>
+        <div class="a"><p>Its <code>eth0</code> is one end of a veth pair; the other end plugs into a host bridge like <code>docker0</code>. The container gets a private IP from the bridge's subnet and a default route to the bridge gateway. Outbound packets cross the veth to the bridge, hit the host's routing, and get source-NATed (MASQUERADE) to the host's IP so replies can return. So connectivity is veth + bridge + NAT, with the container's private address never seen on the real network.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through exactly what <code>-p 8080:80</code> does.</summary>
+        <div class="a"><p>It publishes the container's port 80 on the host's port 8080 by installing a destination-NAT rule. Docker adds a rule in the <code>nat</code> table's <code>DOCKER</code> chain, reached from PREROUTING and OUTPUT, that rewrites the destination of packets arriving on host <code>:8080</code> to the container's IP on <code>:80</code>, and it also runs a small <code>docker-proxy</code> process bound to the host port to cover localhost and hairpin cases. So a client hitting <code>host:8080</code> is DNATed across the bridge and veth into the container, which answers on 80; the reply is un-NATed so the client only ever sees the host's address and port. Without <code>-p</code> there's no such rule, so even though the app is listening, nothing routes an external connection in — which is why "listening" and "published" are different things. A frequent real bug is the app binding to <code>127.0.0.1</code> inside the container, so the DNATed connection arriving on <code>eth0</code> is refused even though publishing is correct.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Why do containers resolve each other by name on a user-defined network but not on the default bridge?</summary>
+        <div class="a"><p>Because Docker only runs its embedded DNS server for user-defined networks. When a container is on a user-defined bridge, Docker sets its <code>/etc/resolv.conf</code> nameserver to <code>127.0.0.11</code>, an embedded resolver that knows the names and current IPs of the other containers on that same network and forwards everything else upstream. On the default <code>bridge</code> network there's no embedded DNS — that's a deliberate legacy behaviour — so containers there are reachable by IP but not by name. The practical rule is to always put multi-container apps on a user-defined network, which is exactly what Compose does automatically. It matters because container IPs change across restarts, so name-based discovery is the only stable way for services to find each other, and it's the direct ancestor of cluster DNS in Kubernetes.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A container's app works with <code>curl localhost</code> inside it, but you can't reach the published port from your laptop. Where do you look?</summary>
+        <div class="a"><p>I split inside-versus-outside first. It works inside, so the app is fine; the break is in the path from the host into the container. I'd check three things fast: is the port actually published (is there a <code>DNAT</code> rule in <code>iptables -t nat -S DOCKER</code>)? What address did the app bind to — if it's <code>127.0.0.1</code> inside the container rather than <code>0.0.0.0</code>, the forwarded connection arriving on <code>eth0</code> gets refused, which perfectly matches "localhost works, published port doesn't." And is a host firewall dropping it ahead of Docker's chains? A quick <code>tcpdump -ni docker0 port 80</code> while curling from the laptop tells me whether the packet even reaches the container. Nine times out of ten it's the bind address or a missing <code>-p</code>, not the application.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>How is this different from Kubernetes pod networking?</summary>
+        <div class="a"><p>The primitives are the same — each pod has a network namespace and a veth pair into the node — but the routing policy differs. Kubernetes mandates that every pod gets a cluster-routable IP and that any pod can reach any other pod without NAT, so the pod-to-pod path drops the source-NAT that Docker's bridge model uses; the CNI plugin routes pod IPs across nodes via an overlay, real-network routes, or native VPC IPs. NAT doesn't disappear entirely — egress to the internet is still masqueraded to the node, and Services add their own DNAT-style translation to a set of backend pods — but the flat, NAT-free pod address space is the defining change. And DNS moves from Docker's embedded <code>127.0.0.11</code> to cluster DNS (CoreDNS) resolving Service names. So it's the same building blocks with pod IPs promoted to first-class citizens.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>A container's <code>eth0</code> is one end of a veth pair; the host end plugs into a software bridge (<code>docker0</code> by default, <code>172.17.0.0/16</code>, gateway <code>.1</code>). Containers on the same bridge reach each other at layer 2 with no NAT. Outbound traffic is source-NATed (MASQUERADE, POSTROUTING) to the host's IP so replies return; inbound traffic to a published port is destination-NATed (the <code>DOCKER</code> chain) into the container — <code>-p 8080:80</code> is exactly that DNAT rule, plus a <code>docker-proxy</code> helper. An unpublished port isn't reachable from the host, and an app bound to <code>127.0.0.1</code> won't accept forwarded connections. Names resolve via an embedded DNS server at <code>127.0.0.11</code> on user-defined networks only — the default bridge has none, so use a user-defined network (Compose does this for you). Put your own firewall rules in <code>DOCKER-USER</code>. All of this is the ancestor of the Kubernetes CNI model, which keeps the veth pair but drops NAT for pod-to-pod traffic.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>A container's <code>eth0</code> is one end of a veth pair; the other end is a host <code>vethXXXX</code> plugged into a bridge.</li>
+      <li>The bridge (<code>docker0</code>) is a software layer-2 switch; same-bridge container-to-container traffic is direct, no NAT.</li>
+      <li>Outbound traffic is SNAT/MASQUERADE'd to the host IP (POSTROUTING) so the private container IP never appears on the real network.</li>
+      <li><code>-p 8080:80</code> installs a DNAT rule (the <code>DOCKER</code> chain) rewriting host <code>:8080</code> to the container's <code>:80</code>, plus a <code>docker-proxy</code>.</li>
+      <li>No <code>-p</code> means no inbound rule — an unpublished port is unreachable from the host even though the app listens.</li>
+      <li>An app bound to <code>127.0.0.1</code> inside the container rejects the forwarded connection; bind <code>0.0.0.0</code> to be reachable.</li>
+      <li>Embedded DNS at <code>127.0.0.11</code> resolves names on user-defined networks; the default bridge has no name resolution.</li>
+      <li>Always put multi-container apps on a user-defined network (Compose does automatically) and reference by name, not IP.</li>
+      <li>Put custom firewall rules in <code>DOCKER-USER</code>; it runs before Docker's chains and survives restarts.</li>
+      <li>This bridge/veth/NAT/DNS model is the ancestor of the Kubernetes CNI — which keeps veth but makes pod IPs routable without NAT.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch12-l3-ip-cidr-subnetting-routing-nat.html"><b>Ch 12</b> IP, routing &amp; NAT</a>
+      <a href="ch22-linux-namespaces.html"><b>Ch 22</b> Namespaces</a>
+      <a href="ch41-the-kubernetes-network-model-and-cni.html"><b>Ch 41</b> The K8s network model &amp; CNI</a>
+      <a href="ch42-pod-networking-internals-pod-to-pod.html"><b>Ch 42</b> Pod-to-Pod</a>
+      <a href="ch43-services-and-the-datapath-pod-to-service.html"><b>Ch 43</b> Services &amp; the datapath</a>
+      <a href="ch45-coredns-and-service-discovery.html"><b>Ch 45</b> CoreDNS</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Docker documentation — <a href="https://docs.docker.com/engine/network/">Networking overview</a>: drivers, the default vs user-defined bridge, and published ports.</li>
+      <li>Docker documentation — <a href="https://docs.docker.com/engine/network/drivers/bridge/">Bridge network driver</a>: <code>docker0</code>, user-defined bridges, and automatic DNS resolution between containers.</li>
+      <li>Docker documentation — <a href="https://docs.docker.com/engine/network/packet-filtering-firewalls/">Packet filtering and firewalls</a>: the <code>DOCKER</code>, <code>DOCKER-USER</code>, and isolation chains, and how publishing programs <code>iptables</code>.</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man4/veth.4.html">veth(4)</a> and <a href="https://man7.org/linux/man-pages/man8/ip-link.8.html">ip-link(8)</a>: virtual Ethernet pairs and the bridge, from the source.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/services-networking/">Services, Load Balancing, and Networking</a>: how the model here evolves into the cluster network.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch24-container-filesystems-overlayfs-and-image-layers.html"><span class="dir">← Prev</span><div class="ti">Ch 24 — Container filesystems: overlayfs &amp; image layers</div></a>
+      <a class="nx" href="ch26-docker-containerd-runc-and-the-oci-model.html"><span class="dir">Next →</span><div class="ti">Ch 26 — Docker, containerd, runc &amp; the OCI model</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 25 of 121 · Part III · Containers &amp; Container Internals. Capture one packet on docker0 and the CNI chapters will read like a sequel.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Bridge + veth + NAT</a>
+    <a href="#internals">What docker run does</a>
+    <a href="#components">The components</a>
+    <a href="#flow">Following a request</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

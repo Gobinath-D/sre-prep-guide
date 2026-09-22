@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 1 — The Kernel, User Space &amp; System Calls</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part I · Linux &nbsp;·&nbsp; Chapter 1</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part I · Linux &amp; OS Foundations · Chapter 1</div>
+      <h1>The kernel, user space &amp; system calls</h1>
+      <p class="tagline">Every command you run, every packet nginx sends, every file a pod writes — all of it eventually asks one program for permission: the kernel. Understand this one boundary and half of Linux stops being mysterious.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~35 min read · Linux lab (Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain user space vs kernel space to a colleague without hand-waving.</li>
+          <li>Describe exactly what happens when a program calls <code>read()</code> — trap, mode switch, and return.</li>
+          <li>Use <code>strace</code> to see the system calls a process makes, and read the output.</li>
+          <li>Diagnose the classic "100% CPU but the app looks idle" incident, and "too many open files".</li>
+          <li>Say why a container shares the host kernel — the fact that makes containers cheap and also leaky.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem the kernel solves</h2>
+    <p>Picture a single machine. One CPU, some RAM, a disk, a network card. Now you want to run twenty programs on it at once — a web server, a database, your shell, a log shipper, whatever. Three problems show up immediately.</p>
+    <p>First, they'd fight over the hardware. If two programs both wrote to the disk whenever they liked, they'd scribble over each other's data. Second, they'd fight over memory — one program could read another's passwords straight out of RAM, or crash the machine by grabbing all of it. Third, nothing would be fair: a busy program could hog the CPU forever and starve everything else.</p>
+    <p>Somebody has to sit in the middle and referee. That referee is the <b>kernel</b>. It's the core of the operating system — a program that boots first, never exits, and owns the hardware. Every other program has to go through it to touch anything real: the disk, the network, memory, the clock, another process. The kernel hands out slices of the CPU, keeps each program's memory walled off from the others, and decides who gets to do what.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>The kernel isn't a background service you can restart. It <em>is</em> the operating system's core. Your programs are guests; the kernel is the one holding the keys to the hardware. Nothing reaches the disk, the network, or another process without asking it.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a secured office building</h2>
+    <p>Here's the picture I want you to carry for the rest of the book.</p>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Think of the machine as an office building. The valuables — the wiring, the safe, the mail room, the phone lines — are the <b>hardware</b>. They live in a locked back room that only the <b>facilities team</b> can enter. That team is the <b>kernel</b>.</p>
+      <p>You and every other program are <b>tenants</b> in the front offices. You can't walk into the back room and grab the phone lines yourself. When you need something — "send this letter," "open that filing cabinet," "what time is it?" — you fill in a request form and slide it through a <b>service window</b>. The facilities team checks that you're allowed, does the privileged thing on your behalf, and slides the result back.</p>
+      <p>That service window is the <b>system call</b>. Passing a form through it means going through a security checkpoint, which takes a moment — so you don't want to queue at the window a million times a second if you can avoid it. And for a few read-only questions like "what time is it?", there's a notice board on the wall you can just glance at without queuing at all. (That notice board is real; it's called the <b>vDSO</b>, and we'll get to it.)</p>
+    </div>
+    <p>Every term in that analogy maps onto something concrete:</p>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In Linux</th></tr>
+      <tr><td>The locked back room + valuables</td><td>Hardware (CPU, RAM, disk, NIC) — reachable only in kernel mode</td></tr>
+      <tr><td>The facilities team</td><td>The kernel</td></tr>
+      <tr><td>Tenants in front offices</td><td>User-space processes (your programs)</td></tr>
+      <tr><td>The service window + a submitted form</td><td>A system call (e.g. <code>read</code>, <code>write</code>, <code>openat</code>)</td></tr>
+      <tr><td>The security checkpoint you cross</td><td>The CPU mode switch (ring 3 → ring 0)</td></tr>
+      <tr><td>The assistant who knows which form to use</td><td><code>libc</code> (glibc/musl) — it wraps raw syscalls</td></tr>
+      <tr><td>The read-only notice board</td><td>The vDSO (fast path for a few calls like <code>clock_gettime</code>)</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>User space and kernel space</h2>
+    <p>The CPU itself enforces this split. Modern CPUs run code at different <b>privilege levels</b>, called rings. Linux uses two of them:</p>
+    <ul>
+      <li><b>Ring 3 — user mode.</b> Where your programs run. Code here cannot touch hardware directly, cannot read arbitrary physical memory, and cannot execute privileged CPU instructions. If it tries, the CPU faults and the kernel kills it (that's a segfault).</li>
+      <li><b>Ring 0 — kernel mode.</b> Where the kernel runs. Full access to everything.</li>
+    </ul>
+    <p>Alongside privilege, each process gets its own <b>virtual address space</b> — its own private map of memory. When your program looks at address <code>0x400000</code>, that's not really byte 4-million of the RAM chip; the kernel and the CPU's memory-management unit translate it to some physical page, and your neighbour's <code>0x400000</code> maps somewhere completely different. That's why one crashing program doesn't take down the others, and why it can't read their memory. We go deep on this in <a href="ch03-memory-virtual-memory-page-cache-swap-oom.html">Chapter 3</a>.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 400" role="img" aria-label="User space, the system-call boundary, kernel space, and hardware">
+        <!-- user space band -->
+        <rect x="18" y="18" width="684" height="116" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="34" y="40" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">USER SPACE — ring 3 · unprivileged</text>
+        <rect x="42" y="52" width="230" height="66" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="157" y="80" text-anchor="middle" style="fill:var(--ink);font:600 14px sans-serif">your program</text>
+        <text x="157" y="100" text-anchor="middle" style="fill:var(--muted);font:12px sans-serif">cat · nginx · python</text>
+        <rect x="300" y="52" width="220" height="66" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="410" y="80" text-anchor="middle" style="fill:var(--ink);font:600 14px sans-serif">libc (glibc / musl)</text>
+        <text x="410" y="100" text-anchor="middle" style="fill:var(--muted);font:12px sans-serif">wraps raw syscalls</text>
+        <!-- boundary -->
+        <line x1="18" y1="150" x2="702" y2="150" style="stroke:var(--deep);stroke-width:1.5;stroke-dasharray:7 5"/>
+        <text x="360" y="145" text-anchor="middle" style="fill:var(--deep);font:700 11.5px sans-serif;letter-spacing:.04em">SYSTEM-CALL BOUNDARY · CPU mode switch (ring 3 → ring 0)</text>
+        <!-- kernel band -->
+        <rect x="18" y="166" width="684" height="128" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="34" y="188" style="fill:var(--accent);font:700 12px sans-serif;letter-spacing:.05em">KERNEL SPACE — ring 0 · privileged</text>
+        <rect x="42" y="200" width="150" height="76" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="117" y="235" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">scheduler</text>
+        <text x="117" y="253" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">who runs, when</text>
+        <rect x="204" y="200" width="150" height="76" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="279" y="235" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">memory mgr</text>
+        <text x="279" y="253" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">virtual → physical</text>
+        <rect x="366" y="200" width="150" height="76" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="441" y="235" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">filesystems (VFS)</text>
+        <text x="441" y="253" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">files, inodes</text>
+        <rect x="528" y="200" width="150" height="76" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="603" y="235" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">net + drivers</text>
+        <text x="603" y="253" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">TCP/IP, devices</text>
+        <!-- hardware band -->
+        <rect x="18" y="326" width="684" height="56" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="34" y="346" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">HARDWARE</text>
+        <text x="360" y="366" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">CPU &nbsp;·&nbsp; RAM &nbsp;·&nbsp; disk &nbsp;·&nbsp; network card</text>
+        <!-- arrows -->
+        <defs>
+          <marker id="a" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--deep)"/></marker>
+          <marker id="b" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+        </defs>
+        <line x1="120" y1="120" x2="120" y2="198" style="stroke:var(--deep);stroke-width:2" marker-end="url(#a)"/>
+        <text x="128" y="162" style="fill:var(--deep);font:600 11px sans-serif">read() → trap</text>
+        <line x1="250" y1="198" x2="250" y2="120" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#b)"/>
+        <text x="258" y="162" style="fill:var(--accent2);font:600 11px sans-serif">bytes + return code</text>
+      </svg>
+      <figcaption>Your program can only reach the hardware by crossing the system-call boundary into the kernel — and back.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>This split is exactly why a container "shares the host kernel." A container is a normal user-space process; there's no second kernel inside it. That's why containers start in milliseconds and weigh almost nothing — but also why a kernel bug or a too-generous capability in one container can affect the whole host. A VM, by contrast, ships its own kernel. Hold that thought for <a href="ch21-what-a-container-really-is.html">Chapter 21</a>; it's the single most important difference between a container and a VM.</p>
+    </div>
+
+    <h2 id="syscall"><span class="beat">Internal working</span>What a system call actually does</h2>
+    <p>"Go through the service window" is the analogy. Here's the machinery underneath, step by step, for a call like <code>read(fd, buf, 4096)</code>:</p>
+    <ol class="steps">
+      <li><b>Your program calls a libc function.</b> You wrote <code>read(...)</code> in C (or Python's <code>f.read()</code>, which calls it eventually). libc puts the syscall <em>number</em> for <code>read</code> into a specific CPU register and the arguments into others.</li>
+      <li><b>It executes a special instruction.</b> On x86-64 that's <code>syscall</code>. This isn't a normal jump — it's a deliberate trap that flips the CPU from ring 3 into ring 0 and jumps to a fixed entry point the kernel registered at boot.</li>
+      <li><b>The CPU switches mode.</b> This is the checkpoint. The CPU saves your program's state, switches to the kernel's stack, and now runs with full privilege. This switch has a real cost — hundreds of nanoseconds — because the CPU has to change protection state and often flush some caches.</li>
+      <li><b>The kernel looks up the call.</b> It uses the syscall number as an index into the <b>system-call table</b> and jumps to the handler — here, <code>sys_read</code>.</li>
+      <li><b>The kernel does the privileged work</b> — and checks you're allowed. It validates the file descriptor, copies data from the page cache or asks the disk driver, and copies the bytes into your buffer. If you're waiting on a slow disk or an empty socket, the kernel <em>puts your process to sleep</em> and runs someone else in the meantime.</li>
+      <li><b>It returns.</b> The kernel puts a return value in a register (bytes read, or a negative error), switches the CPU back to ring 3, and restores your program. libc turns a negative return into <code>-1</code> plus <code>errno</code>.</li>
+    </ol>
+    <p>So a system call is a controlled, one-way door: the only way into the kernel is through an entry point the kernel itself chose. Your program never runs kernel code of its choosing. That's the whole security model in one sentence.</p>
+
+    <div class="box keypoint"><div class="h">The cost, and the vDSO</div>
+      <p>Because every syscall pays for a mode switch, doing millions of them adds up. The kernel optimises the most common read-only calls — like "what time is it?" (<code>clock_gettime</code>) — by mapping a small read-only page into every process called the <b>vDSO</b>. For those calls, your program reads the answer straight from memory with no trap at all. That's the notice board from the analogy. It's why <code>gettimeofday</code> is basically free while <code>read</code> is not.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: a program wants to read a file. Can it talk to the disk itself?</summary>
+      <div class="body">
+        <p>No. Reading a disk means driving hardware, which only ring-0 code may do. The program calls <code>read()</code>, which traps into the kernel; the kernel's filesystem and block layers fetch the data (often from the page cache in RAM, sometimes from the physical disk) and copy it into the program's buffer. The program only ever sees the bytes handed back, never the disk.</p>
+        <p>This is also why you can't "speed up" disk reads from user space alone — the ceiling is set by how the kernel and hardware move the data. Keep this in mind for the page-cache chapter.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces involved</h2>
+    <p>Four actors show up in every syscall story, and you'll name them constantly on the job:</p>
+    <ul>
+      <li><b>The kernel subsystems.</b> The scheduler (who gets the CPU), the memory manager (virtual-to-physical mapping, the page cache), the VFS and filesystems (files and inodes), and the network stack and device drivers. Each syscall lands in one of these.</li>
+      <li><b>libc.</b> Almost nobody writes raw <code>syscall</code> instructions. You call C library functions and libc does the register-loading and trapping for you. On most Linux distros that's glibc; Alpine images use musl, which behaves differently in a few places (DNS resolution, most famously — a real source of "works on Ubuntu, breaks on Alpine" bugs you'll meet in <a href="ch15-dns-end-to-end.html">Chapter 15</a>).</li>
+      <li><b>The syscall itself</b> — identified by a stable number. <code>read</code> is 0 on x86-64, <code>write</code> is 1, and so on. These numbers are a permanent contract, which is why old binaries keep working on new kernels.</li>
+      <li><b><code>/proc</code>.</b> The kernel exposes each process's state as files under <code>/proc/&lt;pid&gt;/</code>. It's not a real disk directory — it's a live window into kernel data structures. You'll live in here when troubleshooting.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one real program</h2>
+    <p>Enough theory. Let's watch a trivial program and see every door it opens. When you run <code>cat /etc/hostname</code>, the kernel does a lot on your behalf: it loads the program, opens the file, reads it, writes to your terminal, and exits. Each of those is a syscall, and we can see them all. That's the next section — the lab.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>These labs need a Linux environment. You're on a Mac, so the cleanest option is a throwaway Linux container — which also ties straight into the Docker chapters. Everything below runs inside it. Start the container once:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># A disposable Ubuntu box. --cap-add SYS_PTRACE lets strace attach.</span>
+docker run --rm -it --cap-add=SYS_PTRACE ubuntu:24.04 bash
+
+<span class="c"># Inside the container, install the tools we'll use:</span>
+apt-get update &amp;&amp; apt-get install -y strace procps lsof</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — see a program's system calls</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Run the simplest useful program under <code>strace</code>, which prints every syscall a process makes.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>echo "hello-sre" &gt; /tmp/host
+strace -f cat /tmp/host</code></pre></div>
+        <p>You'll see dozens of lines. Ignore the startup noise for now (that's the kernel loading libc). Look for the heart of it near the end:</p>
+        <div class="out"><span class="ol">Output (trimmed)</span>openat(AT_FDCWD, "/tmp/host", O_RDONLY)   = 3
+read(3, "hello-sre\n", 131072)            = 10
+write(1, "hello-sre\n", 10)               = 10
+read(3, "", 131072)                       = 0
+close(3)                                  = 0</code></div>
+        <p>Read it like a sentence. <code>openat</code> asks the kernel to open the file and hands back <b>file descriptor 3</b> — a small integer that means "this open file" for the rest of the program. <code>read(3, …)</code> pulls 10 bytes into a buffer and returns the count. <code>write(1, …)</code> sends those bytes to descriptor 1, which is standard output — your terminal. The second <code>read</code> returns <code>0</code>: end of file. Then <code>close(3)</code>. That's the entire job of <code>cat</code>, laid bare.</p>
+        <p>Descriptors 0, 1, 2 are always standard input, output, and error. Descriptor 3 is the first one this program opened. We'll use file descriptors constantly — they're the subject of <a href="ch04-filesystems-inodes-file-descriptors-disk-i-o.html">Chapter 4</a>.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — count and time the calls</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p><code>strace -c</code> doesn't print every call — it counts them and times them. This one flag is the difference between guessing and knowing where a process spends its kernel time.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>strace -c cat /tmp/host</code></pre></div>
+        <div class="out"><span class="ol">Output</span>% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 24.1    0.000112           9        12           mmap
+ 15.6    0.000072           9         8           openat
+ …
+  0.0    0.000000           0         1           read
+  0.0    0.000000           0         1           write</code></div>
+        <p>Now peek at the live view of a running process. Open a second shell into the container (<code>docker exec -it &lt;id&gt; bash</code>) and watch a sleeping process do nothing:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>sleep 300 &amp;
+strace -p $! </code></pre></div>
+        <div class="out"><span class="ol">Output</span>strace: Process 141 attached
+clock_nanosleep(CLOCK_REALTIME, 0, {tv_sec=300, …</code></div>
+        <p>It's parked in a single syscall, <code>clock_nanosleep</code>, waiting. The process is not "using" the CPU — the kernel put it to sleep and will wake it in 300 seconds. This is the difference between a process that's <em>blocked</em> and one that's <em>burning CPU</em>, and telling them apart is a core troubleshooting skill.</p>
+      </div>
+    </div>
+
+    <details class="recall"><summary>Think first: you attach strace to a stuck production process and it just sits in <code>read(7, …)</code> forever. Is it crashed?</summary>
+      <div class="body">
+        <p>No — it's <b>blocked</b>, waiting for data that isn't coming. A crashed process is gone; this one is alive and parked in a syscall. <code>read(7, …)</code> means it's waiting on file descriptor 7. Your next move is to find out what fd 7 <em>is</em>: <code>ls -l /proc/&lt;pid&gt;/fd/7</code>. If it's a socket to a database that's not answering, you've just found your incident — the app is waiting on a dependency, not broken itself. That single reframe ("blocked, not dead") saves hours.</p>
+      </div>
+    </details>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — watch a syscall fail</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Failures are just syscalls returning errors. Force one and read it:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>strace -f cat /tmp/does-not-exist</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>openat(AT_FDCWD, "/tmp/does-not-exist", O_RDONLY) = -1 ENOENT (No such file or directory)</code></div>
+        <p>The kernel returned <code>-1</code> and set <code>errno</code> to <code>ENOENT</code>. That error name is worth memorising — you'll see <code>ENOENT</code> (missing file), <code>EACCES</code> (permission denied), <code>ECONNREFUSED</code> (nothing listening on that port), and <code>EMFILE</code> (too many open files) for the rest of your career. Now a permission failure:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>touch /tmp/secret &amp;&amp; chmod 000 /tmp/secret
+strace -f cat /tmp/secret 2&gt;&amp;1 | grep secret</code></pre></div>
+        <div class="out"><span class="ol">Output</span>openat(AT_FDCWD, "/tmp/secret", O_RDONLY) = -1 EACCES (Permission denied)</code></div>
+        <p>When an app logs a vague "could not read config," this is how you find the truth: strace shows you the exact path it tried and the exact reason the kernel said no.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — the "busy but idle" process</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Here's a small program that pins a CPU by asking the kernel the time in a tight loop — a stand-in for a real app with a bad polling loop. Run it and investigate <em>as if you didn't write it</em>.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># A process that burns CPU entirely inside a syscall loop:</span>
+bash -c 'while true; do date &gt;/dev/null; done' &amp;
+PID=$!
+top -b -n1 -p $PID | tail -2</code></pre></div>
+        <p>You'll see it near 100% CPU. The question a senior SRE asks first: <em>is that CPU being spent in my code (user) or in the kernel (system)?</em> Check, then confirm with strace:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>cat /proc/$PID/status | grep -i state
+strace -c -p $PID   <span class="c"># let it run a few seconds, then Ctrl-C</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 38.0    0.451       2      210443           clock_gettime / openat / execve …</code></div>
+        <p>Hundreds of thousands of calls in seconds. The process isn't computing anything — it's hammering the syscall boundary. In the real world this is a library polling a clock, a health check with no sleep, or a retry loop with no backoff. The fix is never "add CPU"; it's "stop making so many syscalls." Kill it with <code>kill $PID</code>.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — "too many open files"</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>Every open file, socket, and pipe is a file descriptor, and the kernel caps how many each process may hold. Hit the cap and <code>openat</code> starts returning <code>EMFILE</code> — which surfaces as your service refusing new connections while looking otherwise healthy. Reproduce it:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>ulimit -n 20            <span class="c"># set a tiny FD limit for this shell</span>
+python3 -c 'f=[open("/etc/hostname") for _ in range(50)]'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>OSError: [Errno 24] Too many open files: '/etc/hostname'</code></div>
+        <p><b>Errno 24 is <code>EMFILE</code>.</b> Now the senior question: given a running service throwing this, how would you confirm the cause and find the leak, without restarting it? Think it through before opening the answer.</p>
+        <details class="recall"><summary>Reveal an approach</summary>
+          <div class="body">
+            <p>Count what the process currently holds and compare to its limit:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>ls /proc/&lt;pid&gt;/fd | wc -l          <span class="c"># how many FDs open right now</span>
+cat /proc/&lt;pid&gt;/limits | grep 'open files'   <span class="c"># the ceiling</span>
+ls -l /proc/&lt;pid&gt;/fd | awk '{print $NF}' | sort | uniq -c | sort -rn | head</code></pre></div>
+            <p>The last command groups the descriptors by what they point to. If you see thousands of sockets to the same host, that's a connection leak — the app opens connections and never closes them. The real fix is in the app (close what you open, or use a pool); raising <code>ulimit</code> only delays the next outage. You'll meet this exact shape again as database connection exhaustion in <a href="ch86-the-data-layer-mysql-and-postgresql.html">Chapter 86</a>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <p>You now have the four highest-value patterns. Here they are as an SRE would file them mentally:</p>
+    <div class="box realworld"><div class="h">Incident pattern · high system CPU</div>
+      <p><b>Symptom:</b> a host or pod is at 100% CPU but the app seems to be doing little useful work. <b>First cut:</b> split user vs system CPU (<code>top</code> shows <code>%us</code> vs <code>%sy</code>). High <code>%sy</code> means time spent in the kernel — a syscall storm. <b>Confirm:</b> <code>strace -c -p &lt;pid&gt;</code> for a few seconds and look for one syscall with a huge count. <b>Cause is usually:</b> a poll loop with no backoff, excessive logging (every log line is a <code>write</code>), or a library checking the clock or a lock too often.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · the hung service</div>
+      <p><b>Symptom:</b> requests time out; the process is up but unresponsive. <b>First cut:</b> <code>strace -p &lt;pid&gt;</code>. If it sits in one <code>read</code>/<code>futex</code>/<code>connect</code>, it's blocked, not crashed. <b>Confirm what it waits on:</b> <code>ls -l /proc/&lt;pid&gt;/fd/&lt;n&gt;</code>. <b>Cause is usually:</b> a downstream dependency (DB, cache, another service) that stopped answering — so fix the dependency, not this process.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · "operation not permitted" in a container</div>
+      <p><b>Symptom:</b> code that works on a VM fails inside a container with <code>EPERM</code> on a syscall that should be allowed. <b>Cause is usually:</b> the container's <b>seccomp</b> profile blocks that syscall. seccomp is a kernel feature that filters which syscalls a process may make — the security payoff of the shared-kernel model. You'll configure it in <a href="ch27-container-security-and-process-to-container-to.html">Chapter 27</a>. The tell is that the failing syscall is something unusual (<code>clone3</code>, <code>mount</code>, a keyring call), and it's <code>EPERM</code>, not <code>ENOENT</code> or <code>EACCES</code>.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Security.</b> The syscall boundary is the main security boundary on a Linux host. Three kernel features tighten it, and you'll see all three in the container and Kubernetes chapters: <b>capabilities</b> break root's power into fine-grained pieces (so a process can bind a low port without full root), <b>seccomp</b> filters which syscalls are even allowed, and <b>namespaces</b> change what a syscall can see (a different set of processes, network interfaces, mounts). Containers are built entirely out of these.</p>
+    <p><b>Performance.</b> Because each syscall costs a mode switch, high-throughput systems try to make fewer, bigger calls. That's the reasoning behind buffered I/O (write 64&nbsp;KB at once, not a byte at a time), behind <code>epoll</code> (watch thousands of sockets with one call instead of one call per socket), and behind newer interfaces like <code>io_uring</code> that batch I/O submissions to cut trap overhead. You don't need to implement these, but when someone says "we reduced syscalls per request," this is what they mean and why it helped.</p>
+    <p><b>Common mistakes</b> engineers make before they understand this layer: blaming "slow disk" when the process is actually blocked on a network socket; adding CPU to a syscall-storm problem; raising <code>ulimit</code> to paper over an FD leak; and assuming a container is as isolated as a VM. Each of those is a wrong turn this chapter should now stop you from taking.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>This looks like low-level trivia, but it sets ceilings you design around. The cost of syscalls and context switches is why a single machine can only accept so many connections per second, which is why you put a load balancer in front and scale horizontally (<a href="ch94-building-blocks.html">Chapter 94</a>). It's why event-driven servers like nginx and Envoy handle far more connections than thread-per-request designs — they spend fewer syscalls per connection. And "the app is blocked on a dependency, not broken" is the seed of timeouts, circuit breakers, and bulkheads in <a href="ch88-reliability-engineering.html">Chapter 88</a>: in a distributed system, most of your processes are usually asleep in a syscall, waiting on someone else.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Open each one only after you've answered it in your head.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's the difference between user space and kernel space?</summary>
+        <div class="a"><p>Kernel space is privileged code that owns the hardware and runs in CPU ring 0; user space is where normal programs run, in ring 3, with no direct hardware access. A user program reaches hardware only by making a system call, which traps into the kernel, has it do the privileged work, and returns the result. The split is what keeps processes isolated and the machine stable.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through what happens when a program calls <code>read()</code>.</summary>
+        <div class="a"><p>The program calls libc's <code>read</code>, which loads the syscall number and arguments into registers and executes the <code>syscall</code> instruction. That traps the CPU from ring 3 to ring 0 — a mode switch — and jumps to the kernel's entry point. The kernel indexes the syscall table to <code>sys_read</code>, validates the file descriptor and the buffer, and fetches the data — from the page cache if it's warm, otherwise by asking the block or network layer, during which it may put the process to sleep and schedule another. When the data's ready it copies it into the program's buffer, puts the byte count (or a negative errno) in a register, switches back to ring 3, and resumes the program. libc turns a negative return into <code>-1</code> and sets <code>errno</code>. The key ideas I'd stress: the boundary is a controlled trap, the mode switch has a cost, and a blocking call means the kernel parks the process rather than spinning.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Why is a mode switch expensive, and how does the vDSO help?</summary>
+        <div class="a"><p>A mode switch changes CPU protection state, swaps to a kernel stack, and can disturb caches and pipelines, so it costs on the order of hundreds of nanoseconds even when the call does almost nothing. For calls made constantly and needing no privileged action — reading the clock, the PID — the kernel maps a read-only page, the vDSO, into every process's address space, so those calls read the answer directly in user mode with no trap. It matters because latency-sensitive code that timestamps every request would otherwise pay a syscall on every timestamp; the vDSO removes that. It's also a good segue into why we batch I/O and use epoll/io_uring: all of it is about paying the boundary cost fewer times.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A service is pinned at 100% CPU but throughput is low. How do you investigate?</summary>
+        <div class="a"><p>First I split the CPU: <code>top</code> to see user versus system time. High system time points at the kernel, so I'd run <code>strace -c -p &lt;pid&gt;</code> for a few seconds and look for a single syscall with an enormous count — that's a syscall storm, usually a poll loop without backoff or excessive logging. High user time instead points at the code itself, and I'd reach for a CPU profiler or <code>perf top</code> to find the hot function. Either way I'm separating "spending time in my code" from "spending time crossing into the kernel" before I touch anything, and I'd never respond by just adding CPU until I know which it is.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>How does all this relate to containers?</summary>
+        <div class="a"><p>A container is just a user-space process sharing the host's single kernel — there's no kernel inside it. That's why containers are cheap and start instantly, and why the same syscall reasoning applies unchanged inside a pod. It's also why container security lives at this boundary: capabilities limit privileged operations, seccomp filters which syscalls are allowed, and namespaces change what those syscalls can see. A VM differs precisely here — it runs its own kernel, so the isolation is stronger and the overhead higher. If someone gets <code>EPERM</code> on a normal syscall inside a container, my first guess is a seccomp profile.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>The kernel owns the hardware and referees every program. Programs run unprivileged in user space (ring 3) and reach hardware only through system calls, which trap into kernel space (ring 0), have the kernel do the privileged work, and return a value or an error. The mode switch costs real time, so fewer, larger syscalls beat many tiny ones. <code>strace</code> shows you the calls; <code>strace -c</code> counts them; <code>/proc/&lt;pid&gt;/</code> is your window into a live process. Blocked is not the same as crashed. And a container is a user-space process on a shared kernel — cheap, fast, and only as isolated as capabilities, seccomp, and namespaces make it.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>The kernel is the OS core: it owns the hardware and never exits. Programs are guests.</li>
+      <li>User space (ring 3) is unprivileged; kernel space (ring 0) has full access. The CPU enforces the split.</li>
+      <li>A system call is the only door from user space into the kernel — a deliberate trap to a fixed entry point.</li>
+      <li>Every syscall pays a mode-switch cost, so batching I/O and using epoll/io_uring reduce that cost.</li>
+      <li>The vDSO lets a few read-only calls (like the clock) skip the trap entirely.</li>
+      <li>File descriptors (0/1/2 = stdin/stdout/stderr) are how programs refer to open files and sockets.</li>
+      <li><code>strace</code> shows syscalls; <code>strace -c</code> counts and times them; both are first-reach tools.</li>
+      <li>High <code>%sy</code> CPU = kernel time = likely a syscall storm; high <code>%us</code> = your code.</li>
+      <li>A process sitting in a syscall is blocked (waiting), not crashed — find what it waits on via <code>/proc/&lt;pid&gt;/fd</code>.</li>
+      <li>A container shares the host kernel; its isolation is capabilities + seccomp + namespaces, not a second kernel.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds toward:</span>
+      <a href="ch02-processes-threads-scheduling-signals.html"><b>Ch 2</b> Processes &amp; scheduling</a>
+      <a href="ch03-memory-virtual-memory-page-cache-swap-oom.html"><b>Ch 3</b> Memory &amp; page cache</a>
+      <a href="ch04-filesystems-inodes-file-descriptors-disk-i-o.html"><b>Ch 4</b> File descriptors &amp; I/O</a>
+      <a href="ch07-the-sre-linux-toolkit-as-a-diagnostic.html"><b>Ch 7</b> The SRE toolkit</a>
+      <a href="ch21-what-a-container-really-is.html"><b>Ch 21–23</b> Containers, namespaces, cgroups</a>
+      <a href="ch104-compute-and-memory-runbooks.html"><b>Ch 104</b> CPU/memory runbooks</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man2/syscalls.2.html">syscalls(2)</a> and <a href="https://man7.org/linux/man-pages/man2/read.2.html">read(2)</a>. The authoritative reference for every call and its errors.</li>
+      <li>The Linux Kernel documentation — <a href="https://docs.kernel.org/">docs.kernel.org</a> (official), including the system-call and memory-management sections.</li>
+      <li>The Open Group — <a href="https://pubs.opengroup.org/onlinepubs/9699919799/">POSIX.1-2017 Base Specifications</a>: the standard defining the system-call interface.</li>
+      <li>Intel — <a href="https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html">64 and IA-32 Architectures Software Developer's Manual</a>: the vendor reference for privilege rings and the <code>syscall</code> instruction.</li>
+      <li>Google — <a href="https://sre.google/sre-book/table-of-contents/"><i>Site Reliability Engineering</i></a> (first-party): how these fundamentals connect to running services.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="../index.html"><span class="dir">← Back</span><div class="ti">Contents &amp; curriculum</div></a>
+      <a class="nx" href="ch02-processes-threads-scheduling-signals.html"><span class="dir">Next →</span><div class="ti">Ch 2 — Processes, threads, scheduling &amp; signals</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 1 of 121 · Part I · Linux &amp; OS Foundations. Run the labs in a container; the reflexes are the point.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">User vs kernel space</a>
+    <a href="#syscall">What a syscall does</a>
+    <a href="#components">The components</a>
+    <a href="#flow">Following a program</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 7 — The SRE Linux toolkit as a diagnostic system</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part I · Linux &nbsp;·&nbsp; Chapter 7</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part I · Linux &amp; OS Foundations · Chapter 7</div>
+      <h1>The SRE Linux toolkit as a diagnostic system</h1>
+      <p class="tagline">A page fires at 3am. You have thirty commands in muscle memory and sixty seconds before someone asks "what's going on?". The difference between senior and junior isn't knowing more tools — it's knowing which tool answers which question, and reaching for it without thinking.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~40 min read · Linux lab (Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Run a 60-second triage on any Linux host and say whether it's CPU-, memory-, disk-, or network-bound.</li>
+          <li>Map every tool — <code>top</code>, <code>vmstat</code>, <code>iostat</code>, <code>pidstat</code>, <code>sar</code>, <code>free</code>, <code>ss</code>, <code>lsof</code>, <code>strace</code> — to the exact question it answers, using the USE method.</li>
+          <li>Read the columns that matter: run-queue length, <code>%wa</code>, <code>si/so</code>, <code>await</code>, <code>%util</code>, <code>MemAvailable</code>, socket states.</li>
+          <li>Localise a synthetic CPU, memory, and I/O load to the responsible process every time.</li>
+          <li>Know when the fixed tools run out and reach for <code>bpftrace</code>/eBPF — and know what it costs you.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem: flailing under pressure</h2>
+    <p>Watch someone junior debug a slow host and you'll see the same thing every time. They SSH in, run <code>top</code>, stare at it, run <code>top</code> again, maybe <code>df -h</code>, maybe <code>ps aux | grep something</code>, then paste a screenshot into Slack and ask what to do. It's not that they don't know commands. It's that they have no <em>system</em> — no ordered set of questions that narrows "the box is unhappy" down to "this process is saturating this resource."</p>
+    <p>The tools themselves aren't the hard part. Any of them takes ten minutes to learn. The hard part is that under pressure, with an SLO burning and people watching, you need to know — reflexively — that a rising load average with idle CPU means you look at disk and uninterruptible sleep, not at CPU; that <code>free</code> showing "100 MB free" is almost never the memory problem people think it is; that 100% disk <code>%util</code> on an NVMe drive might mean nothing at all. Reflexes, not knowledge.</p>
+    <p>So this chapter isn't a tour of commands. It's a diagnostic system: a small, ordered method that turns any Linux host into a set of four resources — CPU, memory, disk, network — and asks the same three questions of each. Once you have the method, the tools slot into place as answers, and you stop guessing.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>You will not remember thirty tools under pressure. You will remember one method and the two or three tools that hang off each branch of it. Learn the method first; the tools are just where you go to read the number.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: USE, like a triage nurse</h2>
+    <p>The method is the <b>USE method</b>: for every <b>resource</b>, check three things in order — <b>U</b>tilisation, <b>S</b>aturation, <b>E</b>rrors. Utilisation is "how busy is it" (percent of time doing work). Saturation is "how much work is queued that it can't get to yet" (the backlog). Errors is "is it failing" (dropped packets, I/O errors, failed allocations). Do that for CPU, memory, disk, and network and you have covered almost every host-level performance problem there is.</p>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>A good ER triage nurse does not start with an MRI. When you walk in, they take vitals in a fixed order — pulse, blood pressure, temperature, oxygen — because those cheap, fast numbers tell them <em>which system</em> is in trouble before they order an expensive scan. A racing pulse and low oxygen sends you one way; a fever sends you another. Only then do they call the specialist and run the deep test.</p>
+      <p>USE is your triage vitals. <code>vmstat</code>, <code>free</code>, and <code>uptime</code> are the pulse and blood-pressure cuff: cheap, instant, and they tell you whether this is a CPU story, a memory story, a disk story, or a network story. <code>strace</code>, <code>lsof</code>, and <code>bpftrace</code> are the MRI — precise, more expensive to run, and you only order them once triage has pointed you at the organ. Reach for the MRI first and you waste the golden minute reading detail about the wrong system.</p>
+    </div>
+    <p>Every part of the analogy maps onto something you'll type:</p>
+    <table class="t">
+      <tr><th>In the ER</th><th>On the host</th></tr>
+      <tr><td>The patient</td><td>The host (or pod) that paged you</td></tr>
+      <tr><td>The four vital systems</td><td>The four resources: CPU, memory, disk, network</td></tr>
+      <tr><td>Pulse / BP / temp / O₂ — taken in a fixed order</td><td>USE: Utilisation, Saturation, Errors — checked per resource</td></tr>
+      <tr><td>The quick vitals cuff</td><td><code>uptime</code>, <code>vmstat 1</code>, <code>free -m</code>, <code>dmesg</code></td></tr>
+      <tr><td>Pointing at the organ in trouble</td><td><code>mpstat</code>, <code>iostat</code>, <code>pidstat</code>, <code>ss</code></td></tr>
+      <tr><td>The MRI you order once you know where to look</td><td><code>strace</code>, <code>lsof</code>, <code>bpftrace</code>/eBPF</td></tr>
+      <tr><td>The chart from last night's shift</td><td><code>sar</code> — the historical record collected while you slept</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>Which tool answers which question</h2>
+    <p>Here's the whole toolkit as one decision path. Start at the top with the cheap vitals, let them point you at a resource, then localise. This is the picture to burn into memory — everything after it is detail.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 470" role="img" aria-label="A top-down triage decision path from cheap vitals to per-resource tools to deep confirmation">
+        <defs>
+          <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--muted)"/></marker>
+        </defs>
+        <!-- A: vitals -->
+        <rect x="176" y="18" width="368" height="50" rx="9" style="fill:var(--chip);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="360" y="40" text-anchor="middle" style="fill:var(--ink);font:700 14px sans-serif">uptime · dmesg -T | tail</text>
+        <text x="360" y="58" text-anchor="middle" style="fill:var(--muted);font:11.5px sans-serif">Is load rising? Any OOM kills, I/O errors, TCP drops?</text>
+        <line x1="360" y1="68" x2="360" y2="92" style="stroke:var(--muted);stroke-width:1.6" marker-end="url(#ar)"/>
+        <!-- B: vmstat -->
+        <rect x="140" y="94" width="440" height="54" rx="9" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.6"/>
+        <text x="360" y="116" text-anchor="middle" style="fill:var(--accent);font:700 13.5px sans-serif">vmstat 1 — the one-screen vital sign</text>
+        <text x="360" y="135" text-anchor="middle" style="fill:var(--ink);font:600 12.5px monospace">r  b   si so   bi bo   us sy id wa st</text>
+        <!-- fan-out lines to 4 columns -->
+        <line x1="360" y1="148" x2="95" y2="196" style="stroke:var(--muted);stroke-width:1.4" marker-end="url(#ar)"/>
+        <line x1="360" y1="148" x2="272" y2="196" style="stroke:var(--muted);stroke-width:1.4" marker-end="url(#ar)"/>
+        <line x1="360" y1="148" x2="448" y2="196" style="stroke:var(--muted);stroke-width:1.4" marker-end="url(#ar)"/>
+        <line x1="360" y1="148" x2="625" y2="196" style="stroke:var(--muted);stroke-width:1.4" marker-end="url(#ar)"/>
+        <!-- Column signal boxes y=198 -->
+        <rect x="20" y="198" width="150" height="60" rx="8" style="fill:var(--chip);stroke:var(--accent);stroke-width:2"/>
+        <text x="95" y="219" text-anchor="middle" style="fill:var(--accent);font:700 12px sans-serif">CPU-bound</text>
+        <text x="95" y="236" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">r &gt; #cores,</text>
+        <text x="95" y="250" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">high us/sy</text>
+        <rect x="196" y="198" width="150" height="60" rx="8" style="fill:var(--chip);stroke:var(--applied);stroke-width:2"/>
+        <text x="271" y="219" text-anchor="middle" style="fill:var(--applied);font:700 12px sans-serif">Memory-bound</text>
+        <text x="271" y="236" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">si/so &gt; 0,</text>
+        <text x="271" y="250" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">low avail</text>
+        <rect x="372" y="198" width="150" height="60" rx="8" style="fill:var(--chip);stroke:var(--accent2);stroke-width:2"/>
+        <text x="447" y="219" text-anchor="middle" style="fill:var(--accent2);font:700 12px sans-serif">Disk-bound</text>
+        <text x="447" y="236" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">high wa,</text>
+        <text x="447" y="250" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">b &gt; 0</text>
+        <rect x="548" y="198" width="152" height="60" rx="8" style="fill:var(--chip);stroke:var(--violet);stroke-width:2"/>
+        <text x="624" y="219" text-anchor="middle" style="fill:var(--violet);font:700 12px sans-serif">Network-bound</text>
+        <text x="624" y="236" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">retransmits,</text>
+        <text x="624" y="250" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">drops, backlog</text>
+        <!-- short arrows to tool boxes -->
+        <line x1="95" y1="258" x2="95" y2="282" style="stroke:var(--muted);stroke-width:1.4" marker-end="url(#ar)"/>
+        <line x1="271" y1="258" x2="271" y2="282" style="stroke:var(--muted);stroke-width:1.4" marker-end="url(#ar)"/>
+        <line x1="447" y1="258" x2="447" y2="282" style="stroke:var(--muted);stroke-width:1.4" marker-end="url(#ar)"/>
+        <line x1="624" y1="258" x2="624" y2="282" style="stroke:var(--muted);stroke-width:1.4" marker-end="url(#ar)"/>
+        <!-- tool boxes y=284 -->
+        <rect x="20" y="284" width="150" height="56" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="95" y="306" text-anchor="middle" style="fill:var(--ink);font:600 11.5px monospace">mpstat -P ALL</text>
+        <text x="95" y="324" text-anchor="middle" style="fill:var(--ink);font:600 11.5px monospace">pidstat -u 1</text>
+        <rect x="196" y="284" width="150" height="56" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="271" y="306" text-anchor="middle" style="fill:var(--ink);font:600 11.5px monospace">free -m</text>
+        <text x="271" y="324" text-anchor="middle" style="fill:var(--ink);font:600 11.5px monospace">pidstat -r 1</text>
+        <rect x="372" y="284" width="150" height="56" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="447" y="306" text-anchor="middle" style="fill:var(--ink);font:600 11.5px monospace">iostat -xz 1</text>
+        <text x="447" y="324" text-anchor="middle" style="fill:var(--ink);font:600 11.5px monospace">pidstat -d 1</text>
+        <rect x="548" y="284" width="152" height="56" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="624" y="306" text-anchor="middle" style="fill:var(--ink);font:600 11.5px monospace">ss -s · ss -ti</text>
+        <text x="624" y="324" text-anchor="middle" style="fill:var(--ink);font:600 11.5px monospace">sar -n DEV 1</text>
+        <!-- converge to bottom -->
+        <line x1="95" y1="340" x2="360" y2="396" style="stroke:var(--muted);stroke-width:1.3" marker-end="url(#ar)"/>
+        <line x1="271" y1="340" x2="360" y2="396" style="stroke:var(--muted);stroke-width:1.3" marker-end="url(#ar)"/>
+        <line x1="447" y1="340" x2="360" y2="396" style="stroke:var(--muted);stroke-width:1.3" marker-end="url(#ar)"/>
+        <line x1="624" y1="340" x2="360" y2="396" style="stroke:var(--muted);stroke-width:1.3" marker-end="url(#ar)"/>
+        <!-- bottom band -->
+        <rect x="120" y="398" width="480" height="52" rx="9" style="fill:var(--panel);stroke:var(--deep);stroke-width:1.6"/>
+        <text x="360" y="420" text-anchor="middle" style="fill:var(--deep);font:700 13px sans-serif">Confirm the exact culprit</text>
+        <text x="360" y="439" text-anchor="middle" style="fill:var(--ink);font:600 12px monospace">strace · lsof · bpftrace / eBPF</text>
+      </svg>
+      <figcaption>Cheap vitals first (<code>uptime</code>, <code>vmstat</code>) point at a resource; per-resource tools localise it; the deep tools confirm exactly who and why.</figcaption>
+    </figure>
+
+    <p>Notice the shape. The top is broad and cheap — two commands that cost nothing and cover the whole machine. The middle narrows to one resource. The bottom is expensive and precise. You always move down, never sideways, and you don't reach the bottom row until the middle row has told you where to point it.</p>
+
+    <h2 id="internals"><span class="beat">Internal working</span>Where the numbers actually come from</h2>
+    <p>Every one of these tools is a thin reader over kernel counters. Almost none of them measure anything themselves — they read files the kernel exposes and, for the rate tools, take two samples and divide by the time between them. Understanding that is what lets you trust or distrust a number.</p>
+    <ol class="steps">
+      <li><b>The kernel keeps running counters in <code>/proc</code> and <code>/sys</code>.</b> <code>/proc/stat</code> holds cumulative CPU time in <em>jiffies</em> split into user, nice, system, idle, iowait, irq, softirq, and steal. <code>/proc/meminfo</code> holds memory totals. <code>/proc/diskstats</code> holds per-device I/O counts and accumulated service time. These only ever go up.</li>
+      <li><b>Rate tools sample twice and subtract.</b> When you run <code>vmstat 1</code> or <code>iostat 1</code>, the first line is the average since boot — usually useless. Every line after it is <code>(counter_now − counter_1s_ago) / 1s</code>. That's why the first line is a lie and you always read the second onward.</li>
+      <li><b>CPU percent is jiffies, not magic.</b> <code>top</code> reads the CPU-time fields from <code>/proc/stat</code>, waits, reads again, and divides each field's delta by the total delta. <code>%us</code> is time in your code, <code>%sy</code> in the kernel, <code>%wa</code> is idle-waiting-on-I/O, and <code>%st</code> (steal) is time the hypervisor gave to another tenant — the number that quietly explains slow EC2 instances.</li>
+      <li><b>Load average counts more than CPU.</b> <code>/proc/loadavg</code> is an exponentially-weighted moving average (1, 5, 15 min) of tasks that are <em>runnable</em> <b>plus</b> tasks in <em>uninterruptible sleep</em> (state <code>D</code>, usually blocked on disk). This is the single most misread number in Linux: a load of 30 on a 4-core box can mean CPU saturation <em>or</em> thirty processes all stuck waiting on a slow disk. Load alone can't tell you which — <code>vmstat</code>'s <code>r</code> vs <code>b</code> columns can.</li>
+      <li><b>Disk <code>%util</code> is a single-queue relic.</b> <code>iostat</code> computes <code>%util</code> as the fraction of wall-clock time the device had at least one request in flight. On a spinning disk that maps to "how busy," but SSDs and NVMe serve dozens of requests in parallel, so they can show 100% <code>%util</code> while nowhere near saturated. On modern storage, trust <code>await</code> (average latency per I/O) and queue depth, not <code>%util</code>.</li>
+      <li><b><code>free</code>'s "available" is the kernel's own estimate.</b> <code>MemAvailable</code> in <code>/proc/meminfo</code> is the kernel telling you how much a new process could get <em>without swapping</em>, already accounting for reclaimable page cache. It's the number that matters. "free" (truly untouched RAM) is nearly always small and nearly always irrelevant, because Linux spends free RAM on cache by design.</li>
+    </ol>
+    <div class="box gotcha"><div class="h">The number everyone misreads</div>
+      <p>"We're out of memory — <code>free</code> shows only 200&nbsp;MB free!" No. Linux uses spare RAM as page cache (<a href="ch03-memory-virtual-memory-page-cache-swap-oom.html">Chapter 3</a>), and that cache is reclaimable on demand. The question is never "how much is free," it's "how much is <em>available</em>, and are we <em>swapping</em>?" Read <code>MemAvailable</code> and watch <code>si/so</code> in <code>vmstat</code>. A box with 200&nbsp;MB free and 12&nbsp;GB available and zero swap activity is perfectly healthy.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: load average is 40 on an 8-core host, but <code>top</code> shows the CPUs are 85% idle. What's happening?</summary>
+      <div class="body">
+        <p>The CPUs are idle, so this isn't a CPU problem — the load is coming from tasks in uninterruptible sleep (state <code>D</code>), almost always blocked on I/O. Load average counts runnable <em>and</em> <code>D</code>-state tasks, so a slow or failing disk (or an NFS mount that stopped answering) drives load up while the CPUs sit waiting. Your next move is <code>vmstat 1</code> and look at the <code>b</code> column and <code>wa</code>%, then <code>iostat -xz 1</code> to find the device with high <code>await</code>. Adding CPU here would do nothing; the bottleneck is storage.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The toolkit, named</h2>
+    <p>Now the tools themselves, each filed under the question it answers. Learn them in this frame and you'll never again wonder "which one do I run?"</p>
+    <ul>
+      <li><b><code>uptime</code> — "is it getting worse?"</b> Three load averages: 1, 5, 15 minutes. You read them as a trend. 1&nbsp;min &gt; 15&nbsp;min means the problem is growing right now; the reverse means it's recovering. It's the cheapest command there is and the right first move.</li>
+      <li><b><code>vmstat 1</code> — the whole machine on one line.</b> Your primary vital sign. <code>r</code> = runnable tasks (CPU demand), <code>b</code> = blocked/uninterruptible (I/O demand), <code>si/so</code> = swap in/out (memory pressure), <code>bi/bo</code> = block I/O, <code>us/sy/id/wa/st</code> = CPU split. One screen tells you which of the four resources to chase.</li>
+      <li><b><code>mpstat -P ALL 1</code> — "one core or all of them?"</b> Per-CPU breakdown. Catches the classic single-threaded bottleneck: one core pinned at 100% while seven sit idle, so aggregate CPU looks fine (12%) but the app is capped. Aggregate numbers hide this; <code>mpstat</code> reveals it.</li>
+      <li><b><code>top</code> / <code>htop</code> — "who, roughly?"</b> The live leaderboard of processes by CPU and memory. <code>htop</code> adds colour, per-core bars, and tree view. Good for a first glance and for sorting, but it samples slowly and doesn't attribute I/O well — which is where <code>pidstat</code> earns its keep.</li>
+      <li><b><code>pidstat 1</code> — "which process, precisely?"</b> The bridge from "the machine is disk-bound" to "and it's <em>this</em> PID doing it." <code>pidstat -u</code> for CPU, <code>-r</code> for memory faults, <code>-d</code> for disk read/write per process, <code>-w</code> for context switches. This is the tool that turns a system-wide symptom into a named culprit.</li>
+      <li><b><code>iostat -xz 1</code> — disk saturation.</b> Per-device. <code>await</code> = average latency per I/O in ms (the number to trust), <code>r/s w/s</code> = IOPS, <code>rkB/s wkB/s</code> = throughput, <code>aqu-sz</code> = average queue depth (saturation), <code>%util</code> = busy time (trust it only on spinning disks).</li>
+      <li><b><code>free -m</code> — memory at a glance.</b> Read the <code>available</code> column, not <code>free</code>. Cross-check with <code>vmstat</code>'s <code>si/so</code>: available high and no swapping means memory is fine no matter how little shows as "free."</li>
+      <li><b><code>ss -tanp</code> / <code>ss -s</code> — sockets and connection state.</b> The modern replacement for <code>netstat</code>, reading straight from the kernel. <code>ss -s</code> summarises counts by state; <code>ss -tanp</code> lists every TCP socket with the owning process; <code>ss -ti</code> shows per-connection TCP internals (rtt, cwnd, retransmits). On a <code>LISTEN</code> socket, <code>Recv-Q</code> is the current accept-backlog depth and <code>Send-Q</code> is its ceiling — a full backlog is dropped connections.</li>
+      <li><b><code>lsof</code> — "what is this process holding open?"</b> Every open file, socket, and pipe, with the owning PID. Finds FD leaks (<code>lsof -p &lt;pid&gt; | wc -l</code>), the process pinning a filesystem you can't unmount (<code>lsof +D /mnt</code>), and deleted-but-still-open files quietly eating disk (<code>lsof | grep deleted</code>).</li>
+      <li><b><code>strace</code> — syscall-level truth.</b> From <a href="ch01-kernel-and-system-calls.html">Chapter 1</a>: shows exactly what a process asks the kernel and what it gets back. Order it once triage has narrowed things down — it's precise but it slows the target, so it's an MRI, not a vital sign.</li>
+      <li><b><code>sar</code> — the time machine.</b> The <code>sysstat</code> package can collect all of the above every few minutes into a rotating archive. When the incident was at 2am and you were asleep, <code>sar</code> replays exactly what CPU, memory, disk, and network were doing then. Enable it before you need it; you cannot go back and collect the past.</li>
+      <li><b><code>bpftrace</code> / eBPF — the questions the fixed tools can't ask.</b> Programmable, in-kernel, low-overhead tracing. When you need "which process caused this disk I/O," "what's the latency distribution of block reads," or "which files take longest to open," the counter-reading tools can't answer — but a one-line eBPF program can, safely, in production. This is where the toolkit ends and the deep observability chapters (<a href="ch74-observability-foundations.html">Chapter 74</a>) begin.</li>
+    </ul>
+
+    <details class="recall"><summary>Think first: aggregate CPU is 12% but the service is clearly capped and slow. Which tool proves what's wrong, and what will it show?</summary>
+      <div class="body">
+        <p><code>mpstat -P ALL 1</code>. On an 8-core box, 12% aggregate is roughly one core fully busy (1/8 ≈ 12.5%). <code>mpstat</code> will show one CPU at ~100% and the rest near idle — a single-threaded hot path. The fix isn't more cores or more replicas of the box; it's parallelising the workload (more worker threads/processes) or splitting the hot function. <code>top</code> pressing <kbd>1</kbd> shows per-core too, but <code>mpstat</code> gives you a clean averaged view over an interval.</p>
+      </div>
+    </details>
+
+    <h2 id="flow"><span class="beat">Data flow</span>The first 60 seconds</h2>
+    <p>Netflix's performance team made a famous checklist: the commands a good engineer runs in the first minute on an unfamiliar, unhappy host. Here is my version of that flow — the order I actually type when a host pages me, and why each step earns its seconds.</p>
+    <ol class="steps">
+      <li><b><code>uptime</code></b> — load trend. Rising fast, or already recovering? Sets the urgency.</li>
+      <li><b><code>dmesg -T | tail -30</code></b> — the kernel's own words. OOM kills, I/O errors, TCP <code>SYN flooding</code>, filesystem-read-only events. If the kernel already logged the cause, you're done in ten seconds.</li>
+      <li><b><code>vmstat 1 5</code></b> — read lines 2 onward. <code>r</code> high → CPU. <code>b</code> high + <code>wa</code> high → disk. <code>si/so</code> nonzero → memory/swap. <code>st</code> high → noisy hypervisor neighbour. This one command usually names the resource.</li>
+      <li><b><code>mpstat -P ALL 1 3</code></b> — if it looked CPU-bound: one core or all? And is it <code>%usr</code> (your code) or <code>%sys</code> (kernel/syscall storm)?</li>
+      <li><b><code>pidstat 1 3</code></b> — attribute it to a process. Pair with <code>-d</code> for disk, <code>-r</code> for memory. Now you have a PID, not just a symptom.</li>
+      <li><b><code>iostat -xz 1 3</code></b> — if disk-bound: which device, what's <code>await</code>, is the queue deep?</li>
+      <li><b><code>free -m</code></b> — <code>available</code> and swap. Confirms or clears the memory hypothesis.</li>
+      <li><b><code>ss -s</code></b> and <b><code>sar -n DEV 1 3</code></b> — socket counts and per-interface throughput/drops, if the story points at network.</li>
+    </ol>
+    <p>Eight commands, well under a minute. At the end you can say a real sentence — "the host is disk-bound, device <code>nvme0n1</code> at 40&nbsp;ms <code>await</code>, driven by PID 8842, the log shipper" — and <em>then</em> you order the MRI: <code>strace -p 8842</code> or a <code>bpftrace</code> histogram to confirm exactly why. You never skip to the MRI. The whole point is that the cheap steps stop you pointing an expensive, target-slowing tool at the wrong process.</p>
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>This flow is what separates a two-minute triage from a thirty-minute one. The junior version — SSH in, run <code>top</code>, guess — usually lands on CPU because that's the column people watch, and then the "fix" is to add replicas or cores, which does nothing when the real bottleneck was a saturated disk or a swap storm. The flow forces you to check all four resources cheaply before you commit to a theory. On call, that discipline is the difference between a fixed incident and a widened one.</p>
+    </div>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>You're on a Mac, so run everything in a throwaway Linux container. One box for labs 1–4; lab 5 needs a privileged container for eBPF. Start the main one and load the toolkit:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># A disposable Ubuntu box with room to make some noise.</span>
+docker run --rm -it --name diag ubuntu:24.04 bash
+
+<span class="c"># procps = top/free/vmstat; sysstat = sar/iostat/pidstat/mpstat.</span>
+apt-get update &amp;&amp; apt-get install -y \
+  procps sysstat stress-ng lsof strace iproute2 htop</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — take a baseline with every vital</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>You can't spot "abnormal" if you've never looked at "normal." Snapshot an idle box with each vital so the shape of a healthy machine is in your eye.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>uptime
+vmstat 1 3        <span class="c"># ignore line 1 (since-boot avg); read lines 2-3</span>
+free -m
+mpstat -P ALL 1 2</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>load average: 0.00, 0.01, 0.00
+
+procs -----------memory---------- ---swap-- -----io---- --system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 0  0      0  15631    112   1874    0    0     3     6   62  110  0  0 100  0  0
+
+               total        used        free      shared  buff/cache   available
+Mem:           15997         642       15631          12        1986       15355</div>
+        <p>Read the shape. <code>r</code> and <code>b</code> are 0 — nothing waiting on CPU or I/O. <code>si/so</code> are 0 — no swapping. <code>id</code> is 100 — CPU idle. In <code>free</code>, only 642&nbsp;MB is "used" but <code>available</code> is 15&nbsp;GB: the difference between <code>free</code> and <code>available</code> is the reclaimable page cache. This is what healthy looks like. Keep it in mind for the next four labs.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — map the columns to USE</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Before breaking anything, wire each column to the USE question it answers, so the numbers mean something under pressure.</p>
+        <table class="t">
+          <tr><th>Resource</th><th>Utilisation</th><th>Saturation</th><th>Errors</th></tr>
+          <tr><td>CPU</td><td><code>vmstat</code> us+sy; <code>mpstat</code> per-core</td><td><code>vmstat</code> <code>r</code> &gt; #cores; load avg</td><td>rare (thermal, ECC) — <code>dmesg</code></td></tr>
+          <tr><td>Memory</td><td><code>free</code> used vs available</td><td><code>vmstat</code> <code>si/so</code>; OOM kills</td><td><code>dmesg</code> (ECC, alloc failures)</td></tr>
+          <tr><td>Disk</td><td><code>iostat</code> <code>%util</code> (spinning only)</td><td><code>iostat</code> <code>await</code>, <code>aqu-sz</code>; <code>vmstat</code> <code>b</code>/<code>wa</code></td><td><code>dmesg</code>, <code>/sys</code> error counters</td></tr>
+          <tr><td>Network</td><td><code>sar -n DEV</code> throughput vs link</td><td><code>ss -s</code>; retransmits; backlog</td><td><code>ss -ti</code>; <code>ip -s link</code> drops</td></tr>
+        </table>
+        <p>Now watch context switches and interrupts idle vs busy — the <code>cs</code> and <code>in</code> columns in <code>vmstat</code>. A machine doing real work shows thousands per second; tens of thousands with no useful throughput is often a lock-contention or thundering-herd smell you'll chase later.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>vmstat 1 3        <span class="c"># note the cs (context switch) and in (interrupt) columns</span></code></pre></div>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — a synthetic CPU load, localised</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Generate a controlled CPU burn on <em>two</em> workers, then find it with the flow — as if you didn't know what you'd started.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>stress-ng --cpu 2 --timeout 60s &amp;
+uptime            <span class="c"># step 1: load climbing?</span>
+vmstat 1 3        <span class="c"># step 3: which resource?</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span> r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 2  0      0  15550    112   1876    0    0     0     0  340  120 25  0 75  0  0</div>
+        <p><code>r</code> is 2 (two runnable tasks), <code>us</code> is up, <code>b/wa/si/so</code> are all 0. This is textbook CPU-bound, in user space, not the kernel. Now: one core or several, and which process?</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>mpstat -P ALL 1 2     <span class="c"># two cores near 100% usr, others idle</span>
+pidstat -u 1 3        <span class="c"># attribute it to a PID</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>   PID    %usr %system  %CPU   Command
+  8801   99.0    0.0    99.0   stress-ng-cpu
+  8802   99.0    0.0    99.0   stress-ng-cpu</div>
+        <p>Two PIDs at ~99% <code>%usr</code>, zero <code>%system</code>. Diagnosis complete: user-space CPU burn, two workers, named. In a real incident "high <code>%usr</code>" sends you to a code profiler (<a href="ch104-compute-and-memory-runbooks.html">Chapter 104</a>); "high <code>%system</code>" sends you to <code>strace -c</code> for a syscall storm, exactly as in Chapter 1.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — memory pressure, then disk</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Two loads back to back. First, squeeze memory hard enough to swap; investigate before you read the reveal.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Allocate and touch more RAM than is comfortable, for 60s.</span>
+stress-ng --vm 2 --vm-bytes 90% --vm-keep --timeout 60s &amp;
+vmstat 1 5
+free -m</code></pre></div>
+        <p>What in the output tells you this is memory and not CPU? Which single column would you screenshot to prove it to a colleague? Decide, then check.</p>
+        <details class="recall"><summary>Reveal — the memory tell</summary>
+          <div class="body">
+            <p><code>si</code> and <code>so</code> (swap-in / swap-out) go nonzero in <code>vmstat</code>, and <code>free</code>'s <code>available</code> collapses while swap <code>used</code> climbs. That's the proof: the box is reclaiming and paging to disk. Watch for <code>b</code> and <code>wa</code> to rise too, because swapping <em>is</em> disk I/O — a memory problem that masquerades as a disk problem. <code>pidstat -r 1</code> names the process by major-fault rate. If it goes far enough the kernel invokes the OOM killer and you'll see it in <code>dmesg -T</code> — the topic of <a href="ch03-memory-virtual-memory-page-cache-swap-oom.html">Chapter 3</a>.</p>
+          </div>
+        </details>
+        <p>Now a disk load. Write a steady stream and localise the device and the process:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>stress-ng --hdd 2 --hdd-bytes 1g --timeout 60s &amp;
+iostat -xz 1 3        <span class="c"># which device, what await, how deep the queue</span>
+pidstat -d 1 3        <span class="c"># which process is writing</span></code></pre></div>
+        <div class="out"><span class="ol">Output (iostat, trimmed)</span>Device   r/s    w/s   rkB/s    wkB/s  aqu-sz  await  %util
+nvme0n1  0.0  920.0     0.0  235000.0    6.40   7.10   99.8</div>
+        <p>High <code>w/s</code> and <code>wkB/s</code>, a queue depth over 6, <code>await</code> at 7&nbsp;ms. Note <code>%util</code> reads 99.8% — but on NVMe that alone wouldn't prove saturation; the <code>aqu-sz</code> and <code>await</code> climbing is the real signal. <code>pidstat -d</code> gives you the writing PID. That's the full disk path: resource → device → process.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — when the fixed tools run out (eBPF)</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>The counter-reading tools tell you <em>that</em> the disk is busy, but not always <em>which process</em> issued each read, or the <em>latency distribution</em> of those reads. That's an eBPF question. eBPF needs kernel access, so run a privileged container (on Docker Desktop the LinuxKit kernel ships BTF, so this usually just works):</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker run --rm -it --privileged --pid=host ubuntu:24.04 bash
+apt-get update &amp;&amp; apt-get install -y bpftrace
+
+<span class="c"># Count every syscall by process name, whole machine, ~0% overhead.</span>
+bpftrace -e 'tracepoint:raw_syscalls:sys_enter { @[comm] = count(); }'</code></pre></div>
+        <div class="out"><span class="ol">Output (Ctrl-C to print)</span>@[systemd]: 1240
+@[stress-ng-cpu]: 88190
+@[containerd]: 210934</div>
+        <p>One tracepoint, the whole system, negligible overhead — the thing <code>strace</code> could never do safely in production because it slows its target. Now the senior question: a service shows 15&nbsp;ms disk <code>await</code> in <code>iostat</code>, but the team swears their reads are tiny. How would you prove where the latency lives — and what would you look at if <code>bpftrace</code> won't load at all?</p>
+        <details class="recall"><summary>Reveal an approach</summary>
+          <div class="body">
+            <p>Draw the latency as a histogram, not an average — averages hide the tail that's actually hurting you:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Block I/O latency histogram (ships with bpftrace as biolatency.bt too):</span>
+bpftrace -e 'tracepoint:block:block_rq_issue { @s[args.dev, args.sector] = nsecs; }
+  tracepoint:block:block_rq_complete /@s[args.dev, args.sector]/ {
+    @us = hist((nsecs - @s[args.dev, args.sector]) / 1000);
+    delete(@s[args.dev, args.sector]); }'</code></pre></div>
+            <p>A bimodal histogram — most I/O at 200&nbsp;µs but a fat bump at 20&nbsp;ms — tells you the average of 15&nbsp;ms is a lie: most reads are fast and a tail is slow (a noisy neighbour, or cache misses hitting cold storage). If <code>bpftrace</code> can't load (no BTF, locked-down kernel, some managed nodes), fall back to <code>perf record -e block:block_rq_issue</code>, to <code>/proc/&lt;pid&gt;/stack</code> to see where a blocked task is parked, or to <code>sar -d</code> historical device latency. The point is the method — reach for the tool that answers "distribution and attribution," not just "how busy."</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <p>Four patterns cover most of what pages you. Filed the way an SRE actually holds them:</p>
+    <div class="box realworld"><div class="h">Incident pattern · high load, idle CPU</div>
+      <p><b>Symptom:</b> load average alarming, CPU graphs calm. <b>First cut:</b> <code>vmstat 1</code> — is it the <code>r</code> column (CPU demand) or the <code>b</code> column (uninterruptible, usually I/O)? <b>Confirm:</b> <code>iostat -xz 1</code> for device <code>await</code>, and <code>ps -eo state,pid,cmd | grep '^D'</code> to list the stuck tasks. <b>Cause is usually:</b> a slow or failing disk, or a hung network filesystem (NFS/EFS) that turns every read into a multi-second wait. Adding CPU never helps.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · "out of memory" that isn't</div>
+      <p><b>Symptom:</b> someone panics that <code>free</code> shows almost no free memory. <b>First cut:</b> read <code>available</code>, not <code>free</code>, and check <code>vmstat</code> <code>si/so</code>. <b>Confirm:</b> <code>dmesg -T | grep -i oom</code> for actual kills. <b>Cause is usually:</b> nothing — Linux is using RAM as cache as designed. The <em>real</em> memory incident looks different: <code>available</code> low <b>and</b> swap active <b>and</b> OOM kills in <code>dmesg</code>. Learn to tell the two apart and you'll stop half your "memory" pages at a glance.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · connections refused, box looks fine</div>
+      <p><b>Symptom:</b> clients get connection refused or timeouts; CPU, memory, disk all healthy. <b>First cut:</b> <code>ss -s</code> for socket counts, then <code>ss -tanp state listening</code> and look at <code>Recv-Q</code>/<code>Send-Q</code> on the listener. <b>Confirm:</b> a full accept backlog (<code>Recv-Q</code> pinned at <code>Send-Q</code>) means the app isn't accepting fast enough, or you're being flooded. <b>Cause is usually:</b> an app stuck not calling <code>accept()</code>, an FD limit hit (<code>lsof -p &lt;pid&gt; | wc -l</code> vs <code>/proc/&lt;pid&gt;/limits</code>), or a real connection surge you can see in <code>dmesg</code> as "possible SYN flooding."</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · the cloud host that's mysteriously slow</div>
+      <p><b>Symptom:</b> an EC2 or VM instance runs slower than its specs say it should, intermittently. <b>First cut:</b> <code>vmstat 1</code> and read the <code>st</code> (steal) column. <b>Confirm:</b> <code>mpstat -P ALL 1</code> — steal spread across cores. <b>Cause is usually:</b> a noisy neighbour on the same physical host, or a burstable instance (<code>t</code>-family) that ran out of CPU credits. No amount of in-guest tuning fixes steal; you change instance type or move.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>You do not SSH to a thousand boxes.</b> Everything in this chapter is the right tool for <em>one</em> host you're actively debugging, or the reflexes behind an automated collector. At scale you run an agent — <code>node_exporter</code> feeding Prometheus (<a href="ch75-prometheus.html">Chapter 75</a>) — that scrapes exactly these <code>/proc</code> and <code>/sys</code> counters continuously, so the USE method becomes a dashboard and an alert instead of a login. The manual toolkit is what you fall back to when the dashboard says "something's wrong here" and you need to go deep on the one box. Both live on the same numbers.</p>
+    <p><b>Overhead is real and uneven.</b> <code>vmstat</code>, <code>iostat</code>, <code>free</code> are counter reads — effectively free, safe on a hot production box. <code>strace</code> is not: it stops the target on every syscall via <code>ptrace</code> and can slow a busy process by an order of magnitude, so never attach it to a latency-critical process without knowing that. eBPF sits in between — designed for production, single-digit-percent overhead — which is exactly why the industry moved toward it for always-on tracing.</p>
+    <p><b>USE vs RED.</b> USE (utilisation/saturation/errors) is a <em>resource</em> lens — perfect for hosts and hardware. Its sibling RED (rate/errors/duration) is a <em>request</em> lens — perfect for services. You use USE to answer "is this machine sick?" and RED to answer "is this service sick?"; a mature on-call reaches for both and knows which question they're asking. RED comes back in the SLO chapter (<a href="ch80-sli-slo-sla-and-error-budgets.html">Chapter 80</a>).</p>
+    <p><b>Common mistakes</b> that this chapter should stop: reading <code>free</code>'s "free" instead of "available"; trusting load average as a CPU metric; treating <code>%util</code> as saturation on SSD/NVMe; running <code>strace</code> on a critical process during peak; and — the big one — reaching for the deep tool before the cheap vitals have told you where to point it. Order matters more than which tools you know.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>The USE method isn't only a debugging trick; it's how you size and reason about systems. Capacity planning (<a href="ch89-capacity-planning-and-performance.html">Chapter 89</a>) is USE applied ahead of time: for each resource, at what utilisation does saturation begin, and how much headroom do you keep before it? Autoscaling signals are USE turned into triggers — you scale on the resource that saturates first, and picking the wrong one (scaling on CPU when the real limit is memory or connection count) is a classic outage. Dashboards worth having (<a href="ch76-grafana-and-dashboard-design.html">Chapter 76</a>) are laid out by resource with utilisation, saturation, and errors visible together, because that's the shape a human triages in. And the deepest link: knowing that a single machine has finite CPU, finite I/O, and finite sockets — and being able to <em>see</em> which runs out first — is what tells you when to scale a box up versus scale the service out. That decision starts here, at the counters.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before you open it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's the USE method?</summary>
+        <div class="a"><p>For every resource on the system — CPU, memory, disk, network — you check three things: Utilisation (how busy it is), Saturation (how much work is queued that it can't get to yet), and Errors. It gives you a complete, ordered checklist so you cover every resource instead of fixating on the one metric you happened to look at. In practice it turns "the box is slow" into "this resource is saturated," which is the question that actually leads to a fix.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through your first 60 seconds on a host that just paged you.</summary>
+        <div class="a"><p><code>uptime</code> first — is load rising or recovering, how urgent. Then <code>dmesg -T | tail</code> in case the kernel already logged the cause: OOM kills, I/O errors, TCP drops. Then <code>vmstat 1</code>, reading past the first line: the <code>r</code> column for CPU demand, <code>b</code> and <code>wa</code> for disk waiting, <code>si/so</code> for swapping, <code>st</code> for hypervisor steal. That one command usually names the resource. From there I branch: <code>mpstat -P ALL 1</code> to see if CPU pressure is one core or all and whether it's user or system time; <code>iostat -xz 1</code> for device <code>await</code> if it's disk; <code>free -m</code> reading <code>available</code> for memory; <code>ss -s</code> and <code>sar -n DEV</code> for network. Then <code>pidstat</code> to attribute the load to a specific process. Only after all that do I reach for the precise tools — <code>strace</code>, <code>lsof</code>, <code>bpftrace</code> — because they're expensive or slow the target, so I want to know exactly where to point them first.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Load average is 40 on an 8-core box but CPUs are 90% idle. Explain, and where do you look?</summary>
+        <div class="a"><p>Load average on Linux isn't a CPU metric — it's an exponentially-weighted count of tasks that are runnable <em>plus</em> tasks in uninterruptible sleep, state <code>D</code>, which almost always means blocked on I/O. So idle CPUs with high load means a lot of tasks are stuck waiting, not computing. I'd run <code>vmstat 1</code> and expect a high <code>b</code> column and high <code>%wa</code>; then <code>iostat -xz 1</code> to find the device with high <code>await</code> and a deep queue, and <code>ps -eo state,pid,wchan,cmd | grep '^D'</code> to see the blocked tasks and what kernel function they're parked in. The usual culprits are a saturated or failing disk, or a hung network mount like NFS/EFS where every syscall blocks for seconds. The important reflex is that adding CPU does nothing here — the fix is on the storage or network path.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A service is capped and slow, but overall CPU shows only ~12% on an 8-core box. What's going on and how do you prove it?</summary>
+        <div class="a"><p>12% of 8 cores is almost exactly one core fully busy, which smells like a single-threaded bottleneck hidden by the aggregate. I'd prove it with <code>mpstat -P ALL 1</code> (or <code>top</code> then press <kbd>1</kbd>): I expect one CPU near 100% and the rest idle. <code>pidstat -t</code> can show it's one hot thread within the process. The fix isn't more replicas or a bigger box — extra cores sit idle — it's parallelising the work: more worker threads or processes, sharding the hot loop, or moving the serial section off the request path. This is why aggregate CPU is a trap: it averages away the exact thing that's saturated.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>When would you reach past these tools for eBPF/bpftrace, and what does it cost you?</summary>
+        <div class="a"><p>When the fixed tools tell me <em>that</em> a resource is busy but can't tell me <em>which process</em> caused each event or the <em>distribution</em> of a latency — questions like "which PID issued these disk reads," "what's the histogram of block-I/O latency," "which files are slowest to open." Those need programmable, in-kernel tracing, which is eBPF. The cost is mainly access and portability: it needs a recent kernel with BTF and privileged (root) access, and it doesn't run everywhere (some locked-down managed nodes). The runtime overhead is low by design — single-digit percent — which is the whole reason it's safe in production where <code>strace</code> isn't, since <code>strace</code> stops the target on every syscall. So I reach for it deliberately, after triage has narrowed the question, not as a first move.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>Under pressure you won't recall thirty tools — you'll recall one method. The USE method checks Utilisation, Saturation, and Errors for each of CPU, memory, disk, and network. The 60-second flow runs the cheap, whole-machine vitals first (<code>uptime</code>, <code>dmesg</code>, <code>vmstat</code>), lets them name the resource, then localises with the per-resource tools (<code>mpstat</code>, <code>iostat</code>, <code>free</code>, <code>ss</code>) and attributes to a PID with <code>pidstat</code>. Only then do you order the expensive, precise tools — <code>strace</code>, <code>lsof</code>, <code>bpftrace</code> — because they cost overhead or slow the target. Every tool is just a reader over kernel counters in <code>/proc</code> and <code>/sys</code>; the rate tools sample twice and divide, so line one is always a lie. Read <code>available</code> not <code>free</code>, trust <code>await</code> not <code>%util</code> on SSDs, and remember load average counts I/O waiters, not just CPU.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>USE: for each resource (CPU, memory, disk, network) check Utilisation, Saturation, Errors — in that order.</li>
+      <li>Cheap vitals first, expensive tools last: <code>uptime</code> → <code>vmstat</code> → localise → <code>pidstat</code> → then <code>strace</code>/<code>bpftrace</code>.</li>
+      <li><code>vmstat 1</code> is the one-screen triage: <code>r</code>=CPU demand, <code>b</code>+<code>wa</code>=disk, <code>si/so</code>=swap, <code>st</code>=hypervisor steal.</li>
+      <li>Load average counts runnable <b>and</b> uninterruptible (<code>D</code>-state) tasks — high load with idle CPU means I/O, not CPU.</li>
+      <li>Read <code>free</code>'s <code>available</code> column, never "free" — Linux uses spare RAM as reclaimable cache by design.</li>
+      <li>On SSD/NVMe, <code>%util</code> lies; trust <code>await</code> (latency) and queue depth for real disk saturation.</li>
+      <li><code>mpstat -P ALL</code> exposes single-threaded bottlenecks that aggregate CPU averages away.</li>
+      <li><code>pidstat</code> is the bridge from "the machine is X-bound" to "and it's this PID"; <code>-u/-r/-d/-w</code> for CPU/mem/disk/switches.</li>
+      <li><code>strace</code> is an MRI — precise but it slows the target; eBPF/<code>bpftrace</code> answers attribution and distribution at low overhead.</li>
+      <li>Every tool reads kernel counters; rate tools sample twice, so ignore the first line and enable <code>sar</code> before you need history.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on and toward:</span>
+      <a href="ch01-kernel-and-system-calls.html"><b>Ch 1</b> Syscalls &amp; strace</a>
+      <a href="ch03-memory-virtual-memory-page-cache-swap-oom.html"><b>Ch 3</b> Memory, swap, OOM</a>
+      <a href="ch04-filesystems-inodes-file-descriptors-disk-i-o.html"><b>Ch 4</b> Disk I/O &amp; FDs</a>
+      <a href="ch74-observability-foundations.html"><b>Ch 74</b> Observability</a>
+      <a href="ch89-capacity-planning-and-performance.html"><b>Ch 89</b> Capacity &amp; performance</a>
+      <a href="ch104-compute-and-memory-runbooks.html"><b>Ch 104</b> CPU/memory runbooks</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man5/proc.5.html">proc(5)</a>: the authoritative map of <code>/proc</code>, where every one of these tools reads its numbers.</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man8/vmstat.8.html">vmstat(8)</a>, <a href="https://man7.org/linux/man-pages/man1/top.1.html">top(1)</a>, <a href="https://man7.org/linux/man-pages/man1/free.1.html">free(1)</a>, <a href="https://man7.org/linux/man-pages/man8/ss.8.html">ss(8)</a>, <a href="https://man7.org/linux/man-pages/man8/lsof.8.html">lsof(8)</a>: the tool references, including exact column meanings.</li>
+      <li>The <code>sysstat</code> project — <a href="https://sysstat.github.io/">sysstat.github.io</a> (first-party): documentation for <code>sar</code>, <code>iostat</code>, <code>pidstat</code>, and <code>mpstat</code>, and how the historical collector works.</li>
+      <li>The Linux Kernel documentation — <a href="https://docs.kernel.org/">docs.kernel.org</a>: the accounting and block-layer sections that define load average, iowait, and <code>diskstats</code>.</li>
+      <li>eBPF — <a href="https://ebpf.io/">ebpf.io</a> (official) and the kernel's <a href="https://docs.kernel.org/bpf/">BPF documentation</a>: what eBPF is, and why it's safe to trace with in production.</li>
+      <li>Google — <a href="https://sre.google/sre-book/table-of-contents/"><i>Site Reliability Engineering</i></a> (first-party): the monitoring and practical-alerting chapters that put resource signals into an on-call context.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch06-systemd-journald-cron-service-lifecycle.html"><span class="dir">← Prev</span><div class="ti">Ch 6 — systemd, journald, cron, service lifecycle</div></a>
+      <a class="nx" href="ch08-bash-and-shell-scripting-for-automation.html"><span class="dir">Next →</span><div class="ti">Ch 8 — Bash and shell scripting for automation</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 7 of 121 · Part I · Linux &amp; OS Foundations. Learn the method, not the man pages; the tools are just where you read the number.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">USE mental model</a>
+    <a href="#arch">Which tool, which question</a>
+    <a href="#internals">Where the numbers come from</a>
+    <a href="#components">The toolkit</a>
+    <a href="#flow">The 60-second triage</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 16 — HTTP, HTTP/2, HTTP/3 &amp; gRPC</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part II · Networking &nbsp;·&nbsp; Chapter 16</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part II · Networking from First Principles · Chapter 16</div>
+      <h1>HTTP, HTTP/2, HTTP/3, and gRPC</h1>
+      <p class="tagline">HTTP started as plain text you could type by hand and grew into the load-bearing protocol of the internet. Each version — 1.1, 2, 3 — exists to kill a specific kind of head-of-line blocking. And gRPC's habit of pinning everything to one long-lived connection quietly breaks the naive load balancer you thought was fine. Get these distinctions right and you'll debug latency and traffic-skew problems others can only guess at.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~46 min read · Linux lab (Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Read an HTTP exchange by hand — methods, status classes, and the headers that matter.</li>
+          <li>Explain the three head-of-line blocking problems and which HTTP version fixes which.</li>
+          <li>Say why HTTP/2 multiplexes over one TCP connection and why HTTP/3 had to leave TCP for QUIC.</li>
+          <li>Explain why gRPC breaks connection-level (L4) load balancing, and name the three fixes.</li>
+          <li>Negotiate and inspect HTTP/2 with <code>curl</code>, and reason about keep-alive tuning.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem HTTP keeps re-solving</h2>
+    <p>HTTP began as almost nothing: a client opens a connection, sends a line of text — <code>GET /page HTTP/1.0</code> — and the server sends back some headers and a body. That simplicity is why it won. You can speak it by hand over <code>nc</code>, it's stateless (each request stands alone), and it carries anything. But the same simplicity created a performance problem that has taken three protocol revisions to chase down, and the problem has a name you'll say constantly: <b>head-of-line blocking</b> — one thing stuck at the front of a queue holding up everything behind it.</p>
+    <p>The story of HTTP is the story of that blocking moving down the stack as each version fixes it at one layer only to expose it at the next. HTTP/1.0 opened a fresh connection per request — expensive. HTTP/1.1 kept connections alive and reused them, but a connection could only carry <em>one response at a time</em>, so a slow response blocked every request queued behind it; browsers papered over this by opening six connections per site. HTTP/2 fixed <em>that</em> by multiplexing many independent streams over a single connection — but because they all ride one TCP connection, a single lost packet stalls <em>all</em> the streams, because TCP insists on in-order delivery. HTTP/3 fixes <em>that</em> by abandoning TCP for QUIC over UDP, where streams are genuinely independent and one stream's packet loss doesn't touch the others.</p>
+    <p>So the versions aren't arbitrary marketing numbers. Each one exists to remove a specific stall: application-layer blocking (1.1 keep-alive helped, multiplexing in 2 solved), then transport-layer blocking (3/QUIC solved). Meanwhile gRPC took HTTP/2's multiplexing and built RPC on top — long-lived connections carrying thousands of calls — which is wonderful for efficiency and terrible for any load balancer that only understands connections, not requests.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>There are three distinct head-of-line blocking problems: (1) <b>HTTP/1.1</b> — one response per connection at a time; (2) <b>HTTP/2</b> — many streams share one TCP connection, so one lost segment blocks all of them; (3) <b>solved by HTTP/3</b> — QUIC gives each stream independent loss recovery. Know which layer each version fixes and the rest of this chapter — including the gRPC load-balancing trap — follows.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: lanes on a road</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Picture traffic between two towns. <b>HTTP/1.1 is a single-lane road where cars must stay in order.</b> Send a truck (a big, slow response) and every car behind it crawls at truck speed until the truck arrives — head-of-line blocking. The workaround browsers used was to build six parallel single-lane roads (six connections) so a truck on one lane doesn't block the others. Wasteful, but it worked.</p>
+      <p><b>HTTP/2 is one road with many lanes.</b> Cars for different destinations (different requests, called <em>streams</em>) interleave freely on the same road, so a truck in one lane no longer blocks cars in another — you got concurrency back with a single connection. But there's a catch: it's still <em>one road surface</em>. If a pothole (a lost TCP packet) appears, the whole road is closed until the crew patches that one spot, because the rule is "nothing may pass the pothole until it's fixed and everything stays in order." One lost packet, and every lane stalls. That's TCP-level head-of-line blocking.</p>
+      <p><b>HTTP/3 gives every lane its own independent surface.</b> A pothole in lane 2 (a lost packet on stream 2) closes only lane 2; lanes 1 and 3 keep flowing while lane 2 is patched. That's what QUIC's per-stream loss recovery buys, and it's why HTTP/3 shines exactly where TCP struggles — lossy mobile networks. QUIC also lets a car keep its plate when it changes roads (connection migration), so your phone switching from Wi-Fi to cellular doesn't drop the connection.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In HTTP</th></tr>
+      <tr><td>The road between the towns</td><td>The connection (TCP for 1.1/2, QUIC/UDP for 3)</td></tr>
+      <tr><td>A car heading somewhere</td><td>A request/response — in HTTP/2+ a <em>stream</em></td></tr>
+      <tr><td>Single lane, strict order</td><td>HTTP/1.1: one response at a time per connection</td></tr>
+      <tr><td>Six parallel roads</td><td>Browsers opening ~6 connections per origin</td></tr>
+      <tr><td>Many lanes, one surface</td><td>HTTP/2: multiplexed streams over one TCP connection</td></tr>
+      <tr><td>A pothole closing the whole road</td><td>A lost TCP segment stalling all HTTP/2 streams</td></tr>
+      <tr><td>Independent lane surfaces</td><td>HTTP/3: QUIC streams with per-stream loss recovery</td></tr>
+      <tr><td>Keeping your plate across roads</td><td>QUIC connection migration (survives IP changes)</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>Three versions, three ways to move requests</h2>
+    <p>The figure is a packet-flow view of the same three requests (call them A, B, C) sent over each protocol. Watch where the blocking lives in each row — and where it disappears.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 468" role="img" aria-label="Packet flow of three requests over HTTP/1.1 (serial on one connection), HTTP/2 (interleaved streams on one TCP connection, blocked by one lost segment), and HTTP/3 (independent QUIC streams over UDP where one loss blocks only its stream)">
+        <defs>
+          <marker id="h" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" style="fill:var(--muted)"/></marker>
+        </defs>
+
+        <!-- ================= HTTP/1.1 ================= -->
+        <text x="14" y="30" style="fill:var(--accent);font:700 13px sans-serif">HTTP/1.1 — one response at a time per connection</text>
+        <text x="14" y="48" style="fill:var(--muted);font:11px sans-serif">client</text>
+        <text x="674" y="48" text-anchor="end" style="fill:var(--muted);font:11px sans-serif">server</text>
+        <line x1="60" y1="66" x2="662" y2="66" style="stroke:var(--line);stroke-width:1"/>
+        <!-- serial blocks -->
+        <rect x="64" y="54" width="150" height="24" rx="4" style="fill:var(--accent);opacity:.85"/>
+        <text x="139" y="71" text-anchor="middle" style="fill:#fff;font:700 11px sans-serif">A (big/slow)</text>
+        <rect x="220" y="54" width="90" height="24" rx="4" style="fill:var(--accent);opacity:.45"/>
+        <text x="265" y="71" text-anchor="middle" style="fill:#fff;font:700 11px sans-serif">B waits</text>
+        <rect x="316" y="54" width="90" height="24" rx="4" style="fill:var(--accent);opacity:.3"/>
+        <text x="361" y="71" text-anchor="middle" style="fill:#fff;font:700 11px sans-serif">C waits</text>
+        <text x="430" y="71" style="fill:var(--deep);font:600 11px sans-serif">← B and C are blocked behind A (HOL). Browsers open ~6 connections to escape it.</text>
+
+        <line x1="18" y1="92" x2="702" y2="92" style="stroke:var(--line);stroke-dasharray:3 3"/>
+
+        <!-- ================= HTTP/2 ================= -->
+        <text x="14" y="120" style="fill:var(--accent2);font:700 13px sans-serif">HTTP/2 — streams A, B, C multiplexed over ONE TCP connection</text>
+        <line x1="60" y1="156" x2="662" y2="156" style="stroke:var(--line);stroke-width:1"/>
+        <!-- interleaved frames -->
+        <rect x="64"  y="144" width="52" height="24" rx="4" style="fill:var(--accent)"/><text x="90" y="161" text-anchor="middle" style="fill:#fff;font:700 10px sans-serif">A</text>
+        <rect x="120" y="144" width="52" height="24" rx="4" style="fill:var(--accent2)"/><text x="146" y="161" text-anchor="middle" style="fill:#fff;font:700 10px sans-serif">B</text>
+        <rect x="176" y="144" width="52" height="24" rx="4" style="fill:var(--violet)"/><text x="202" y="161" text-anchor="middle" style="fill:#fff;font:700 10px sans-serif">C</text>
+        <rect x="232" y="144" width="52" height="24" rx="4" style="fill:var(--accent)"/><text x="258" y="161" text-anchor="middle" style="fill:#fff;font:700 10px sans-serif">A</text>
+        <!-- lost segment -->
+        <rect x="288" y="144" width="52" height="24" rx="4" style="fill:var(--deep)"/><text x="314" y="161" text-anchor="middle" style="fill:#fff;font:800 10px sans-serif">LOST</text>
+        <rect x="344" y="144" width="52" height="24" rx="4" style="fill:var(--accent2);opacity:.35"/><text x="370" y="161" text-anchor="middle" style="fill:#fff;font:700 10px sans-serif">B?</text>
+        <rect x="400" y="144" width="52" height="24" rx="4" style="fill:var(--violet);opacity:.35"/><text x="426" y="161" text-anchor="middle" style="fill:#fff;font:700 10px sans-serif">C?</text>
+        <text x="466" y="161" style="fill:var(--deep);font:600 11px sans-serif">← one lost TCP segment stalls ALL streams (TCP-level HOL)</text>
+        <text x="64" y="188" style="fill:var(--muted);font:11px sans-serif">application-layer HOL is solved — but the shared TCP byte stream re-introduces it on loss.</text>
+
+        <line x1="18" y1="212" x2="702" y2="212" style="stroke:var(--line);stroke-dasharray:3 3"/>
+
+        <!-- ================= HTTP/3 ================= -->
+        <text x="14" y="240" style="fill:var(--violet);font:700 13px sans-serif">HTTP/3 — independent QUIC streams over UDP</text>
+        <!-- three separate lanes -->
+        <text x="14" y="278" style="fill:var(--muted);font:11px sans-serif">stream A</text>
+        <line x1="70" y1="282" x2="662" y2="282" style="stroke:var(--line)"/>
+        <rect x="80" y="270" width="46" height="22" rx="4" style="fill:var(--accent)"/><rect x="140" y="270" width="46" height="22" rx="4" style="fill:var(--accent)"/><rect x="200" y="270" width="46" height="22" rx="4" style="fill:var(--accent)"/>
+        <text x="470" y="286" style="fill:var(--accent2);font:600 11px sans-serif">flows freely →</text>
+
+        <text x="14" y="318" style="fill:var(--muted);font:11px sans-serif">stream B</text>
+        <line x1="70" y1="322" x2="662" y2="322" style="stroke:var(--line)"/>
+        <rect x="80" y="310" width="46" height="22" rx="4" style="fill:var(--accent2)"/>
+        <rect x="140" y="310" width="46" height="22" rx="4" style="fill:var(--deep)"/><text x="163" y="325" text-anchor="middle" style="fill:#fff;font:800 9px sans-serif">LOST</text>
+        <rect x="200" y="310" width="46" height="22" rx="4" style="fill:var(--accent2);opacity:.35"/>
+        <text x="470" y="326" style="fill:var(--deep);font:600 11px sans-serif">only stream B waits for its retransmit</text>
+
+        <text x="14" y="358" style="fill:var(--muted);font:11px sans-serif">stream C</text>
+        <line x1="70" y1="362" x2="662" y2="362" style="stroke:var(--line)"/>
+        <rect x="80" y="350" width="46" height="22" rx="4" style="fill:var(--violet)"/><rect x="140" y="350" width="46" height="22" rx="4" style="fill:var(--violet)"/><rect x="200" y="350" width="46" height="22" rx="4" style="fill:var(--violet)"/>
+        <text x="470" y="366" style="fill:var(--accent2);font:600 11px sans-serif">flows freely →</text>
+
+        <text x="14" y="402" style="fill:var(--ink);font:600 11.5px sans-serif">QUIC gives each stream its own loss recovery, and folds TLS 1.3 into the handshake (faster setup, always encrypted).</text>
+        <text x="14" y="422" style="fill:var(--muted);font:11px sans-serif">Because it rides UDP, HTTP/3 also survives IP changes via connection IDs — the Wi-Fi-to-cellular handoff.</text>
+        <line x1="70" y1="440" x2="662" y2="440" style="stroke:var(--violet);stroke-width:1.5" marker-end="url(#h)"/>
+        <text x="366" y="456" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">one QUIC connection over UDP, carrying independent streams</text>
+      </svg>
+      <figcaption>Same three requests, three transports. HTTP/1.1 serializes them; HTTP/2 interleaves them but shares one TCP byte stream (so one loss stalls all); HTTP/3 gives each stream independent loss recovery over QUIC/UDP. The blocking moves down a layer with each version until QUIC removes it.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>These distinctions decide real dashboards. HTTP/2 to a service over a lossy path can be <em>slower</em> than HTTP/1.1's six connections, because one loss stalls every stream — a genuinely counterintuitive incident. gRPC (built on HTTP/2) will happily send all traffic down one connection to one backend and starve the rest of your fleet if your load balancer only balances connections. And keep-alive misconfigured either way churns connections and hammers you with the TIME_WAIT and handshake costs from Chapters 13 and 14. This chapter is where L4 meets the app.</p>
+    </div>
+
+    <h2 id="h2"><span class="beat">Internal working</span>Anatomy, then multiplexing, then QUIC</h2>
+    <p>Start with the part that never changed across versions — the <b>semantics</b> (methods, status codes, headers), standardised in RFC 9110 — then the wire formats that did change.</p>
+    <h4>Methods and what they promise</h4>
+    <p>The method is a verb with a contract. <code>GET</code> retrieves and is <b>safe</b> (no side effects) and <b>idempotent</b> (repeating it changes nothing). <code>PUT</code> and <code>DELETE</code> are idempotent but not safe — doing them twice lands you in the same state as once. <code>POST</code> is neither: two POSTs may create two resources, which is exactly why a double-submitted payment is dangerous and why retries need idempotency keys. <code>HEAD</code> is <code>GET</code> without a body; <code>OPTIONS</code> asks what's allowed (and drives CORS preflight); <code>PATCH</code> is a partial update. The safe/idempotent distinction isn't trivia — it's what tells a proxy, a cache, or a retry layer whether it may repeat a request on your behalf.</p>
+    <h4>Status classes</h4>
+    <p>Five classes, and the boundaries carry meaning. <b>1xx</b> informational (<code>100 Continue</code>, <code>101 Switching Protocols</code>); <b>2xx</b> success (<code>200</code>, <code>201 Created</code>, <code>204 No Content</code>); <b>3xx</b> redirection (<code>301</code> permanent vs <code>302</code> temporary, <code>304 Not Modified</code> for caching); <b>4xx</b> the client's fault (<code>400</code>, <code>401</code> unauthenticated vs <code>403</code> forbidden, <code>404</code>, <code>429 Too Many Requests</code>); <b>5xx</b> the server's fault (<code>500</code>, and the trio SREs live in: <code>502 Bad Gateway</code>, <code>503 Service Unavailable</code>, <code>504 Gateway Timeout</code>). That last trio is diagnostic: a proxy returns <code>502</code> when the upstream gave a broken reply, <code>503</code> when it's overloaded or has no healthy upstream, and <code>504</code> when the upstream didn't answer in time — three different failures people lump together as "the site's down" (the runbook is <a href="ch106-http-status-code-runbooks.html">Chapter 106</a>).</p>
+    <h4>Headers and keep-alive</h4>
+    <p>Headers carry the metadata: <code>Host</code> (mandatory in 1.1, so one IP can serve many sites), <code>Content-Type</code> and <code>Content-Length</code>, <code>Transfer-Encoding: chunked</code> (stream a body of unknown length), <code>Cache-Control</code>, <code>Authorization</code>. And <code>Connection: keep-alive</code> — the default in HTTP/1.1 — is the header that says "don't close this TCP connection, I'll reuse it," which is the same connection-reuse win from <a href="ch14-ports-sockets-ephemeral-ports-connection-lifecycle.html">Chapter 14</a>: skip the handshake and the slow-start ramp on every request after the first.</p>
+    <h4>HTTP/2: binary framing and multiplexing</h4>
+    <p>HTTP/2 keeps all of that semantics and changes only the wire format. Instead of text, it uses a <b>binary framing layer</b>: the connection is divided into <b>streams</b>, each stream carries one request/response, and streams are chopped into frames that interleave on the single connection. That interleaving is multiplexing — the many-lanes road. Headers get compressed with <b>HPACK</b> (a shared, stateful table, so repeated headers like cookies cost almost nothing after the first request). One connection now does what used to need six. The cost, again: all streams share one TCP byte stream, so a single lost segment blocks delivery of <em>every</em> stream until it's retransmitted — TCP-level head-of-line blocking that HTTP/2 cannot escape because it's below HTTP/2.</p>
+    <p>Frame by frame, here's what one HTTP/2 request actually does on the wire — this is the staff-level detail behind "multiplexing":</p>
+    <ol class="steps">
+      <li><b>One TCP connection opens and TLS negotiates <code>h2</code>.</b> During the TLS handshake, ALPN advertises <code>h2</code>; both sides agree, and no second connection is needed for the rest of the session.</li>
+      <li><b>Each side sends a <code>SETTINGS</code> frame.</b> This connection preface exchanges limits — maximum concurrent streams, initial flow-control window, max frame size — so neither end overwhelms the other.</li>
+      <li><b>The client opens a stream with a <code>HEADERS</code> frame.</b> It carries the request as HPACK-compressed headers, including pseudo-headers (<code>:method</code>, <code>:path</code>, <code>:authority</code>, <code>:scheme</code>). Client-initiated streams get odd IDs; the ID is how every later frame is routed to the right request.</li>
+      <li><b>Body bytes ride <code>DATA</code> frames on that stream</b> — and a second request can open its own stream immediately, its frames interleaving with the first on the same connection. That interleaving <em>is</em> the multiplexing.</li>
+      <li><b>The server replies with <code>HEADERS</code> then <code>DATA</code> on the same stream ID.</b> Responses from many streams come back interleaved; the receiver reassembles each by stream ID. Per-stream and per-connection flow control is managed with <code>WINDOW_UPDATE</code> frames.</li>
+      <li><b>The stream ends when both sides flag <code>END_STREAM</code>; the connection stays open for reuse.</b> To wind the whole connection down gracefully, either side sends a <code>GOAWAY</code> frame telling the peer which stream IDs it will still finish — the same mechanism gRPC uses to shed a connection.</li>
+    </ol>
+    <h4>HTTP/3: QUIC over UDP</h4>
+    <p>To remove that last stall you have to leave TCP, and that's QUIC (RFC 9000). QUIC runs over UDP and reimplements the good parts of TCP — reliability, ordering, congestion control — but <em>per stream</em>, so a lost packet only delays the one stream whose data it carried; the others keep flowing. QUIC also folds the TLS 1.3 handshake into the connection setup, so a new connection is encrypted from the first byte and set up in fewer round trips (often 1-RTT, sometimes 0-RTT for resumption). And because a QUIC connection is identified by a <b>connection ID</b> rather than the 4-tuple, it survives an IP change — your phone moving from Wi-Fi to cellular keeps the same connection instead of re-establishing it. HTTP/3 is just HTTP semantics over QUIC, with QPACK replacing HPACK to avoid re-introducing head-of-line blocking in header decoding.</p>
+
+    <details class="recall"><summary>Think first: you move a service from HTTP/1.1 to HTTP/2 and, on one lossy network path, tail latency gets <em>worse</em>. How is that possible?</summary>
+      <div class="body">
+        <p>TCP-level head-of-line blocking. Under HTTP/1.1 the browser used six separate TCP connections, so a lost packet only stalled the one connection it was on — the other five kept delivering. Under HTTP/2 everything shares a single TCP connection, so that same lost packet now stalls <em>all</em> the multiplexed streams at once until it's retransmitted. On a clean network HTTP/2 wins easily (one connection, no per-connection overhead, multiplexing); on a lossy path the single shared byte stream can lose to six independent ones. This is exactly the problem HTTP/3 was built to solve by giving each stream independent loss recovery over QUIC. The lesson: HTTP/2 is not a universal win, and "we upgraded to h2 and tail latency regressed on mobile" is a real, explainable incident, not a mystery.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The versions compared, and gRPC</h2>
+    <table class="t">
+      <tr><th></th><th>HTTP/1.1</th><th>HTTP/2</th><th>HTTP/3</th></tr>
+      <tr><td>Transport</td><td>TCP</td><td>TCP</td><td>QUIC / UDP</td></tr>
+      <tr><td>Wire format</td><td>Text</td><td>Binary frames</td><td>Binary frames</td></tr>
+      <tr><td>Concurrency</td><td>1 response/conn (≈6 conns)</td><td>Many streams / 1 conn</td><td>Many streams / 1 conn</td></tr>
+      <tr><td>App-layer HOL</td><td>Yes</td><td>Solved (multiplexing)</td><td>Solved</td></tr>
+      <tr><td>Transport HOL</td><td>Per-connection</td><td><b>Yes</b> (shared TCP stream)</td><td>Solved (per-stream)</td></tr>
+      <tr><td>Header compression</td><td>None</td><td>HPACK</td><td>QPACK</td></tr>
+      <tr><td>Encryption</td><td>Optional (TLS)</td><td>Effectively required by browsers</td><td>Built in (TLS 1.3)</td></tr>
+      <tr><td>Survives IP change</td><td>No</td><td>No</td><td>Yes (connection ID)</td></tr>
+    </table>
+    <h4>gRPC — HTTP/2 as an RPC substrate</h4>
+    <p>gRPC is a remote-procedure-call framework that uses HTTP/2 as its transport and Protocol Buffers as its message format. Each RPC is an HTTP/2 stream, so a single long-lived connection multiplexes many concurrent calls, and gRPC adds four call shapes: unary (one request, one response), server-streaming, client-streaming, and bidirectional streaming — the last two being genuinely long-lived streams that stay open for the life of the interaction. That efficiency (one warm connection, no per-call handshake, binary messages) is why gRPC is the default for internal service-to-service traffic. It's also the root of the load-balancing problem in the next section: everything a client sends goes down <em>one</em> connection.</p>
+    <p>gRPC leans on HTTP/2's <b>keep-alive PING frames</b> to keep those long-lived connections healthy — detecting a dead peer and keeping middleboxes from dropping an idle connection. Tuned too aggressively, though, the pings themselves become a problem: a server can respond to a client pinging too often with a <code>GOAWAY</code> carrying <code>ENHANCE_YOUR_CALM / too_many_pings</code>, tearing the connection down. Keep-alive tuning is therefore a two-sided negotiation, not a knob you crank.</p>
+
+    <details class="recall"><summary>Think first: you add three new replicas behind your gRPC service, but the existing replicas stay hot and the new ones get almost no traffic. What's going on?</summary>
+      <div class="body">
+        <p>Your load balancer is balancing <em>connections</em>, not <em>requests</em>. gRPC clients open one long-lived HTTP/2 connection and multiplex all their calls over it, so a connection-level (L4) load balancer makes its decision <em>once</em>, at connect time, and pins that connection — and therefore every request on it — to whichever backend it picked. New replicas added later get no share of existing connections, so they stay cold; the old replicas keep serving everything. The fix is to balance at the request/stream level: an L7, HTTP/2-aware proxy (like Envoy) that distributes individual streams across backends, or client-side load balancing where the gRPC client resolves all backend addresses and round-robins calls across sub-connections, or a service mesh that does the L7 balancing for you. This is the single most common gRPC-in-production surprise, and it looks exactly like "autoscaling isn't working."</p>
+      </div>
+    </details>
+
+    <h2 id="flow"><span class="beat">Data flow</span>One request, three ways</h2>
+    <p>A client fetches a page needing three resources. <b>Over HTTP/1.1</b> with keep-alive, the browser opens up to six TCP connections and pipelines nothing risky, sending requests and getting responses one-per-connection-at-a-time; the three resources race across the six lanes, and a slow one only blocks its own connection. <b>Over HTTP/2</b>, the browser opens one TCP connection, negotiates <code>h2</code> via TLS ALPN, and sends all three requests as concurrent streams; frames interleave, headers are HPACK-compressed, and the responses come back multiplexed — unless a packet is lost, in which case all three stall until it's retransmitted. <b>Over HTTP/3</b>, the client opens a QUIC connection over UDP (TLS 1.3 folded in, so it's encrypted and set up in one round trip), sends the three requests as independent QUIC streams, and a loss affecting one stream leaves the other two flowing. Same request, same HTTP semantics (methods, headers, status codes are identical across all three), but a completely different behaviour under concurrency and loss — which is the whole reason the versions exist and the whole reason your latency graphs change shape when you switch.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>These labs use <code>curl</code> and a local nginx that speaks HTTP/2. Set the server up once:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>docker run --rm -it --name http-lab -p 8080:8080 -p 8443:8443 nginx:latest bash
+
+<span class="c"># Inside: tools + a self-signed cert for the h2 endpoint</span>
+apt-get update &amp;&amp; apt-get install -y curl openssl nghttp2-client procps iproute2
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+  -keyout /k.pem -out /c.pem -subj "/CN=localhost" 2&gt;/dev/null
+
+cat &gt;/etc/nginx/conf.d/lab.conf &lt;&lt;'EOF'
+server { listen 8080; location / { return 200 "hi over $server_protocol\n"; } }
+server {
+  listen 8443 ssl;
+  http2 on;                       # older nginx: use  listen 8443 ssl http2;
+  ssl_certificate /c.pem; ssl_certificate_key /k.pem;
+  location / { return 200 "hi over $server_protocol\n"; }
+}
+EOF
+nginx -g 'daemon off;' &amp;</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — read an HTTP exchange with curl -v</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p><code>curl -v</code> prints the request line, the headers both ways, and the status line. Learn to read it top to bottom.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>curl -v http://localhost:8080/ 2&gt;&amp;1 | sed -n '1,20p'</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>&gt; GET / HTTP/1.1              <span class="c"># request line: method, path, version</span>
+&gt; Host: localhost:8080        <span class="c"># mandatory in 1.1</span>
+&gt; User-Agent: curl/8.5.0
+&gt; Accept: */*
+&gt;
+&lt; HTTP/1.1 200 OK             <span class="c"># status line: version, code, reason</span>
+&lt; Server: nginx
+&lt; Content-Type: text/plain
+&lt; Content-Length: 15
+&lt;
+hi over HTTP/1.1</code></pre></div>
+        <p>Lines starting <code>&gt;</code> are what curl sent; <code>&lt;</code> are what the server replied. That's the whole protocol laid bare — a verb, a path, a version, headers, a blank line, then the body. Everything else in this chapter is a smarter way to move these same bytes.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — negotiate HTTP/2 with ALPN</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>HTTP/2 in the real world is negotiated during the TLS handshake via <b>ALPN</b>. Ask for it, and watch the protocol get chosen.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>curl -k -v --http2 https://localhost:8443/ 2&gt;&amp;1 | grep -iE 'ALPN|HTTP/2|using HTTP'
+echo "---"
+curl -k -s --http1.1 https://localhost:8443/     <span class="c"># force old version on the same server</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>* ALPN: curl offers h2,http/1.1
+* ALPN: server accepted h2
+* using HTTP/2
+hi over HTTP/2
+---
+hi over HTTP/1.1</code></pre></div>
+        <p>Same server, same URL — the protocol is <em>negotiated</em>. curl offered <code>h2</code> and <code>http/1.1</code> in the TLS ClientHello's ALPN extension, and the server picked <code>h2</code>. Force <code>--http1.1</code> and the identical endpoint speaks 1.1. This is why "which HTTP version am I actually using?" is a real question in production: it depends on what both sides negotiated, not on what you assumed.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — see multiplexing, and the connection that carries it</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Prove that HTTP/2 puts many requests on <em>one</em> connection while HTTP/1.1 needs several. First, <code>nghttp</code> shows the individual streams; then <code>ss</code> shows how many TCP connections each approach actually opens.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># nghttp: request several paths at once, watch distinct stream IDs on ONE connection</span>
+nghttp -ns https://localhost:8443/ https://localhost:8443/ https://localhost:8443/ 2&gt;&amp;1 | grep -E 'stream|recv'
+
+<span class="c"># Count connections: 3 requests over h2 (one conn) vs http/1.1 (curl opens per-URL)</span>
+curl -k -s --http2 https://localhost:8443/{a,b,c} -o /dev/null -w '%{num_connects} connects\n'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>[  id=13 ] recv HEADERS ...    <span class="c"># stream 13</span>
+[  id=15 ] recv HEADERS ...    <span class="c"># stream 15  — different streams,</span>
+[  id=17 ] recv HEADERS ...    <span class="c"># stream 17  — same connection</span>
+1 connects                     <span class="c"># three requests, one TCP connection</span></code></pre></div>
+        <p>Three requests, three stream IDs, but <b>one</b> TCP connection (<code>num_connects = 1</code>) — that's multiplexing. Now the "break": what makes this a problem rather than a pure win?</p>
+        <details class="recall"><summary>Reveal the shared-connection risk</summary>
+          <div class="body">
+            <p>Everything riding one connection means everything shares the fate of that one TCP byte stream. A single lost segment blocks delivery of all three streams (TCP-level head-of-line blocking), which is why HTTP/2 can lose to HTTP/1.1's multiple connections on a lossy path — and exactly what HTTP/3 fixes by giving each stream independent loss recovery over QUIC. It also means the single connection is a single point of contention: if a proxy or load balancer routes by connection, all three requests go to the same backend (the gRPC problem in Lab 5). The takeaway: multiplexing trades many connections for one, which is a big efficiency win and a concentration of risk — and whether it helps or hurts depends on packet loss and on how your load balancer makes decisions.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — keep-alive and connection churn</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Keep-alive decides whether requests reuse a connection or open a fresh one each time. Measure both against the HTTP/1.1 endpoint and watch the connection count and leftover sockets.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># A) Reuse one connection for 100 requests (keep-alive, curl's default per invocation):</span>
+curl -s http://localhost:8080/$(printf '%.0s ' {1..1}) -o /dev/null
+curl -s -w 'reused: %{num_connects} connects for 100 reqs\n' -o /dev/null \
+  $(printf 'http://localhost:8080/ %.0s' {1..100})
+
+<span class="c"># B) Force a new connection per request (Connection: close):</span>
+for i in $(seq 1 100); do curl -s -H 'Connection: close' http://localhost:8080/ -o /dev/null; done
+echo "close-per-request TIME_WAIT: $(ss -tan state time-wait 'sport = :8080 or dport = :8080' | wc -l)"</code></pre></div>
+        <div class="out"><span class="ol">Output</span>reused: 1 connects for 100 reqs
+close-per-request TIME_WAIT: ~100</code></pre></div>
+        <p>Reusing keep-alive: 100 requests, <b>one</b> connection, zero churn. Forcing <code>Connection: close</code>: 100 handshakes and ~100 sockets left in TIME_WAIT — the exact port-pressure and latency cost from <a href="ch14-ports-sockets-ephemeral-ports-connection-lifecycle.html">Chapter 14</a>. In production the usual bug is a mismatch: the client wants to keep connections alive but the server's <code>keepalive_timeout</code> is too low (or a proxy in the middle closes early), so connections die between requests and the client silently pays for a fresh handshake every time. Tune the server keep-alive to comfortably outlast the client's request interval, and make sure no middlebox closes connections earlier than either endpoint expects.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — the gRPC L4 load-balancing trap</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>You don't need a full gRPC stack to see the mechanism — you need to internalise that gRPC pins all its calls to one long-lived HTTP/2 connection. Demonstrate the pinning with the tools you have, then reason about the fix. First, prove that many h2 requests share one connection to one backend:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># 50 requests over h2 — count how many TCP connections (backends) they touch:</span>
+curl -k -s --http2 -o /dev/null -w '%{num_connects} connects for 50 requests\n' \
+  $(printf 'https://localhost:8443/ %.0s' {1..50})</code></pre></div>
+        <div class="out"><span class="ol">Output</span>1 connects for 50 requests</code></pre></div>
+        <p>All 50 rode one connection. Now imagine that connection went through a connection-level (L4) load balancer to a pool of backends. The senior question: <em>which backends served the 50 requests, and what happens when you scale the pool from 2 to 5?</em> Reason it fully before opening the answer.</p>
+        <details class="recall"><summary>Reveal the trap and the three fixes</summary>
+          <div class="body">
+            <p><b>All 50 requests hit exactly one backend</b> — whichever one the L4 load balancer chose when the single connection was established. An L4 balancer makes its routing decision per <em>connection</em>, at connect time, and then forwards that connection's whole byte stream unchanged; it has no idea the connection carries 50 independent HTTP/2 streams. So scaling from 2 to 5 backends does nothing for existing clients: their connections are already pinned, the three new backends stay cold, and load stays skewed. That's the gRPC load-balancing pitfall, and it fools people because it looks like autoscaling or the balancer is broken when both are working exactly as designed.</p>
+            <p>The three fixes, in order of how often you'll reach for them: (1) <b>L7 / request-level load balancing</b> — put an HTTP/2-aware proxy like Envoy in front that terminates the connection and balances individual streams across backends; (2) <b>client-side load balancing</b> — have the gRPC client resolve <em>all</em> backend addresses (e.g. via a headless Service in Kubernetes) and round-robin calls across multiple sub-connections itself; (3) a <b>service mesh</b>, which is really option 1 automated for every service. You'll also tune HTTP/2 keep-alive so long-lived connections stay healthy through idle timeouts — but not so aggressively that the server sends <code>GOAWAY too_many_pings</code>. This is the flagship reason "gRPC needs different load balancing than REST," and it's a near-certain interview question for any platform role.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · gRPC traffic skew after scaling</div>
+      <p><b>Symptom:</b> new replicas behind a gRPC service get little or no traffic; old replicas stay hot; autoscaling "doesn't help." <b>First cut:</b> check per-backend request rates and how the load balancer routes (L4 vs L7). <b>Confirm:</b> each client's requests all land on one backend. <b>Cause is usually:</b> connection-level (L4) balancing of long-lived HTTP/2 connections. <b>Fix:</b> L7/request-level balancing (Envoy), client-side LB with a headless Service, or a mesh.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · HTTP/2 tail latency worse on mobile</div>
+      <p><b>Symptom:</b> after enabling HTTP/2, p99 latency regresses specifically on lossy/mobile networks. <b>First cut:</b> compare loss rates and connection counts. <b>Confirm:</b> the regression tracks packet loss. <b>Cause is usually:</b> TCP-level head-of-line blocking — one lost segment stalls all multiplexed streams, where HTTP/1.1's multiple connections would have isolated the loss. <b>Fix:</b> enable HTTP/3/QUIC where clients support it; it's precisely this problem's cure.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · connections dropped by a keep-alive mismatch</div>
+      <p><b>Symptom:</b> intermittent request failures or unexplained latency; connections seem to reset between requests. <b>First cut:</b> compare the client's idle interval to the server's and any proxy's keep-alive/idle timeouts. <b>Confirm:</b> the server or a middlebox closes the connection before the client reuses it. <b>Cause is usually:</b> a <code>keepalive_timeout</code> (or LB idle timeout) shorter than the client's reuse interval, or gRPC keep-alive pings so aggressive the server sends <code>GOAWAY too_many_pings</code>. <b>Fix:</b> align the timeouts so the endpoints and every middlebox agree.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · 502 vs 503 vs 504 confusion</div>
+      <p><b>Symptom:</b> a spike of 5xx from a proxy or gateway, reported vaguely as "the site is down." <b>First cut:</b> separate the codes. <b>Confirm &amp; cause:</b> <code>502</code> = the upstream returned a broken/invalid response (crashed worker, protocol mismatch); <code>503</code> = no healthy upstream or the service is shedding load; <code>504</code> = the upstream didn't respond within the proxy's timeout (slow backend or dependency). <b>Fix:</b> each points at a different layer — treating them as one number wastes the first ten minutes (the runbook is <a href="ch106-http-status-code-runbooks.html">Chapter 106</a>).</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Pick the version for the path, not the fashion.</b> HTTP/2 is the right default for most service-to-service and browser traffic on reliable networks — one connection, multiplexing, header compression. But it is not a free upgrade on lossy paths, where TCP head-of-line blocking can make it lose to HTTP/1.1's parallel connections; that's the case for HTTP/3, especially for mobile and edge clients. Enable HTTP/3 where clients support it and keep HTTP/2 as the negotiated fallback.</p>
+    <p><b>Load-balance gRPC at L7 or client-side, always.</b> The single biggest gRPC operational rule: never put long-lived HTTP/2 connections behind a connection-level balancer and expect even distribution. Use an HTTP/2-aware proxy, client-side balancing over a headless Service, or a mesh — and monitor per-backend request rates so skew is visible before it becomes an outage.</p>
+    <p><b>Security is increasingly non-optional.</b> Browsers require TLS for HTTP/2 in practice, and HTTP/3 builds TLS 1.3 into the protocol — there is no unencrypted HTTP/3. That's good, but it means your observability has to adapt: you can't read encrypted traffic off the wire, so you rely on structured logs, application metrics, and mesh telemetry instead of <code>tcpdump</code> of cleartext. And QUIC rides UDP, which some corporate firewalls block or rate-limit, so plan for graceful fallback to HTTP/2 over TCP rather than a hard failure.</p>
+    <p><b>Common mistakes:</b> assuming HTTP/2 is always faster; L4-balancing gRPC and blaming autoscaling for the skew; keep-alive timeouts that disagree across client, server, and proxy; lumping 502/503/504 together; and forgetting that a retried non-idempotent <code>POST</code> can double an effect, so retries need idempotency keys. Every one of these is avoidable with the model from this chapter.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>HTTP's shape drives edge and service-to-service design. At the edge, terminating HTTP/2 and HTTP/3 at a load balancer or CDN and speaking a simpler protocol to origins is a standard pattern — it puts the version negotiation, TLS, and QUIC handling in one tuned tier. Inside the mesh, the choice between REST-over-HTTP and gRPC is partly a load-balancing decision: gRPC's long-lived multiplexed connections demand L7 balancing, which is a major reason service meshes exist and put an Envoy sidecar next to every pod (<a href="ch66-service-mesh-foundations.html">Chapter 66</a>). Keep-alive and connection pooling connect straight back to the port and socket limits of <a href="ch14-ports-sockets-ephemeral-ports-connection-lifecycle.html">Chapter 14</a> — a gateway fanning in thousands of client connections and out to a pool of backends is doing exactly the reuse math you learned there. And the idempotency of methods is the foundation of safe retries, timeouts, and circuit breakers in <a href="ch88-reliability-engineering.html">Chapter 88</a>: you can only retry automatically what's safe to repeat. HTTP isn't just how the browser talks to the server; it's the contract that shapes the whole request path.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What problem does HTTP/2 multiplexing solve, and what does it not solve?</summary>
+        <div class="a"><p>It solves application-layer head-of-line blocking: HTTP/1.1 could only carry one response at a time per connection, so a slow response blocked everything behind it and browsers opened about six connections to cope. HTTP/2 puts many independent streams on one connection and interleaves their frames, so requests no longer wait in line. What it does <em>not</em> solve is transport-layer head-of-line blocking: all those streams share one TCP byte stream, so a single lost packet stalls every stream until it's retransmitted. That remaining problem is exactly what HTTP/3 over QUIC fixes.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through the three HTTP versions and the blocking each addresses.</summary>
+        <div class="a"><p>HTTP/1.1 uses TCP and text, keeps connections alive for reuse, but carries one response at a time per connection — so a slow response head-of-line-blocks the rest, and browsers work around it with roughly six parallel connections per origin. HTTP/2 keeps the same semantics but switches to a binary framing layer with streams multiplexed over a single TCP connection, plus HPACK header compression; that removes the application-layer blocking and the need for many connections. But because every stream shares one TCP connection, and TCP delivers its byte stream strictly in order, one lost segment now blocks all streams — transport-layer head-of-line blocking that HTTP/2 can't escape because it lives below it. HTTP/3 fixes that by moving off TCP entirely to QUIC over UDP, which implements reliability and ordering per stream, so a lost packet only delays its own stream while the others keep flowing; QUIC also folds in TLS 1.3 for faster, always-encrypted setup and uses connection IDs so a connection survives an IP change. So each version removes a specific stall, and the blocking moves down a layer until QUIC eliminates it.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Why does gRPC break L4 load balancing, and how do you fix it?</summary>
+        <div class="a"><p>gRPC runs over HTTP/2 and multiplexes every call as a stream over a single long-lived connection to a backend. A layer-4 load balancer balances <em>connections</em> — it picks a backend when the TCP connection is established and then forwards that connection's bytes unchanged, with no visibility into the many requests inside it. So a gRPC client's one connection pins all of its calls to one backend for the life of that connection. The consequences are traffic skew and dead new replicas: when you scale the backend pool, existing clients keep their pinned connections, so the new backends get no traffic and load stays lopsided — which looks like broken autoscaling but is the balancer working exactly as an L4 balancer should. The fixes all move the decision to the request/stream level. First, an L7, HTTP/2-aware proxy such as Envoy terminates the connection and distributes individual streams across backends. Second, client-side load balancing: the gRPC client resolves all backend addresses — in Kubernetes via a headless Service returning every pod IP — and round-robins calls across multiple sub-connections itself. Third, a service mesh, which is really the first option applied automatically to every service via sidecars. Alongside any of these I'd tune HTTP/2 keep-alive so long-lived connections survive idle timeouts, but not so aggressively that the server responds with GOAWAY and too_many_pings. The core insight is that gRPC needs request-level balancing precisely because it deliberately reuses one connection for everything.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>You enabled HTTP/2 and p99 latency got worse for mobile users. What happened and what do you do?</summary>
+        <div class="a"><p>This is TCP-level head-of-line blocking showing up on a lossy network. Before, mobile browsers used several independent TCP connections, so a lost packet stalled only the one connection it was on and the others kept delivering. After enabling HTTP/2, all the streams share a single TCP connection, so that same lost packet now stalls every stream at once until it's retransmitted — and mobile networks have enough loss for this to dominate the tail. On clean networks HTTP/2 still wins, which is why the regression is specifically mobile/lossy. I'd confirm by correlating the p99 regression with packet-loss rates and checking it's absent on low-loss paths. The real fix is HTTP/3 over QUIC, whose per-stream loss recovery means one lost packet only delays its own stream — this is the exact problem QUIC was designed for. So I'd enable HTTP/3 for clients that support it while keeping HTTP/2 as the negotiated fallback, and I would not simply "roll back to HTTP/1.1" as a permanent answer, because that's giving up multiplexing to dodge a problem QUIC solves properly.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>What's the difference between 502, 503, and 504, and why does it matter?</summary>
+        <div class="a"><p>All three are 5xx errors returned by a proxy or gateway, but they point at different failures. A 502 Bad Gateway means the upstream gave the proxy an invalid or broken response — a crashed worker, a protocol mismatch, the backend closing the connection mid-reply. A 503 Service Unavailable means there's no healthy upstream to send to or the service is deliberately shedding load — often all backends failing health checks, or a rate limiter kicking in. A 504 Gateway Timeout means the upstream was reachable but didn't respond within the proxy's timeout — a slow backend, or a slow dependency behind it. It matters because each sends you to a different layer: a 502 says look at the backend process and the proxy-to-backend protocol, a 503 says look at capacity and health checks, and a 504 says look at latency and downstream dependencies and your timeout budget. Teams that lump them together as "the site's down" waste the first ten minutes of an incident; separating them is often the fastest path to the right subsystem.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>HTTP's semantics — methods, status codes, headers — are stable across versions; what changed is how the bytes move. HTTP/1.1 reuses connections with keep-alive but carries one response at a time, so browsers open ~6 connections to get concurrency. HTTP/2 multiplexes many streams over one TCP connection with binary frames and HPACK, killing application-layer head-of-line blocking — but the shared TCP stream means one lost segment stalls all streams (transport-layer HOL). HTTP/3 moves to QUIC over UDP, giving each stream independent loss recovery, folding in TLS 1.3, and surviving IP changes via connection IDs. gRPC runs on HTTP/2 and multiplexes all calls over one long-lived connection, which breaks connection-level (L4) load balancing — fix it with L7/request-level balancing, client-side LB, or a mesh, and tune keep-alive carefully. Know your status classes, especially 502 vs 503 vs 504, and remember only idempotent methods are safe to retry automatically.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>HTTP semantics (methods, status codes, headers) are identical across 1.1/2/3; only the wire transport changes.</li>
+      <li>HTTP/1.1 = one response per connection at a time (app-layer HOL); browsers open ~6 connections to work around it.</li>
+      <li>HTTP/2 = binary frames + streams multiplexed over one TCP connection + HPACK; solves app-layer HOL.</li>
+      <li>HTTP/2's catch: one lost TCP segment stalls all streams — transport-layer HOL it can't escape.</li>
+      <li>HTTP/3 = QUIC over UDP: per-stream loss recovery (no transport HOL), built-in TLS 1.3, connection migration.</li>
+      <li>gRPC rides HTTP/2 and pins all calls to one long-lived connection — great efficiency, breaks L4 balancing.</li>
+      <li>Fix gRPC balancing at L7 (Envoy), client-side (headless Service), or with a mesh — never connection-level.</li>
+      <li>Keep-alive reuses connections (no handshake, no slow-start restart); mismatched timeouts cause churn and resets.</li>
+      <li>Status classes: 2xx ok, 3xx redirect, 4xx client, 5xx server; 502=bad upstream reply, 503=no healthy upstream, 504=upstream timeout.</li>
+      <li>Only safe/idempotent methods (GET, PUT, DELETE) are safe to auto-retry; POST needs idempotency keys.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on and toward:</span>
+      <a href="ch13-l4-tcp-deep-and-udp.html"><b>Ch 13</b> TCP &amp; UDP</a>
+      <a href="ch14-ports-sockets-ephemeral-ports-connection-lifecycle.html"><b>Ch 14</b> Keep-alive &amp; pooling</a>
+      <a href="ch17-tls-and-pki.html"><b>Ch 17</b> TLS &amp; PKI</a>
+      <a href="ch66-service-mesh-foundations.html"><b>Ch 66</b> Service mesh</a>
+      <a href="ch106-http-status-code-runbooks.html"><b>Ch 106</b> HTTP status runbooks</a>
+      <a href="ch88-reliability-engineering.html"><b>Ch 88</b> Retries &amp; idempotency</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc9110">RFC 9110: HTTP Semantics</a>. Methods, status codes, and headers, shared by all versions.</li>
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc9112">RFC 9112: HTTP/1.1</a> and <a href="https://www.rfc-editor.org/rfc/rfc9113">RFC 9113: HTTP/2</a>. The 1.1 syntax and the binary framing / multiplexing spec.</li>
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc9114">RFC 9114: HTTP/3</a>. HTTP semantics mapped onto QUIC, including QPACK.</li>
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc9000">RFC 9000: QUIC — A UDP-Based Multiplexed and Secure Transport</a>. Per-stream reliability, TLS 1.3 integration, connection migration.</li>
+      <li>gRPC — <a href="https://grpc.io/docs/">grpc.io/docs</a>. The official docs, including load-balancing and keep-alive guidance.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch15-dns-end-to-end.html"><span class="dir">← Prev</span><div class="ti">Ch 15 — DNS, end to end</div></a>
+      <a class="nx" href="ch17-tls-and-pki.html"><span class="dir">Next →</span><div class="ti">Ch 17 — TLS and PKI</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 16 of 121 · Part II · Networking from First Principles. When latency or traffic-skew doesn't add up, ask which HTTP version negotiated and how the balancer routes it.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Three versions, three flows</a>
+    <a href="#h2">Anatomy, h2, QUIC</a>
+    <a href="#components">Compared, and gRPC</a>
+    <a href="#flow">One request, three ways</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

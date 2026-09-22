@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 14 — Ports, Sockets, Ephemeral Ports &amp; the Connection Lifecycle</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part II · Networking &nbsp;·&nbsp; Chapter 14</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part II · Networking from First Principles · Chapter 14</div>
+      <h1>Ports, sockets, ephemeral ports &amp; the connection lifecycle</h1>
+      <p class="tagline">One server, one IP, one port 443 — and fifty thousand connections at once, none of them confused for another. The trick is a four-part key the kernel stamps on every packet. Understand that key and two of the ugliest production bugs — port exhaustion and CLOSE_WAIT leaks — become obvious instead of terrifying.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~40 min read · Linux lab (Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>State the 4-tuple that uniquely identifies a connection, and explain how the kernel demultiplexes with it.</li>
+          <li>Tell a listening socket from a connected socket, and trace <code>socket → bind → listen → accept → connect</code>.</li>
+          <li>Name the ephemeral port range and explain why exhaustion is a client-side problem, not a server one.</li>
+          <li>Reproduce ephemeral-port exhaustion and a CLOSE_WAIT leak on your laptop, and read them in <code>ss</code>.</li>
+          <li>Say why connection pooling and keep-alive are the real fix, not a bigger port range.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem ports solve</h2>
+    <p>An IP address gets a packet to the right <em>machine</em>. But a machine runs many programs that all want the network at once — a web server, an SSH daemon, a metrics agent, your shell's outbound curl. When a packet arrives at <code>10.0.0.10</code>, which program gets it? IP alone can't say; it only names the host. You need a second number that names the <em>conversation</em> inside the host. That number is the <b>port</b>.</p>
+    <p>But a single port isn't enough either. A busy web server has one port — 443 — and thousands of clients talking to it simultaneously. If "port 443" were the whole identity, every client's packets would blur into one indistinguishable stream. So the real identity of a connection is not one port but <b>four values together</b>: the local IP, the local port, the remote IP, and the remote port. That quartet — the <b>4-tuple</b> — is unique across the whole connection, and it's how one server keeps fifty thousand conversations on port 443 perfectly separated.</p>
+    <p>Everything in this chapter follows from that idea. A <b>socket</b> is the kernel object that holds one endpoint of a connection (or the willingness to accept new ones). Ports come in ranges with different meanings. Clients borrow a throwaway <b>ephemeral</b> port for each outbound connection, and running out of them is a real outage. And a connection has a lifecycle from creation to close that, if the application skips the last step, leaks sockets until the process falls over.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>A connection is identified by the 4-tuple <code>(local IP, local port, remote IP, remote port)</code>. A server does <em>not</em> spend a port per client — every client shares the server's one listening port, and the differing remote IP:port keeps them distinct. This is why "we'll run out of ports" is almost always a <b>client-side</b> fear, not a server-side one.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a company switchboard</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Picture a large company with one public phone number (the <b>IP address</b>) and internal extensions (the <b>ports</b>). Extension 443 is the sales desk; extension 22 is IT. When you dial in and ask for extension 443, the switchboard connects you to sales. So far, one number, many extensions — that's IP plus port.</p>
+      <p>Now here's the part people miss: the sales desk can be on fifty calls at once, all "on extension 443." How does the desk keep them straight? By <em>who's on the other end</em>. Each live call is identified not just by "extension 443" but by the full pair of endpoints: <em>this</em> outside caller's number and line, talking to <em>our</em> number and extension. That full identity — both ends — is the <b>4-tuple</b>. The extension is shared; the calls are distinct because the callers are distinct.</p>
+      <p>A <b>listening socket</b> is the sales desk sitting by the phone, ready to answer — it's not a call, it's the <em>ability to receive</em> calls. The moment a call connects, it becomes a separate <b>connected socket</b>, its own conversation with its own handle, and the desk goes right back to waiting for the next ring. When a caller hangs up, someone at the desk has to actually put the receiver down; if they wander off leaving it off the hook, that line is stuck forever — that's a <b>CLOSE_WAIT</b> leak.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In Linux / sockets</th></tr>
+      <tr><td>The public phone number</td><td>The IP address</td></tr>
+      <tr><td>An extension (443, 22)</td><td>A port (16-bit, 0–65535)</td></tr>
+      <tr><td>The full identity of one live call (both ends)</td><td>The 4-tuple: local IP+port, remote IP+port</td></tr>
+      <tr><td>The desk waiting by the phone</td><td>A listening socket (<code>LISTEN</code>)</td></tr>
+      <tr><td>One connected call in progress</td><td>A connected socket (<code>ESTABLISHED</code>)</td></tr>
+      <tr><td>The throwaway line an outbound call uses</td><td>An ephemeral (source) port</td></tr>
+      <tr><td>Leaving the receiver off the hook</td><td>A CLOSE_WAIT leak (app never called <code>close()</code>)</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>How one port serves thousands of connections</h2>
+    <p>The figure shows the thing that confuses people until it clicks: a server with a single listening socket on <code>:443</code>, and several connected sockets that all share that same local port yet stay perfectly distinct because the full 4-tuple differs. Follow how an arriving packet is matched to exactly one socket.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 452" role="img" aria-label="One server listening socket on port 443 plus several connected sockets, each identified by a unique 4-tuple; incoming packets are demultiplexed by matching all four values">
+        <defs>
+          <marker id="s1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="s2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+        </defs>
+
+        <!-- clients -->
+        <text x="130" y="30" text-anchor="middle" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">CLIENTS</text>
+        <rect x="24" y="56" width="212" height="44" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="130" y="74" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">Client A</text>
+        <text x="130" y="91" text-anchor="middle" style="fill:var(--muted);font:11px ui-monospace,monospace">203.0.113.5:51001</text>
+        <rect x="24" y="176" width="212" height="44" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="130" y="194" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">Client B</text>
+        <text x="130" y="211" text-anchor="middle" style="fill:var(--muted);font:11px ui-monospace,monospace">198.51.100.7:44210</text>
+        <rect x="24" y="296" width="212" height="44" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="130" y="314" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">Client A again (2nd tab)</text>
+        <text x="130" y="331" text-anchor="middle" style="fill:var(--muted);font:11px ui-monospace,monospace">203.0.113.5:51002</text>
+
+        <!-- server panel -->
+        <rect x="300" y="20" width="400" height="412" rx="12" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="320" y="44" style="fill:var(--accent2);font:700 12px sans-serif;letter-spacing:.05em">SERVER — 10.0.0.10</text>
+
+        <rect x="320" y="56" width="360" height="52" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:2;stroke-dasharray:5 3"/>
+        <text x="334" y="76" style="fill:var(--accent2);font:700 12px ui-monospace,monospace">LISTEN  socket (a factory, not a call)</text>
+        <text x="334" y="97" style="fill:var(--ink);font:12px ui-monospace,monospace">10.0.0.10:443  ←  *:*   (any remote)</text>
+
+        <rect x="320" y="132" width="360" height="76" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="334" y="152" style="fill:var(--muted);font:700 11px sans-serif">CONNECTED socket · Client A</text>
+        <text x="334" y="172" style="fill:var(--ink);font:11.5px ui-monospace,monospace">local  10.0.0.10:443</text>
+        <text x="334" y="190" style="fill:var(--ink);font:11.5px ui-monospace,monospace">remote 203.0.113.5:51001</text>
+
+        <rect x="320" y="220" width="360" height="76" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="334" y="240" style="fill:var(--muted);font:700 11px sans-serif">CONNECTED socket · Client B</text>
+        <text x="334" y="260" style="fill:var(--ink);font:11.5px ui-monospace,monospace">local  10.0.0.10:443</text>
+        <text x="334" y="278" style="fill:var(--ink);font:11.5px ui-monospace,monospace">remote 198.51.100.7:44210</text>
+
+        <rect x="320" y="308" width="360" height="76" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="334" y="328" style="fill:var(--muted);font:700 11px sans-serif">CONNECTED socket · Client A (2nd)</text>
+        <text x="334" y="348" style="fill:var(--ink);font:11.5px ui-monospace,monospace">local  10.0.0.10:443</text>
+        <text x="334" y="366" style="fill:var(--ink);font:11.5px ui-monospace,monospace">remote 203.0.113.5:51002</text>
+
+        <text x="500" y="410" text-anchor="middle" style="fill:var(--accent);font:700 11.5px sans-serif">all share :443 — demuxed by the full 4-tuple (only the remote differs)</text>
+
+        <!-- arrows -->
+        <line x1="238" y1="78" x2="318" y2="168" style="stroke:var(--accent);stroke-width:2" marker-end="url(#s1)"/>
+        <line x1="238" y1="198" x2="318" y2="256" style="stroke:var(--accent);stroke-width:2" marker-end="url(#s1)"/>
+        <line x1="238" y1="318" x2="318" y2="344" style="stroke:var(--accent);stroke-width:2" marker-end="url(#s1)"/>
+      </svg>
+      <figcaption>Same server, same listening port, three connected sockets. Two of them are even from the <em>same client IP</em> — they stay distinct because the client's ephemeral port differs (51001 vs 51002). The 4-tuple is the key; the port alone is not.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>When someone worries "can our service handle 100k connections on one port?", the answer is: ports aren't the constraint — file descriptors and memory are. Each connected socket is a file descriptor and a chunk of kernel memory, so the ceiling is <code>ulimit -n</code> and RAM, tuned exactly like the "too many open files" problem from <a href="ch01-kernel-and-system-calls.html">Chapter 1</a>. Port exhaustion is a different bug entirely, and it's on the <em>client</em>. Knowing which side runs out of what stops you from tuning the wrong machine at 3&nbsp;a.m.</p>
+    </div>
+
+    <h2 id="tuple"><span class="beat">Internal working</span>The 4-tuple, sockets, and the syscall lifecycle</h2>
+    <p>Here's the machinery, in the order a connection actually happens. The <b>server</b> path first:</p>
+    <ol class="steps">
+      <li><b><code>socket()</code></b> creates an endpoint and returns a file descriptor. At this point it's just an fd with no address — it can't receive anything yet.</li>
+      <li><b><code>bind()</code></b> pins it to a local address and port, e.g. <code>0.0.0.0:443</code> (all interfaces) or <code>10.0.0.10:443</code> (one interface). This is where "address already in use" comes from if something else holds the port.</li>
+      <li><b><code>listen()</code></b> marks the socket <em>passive</em> and creates the two queues from <a href="ch13-l4-tcp-deep-and-udp.html">Chapter 13</a>: the SYN queue and the accept queue. The socket is now in <code>LISTEN</code>. It is not a connection — it's a factory for connections.</li>
+      <li><b><code>accept()</code></b> pops one completed connection off the accept queue and returns a <em>new</em> file descriptor for it. The listening socket stays open and keeps accepting; each accepted connection is its own connected socket with a full 4-tuple.</li>
+    </ol>
+    <p>The <b>client</b> path is shorter:</p>
+    <ol class="steps">
+      <li><b><code>socket()</code></b> — an fd, as before.</li>
+      <li><b><code>connect(remote)</code></b> — the client usually skips explicit <code>bind()</code>, so the kernel <em>auto-binds</em> a local ephemeral port for it, then sends the SYN. From this moment the connection has its full 4-tuple: the kernel-chosen local port plus the remote it's dialling.</li>
+    </ol>
+    <p>Now the part that makes it all work — <b>demultiplexing</b>. When a packet arrives, the kernel builds its 4-tuple and looks for a match, most specific first:</p>
+    <ol class="steps">
+      <li><b>Exact 4-tuple match to an established socket?</b> Deliver it there. This is the common case — packets on existing connections.</li>
+      <li><b>No established match, but a listening socket owns that local IP:port?</b> It's a new connection (a SYN); hand it to the listener to begin a handshake.</li>
+      <li><b>No match at all?</b> The kernel replies with a RST (TCP) or an ICMP port-unreachable (UDP) — that's the <code>ECONNREFUSED</code> from the last chapter.</li>
+    </ol>
+    <p>That ordering is why a server needs only one port for countless clients: established connections are matched by the whole tuple before the listener is ever consulted. It's also why the ephemeral port matters so much on the client: for connections to the <em>same</em> destination, the local IP, remote IP, and remote port are all fixed, so the local ephemeral port is the <em>only</em> thing making each connection's tuple unique — and there are a finite number of them.</p>
+
+    <details class="recall"><summary>Think first: a load-balancer node opens connections to one backend at <code>10.0.5.9:8080</code>. Roughly how many simultaneous connections can it make before something breaks, and what breaks?</summary>
+      <div class="body">
+        <p>About 28,000 — the size of the default ephemeral port range (<code>32768–60999</code>). To one fixed destination, three of the four tuple values are constant (the node's local IP, the backend IP, the backend port 8080), so uniqueness rides entirely on the local ephemeral port. Once every ephemeral port is in use for a connection to that destination, the next <code>connect()</code> fails with <code>EADDRNOTAVAIL</code> ("cannot assign requested address"). The server, by contrast, is nowhere near a limit — it's demuxing all of these by their differing remote ports on its single port 8080. The lesson: exhaustion is per-(local IP, destination), and it's a client problem you solve with connection reuse or more source addresses, not by touching the backend.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>Port ranges, reuse options, keep-alive, pooling</h2>
+    <h4>The port ranges (IANA / RFC 6335)</h4>
+    <p>A port is a 16-bit number, so 0–65535, split by IANA into three bands: <b>system / well-known</b> ports 0–1023 (443, 80, 22, 53 — binding these needs privilege or the <code>CAP_NET_BIND_SERVICE</code> capability), <b>user / registered</b> ports 1024–49151 (assigned to specific applications), and <b>dynamic / ephemeral</b> ports 49152–65535 (never assigned, free for temporary client use). Linux doesn't follow IANA's ephemeral boundary exactly — its default is <code>net.ipv4.ip_local_port_range = 32768 60999</code>, roughly 28,000 ports. That number is the budget you can exhaust.</p>
+    <h4>SO_REUSEADDR vs SO_REUSEPORT</h4>
+    <p>Two socket options people confuse constantly. <b><code>SO_REUSEADDR</code></b> mainly lets a server <code>bind()</code> a port that's still held by connections in <code>TIME_WAIT</code> — without it, restarting a crashed server often fails with "address already in use" until the old TIME_WAITs drain. <b><code>SO_REUSEPORT</code></b> is different and newer: it lets <em>multiple</em> sockets bind the <em>same</em> port simultaneously, and the kernel load-balances incoming connections across them. That's how a multi-process server (nginx workers, a Go server with several listeners) spreads accept load across cores without a single accepting thread becoming the bottleneck.</p>
+    <h4>Keep-alive — two different things with the same name</h4>
+    <p><b>TCP keep-alive</b> is a kernel feature: after a connection is idle for <code>tcp_keepalive_time</code> (default 7200 seconds — two hours), the kernel sends probe packets to check the peer is still there, tearing the connection down if it's gone. Its real value in production is keeping middleboxes from silently dropping idle flows, so you tune it far below the default. <b>Application keep-alive</b> is separate — it's the decision to <em>reuse</em> an established connection for multiple requests instead of closing it, which is HTTP's persistent-connection behaviour (<a href="ch16-http-http-2-http-3-and-grpc.html">Chapter 16</a>). Same word, two layers.</p>
+    <h4>Connection reuse and pooling</h4>
+    <p>The single most valuable pattern in this whole chapter: don't open a connection per request. A <b>connection pool</b> keeps a set of established connections open and hands them out for reuse, so you pay the handshake and slow-start cost once and amortise it over thousands of requests. Pooling is what keeps a client's ephemeral-port usage flat instead of climbing, what keeps TIME_WAIT from piling up, and what makes high request rates cheap. Every serious HTTP client, database driver, and RPC library ships a pool; misconfiguring it (pool too small, or accidentally disabled) is a top cause of the exhaustion incidents below.</p>
+
+    <details class="recall"><summary>Think first: your app pool is set to "no keep-alive, new connection per request," and it talks to one internal API. Under load you see thousands of TIME_WAIT and occasional connect failures. What's the single change that fixes it?</summary>
+      <div class="body">
+        <p>Turn on connection reuse (keep-alive / a real pool). Per-request connections mean every request opens a fresh 4-tuple, does a handshake, and — because the client is the active closer — leaves a TIME_WAIT holding an ephemeral port for 60 seconds. At a few hundred requests per second to one destination you approach the ~28k/60s ceiling and <code>connect()</code> starts failing. Reusing connections collapses thousands of short-lived tuples into a handful of long-lived ones, so ephemeral-port usage goes flat and TIME_WAIT nearly vanishes. Bumping the port range or enabling <code>tcp_tw_reuse</code> buys headroom, but the actual defect is opening connections you didn't need to.</p>
+      </div>
+    </details>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following a socket from birth to leak-free death</h2>
+    <p>A client does <code>socket()</code> → gets fd 3 → <code>connect("10.0.0.10:443")</code>; the kernel auto-binds ephemeral port 51001, and the 4-tuple <code>(client:51001, 10.0.0.10:443)</code> exists. Bytes flow over fd 3. When the client is done it calls <code>close(3)</code>, which sends a FIN and releases the fd. On the server, the listening socket (fd 4) had returned a connected socket (fd 7) from <code>accept()</code>; the server reads and writes fd 7, and — this is the step that matters — when it's finished it calls <code>close(7)</code>, sending its own FIN and freeing the fd. Both sides tore down cleanly: the client passes through TIME_WAIT (it closed first), the server reaches CLOSED immediately, and no descriptors leak. The <em>whole</em> difference between a healthy service and a CLOSE_WAIT leak is whether the server reliably reaches that <code>close(7)</code> on every path, including error paths. Miss it — an exception that skips the close, a handler that returns without cleaning up — and fd 7 sits in CLOSE_WAIT forever, one leaked descriptor at a time, until the process hits its fd limit and stops accepting anything.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>All labs run in one throwaway container; open a couple of shells into it with <code>docker exec</code>.</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>docker run --rm -it --name sock-lab ubuntu:24.04 bash
+
+<span class="c"># Inside:</span>
+apt-get update &amp;&amp; apt-get install -y iproute2 netcat-openbsd curl python3 lsof procps</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — read every socket with ss -tanp</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p><code>ss -tanp</code> is the command you'll type ten thousand times: <b>t</b>cp, <b>a</b>ll states, <b>n</b>umeric (don't resolve names), <b>p</b>rocess. Start a server and read the sockets.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>python3 -m http.server 8080 &amp;
+ss -tanp | grep -E 'State|8080'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>State   Recv-Q Send-Q  Local Address:Port  Peer Address:Port  Process
+LISTEN  0      5       0.0.0.0:8080        0.0.0.0:*          users:(("python3",pid=42,fd=3))</code></pre></div>
+        <p>Read the listener: local <code>0.0.0.0:8080</code> (all interfaces), peer <code>0.0.0.0:*</code> (any — the wildcard that says "I'm a factory, not a call"), and the owning process with its <b>file descriptor 3</b>. That fd link is gold: it ties a socket straight to a process and a descriptor, so <code>ls -l /proc/42/fd/3</code> confirms it. Now open a connection and look again — you'll see the listener plus a fully-specified connected socket with a real peer address.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — one port, many connections</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Prove the 4-tuple claim: open several long-lived connections to one server port and watch them all share <code>:8080</code> while staying distinct.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Three connections held open with sleep so we can observe them:</span>
+for i in 1 2 3; do (nc -q0 127.0.0.1 8080 &lt;&lt;&lt;$'GET / HTTP/1.0\r\n\r\n' &amp; sleep 2) &amp; done
+sleep 1
+ss -tanp 'dport = :8080 or sport = :8080' | grep -v LISTEN</code></pre></div>
+        <div class="out"><span class="ol">Output</span>ESTAB  0  0  127.0.0.1:8080   127.0.0.1:39218
+ESTAB  0  0  127.0.0.1:8080   127.0.0.1:39230
+ESTAB  0  0  127.0.0.1:8080   127.0.0.1:39244
+ESTAB  0  0  127.0.0.1:39218  127.0.0.1:8080   <span class="c"># the client ends</span>
+...</code></pre></div>
+        <p>Every server-side row has the same local port, <code>8080</code> — the differing peer ports (<code>39218</code>, <code>39230</code>, <code>39244</code>) are the ephemeral ports the client borrowed, and they're the only thing distinguishing the tuples. One listening port, three live conversations, zero confusion. The server spent no extra ports; the client spent three ephemeral ones.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — exhaust the ephemeral port range</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Shrink the ephemeral range to a tiny window, then try to open more connections than there are ports — all to one destination. Predict the failure before you read it.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>sysctl -w net.ipv4.ip_local_port_range="60000 60009"   <span class="c"># only 10 source ports</span>
+python3 -m http.server 9000 &amp;
+python3 - &lt;&lt;'PY'
+import socket
+held=[]
+try:
+    for i in range(40):
+        c=socket.create_connection(("127.0.0.1",9000))   # keep it open
+        held.append(c)
+    print("opened all 40 (unexpected)")
+except OSError as e:
+    print(f"failed after {len(held)} connections -> errno {e.errno}: {e.strerror}")
+PY</code></pre></div>
+        <div class="out"><span class="ol">Output</span>failed after 10 connections -> errno 99: Cannot assign requested address</code></pre></div>
+        <p>It dies at ten — exactly the number of ports in the range. Why does the same machine, moments earlier, happily serve on <code>:9000</code> yet can't open an eleventh <em>outbound</em> connection?</p>
+        <details class="recall"><summary>Reveal what ran out</summary>
+          <div class="body">
+            <p><b>Source ports</b>, not connections in general. All ten connections go to the identical destination <code>127.0.0.1:9000</code>, so the destination IP and port are fixed and the local IP is fixed — the only free variable in the 4-tuple is the local ephemeral port, and you gave the kernel only ten of them. The eleventh <code>connect()</code> has no unique tuple left to form, so it fails with <code>EADDRNOTAVAIL</code> (errno 99). The server side never even notices — it's demuxing the ten fine. In the real world this is a load balancer, sidecar proxy, or batch job hammering one backend with fresh connections. Fixes: reuse connections (pooling), spread across more destinations, add source IPs, or widen the range. Reset it: <code>sysctl -w net.ipv4.ip_local_port_range="32768 60999"</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — spot a CLOSE_WAIT leak</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Run a server that accepts connections but <em>never closes them</em> — the classic application bug. Then disconnect clients and watch the sockets get stuck.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># A leaky server: accept() forever, keep every fd, never close():</span>
+python3 - &lt;&lt;'PY' &amp;
+import socket
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0",9100)); s.listen(128)
+leaked=[]
+while True:
+    c,_=s.accept(); leaked.append(c)   # BUG: never c.close()
+PY
+sleep 1
+<span class="c"># Five clients connect and immediately hang up:</span>
+for i in $(seq 1 5); do nc -w1 127.0.0.1 9100 &lt;/dev/null; done
+sleep 1
+ss -tanp state close-wait 'sport = :9100'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>Recv-Q Send-Q  Local Address:Port  Peer Address:Port  Process
+1      0       127.0.0.1:9100      127.0.0.1:43102    users:(("python3",pid=88,fd=6))
+1      0       127.0.0.1:9100      127.0.0.1:43110    users:(("python3",pid=88,fd=7))
+...</code></pre></div>
+        <p>Five sockets stuck in <code>CLOSE-WAIT</code>, each pinned to the python process and a distinct fd (6, 7, 8…). They will <b>never</b> clear on their own — and that's the diagnostic tell. Here's the distinction that matters most in this chapter:</p>
+        <details class="recall"><summary>Reveal: CLOSE_WAIT vs TIME_WAIT — which is the app's fault?</summary>
+          <div class="body">
+            <p><b>CLOSE_WAIT is always the application's bug.</b> It means the peer sent a FIN, the kernel ACKed it, and the socket is now waiting for <em>your</em> program to call <code>close()</code> — which it never did. The kernel can't clean it up; only the app can, so CLOSE_WAIT sockets accumulate without limit until the process runs out of file descriptors and stops serving, while looking healthy on CPU and memory. <b>TIME_WAIT, by contrast, is the kernel's doing and self-heals</b> in ~60 seconds; it's normal and protective (<a href="ch13-l4-tcp-deep-and-udp.html">Chapter 13</a>). So the one-line rule on call: a growing pile of TIME_WAIT is a <em>rate</em> problem (too many short connections) that clears itself; a growing pile of CLOSE_WAIT is a <em>code</em> problem (a missing close on some path) that never clears and will eventually take the process down. The fix is in the app — close every socket on every path, including errors — and <code>ss -tanp state close-wait</code> hands you the exact PID and fd to blame. Kill the server to reset: <code>kill %1</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — prove pooling fixes port churn</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>Measure the difference between per-request connections and a reused connection, the way you'd justify a pooling change to a skeptical team. Fire 300 requests two ways and count the aftermath.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>python3 -m http.server 9200 &amp;
+
+<span class="c"># A) New connection per request (curl default per invocation):</span>
+for i in $(seq 1 300); do curl -s http://127.0.0.1:9200/ -o /dev/null; done
+echo "per-request TIME_WAIT:  $(ss -tan state time-wait 'sport = :9200' | wc -l)"
+
+<span class="c"># B) One connection reused for all 300 requests (keep-alive):</span>
+curl -s $(printf 'http://127.0.0.1:9200/ ' {1..300}) -o /dev/null
+echo "reused    TIME_WAIT:  $(ss -tan state time-wait 'sport = :9200' | wc -l)"</code></pre></div>
+        <div class="out"><span class="ol">Output (order of magnitude)</span>per-request TIME_WAIT:  ~300
+reused    TIME_WAIT:  ~1</code></pre></div>
+        <p>Same 300 requests, same work done — but per-request connections leave ~300 ephemeral ports parked in TIME_WAIT, while a single reused connection leaves essentially none. Now the senior question: <em>why is reuse not just "less TIME_WAIT" but genuinely faster?</em></p>
+        <details class="recall"><summary>Reveal the full payoff</summary>
+          <div class="body">
+            <p>Three wins stack up. First, ephemeral-port and TIME_WAIT pressure drop to near zero, so you can't exhaust the range no matter the request rate. Second, you skip the handshake round trip on every request after the first — for a cross-region call that's tens of milliseconds saved per request. Third, you skip TCP slow start each time: a fresh connection starts with a small congestion window and ramps up, so early requests on a new connection are throttled, whereas a warm reused connection already has a large <code>cwnd</code> and runs at full speed. That's why a well-configured connection pool is one of the biggest, cheapest latency wins available, and why "new connection per request" is a performance bug even when it isn't yet an outage. It's the same reasoning that makes HTTP keep-alive and HTTP/2 multiplexing matter in <a href="ch16-http-http-2-http-3-and-grpc.html">Chapter 16</a>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · ephemeral-port exhaustion</div>
+      <p><b>Symptom:</b> a client, proxy, or job starts failing outbound connections to one destination with "cannot assign requested address" (<code>EADDRNOTAVAIL</code>), while the destination is healthy and other destinations work. <b>First cut:</b> <code>ss -tan | grep &lt;dst&gt; | wc -l</code> and <code>sysctl net.ipv4.ip_local_port_range</code>. <b>Confirm:</b> the count of sockets to that destination is near the range size. <b>Cause is usually:</b> per-request connections to one backend. <b>Fix:</b> connection pooling first; then <code>tcp_tw_reuse</code>, a wider range, or more source IPs as headroom.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · CLOSE_WAIT leak</div>
+      <p><b>Symptom:</b> a service slowly stops accepting connections over hours or days; restarting fixes it temporarily; CPU and memory look fine. <b>First cut:</b> <code>ss -tanp state close-wait | wc -l</code> and watch it climb; <code>ls /proc/&lt;pid&gt;/fd | wc -l</code> approaching the fd limit. <b>Confirm:</b> CLOSE_WAIT count grows and never falls. <b>Cause is usually:</b> the application doesn't call <code>close()</code> on some code path — often an error path, a dropped exception, or a framework misuse. <b>Fix:</b> in the code; the OS cannot reclaim these.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · "address already in use" on restart</div>
+      <p><b>Symptom:</b> a service fails to start right after a crash or redeploy with <code>EADDRINUSE</code>, then succeeds a minute later. <b>First cut:</b> <code>ss -tan state time-wait 'sport = :&lt;port&gt;'</code>. <b>Confirm:</b> old connections in TIME_WAIT still hold the port. <b>Cause is usually:</b> the listener didn't set <code>SO_REUSEADDR</code>, so it can't bind over draining TIME_WAITs. <b>Fix:</b> set <code>SO_REUSEADDR</code> on the listening socket (most frameworks expose a flag).</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · fd exhaustion masquerading as "port exhaustion"</div>
+      <p><b>Symptom:</b> a high-connection server stops accepting with <code>EMFILE</code>/"too many open files." <b>First cut:</b> <code>ls /proc/&lt;pid&gt;/fd | wc -l</code> vs <code>cat /proc/&lt;pid&gt;/limits</code>. <b>Cause is usually:</b> the server hit its file-descriptor limit — each connection is an fd. This is not a port problem (the server reuses one port); it's the <code>ulimit -n</code> ceiling. <b>Fix:</b> raise the limit and, if the growth is unbounded, hunt a socket leak.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Know which side runs out of what.</b> Servers are bounded by file descriptors and memory (one fd per connection, all on one port); clients are bounded by ephemeral ports (per local-IP-to-destination). Tune the limit on the machine that actually hits its ceiling — raising the server's port range does nothing for a client's exhaustion, and vice versa. This single distinction resolves a huge fraction of connection incidents.</p>
+    <p><b>Pool and keep alive by default.</b> The cheapest reliability and latency win in networked systems is reusing connections. Set connection pools deliberately (sized to concurrency, not left at a tiny default), enable HTTP keep-alive, and tune TCP keep-alive below any middlebox idle timeout so long-lived pooled connections don't get silently reset. A pool that's too small serialises requests; a pool that never reuses churns ports — both are common misconfigurations.</p>
+    <p><b>Security lives partly here too.</b> Binding a well-known port (&lt;1024) needs privilege or <code>CAP_NET_BIND_SERVICE</code> — which is why containers often run apps on high ports and let a proxy or a service map the low one. Listening on <code>0.0.0.0</code> exposes a service on every interface, including ones you didn't mean to; binding to a specific interface or <code>127.0.0.1</code> is a real access control. And <code>ss -tlnp</code> is a security tool: it shows exactly what's listening and who owns it, which is step one of "what is this box exposing?"</p>
+    <p><b>Common mistakes:</b> assuming a server can run out of ports (it runs out of fds); disabling keep-alive and then fighting TIME_WAIT with kernel tunables; leaving CLOSE_WAIT unmonitored until a service tips over; forgetting <code>SO_REUSEADDR</code> and blaming a slow restart on something else; and binding to <code>0.0.0.0</code> by habit when the service should be local-only.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>The 4-tuple and the ephemeral-port ceiling shape how you build the middle of a system. Any component that fans in — a load balancer, an API gateway, a service-mesh sidecar — is a client to everything behind it, so it's exactly where ephemeral-port exhaustion bites, which is why these components live and die by connection pooling and why some spread across multiple source IPs. The listening-vs-connected distinction is the foundation of how services scale on a box: <code>SO_REUSEPORT</code> across worker processes is how a single port saturates many cores. And the connection lifecycle is why graceful shutdown is a design concern — draining in-flight connections and closing cleanly, rather than dropping them, is the difference between a deploy that's invisible to users and one that spikes errors. When you get to Kubernetes Services (<a href="ch43-services-and-the-datapath-pod-to-service.html">Chapter 43</a>), the DNAT that maps a service IP to pod IPs is manipulating these very tuples, and conntrack is tracking them — the same machinery, one layer up.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>How does one server handle 50,000 connections on a single port without confusion?</summary>
+        <div class="a"><p>Because a connection is identified by the full 4-tuple — local IP, local port, remote IP, remote port — not by the port alone. All 50,000 share the server's one local port, but each has a different remote IP:port, so the kernel demultiplexes every incoming packet to exactly one connected socket by matching all four values. The server spends no extra ports per client; its real limits are file descriptors and memory, one per connection.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through the syscalls for a server and a client, and where the ephemeral port appears.</summary>
+        <div class="a"><p>The server calls <code>socket()</code> to get a file descriptor, <code>bind()</code> to pin it to a local address and port like <code>0.0.0.0:443</code>, and <code>listen()</code> to make it passive — that creates the SYN and accept queues and puts it in LISTEN. It then calls <code>accept()</code> in a loop, and each call pops one completed connection and returns a brand-new fd for that connected socket, while the listening socket keeps accepting. The client calls <code>socket()</code> and then <code>connect(remote)</code>; it usually doesn't <code>bind()</code>, so the kernel auto-assigns a local ephemeral port from <code>ip_local_port_range</code> — that's where the ephemeral port appears, and it's the value that makes each client connection's 4-tuple unique when they all go to the same destination. Data flows over the connected fds, and each side calls <code>close()</code> when done, which sends a FIN. The step people forget is that missing <code>close()</code> on the server is what causes a CLOSE_WAIT leak.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Explain the difference between a CLOSE_WAIT pile-up and a TIME_WAIT pile-up.</summary>
+        <div class="a"><p>They look similar in <code>ss</code> but have opposite causes and opposite owners. TIME_WAIT is held by the active closer — whoever sent the first FIN — after it has acknowledged the peer's FIN, for about 60 seconds on Linux, and then it clears itself. It's the kernel doing its job: protecting a reused 4-tuple from delayed duplicates and keeping the final ACK re-sendable. A big TIME_WAIT pile is a <em>rate</em> symptom — too many short-lived connections per second — and it self-heals; you relieve it with connection reuse, not by disabling it. CLOSE_WAIT is the other side of a close: the peer sent a FIN, your kernel ACKed it, and the socket now waits for <em>your application</em> to call <code>close()</code>. If the app never does, the socket is stuck in CLOSE_WAIT indefinitely — the kernel can't reclaim it. So a growing CLOSE_WAIT pile is always an application bug, usually a missing close on an error path, and it never clears on its own; it grows until the process exhausts its file descriptors and stops accepting, all while CPU and memory look fine. The diagnostic value is that <code>ss -tanp state close-wait</code> gives you the exact PID and fd to fix, and the mental model is: TIME_WAIT self-heals and is the OS's; CLOSE_WAIT accumulates and is yours.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A sidecar proxy fails outbound connections to one upstream with "cannot assign requested address." How do you fix it?</summary>
+        <div class="a"><p>That error is <code>EADDRNOTAVAIL</code>, and it means the proxy ran out of ephemeral source ports to that upstream. Because every connection from the proxy to that one upstream shares the proxy's local IP and the upstream's IP:port, the only unique part of the 4-tuple is the local ephemeral port, and there are only about 28,000 by default. I'd confirm by counting sockets to that upstream with <code>ss -tan</code> and checking <code>ip_local_port_range</code> — if the count is near the range size, that's it. The real fix is connection reuse: the proxy should pool and keep connections to the upstream alive instead of opening a new one per request, which collapses thousands of short-lived tuples into a few long-lived ones and takes the pressure off entirely. As headroom I'd also enable <code>tcp_tw_reuse</code> for outbound connections and could widen the port range or add source IPs, but those are band-aids — if the proxy is opening a connection per request, that's the defect. Crucially, the upstream server is fine and needs no change; this is a client-side limit.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>What's the difference between <code>SO_REUSEADDR</code> and <code>SO_REUSEPORT</code>?</summary>
+        <div class="a"><p><code>SO_REUSEADDR</code> mostly solves the "address already in use" problem on restart: it lets a server <code>bind()</code> a port that still has connections lingering in TIME_WAIT, so a crashed service can come straight back up instead of waiting a minute for those to drain. It does not let two live listeners share a port. <code>SO_REUSEPORT</code> is the newer, stronger option: it allows multiple sockets — typically one per worker process or thread — to bind the <em>same</em> port at the same time, and the kernel load-balances incoming connections across them. That's how a multi-process server like nginx or a multi-listener Go service spreads accept work across CPU cores without a single accepting thread becoming the bottleneck. So: <code>SO_REUSEADDR</code> is about reusing an address that's draining; <code>SO_REUSEPORT</code> is about sharing a live address across workers for scale.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>A port names a conversation inside a host, but a connection's real identity is the 4-tuple: local IP, local port, remote IP, remote port. The kernel demultiplexes every packet by matching the full tuple to a connected socket first, falling back to a listening socket for new connections, and a RST/ICMP for no match. A server needs only one listening port for countless clients — its limits are file descriptors and memory, not ports. Clients borrow an ephemeral port per outbound connection from a ~28,000-port range, and exhausting it (per local-IP-to-destination) is a client-side outage fixed by connection reuse. The lifecycle is <code>socket → bind → listen → accept</code> on the server, <code>socket → connect</code> on the client, and <code>close()</code> on both — skip the server's close and you leak sockets in CLOSE_WAIT until the process dies. TIME_WAIT self-heals and is the OS's; CLOSE_WAIT accumulates and is your code's bug. Read all of it with <code>ss -tanp</code>.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>A connection is the 4-tuple (local IP, local port, remote IP, remote port), not a single port.</li>
+      <li>One listening port serves unlimited clients; they're told apart by their differing remote IP:port.</li>
+      <li>Servers run out of file descriptors and memory, not ports. Port exhaustion is a client-side problem.</li>
+      <li>Ephemeral range is ~28,000 ports (<code>32768–60999</code> default); to one destination that's your simultaneous-connection ceiling.</li>
+      <li>Lifecycle: <code>socket → bind → listen → accept</code> (server), <code>socket → connect</code> (client); <code>connect()</code> auto-binds an ephemeral port.</li>
+      <li>A listening socket is a factory (<code>LISTEN</code>, wildcard remote); <code>accept()</code> returns a new fd per connection.</li>
+      <li>CLOSE_WAIT means your app never called <code>close()</code> — it never clears and is always a code bug.</li>
+      <li>TIME_WAIT is the kernel's, self-heals in ~60s; don't confuse the two.</li>
+      <li><code>SO_REUSEADDR</code> rebinds a draining port on restart; <code>SO_REUSEPORT</code> shares a live port across workers.</li>
+      <li>Connection pooling and keep-alive fix port churn and cut latency (no handshake, no slow-start restart) — the default win.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on and toward:</span>
+      <a href="ch13-l4-tcp-deep-and-udp.html"><b>Ch 13</b> TCP &amp; UDP</a>
+      <a href="ch01-kernel-and-system-calls.html"><b>Ch 1</b> Syscalls &amp; file descriptors</a>
+      <a href="ch16-http-http-2-http-3-and-grpc.html"><b>Ch 16</b> Keep-alive &amp; multiplexing</a>
+      <a href="ch43-services-and-the-datapath-pod-to-service.html"><b>Ch 43</b> Service datapath</a>
+      <a href="ch86-the-data-layer-mysql-and-postgresql.html"><b>Ch 86</b> DB connection pools</a>
+      <a href="ch105-network-runbooks.html"><b>Ch 105</b> Network runbooks</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc6335">RFC 6335: IANA Procedures for Service Name and Transport Protocol Port Number Registry</a>. Defines the well-known / registered / dynamic port ranges.</li>
+      <li>IANA — <a href="https://www.iana.org/assignments/service-names-port-numbers/service-names-port-numbers.xhtml">Service Name and Transport Protocol Port Number Registry</a>. The authoritative assignment list.</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man7/socket.7.html">socket(7)</a>: socket options including <code>SO_REUSEADDR</code> and <code>SO_REUSEPORT</code>.</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man2/connect.2.html">connect(2)</a>, <a href="https://man7.org/linux/man-pages/man2/listen.2.html">listen(2)</a>, <a href="https://man7.org/linux/man-pages/man2/accept.2.html">accept(2)</a>: the connection lifecycle syscalls.</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man7/ip.7.html">ip(7)</a> (the <code>ip_local_port_range</code> sysctl) and <a href="https://man7.org/linux/man-pages/man7/tcp.7.html">tcp(7)</a> (keep-alive settings).</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch13-l4-tcp-deep-and-udp.html"><span class="dir">← Prev</span><div class="ti">Ch 13 — L4: TCP deep, and UDP</div></a>
+      <a class="nx" href="ch15-dns-end-to-end.html"><span class="dir">Next →</span><div class="ti">Ch 15 — DNS, end to end</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 14 of 121 · Part II · Networking from First Principles. When a service "runs out of connections," first ask which side ran out — and of what.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">One port, many clients</a>
+    <a href="#tuple">The 4-tuple &amp; syscalls</a>
+    <a href="#components">Ranges, reuse, pooling</a>
+    <a href="#flow">A socket's lifecycle</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 52 — Load balancing: ALB, NLB &amp; target groups</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part VI · AWS &amp; EKS &nbsp;·&nbsp; Chapter 52</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part VI · AWS &amp; EKS for SREs · Chapter 52</div>
+      <h1>Load balancing — ALB, NLB, target groups, health checks</h1>
+      <p class="tagline">Every request to your service hits a load balancer first. When the pager fires with "502 from the ALB" or "one AZ is melting," this box is where you look — and most engineers only half-understand it.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~32 min read · AWS CLI / LocalStack</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Decide ALB vs NLB for a given service, and say precisely why — layer 7 content routing versus layer 4 throughput and static IPs.</li>
+          <li>Explain what a target group is, the three target types (instance, ip, lambda), and why the choice matters on EKS.</li>
+          <li>Read a health check's state machine and know what flips a target from healthy to unhealthy.</li>
+          <li>Diagnose the three classic incidents: 502/503 with all targets unhealthy, cross-zone imbalance, and idle-timeout connection resets.</li>
+          <li>Reason about cross-zone load balancing, connection draining, and listener rule priority under load.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem a load balancer solves</h2>
+    <p>You've built a service and it works on one box. Now reality arrives. One box can't take the traffic, so you run six copies across three Availability Zones. That instantly creates three problems you didn't have before.</p>
+    <p>First, which copy does a client talk to? You can't hand out six IP addresses and hope clients pick fairly — they won't, and the list changes every deploy. Second, one of those six will die at 3am, and you do not want the 1-in-6 of your users hitting the dead one to just get errors. Third, when you scale from six to twelve for a sale, nothing should have to reconfigure clients or wait for DNS to catch up.</p>
+    <p>So you put one thing in front: a <b>load balancer</b>. It's a single, stable front door. Clients only ever know its address. Behind it, the load balancer spreads connections across your healthy copies, quietly stops sending traffic to the dead one within seconds, and lets you add or remove copies without anyone outside noticing. On AWS that front door is Elastic Load Balancing, and the two types you'll live with are the <b>Application Load Balancer (ALB)</b> and the <b>Network Load Balancer (NLB)</b>.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>A load balancer does two jobs, and people forget the second one. It <em>distributes</em> traffic — obvious. It also <em>detects failure</em> and routes around it, via health checks — the part that actually keeps you up. A load balancer with broken health checks is worse than none: it confidently sends users to dead servers.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a front desk versus a mail chute</h2>
+    <p>Two different jobs, two different tools. Hold this picture.</p>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>An <b>ALB is a hotel concierge</b>. You walk up and say what you want — "I need the spa," "I'm here for the conference in room 4," "where's checkout?" The concierge <em>reads your request</em>, knows the building, and sends you to the right desk. If a desk isn't answering the phone, the concierge quietly stops sending guests there. Reading the request takes a moment, but it means smart routing: by path, by host, by header.</p>
+      <p>An <b>NLB is the building's pneumatic mail chute</b>. You drop a sealed envelope in; it shoots to a floor based only on the address on the outside, blindingly fast, never opening it. It doesn't know or care what's inside. No content routing — just raw, low-latency delivery of whatever you hand it, at enormous volume, with a fixed street address that never changes.</p>
+      <p>The concierge phoning each desk before sending guests is the <b>health check</b>. A desk that stops answering gets no more guests until it picks up again — that's the failure-detection job doing its work.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In AWS</th></tr>
+      <tr><td>Concierge who reads your request</td><td>ALB — layer 7, understands HTTP (host, path, headers, methods)</td></tr>
+      <tr><td>Mail chute that forwards sealed envelopes fast</td><td>NLB — layer 4, forwards TCP/UDP without inspecting it</td></tr>
+      <tr><td>The list of desks a request can go to</td><td>Target group (a set of targets + a health check)</td></tr>
+      <tr><td>A specific desk — room number vs. a phone extension</td><td>Target type: <code>instance</code> (EC2 ID) vs <code>ip</code> (an IP, e.g. a pod)</td></tr>
+      <tr><td>Concierge phoning each desk to check it answers</td><td>Health check (interval, thresholds, matcher)</td></tr>
+      <tr><td>The building's permanent street address</td><td>The load balancer's stable DNS name (NLB adds static IPs)</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>Listener → rules → target group → targets</h2>
+    <p>An Elastic Load Balancer is not one machine. It's a managed, horizontally-scaled fleet with one node per Availability Zone you enable, sitting behind a single DNS name that resolves to one IP per AZ. You never see the nodes; AWS scales them for you. What you configure is a small hierarchy: a <b>listener</b> checks a port, its <b>rules</b> decide where a request goes, and a <b>target group</b> is the pool of backends it goes to.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 820 404" role="img" aria-label="A client request entering an ALB listener, matching a rule, forwarding to a target group, and reaching healthy targets across two Availability Zones">
+        <defs>
+          <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--deep)"/></marker>
+          <marker id="ag" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+        </defs>
+        <!-- client -->
+        <rect x="14" y="160" width="104" height="72" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="66" y="190" text-anchor="middle" style="fill:var(--ink);font:600 14px sans-serif">client</text>
+        <text x="66" y="209" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">browser / app</text>
+        <line x1="118" y1="196" x2="148" y2="196" style="stroke:var(--deep);stroke-width:2" marker-end="url(#ar)"/>
+        <!-- ALB container -->
+        <rect x="150" y="26" width="256" height="352" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="164" y="48" style="fill:var(--accent);font:700 11.5px sans-serif;letter-spacing:.04em">APPLICATION LOAD BALANCER · L7</text>
+        <rect x="168" y="60" width="220" height="52" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="278" y="82" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">Listener · HTTPS :443</text>
+        <text x="278" y="100" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">terminates TLS, then evaluates rules</text>
+        <rect x="168" y="124" width="220" height="40" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="278" y="149" text-anchor="middle" style="fill:var(--ink);font:12px sans-serif">Rule 10 · path <tspan style="fill:var(--accent)">/api/*</tspan> → tg-api</text>
+        <rect x="168" y="170" width="220" height="40" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="278" y="195" text-anchor="middle" style="fill:var(--ink);font:12px sans-serif">Rule 20 · Host <tspan style="fill:var(--accent)">img.*</tspan> → tg-img</text>
+        <rect x="168" y="216" width="220" height="40" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="278" y="241" text-anchor="middle" style="fill:var(--ink);font:12px sans-serif">Rule * · default → tg-web</text>
+        <text x="278" y="286" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">rules are priority-ordered · first match wins</text>
+        <text x="278" y="306" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">one node per AZ · scales behind the DNS name</text>
+        <!-- arrow ALB -> target group -->
+        <line x1="406" y1="144" x2="452" y2="144" style="stroke:var(--deep);stroke-width:2" marker-end="url(#ar)"/>
+        <!-- target group -->
+        <rect x="454" y="104" width="150" height="120" rx="10" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="529" y="130" text-anchor="middle" style="fill:var(--accent2);font:700 12px sans-serif">target group</text>
+        <text x="529" y="150" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">tg-api</text>
+        <text x="529" y="170" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">type: ip · HTTP :8080</text>
+        <text x="529" y="192" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">health: /healthz</text>
+        <text x="529" y="210" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">200 · 30s · 2 fails</text>
+        <!-- targets -->
+        <rect x="648" y="52" width="158" height="52" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="727" y="74" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">target A · AZ-a</text>
+        <text x="727" y="92" text-anchor="middle" style="fill:var(--accent2);font:11px sans-serif">healthy</text>
+        <rect x="648" y="140" width="158" height="52" rx="8" style="fill:var(--panel);stroke:var(--deep);stroke-width:1.5;stroke-dasharray:5 4"/>
+        <text x="727" y="162" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">target B · AZ-a</text>
+        <text x="727" y="180" text-anchor="middle" style="fill:var(--deep);font:11px sans-serif">unhealthy — no traffic</text>
+        <rect x="648" y="228" width="158" height="52" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="727" y="250" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">target C · AZ-b</text>
+        <text x="727" y="268" text-anchor="middle" style="fill:var(--accent2);font:11px sans-serif">healthy</text>
+        <!-- tg -> targets (solid to healthy, none to unhealthy) -->
+        <line x1="604" y1="150" x2="644" y2="82" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#ag)"/>
+        <line x1="604" y1="164" x2="644" y2="254" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#ag)"/>
+        <line x1="604" y1="158" x2="644" y2="166" style="stroke:var(--deep);stroke-width:1.5;stroke-dasharray:4 4"/>
+        <text x="700" y="120" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">health check probes each target</text>
+      </svg>
+      <figcaption>The listener terminates the connection, a rule picks a target group, and the group forwards only to targets its health check currently marks healthy.</figcaption>
+    </figure>
+
+    <p>The split between ALB and NLB is the layer they work at. The <b>ALB works at layer 7</b>: it terminates the connection, reads the HTTP request, and can route on host, path, header, method, query string, or source IP. It does redirects, fixed responses, HTTP/2 and gRPC, sticky sessions, and can even authenticate users before the request ever reaches your code. All that reading costs a little latency and means it only speaks HTTP/HTTPS.</p>
+    <p>The <b>NLB works at layer 4</b>: it forwards TCP, UDP, and TLS connections without understanding what's inside. That makes it brutally fast — millions of requests per second, single-digit-millisecond added latency — and it gives you a static IP per AZ (or your own Elastic IP), which firewalls and allow-lists love. It preserves the client's real source IP to the target. What it can't do is anything content-aware: no path routing, no host routing, no redirects.</p>
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>The choice isn't cosmetic. Put an ALB in front of a gRPC or WebSocket service and you get L7 features but the ALB's 60-second idle timeout and connection handling in the path. Put an NLB in front and you get raw throughput and the client's real IP, but you lose path routing and WAF. On EKS this maps directly: the AWS Load Balancer Controller provisions an ALB for an <code>Ingress</code> and an NLB for a <code>Service</code> of type <code>LoadBalancer</code>. Picking wrong means re-architecting under incident pressure later.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>How a request actually flows, and how health is decided</h2>
+    <p>Take one HTTPS request through an ALB, step by step. This is the machinery under "the ALB routed it."</p>
+    <ol class="steps">
+      <li><b>DNS resolves the ALB name to one IP per AZ.</b> The client connects to one of them. That IP belongs to a load balancer node AWS runs in that AZ. There is no single machine — the fleet scales up and down, and the DNS record changes with it. This is why you always target the <em>name</em>, never a resolved IP.</li>
+      <li><b>The node accepts the TCP connection and terminates TLS.</b> For an ALB this is a full connection to the client — the "front-end connection." The ALB now holds the decrypted HTTP request. (An NLB would instead just forward the bytes on to a target, or terminate TLS and re-open, depending on the listener.)</li>
+      <li><b>The listener evaluates rules in priority order.</b> Each rule has conditions (host, path, header, method, query, source IP) and an action. The load balancer walks rules from lowest priority number upward and stops at the first match. If nothing matches, the default rule fires. The action is usually <code>forward</code> to a target group, but can be a redirect, a fixed response, or an authenticate step.</li>
+      <li><b>The target group picks a healthy target.</b> Only targets currently marked <em>healthy</em> are candidates. The ALB's default algorithm is round-robin; you can switch it to least-outstanding-requests, which sends the next request to whichever target has the fewest in flight — better when request cost varies wildly.</li>
+      <li><b>The node opens a separate connection to the target — the "back-end connection."</b> So there are always two connections: client↔ALB and ALB↔target. They have independent lifecycles and independent keep-alive settings. This detail is the root of the idle-timeout incident we'll hit in the labs.</li>
+      <li><b>The response streams back</b> along the same pair of connections. The ALB can add headers (<code>X-Forwarded-For</code> with the client IP, <code>X-Forwarded-Proto</code>) so the target knows who really called and over what.</li>
+    </ol>
+
+    <p>Now the part that keeps you employed: <b>health checks</b>. Each target group runs an independent health check against every registered target. For an HTTP health check the config is a path (say <code>/healthz</code>), an interval (default 30s), a timeout (default 5s), a healthy threshold (default 5 consecutive passes) and an unhealthy threshold (default 2 consecutive fails), and a success matcher (default HTTP 200). A target starts in <code>initial</code>, and only becomes <code>healthy</code> after it passes the healthy threshold in a row. One target crossing the unhealthy threshold flips to <code>unhealthy</code> and stops receiving new traffic — the load balancer routes around it automatically. That's the whole failure-detection loop.</p>
+
+    <details class="recall"><summary>Think first: your health check hits <code>/</code> and expects a 200, but <code>/</code> returns a 302 redirect to a login page. What happens?</summary>
+      <div class="body">
+        <p>Every target is marked <b>unhealthy</b>, because the matcher only accepts 200 and the app returns 302. The load balancer has no healthy targets, so it answers clients with <b>503 Service Unavailable</b> — even though your app is running perfectly. This is the single most common self-inflicted outage with load balancers: the health check path and the success matcher don't agree with what the app actually returns. The fix is a dedicated, dependency-free health endpoint (returns 200, does no DB call) and a matcher that matches it. Never point a health check at a page that redirects, authenticates, or touches a database.</p>
+      </div>
+    </details>
+
+    <p><b>Cross-zone load balancing</b> decides whether a node can send to targets in <em>other</em> AZs. For an ALB it's always on and free — every node balances across every healthy target in every AZ. For an NLB it's <b>off by default</b>: each node only sends to targets in its own AZ, and turning it on incurs inter-AZ data charges. That default is the source of the imbalance incident: if AZ-a has 8 targets and AZ-b has 2, and cross-zone is off, then the 2 targets in AZ-b each get roughly four times the traffic of the 8 in AZ-a, because DNS sends roughly half the clients to each AZ's node.</p>
+
+    <p><b>Connection draining</b> (the attribute is called <em>deregistration delay</em>, default 300s) is how you remove a target without dropping requests. When you deregister a target — a deploy, a scale-in — it goes to <code>draining</code>: no new connections, but in-flight requests get up to the delay to finish before the target is cut off. Set it too high and deploys crawl; set it to 0 and you cut live requests. For fast HTTP APIs, 30–60s is usually right.</p>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, and what each one owns</h2>
+    <ul>
+      <li><b>Load balancer.</b> The front door: a DNS name, a set of subnets (one per AZ), a security group (ALB always; NLB optionally), and a type (application or network). It owns nothing about routing logic itself — that lives in listeners.</li>
+      <li><b>Listener.</b> A protocol + port the LB listens on (HTTPS:443, TCP:5432). It owns the TLS certificate and the ordered list of rules. One LB can have many listeners.</li>
+      <li><b>Rule (ALB only).</b> A priority, a set of conditions, and an action. Owns the "where does this specific request go" decision. NLB listeners have no rules — one listener forwards to one target group, full stop.</li>
+      <li><b>Target group.</b> A pool of backends plus a health check and a protocol/port. Owns health state and the load-balancing algorithm. Crucially, a target group is decoupled from the LB — the same group can be swapped between load balancers, and blue/green deploys work by pointing a rule at a new group.</li>
+      <li><b>Target + target type.</b> A backend. <code>instance</code> registers an EC2 instance by ID (traffic to its primary network interface). <code>ip</code> registers a raw IP — used for pods (each pod IP is a target on EKS with the VPC CNI), on-prem hosts over Direct Connect, or ENIs. <code>lambda</code> (ALB only) invokes a function. On EKS, <code>ip</code> mode is what lets the ALB send traffic straight to a pod, skipping the node's kube-proxy hop.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one real request end to end</h2>
+    <p>A user loads <code>https://shop.example.com/api/cart</code>. DNS resolves <code>shop.example.com</code> to the ALB (via an alias record — the subject of <a href="ch53-route-53-dns-and-routing-policies.html">Chapter 53</a>), which returns one node IP per AZ. The browser connects, the ALB node terminates TLS, and the HTTPS:443 listener evaluates rules. Rule 10 — path <code>/api/*</code> — matches, so the action forwards to <code>tg-api</code>. That target group has three pods registered as <code>ip</code> targets; two are healthy, one failed its last two <code>/healthz</code> probes and is out. Round-robin picks a healthy pod, the ALB opens a back-end connection to <code>10.0.3.14:8080</code>, adds <code>X-Forwarded-For: 203.0.113.9</code>, and forwards the request. The pod responds 200; the ALB streams it back to the browser over the front-end connection. Total added latency: a few milliseconds. If that pod had died mid-request, the client would see a 502 — which is exactly the incident we reproduce next.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>These labs use the AWS CLI against real Elastic Load Balancing. Real ALBs and NLBs cost roughly $0.02–0.03 per hour plus capacity units, so if you're avoiding any spend, every lab notes a <b>no-cost local alternative</b> — usually <a href="https://www.localstack.aws/">LocalStack</a> (which emulates the ELBv2 API locally in a container) or a diagram walkthrough of the same commands. Set a region once:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Real AWS. Assumes credentials are configured (see Chapter 54).</span>
+export AWS_REGION=us-east-1
+aws sts get-caller-identity          <span class="c"># confirm who you are first</span>
+
+<span class="c"># No-cost local alt: run the ELBv2 API in LocalStack and point the CLI at it.</span>
+<span class="c"># docker run --rm -d -p 4566:4566 localstack/localstack</span>
+<span class="c"># then add --endpoint-url http://localhost:4566 to every aws command below.</span></code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — an ALB, a target group, a listener</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Create the three-part hierarchy from the architecture section. You need two subnets in different AZs and a security group that allows :443 in and target traffic out.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># 1. The load balancer itself — two subnets = two AZs.</span>
+aws elbv2 create-load-balancer --name demo-alb --type application \
+  --subnets subnet-aaaa subnet-bbbb --security-groups sg-web
+
+<span class="c"># 2. A target group: HTTP on 8080, ip targets, health check on /healthz.</span>
+aws elbv2 create-target-group --name tg-api --protocol HTTP --port 8080 \
+  --vpc-id vpc-0123 --target-type ip \
+  --health-check-path /healthz --matcher HttpCode=200
+
+<span class="c"># 3. A listener that forwards :443 to the group (cert from ACM).</span>
+aws elbv2 create-listener --load-balancer-arn $ALB_ARN --protocol HTTPS --port 443 \
+  --certificates CertificateArn=$CERT_ARN \
+  --default-actions Type=forward,TargetGroupArn=$TG_ARN</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>{
+  "TargetGroups": [{
+    "TargetGroupArn": "arn:aws:...:targetgroup/tg-api/6d0e...",
+    "HealthCheckIntervalSeconds": 30,
+    "HealthyThresholdCount": 5,
+    "UnhealthyThresholdCount": 2,
+    "Matcher": { "HttpCode": "200" }
+  }]
+}</code></div>
+        <p>Read the defaults the API filled in: a 30-second interval, five passes to become healthy, two fails to drop out, and a strict 200 matcher. Those numbers decide how fast you detect a dead target (two intervals ≈ 60s) and how fast a flapping one comes back (five intervals ≈ 150s). Memorise them; they're what you tune during an incident.</p>
+        <p class="small"><b>No-cost local alt:</b> run the exact commands against LocalStack with <code>--endpoint-url http://localhost:4566</code>. The ARNs and the JSON shape come back the same, so you practise the API without provisioning a real, billable ALB.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — read health-check status</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Register a couple of targets and ask the target group how it sees them. <code>describe-target-health</code> is the single most useful command in this whole chapter.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>aws elbv2 register-targets --target-group-arn $TG_ARN \
+  --targets Id=10.0.3.14,Port=8080 Id=10.0.4.9,Port=8080
+
+aws elbv2 describe-target-health --target-group-arn $TG_ARN \
+  --query 'TargetHealthDescriptions[].{ip:Target.Id,state:TargetHealth.State,why:TargetHealth.Reason}'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>[
+  { "ip": "10.0.3.14", "state": "healthy",   "why": null },
+  { "ip": "10.0.4.9",  "state": "unhealthy", "why": "Target.ResponseCodeMismatch" }
+]</code></div>
+        <p>Read the <code>Reason</code> field like a diagnosis. <code>Target.ResponseCodeMismatch</code> means the target answered but with the wrong status code — your matcher says 200, the app said something else. Other reasons you'll meet: <code>Target.Timeout</code> (the app didn't answer within the health-check timeout — too slow or wrong port), <code>Target.FailedHealthChecks</code> (connection refused — nothing listening), and <code>Elb.InitialHealthChecking</code> (still warming up, not a problem). The reason string tells you whether to look at the app, the port, or the security group.</p>
+        <p class="small"><b>No-cost local alt:</b> LocalStack returns target states from the same call. Or trace it on the diagram: 10.0.4.9 answers 302, matcher wants 200 → ResponseCodeMismatch → target removed from rotation.</p>
+      </div>
+    </div>
+
+    <details class="recall"><summary>Think first: <code>describe-target-health</code> shows every target <code>unhealthy</code> with reason <code>Target.Timeout</code>, but you can <code>curl</code> the app fine from the same subnet. What's your first suspect?</summary>
+      <div class="body">
+        <p>The <b>security group</b>, specifically the target's inbound rule. Health checks come <em>from the load balancer</em>, on the health-check port, sourced from the LB's security group (ALB) or the LB node IPs (NLB). If the target's SG allows your bastion's IP but not the load balancer's SG on port 8080, your manual curl works while every health check times out. The tell is <code>Target.Timeout</code> (packets dropped, no answer) rather than <code>ConnectionRefused</code> (something actively said no). First move: confirm the target SG allows the LB SG on the health-check port, in both directions if it's an NLB. This is the second-most-common health-check outage after the wrong matcher.</p>
+      </div>
+    </details>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — force a 503 with no healthy targets</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Make the load balancer answer errors while your app is technically fine. Point the health check at a path the app doesn't serve, then hit the ALB.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Repoint the health check at a path that returns 404.</span>
+aws elbv2 modify-target-group --target-group-arn $TG_ARN --health-check-path /does-not-exist
+
+<span class="c"># Wait ~2 intervals, then hit the load balancer.</span>
+curl -s -o /dev/null -w '%{http_code}\n' https://demo-alb-xxxx.us-east-1.elb.amazonaws.com/</code></pre></div>
+        <div class="out"><span class="ol">Output</span>503</code></div>
+        <p>You're getting <b>503 Service Unavailable</b> from the ALB, not from your app — the app never saw the request. Before you read on: what does a 503 from an ALB specifically mean, versus a 502 or a 504? Work out the distinction, then check yourself.</p>
+        <details class="recall"><summary>Reveal what each 5xx from the load balancer means</summary>
+          <div class="body">
+            <p><b>503 Service Unavailable</b> — the load balancer has <em>no healthy targets</em> to send to (or the target group is empty). This is the "all targets failing health checks" outage. Fix: run <code>describe-target-health</code>, read the reason, fix the matcher/path/SG.</p>
+            <p><b>502 Bad Gateway</b> — a target was chosen, but its response was malformed or the connection to it was reset mid-response. Causes: the app crashed while responding, returned invalid HTTP, or closed a keep-alive connection the ALB tried to reuse (the idle-timeout trap in Lab 4).</p>
+            <p><b>504 Gateway Timeout</b> — a target was chosen and the connection opened, but the app didn't respond within the ALB's idle timeout (default 60s). Causes: a slow query, a downstream dependency hanging, or an idle timeout set lower than real request latency.</p>
+            <p>So: 503 = nobody to talk to; 502 = talked, got garbage; 504 = talked, got silence. That three-way split is the fastest triage you have when the ALB is the thing throwing errors.</p>
+          </div>
+        </details>
+        <p class="small"><b>No-cost local alt:</b> on a diagram, set both targets to <code>unhealthy</code> and follow the request: listener matches a rule, target group has zero healthy members, so the ALB short-circuits with 503 before any back-end connection is opened.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — intermittent 502s under keep-alive</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Here's a nasty one that looks random. A service behind an ALB throws a 502 on maybe 1 in 500 requests, only under sustained traffic, and never reproduces in a single curl. The targets are healthy the whole time. Investigate before revealing.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Pull the ALB access logs (enable them first) and count response codes by target.</span>
+aws s3 cp s3://my-alb-logs/AWSLogs/.../ . --recursive --exclude '*' --include '*.log.gz'
+zcat *.log.gz | awk '{print $9, $10}' | sort | uniq -c | sort -rn | head
+<span class="c"># columns 9/10 = elb_status_code / target_status_code in the ALB log format</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>  48213 200 200
+    102 502 -        <span class="c"># ELB said 502, target column is "-" : ALB never got a valid response</span></code></div>
+        <p>The target status is <code>-</code>, meaning the ALB tried a back-end connection and got nothing valid back — not an application 5xx. That points at the <em>connection</em>, not the code. What property of the two-connection model causes a healthy target to reset a connection the ALB thought was reusable?</p>
+        <details class="recall"><summary>Reveal the cause and the fix</summary>
+          <div class="body">
+            <p>It's the <b>keep-alive idle-timeout race</b>. The ALB keeps back-end connections open to reuse them, up to its idle timeout (default 60s). If your application server's keep-alive timeout is <em>shorter</em> than the ALB's — say a stock server at 5s — then the target closes an idle connection that the ALB still believes is open. The next request the ALB sends down that connection hits a socket the target already closed, the target sends a TCP RST, and the ALB surfaces it as a 502 with target status <code>-</code>.</p>
+            <p>The fix is a rule you should tattoo somewhere: <b>the target's keep-alive timeout must be longer than the ALB's idle timeout.</b> Raise the app's keep-alive above 60s (nginx <code>keepalive_timeout 75;</code>, Node's <code>server.keepAliveTimeout = 65000</code>), or lower the ALB idle timeout to match — but always keep the backend's larger. This single mismatch is behind a huge share of "random 502s" tickets.</p>
+          </div>
+        </details>
+        <p class="small"><b>No-cost local alt:</b> reproduce the mechanism locally with two nginx containers — one as the "ALB" proxy with a 60s keep-alive, one as the "target" with <code>keepalive_timeout 1s</code> — then hammer it with <code>ab -k</code> and watch the 502s appear. No AWS needed to see the race.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — cross-zone imbalance on an NLB</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>An NLB fronts a fleet. AZ-a holds 8 targets, AZ-b holds 2 (an Auto Scaling group scaled unevenly). Users report that some connections are fast and some time out, seemingly at random. CPU on the two AZ-b targets is pinned at 100%; the eight in AZ-a are near idle. The senior question: why, and what are your two levers?</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>aws elbv2 describe-target-health --target-group-arn $TG_ARN \
+  --query 'TargetHealthDescriptions[].Target.AvailabilityZone' | sort | uniq -c
+<span class="c"># is cross-zone load balancing on for this NLB / target group?</span>
+aws elbv2 describe-target-group-attributes --target-group-arn $TG_ARN \
+  --query "Attributes[?Key=='load_balancing.cross_zone.enabled']"</code></pre></div>
+        <div class="out"><span class="ol">Output</span>      8 "us-east-1a"
+      2 "us-east-1b"
+[ { "Key": "load_balancing.cross_zone.enabled", "Value": "false" } ]</code></div>
+        <p>Cross-zone is <code>false</code> — the NLB default. Now reason out the traffic math and the two fixes before opening the answer.</p>
+        <details class="recall"><summary>Reveal the reasoning and the two levers</summary>
+          <div class="body">
+            <p>The NLB has one node per AZ, and its DNS name hands out both node IPs, so clients split roughly 50/50 between the AZ-a node and the AZ-b node. With cross-zone <b>off</b>, the AZ-a node only feeds its 8 local targets and the AZ-b node only feeds its 2. So half the traffic is shared among 8 targets (about 6% each) and the other half among just 2 (about 25% each) — the AZ-b pair takes roughly four times the per-target load. That's your pinned CPU and your timeouts.</p>
+            <p><b>Lever one:</b> turn on cross-zone load balancing (<code>load_balancing.cross_zone.enabled=true</code>). Now every node feeds all 10 targets evenly (~10% each). The cost is inter-AZ data transfer, which cross-zone incurs on NLBs — real money at volume. <b>Lever two:</b> keep cross-zone off but make the AZs symmetric — configure the Auto Scaling group to balance capacity across AZs so each holds 5. Even target counts per AZ means even load without paying for cross-AZ traffic. Most teams do lever two for cost and reserve lever one for when symmetry is impractical. Either way, the root cause is the interaction between per-AZ NLB nodes and uneven target distribution — not a "bad" load balancer.</p>
+          </div>
+        </details>
+        <p class="small"><b>No-cost local alt:</b> this one is a pen-and-paper (or diagram) lab — the math is the lesson. Sketch two AZ nodes, 8 and 2 targets, a 50/50 client split, and compute per-target load with cross-zone on versus off.</p>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <p>Three shapes cover the large majority of load-balancer pages. File them mentally like this.</p>
+    <div class="box realworld"><div class="h">Incident pattern · 503, all targets unhealthy</div>
+      <p><b>Symptom:</b> the ALB returns 503 for everything; your app logs show no incoming traffic. <b>First cut:</b> <code>aws elbv2 describe-target-health</code> — are any targets healthy? <b>Confirm:</b> read the <code>Reason</code>. <b>Cause is usually:</b> the health check path or matcher disagrees with the app (a redirect, an auth wall, or a DB-dependent endpoint returning 500), the health-check port is wrong, or a security group blocks the LB from reaching the target. The app is fine; the check is misconfigured.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · random 502s under load</div>
+      <p><b>Symptom:</b> a small, steady fraction of requests get 502, only under real traffic, targets stay healthy. <b>First cut:</b> ALB access logs — is <code>target_status_code</code> a real 5xx or <code>-</code>? <b>Confirm:</b> <code>-</code> means a connection problem, not an app error. <b>Cause is usually:</b> the target's keep-alive timeout is shorter than the ALB idle timeout, so the target closes connections the ALB reuses. Fix by making the backend keep-alive longer than the ALB idle timeout.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · one AZ hot, others idle</div>
+      <p><b>Symptom:</b> targets in one AZ pinned, others idle; intermittent timeouts. <b>First cut:</b> count targets per AZ and check <code>load_balancing.cross_zone.enabled</code>. <b>Cause is usually:</b> NLB with cross-zone off (the default) plus uneven targets per AZ, so the light AZ's node overloads its few targets. Fix: even the AZ counts, or enable cross-zone and accept the inter-AZ cost.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Security.</b> Terminate TLS at the load balancer using a certificate from AWS Certificate Manager, so private keys never sit on your instances and renewals are automatic. Put the ALB's security group as the <em>source</em> in your targets' inbound rules — reference the SG, not IP ranges, so it survives scaling. For public HTTP-facing services, attach AWS WAF to the ALB to filter common attacks before they reach your code. An NLB can now carry a security group too (a 2023 addition); before that, people wrongly assumed instances behind an NLB were firewalled by the LB — they weren't, because the NLB passed the client IP straight through.</p>
+    <p><b>Performance.</b> Elastic Load Balancing scales its node fleet automatically, but not instantly — a step-function traffic spike (a flash sale, a marketing blast) can outrun the scaling and cause 5xx while it catches up. For known spikes, either warm the fleet ahead of time by ramping traffic, or use provisioned capacity where offered. Billing is per Load Balancer Capacity Unit (LCU), which meters new connections, active connections, processed bytes, and rule evaluations — so a service with millions of tiny requests can be dominated by the connection dimension, and long-lived connections by the active-connection dimension. Reach for least-outstanding-requests routing when request cost is wildly uneven; round-robin will overload the target that happens to receive the expensive requests.</p>
+    <p><b>Common mistakes:</b> health-checking a path that touches the database (a slow DB then marks every target unhealthy and takes the whole service down — a health check must test <em>this</em> instance, not the world); leaving deregistration delay at 300s and wondering why deploys take five minutes to drain; assuming an NLB firewalls its targets; and forgetting that the ALB idle timeout and the app keep-alive have to be ordered correctly. Each one is a real outage that reads as mysterious until you know this layer.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>The load balancer is the first building block you draw in almost any system-design answer, and health-check-based failure detection is the mechanism behind "highly available across AZs." When you say a tier is "3× replicated across AZs behind an ALB," you're relying on exactly the health-check loop and cross-zone behaviour from this chapter to make a dead instance invisible to users. The two-connection model connects to <a href="ch16-http-http-2-http-3-and-grpc.html">Chapter 16</a> on HTTP keep-alive, and to timeouts and retries in <a href="ch88-reliability-engineering.html">Chapter 88</a> — a retry only helps if the LB has already routed you to a different, healthy target. At the very top of the stack, the LB's DNS name is what Route 53 points at for regional and failover routing, which is the next chapter. And on EKS, this entire model is what the AWS Load Balancer Controller automates when you create an <code>Ingress</code> or a <code>LoadBalancer</code> Service — we tie it all together in <a href="ch60-end-to-end-synthesis-internet-to-alb.html">Chapter 60</a>.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>ALB or NLB — how do you choose?</summary>
+        <div class="a"><p>ALB if you need layer-7 features: routing by host, path, or header; HTTP/2 or gRPC; redirects; WAF; or user authentication. It terminates and understands HTTP. NLB if you need raw layer-4 throughput, ultra-low latency, a static IP per AZ, or the client's real source IP preserved to the target, or if the protocol isn't HTTP. Rule of thumb: HTTP APIs and web apps get an ALB; TCP/UDP services, extreme scale, and anything needing a fixed IP get an NLB. On EKS that maps to an ALB for Ingress and an NLB for a LoadBalancer Service.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through what a target group is and how health checks work.</summary>
+        <div class="a"><p>A target group is a pool of backends plus a health check and a protocol/port, decoupled from the load balancer itself. Targets register by type: <code>instance</code> (EC2 by ID), <code>ip</code> (a raw IP, which is how pods and on-prem hosts register), or <code>lambda</code>. The group runs an independent health check against every target — for HTTP that's a path, an interval (default 30s), a timeout, a healthy threshold (default 5 consecutive passes), an unhealthy threshold (default 2 fails), and a matcher (default 200). A target only receives traffic while it's in the healthy state; cross the unhealthy threshold and it's pulled from rotation automatically, and the LB routes around it. Because the group is decoupled from the LB, you get blue/green deploys by pointing a listener rule at a new group, and connection draining via the deregistration-delay attribute lets in-flight requests finish before a target is removed. The failure I'd flag: a health check that's too coupled — hitting a DB or an auth wall — turns a dependency blip into a full outage because every target goes unhealthy at once.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>An ALB returns 502, 503, and 504 in different situations. Distinguish them.</summary>
+        <div class="a"><p>They map to three distinct failure points. <b>503</b> means the load balancer has no healthy target to send to — the request never reaches your app; the fix lives in health-check config or target registration. <b>502</b> means a target was selected but the response was invalid or the connection was reset — malformed HTTP, the app crashing mid-response, or, most commonly, a keep-alive race where the target's idle timeout is shorter than the ALB's, so the target closes a connection the ALB reuses and the next request hits a RST. In the access log the tell is <code>target_status_code = "-"</code>: the ALB never got a valid HTTP response. <b>504</b> means the connection to a target opened but the app didn't respond within the ALB idle timeout — a slow query, a hung dependency, or a timeout set below real latency; here the target status is also often <code>-</code> but the elapsed time equals the idle timeout. So my triage is: 503 → check target health; 502 → check access logs for connection resets and keep-alive ordering; 504 → check application latency and the idle-timeout value.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>Targets in one AZ are overloaded while another AZ sits idle. What's happening?</summary>
+        <div class="a"><p>Almost certainly an NLB with cross-zone load balancing off — the default — combined with an uneven number of targets per AZ. Each NLB node serves one AZ, and DNS splits clients roughly evenly across the node IPs, so if AZ-a has eight targets and AZ-b has two, the two in AZ-b absorb the same share of traffic as the eight, roughly four times the per-target load. I'd confirm by counting targets per AZ and reading <code>load_balancing.cross_zone.enabled</code>. The fix is either to make the AZ counts symmetric (cheapest — no cross-AZ data charges) or to enable cross-zone so every node feeds every target evenly, accepting the inter-AZ transfer cost. I'd note the same imbalance can't happen on an ALB, where cross-zone is always on.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>Why does <code>ip</code> target type matter on EKS specifically?</summary>
+        <div class="a"><p>With <code>instance</code> targets the load balancer sends to a node's NodePort and then kube-proxy hops the packet to whatever pod, possibly on another node — an extra network hop, lost client-IP fidelity, and imbalance because the LB balances across nodes, not pods. With <code>ip</code> targets, the AWS VPC CNI gives every pod a real VPC IP, so the AWS Load Balancer Controller registers each pod IP directly in the target group. Now the ALB or NLB talks straight to the pod, kube-proxy is out of the datapath, load is balanced across actual pods, and health checks probe the pod itself. It also means pod churn drives target registration directly, so draining and readiness line up with deploys. That's why <code>ip</code> mode is the default choice for the controller, and it leans entirely on the VPC CNI from <a href="ch58-vpc-cni-the-deep-one.html">Chapter 58</a>.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>A load balancer is a stable front door that both distributes traffic and detects failure. On AWS you choose an ALB (layer 7, HTTP-aware, routes on host/path/header, does redirects/WAF/auth) or an NLB (layer 4, TCP/UDP, ultra-fast, static IP, preserves client IP). The configuration hierarchy is listener → rules (ALB only, priority-ordered, first match wins) → target group → targets. A target group owns the health check and health state; targets register by type — <code>instance</code>, <code>ip</code> (pods, on-prem), or <code>lambda</code>. Health checks flip a target out of rotation after the unhealthy threshold and back after the healthy threshold. Cross-zone is always on for ALB, off by default for NLB (uneven AZ counts then cause imbalance). Two connections exist per request — client↔LB and LB↔target — with independent keep-alives, which is why the backend keep-alive must exceed the ALB idle timeout or you get random 502s. And the fastest triage you own: 503 = no healthy targets, 502 = bad/aborted response, 504 = target too slow.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>A load balancer distributes traffic <em>and</em> detects failure via health checks; the second job is the one that keeps you up.</li>
+      <li>ALB = layer 7 (HTTP host/path/header routing, redirects, WAF, auth); NLB = layer 4 (TCP/UDP, static IP, preserves client IP, extreme throughput).</li>
+      <li>Hierarchy: listener → rules (ALB, priority-ordered, first match wins) → target group → targets.</li>
+      <li>Target types: <code>instance</code> (EC2 by ID), <code>ip</code> (pods and on-prem — the EKS default), <code>lambda</code> (ALB only).</li>
+      <li>Health-check defaults: 30s interval, 5 passes to become healthy, 2 fails to drop out, matcher 200. Never check a path that redirects, authenticates, or hits the DB.</li>
+      <li>503 = no healthy targets; 502 = target chosen but response invalid/reset; 504 = target didn't answer within the idle timeout.</li>
+      <li>Cross-zone is always on for ALB (free), off by default for NLB (and inter-AZ data is charged) — uneven targets per AZ then overload the light AZ.</li>
+      <li>Every request uses two connections with independent keep-alives; keep the backend keep-alive longer than the ALB idle timeout (default 60s) or you get random 502s.</li>
+      <li>Deregistration delay (connection draining, default 300s) lets in-flight requests finish when a target is removed; tune it to your request duration.</li>
+      <li><code>aws elbv2 describe-target-health</code> and its <code>Reason</code> field are your first command in any LB incident.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch13-l4-tcp-deep-and-udp.html"><b>Ch 13</b> TCP &amp; UDP</a>
+      <a href="ch16-http-http-2-http-3-and-grpc.html"><b>Ch 16</b> HTTP &amp; keep-alive</a>
+      <a href="ch51-vpc-security-security-groups-vs-nacls.html"><b>Ch 51</b> Security groups</a>
+      <a href="ch53-route-53-dns-and-routing-policies.html"><b>Ch 53</b> Route 53 routing</a>
+      <a href="ch58-vpc-cni-the-deep-one.html"><b>Ch 58</b> VPC CNI &amp; pod IPs</a>
+      <a href="ch60-end-to-end-synthesis-internet-to-alb.html"><b>Ch 60</b> Internet → ALB → Pod</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/elasticloadbalancing/latest/userguide/how-elastic-load-balancing-works.html">How Elastic Load Balancing works</a>: nodes per AZ, cross-zone, and the shared model across LB types.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/elasticloadbalancing/latest/application/application-load-balancers.html">Application Load Balancers</a> and <a href="https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-listeners.html">Listeners &amp; rules</a>: L7 routing, attributes, the 60s idle timeout.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/elasticloadbalancing/latest/network/network-load-balancers.html">Network Load Balancers</a>: L4 behaviour, the 350s (configurable 60–6000) idle timeout, cross-zone default off.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/elasticloadbalancing/latest/application/target-group-health-checks.html">Target group health checks</a>: intervals, thresholds, matchers, and the reason codes.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-troubleshooting.html">Troubleshoot your Application Load Balancers</a>: the authoritative meaning of each HTTP 4xx/5xx the ALB emits.</li>
+      <li>Amazon Builders' Library — <a href="https://aws.amazon.com/builders-library/implementing-health-checks/">Implementing health checks</a> (Colm MacCárthaigh): why health checks fail closed, and the deep/shallow check trade-off.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch51-vpc-security-security-groups-vs-nacls.html"><span class="dir">← Prev</span><div class="ti">Ch 51 — VPC security: Security Groups vs NACLs</div></a>
+      <a class="nx" href="ch53-route-53-dns-and-routing-policies.html"><span class="dir">Next →</span><div class="ti">Ch 53 — Route 53: DNS and routing policies</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 52 of 121 · Part VI · AWS &amp; EKS for SREs. You can now read a target group's mind. Next: how a name like shop.example.com finds this load balancer in the first place.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Listener → target → targets</a>
+    <a href="#internals">Request flow &amp; health</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">One request end to end</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

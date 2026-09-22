@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 49 — The AWS Mental Model: Regions, AZs, Failure Domains</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part VI · AWS &amp; EKS &nbsp;·&nbsp; Chapter 49</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part VI · AWS &amp; EKS for SREs · Chapter 49</div>
+      <h1>The AWS mental model: regions, AZs, failure domains</h1>
+      <p class="tagline">Before you touch a VPC, a load balancer, or EKS itself, you need the map underneath all of it — what actually guarantees isolation, what fails together, and who is responsible for which half of that guarantee. Get this wrong and every architecture diagram you draw afterward inherits the mistake.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~45 min read · AWS CLI (read-only, no cost)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain exactly what a Region and an Availability Zone each guarantee about failure isolation — and what they don't.</li>
+          <li>Tell an AZ's <em>name</em> apart from its <em>ID</em>, and say why that distinction matters across accounts.</li>
+          <li>State the shared-responsibility split precisely, for at least three services at different abstraction levels.</li>
+          <li>Explain what an AWS account boundary buys you that IAM alone can't, and where Service Control Policies fit.</li>
+          <li>Read your own account's resources and spot a single-AZ deployment that's quietly one outage away from a bad day.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>Before the VPC, the actual failure map</h2>
+    <p>Every AWS diagram you'll draw from here on has boxes labelled "us-east-1" and little sub-boxes labelled "AZ-a," "AZ-b," "AZ-c." Most engineers treat those as scenery — a place resources happen to live — and move straight to security groups and subnets. That's backwards. The reason you spread anything across three AZs, the reason a single account can be both your strongest security boundary and your biggest single point of failure, and the reason "it works in us-east-1" tells you nothing about "it works in eu-west-1" — all of that comes from a small number of hard guarantees AWS makes about its own physical infrastructure. Everything else in Part VI assumes you already have this map.</p>
+    <p>This chapter is that map. Not the API calls yet — those come immediately after, once you can actually reason about what you're looking at.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>A Region and an Availability Zone aren't just labels for "where" — they're the units AWS uses to make specific, contractual promises about <em>independence</em>. Once you know exactly what's independent from what, you can predict how a failure will (and won't) spread, without ever having watched one happen.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a hospital network, city by city</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Picture a hospital network that operates in several cities. Each city runs its own hospital system end to end — its own patient records system, its own supply chain, its own staff scheduling — completely independent of every other city's. A records outage in one city has zero effect on any other city. That's a <b>Region</b>.</p>
+      <p>Within one city, the network runs several separate hospital <b>campuses</b> — different buildings, different plots of land, each with its own backup generators, its own water supply, its own dedicated staff. A fire or a power failure at one campus doesn't touch the others, because nothing structural is shared between them. But all the campuses in one city are connected by a dedicated, fast ambulance corridor, so a patient (or a piece of data) can move between them in minutes, not hours — which is exactly why doctors are comfortable keeping duplicate records live at two campuses at once. That's an <b>Availability Zone</b>.</p>
+      <p>Here's the wrinkle that catches people out: ask a doctor which campus is "the North campus" and you'll get a different building depending which hospital network you ask, because each network privately assigns its own nicknames to spread its own patient load evenly. The health ministry's official registration number for that exact physical building, though, never changes no matter who you ask. That's the difference between an AZ's <b>name</b> (account-specific, deliberately shuffled) and its <b>ID</b> (physical, stable).</p>
+      <p>The hospital's own corporate office keeps the buildings standing, the power on, and security guards at the doors — that's <em>their</em> job. What actually happens to a patient once they're inside is the medical team's responsibility. Neither side can do the other's job, and blaming the wrong one wastes exactly the time you don't have during an incident. That's <b>shared responsibility</b>.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In AWS</th></tr>
+      <tr><td>A city, running fully independently of other cities</td><td>A <b>Region</b> (e.g. <code>us-east-1</code>)</td></tr>
+      <tr><td>One campus within a city — its own power, staff, building</td><td>An <b>Availability Zone</b></td></tr>
+      <tr><td>The dedicated, fast corridor between campuses in one city</td><td>Low-latency private links between AZs in one Region</td></tr>
+      <tr><td>A campus's local nickname vs. the ministry's registration number</td><td>An AZ <b>name</b> (<code>us-east-1a</code>) vs. its <b>ID</b> (<code>use1-az1</code>)</td></tr>
+      <tr><td>Corporate keeps the building standing; doctors treat patients</td><td>AWS secures "of the cloud"; you secure "in the cloud"</td></tr>
+      <tr><td>A hospital's own separate legal entity and records system</td><td>An <b>AWS account</b> — the blast-radius and billing boundary</td></tr>
+      <tr><td>The regional health authority overseeing several hospitals</td><td><b>AWS Organizations</b>, with consolidated billing across accounts</td></tr>
+      <tr><td>A blanket safety rule no single hospital administrator can override</td><td>A <b>Service Control Policy</b> (SCP) — a ceiling, not a grant</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>A Region, three AZs, and where a failure stops</h2>
+    <p>AWS's global infrastructure is a strict hierarchy: a <b>partition</b> (the standard commercial partition, plus separate ones for China and US government regions) contains many <b>Regions</b>, each Region contains multiple <b>Availability Zones</b>, and each AZ is itself one or more physically distinct data centers, presented to you as one logical unit. The important line is drawn at the AZ boundary: it's the smallest unit AWS designs to fail independently.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 380" role="img" aria-label="A region containing three Availability Zones connected by a private low-latency backbone, with one AZ marked with a failure boundary that does not cross into the other two">
+        <defs>
+          <marker id="r-ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+        </defs>
+        <text x="360" y="20" text-anchor="middle" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">ONE REGION · THREE AZs · ONE FAILURE BOUNDARY</text>
+
+        <rect x="18" y="36" width="684" height="300" rx="12" style="fill:none;stroke:var(--accent);stroke-width:1.5;stroke-dasharray:2 0"/>
+        <text x="34" y="56" style="fill:var(--accent);font:700 11.5px sans-serif;letter-spacing:.04em">REGION · us-east-1 — fully independent of every other Region</text>
+
+        <!-- AZ a -->
+        <rect x="40" y="72" width="190" height="130" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="135" y="94" text-anchor="middle" style="fill:var(--ink);font:700 12px sans-serif">AZ · us-east-1a</text>
+        <text x="135" y="112" text-anchor="middle" style="fill:var(--muted);font:9.5px ui-monospace,monospace">AZ ID: use1-az1</text>
+        <rect x="56" y="122" width="158" height="66" rx="7" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="135" y="146" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">own power, network,</text>
+        <text x="135" y="162" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">cooling, staff</text>
+
+        <!-- AZ b - marked as failing -->
+        <rect x="264" y="72" width="190" height="130" rx="10" style="fill:var(--panel);stroke:var(--deep);stroke-width:2.5;stroke-dasharray:6 4"/>
+        <text x="359" y="94" text-anchor="middle" style="fill:var(--deep);font:700 12px sans-serif">AZ · us-east-1b</text>
+        <text x="359" y="112" text-anchor="middle" style="fill:var(--muted);font:9.5px ui-monospace,monospace">AZ ID: use1-az2</text>
+        <rect x="280" y="122" width="158" height="66" rx="7" style="fill:var(--chip);stroke:var(--deep)"/>
+        <text x="359" y="146" text-anchor="middle" style="fill:var(--deep);font:700 10.5px sans-serif">power event —</text>
+        <text x="359" y="162" text-anchor="middle" style="fill:var(--deep);font:700 10.5px sans-serif">failure contained HERE</text>
+
+        <!-- AZ c -->
+        <rect x="488" y="72" width="190" height="130" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="583" y="94" text-anchor="middle" style="fill:var(--ink);font:700 12px sans-serif">AZ · us-east-1c</text>
+        <text x="583" y="112" text-anchor="middle" style="fill:var(--muted);font:9.5px ui-monospace,monospace">AZ ID: use1-az3</text>
+        <rect x="504" y="122" width="158" height="66" rx="7" style="fill:var(--chip);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="583" y="146" text-anchor="middle" style="fill:var(--accent2);font:700 10.5px sans-serif">unaffected —</text>
+        <text x="583" y="162" text-anchor="middle" style="fill:var(--accent2);font:700 10.5px sans-serif">absorbs the load</text>
+
+        <!-- backbone -->
+        <line x1="135" y1="202" x2="135" y2="224" style="stroke:var(--accent);stroke-width:2"/>
+        <line x1="359" y1="202" x2="359" y2="224" style="stroke:var(--accent);stroke-width:2"/>
+        <line x1="583" y1="202" x2="583" y2="224" style="stroke:var(--accent);stroke-width:2"/>
+        <rect x="80" y="226" width="560" height="34" rx="8" style="fill:var(--chip);stroke:var(--accent)"/>
+        <text x="360" y="248" text-anchor="middle" style="fill:var(--accent);font:700 10.5px sans-serif;letter-spacing:.02em">PRIVATE, LOW-LATENCY BACKBONE — makes synchronous cross-AZ replication practical</text>
+
+        <rect x="40" y="272" width="638" height="52" rx="9" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="56" y="294" style="fill:var(--ink);font:11px sans-serif">3 AZs, not 2: losing one still leaves two — a real majority for quorum systems, and each</text>
+        <text x="56" y="312" style="fill:var(--ink);font:11px sans-serif">survivor absorbs only 50% more load, not 100% more. This is why "Multi-AZ" defaults to three.</text>
+      </svg>
+      <figcaption>An AZ failure is designed to stay inside that one AZ — the other two keep running, on their own power and network, connected by a backbone fast enough to make synchronous replication realistic. A Region failure, by contrast, would need to affect every AZ in it simultaneously, which is precisely what the AZ boundary exists to make unlikely.</figcaption>
+    </figure>
+
+    <details class="recall"><summary>Think first: your account's <code>describe-availability-zones</code> shows <code>us-east-1a</code> as <code>ZoneId use1-az1</code>. A teammate's account shows <code>us-east-1a</code> mapped to <code>use1-az2</code>. Is one of you wrong?</summary>
+      <div class="body">
+        <p>No — this is expected, and it's exactly why the AZ ID exists. AWS deliberately randomises the mapping from AZ <em>name</em> to physical AZ <em>ID</em> independently for each account, specifically to spread customer load evenly across the real physical buildings rather than having every account's "first AZ" pile onto the same one. If you and a teammate are trying to confirm you're placing resources in the <em>same physical</em> AZ — for a shared VPC, a cross-account peering design, or capacity planning — comparing AZ names is meaningless; you have to compare AZ IDs, which are stable and identical no matter which account looks them up.</p>
+      </div>
+    </details>
+
+    <h2 id="internals"><span class="beat">Internal working</span>The hierarchy, and the two boundaries that actually matter</h2>
+    <ol class="steps">
+      <li><b>Partitions sit above everything else,</b> and you'll rarely think about them: the standard commercial partition (<code>aws</code>) covers most Regions, with separate partitions for China (<code>aws-cn</code>) and US government Regions (<code>aws-us-gov</code>) that don't interoperate with the standard one at all — different endpoints, different account systems, no shared resources.</li>
+      <li><b>A Region is a fully independent deployment of AWS's services</b> in one geographic area. It has its own control plane, its own API endpoints, and — critically — nothing replicates between Regions unless you explicitly configure it (S3 Cross-Region Replication, DynamoDB Global Tables, RDS cross-Region read replicas). A Region-wide event, while rare, stops at the Region boundary unless your own architecture spans more than one.</li>
+      <li><b>An Availability Zone is one or more discrete data centers</b> within a Region, each with its own power, cooling, and network connectivity, physically sited to avoid sharing a flood plain or a power grid with the others. AWS's own design goal is that a failure in one AZ — a power event, a cooling failure, a fibre cut — has no effect on its siblings.</li>
+      <li><b>AZs in the same Region are linked by dedicated, high-throughput, low-latency private networking.</b> That link is what makes synchronous replication across AZs realistic — an RDS Multi-AZ standby, a stretched cluster, a quorum system's second and third members — in a way that replicating across Regions, with real speed-of-light latency between cities or continents, simply isn't.</li>
+      <li><b>AZ names are per-account and deliberately shuffled; AZ IDs are physical and universal.</b> <code>us-east-1a</code> in your account and <code>us-east-1a</code> in another account can be, and often are, different physical buildings. <code>use1-az1</code> always means the same building, for everyone. Any design decision that depends on "same physical AZ" — shared VPCs, cross-account capacity planning — has to use AZ IDs, not names.</li>
+      <li><b>An AWS account is the hard boundary underneath all of this</b> — its own resource namespace, its own billing, and (absent an explicit cross-account trust relationship) its own IAM universe that nothing in another account can reach into by default. <b>AWS Organizations</b> lets you manage many accounts centrally — consolidated billing, and <b>Service Control Policies</b> that set a permission <em>ceiling</em> no account's own IAM policies, however permissive, can exceed.</li>
+    </ol>
+    <div class="box keypoint"><div class="h">Two independent axes of blast radius</div>
+      <p>Region/AZ is about <em>physical and infrastructure</em> failure — power, cooling, networking, a whole facility. The account boundary is about <em>logical and security</em> failure — a compromised credential, a misconfigured policy, a runaway automation script. A well-designed system limits both independently: spread across AZs (and, for the truly critical, Regions) for the first, and split by account for the second. Neither one substitutes for the other — a single-account application spread across three AZs still has one IAM blast radius; a multi-account application with everything in one AZ still has one physical blast radius.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: a service runs entirely within one Availability Zone, replicated across three separate AWS accounts for "extra safety." Is it well-architected against an AZ failure?</summary>
+      <div class="body">
+        <p>No — the accounts are solving a completely different problem. Splitting across accounts limits the blast radius of a security or configuration failure (a leaked credential in one account can't touch the others), but it does nothing about a physical AZ failure, because every one of those three accounts still has its only copy of the service sitting in the exact same building. If that AZ goes down, all three accounts go down with it, at the same instant, for the same physical reason. Fixing this needs the other axis entirely: spreading the service itself across multiple AZs within each account (or Region-wide, for the highest bar), independent of however many accounts it happens to be split across.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces and what each one owns</h2>
+    <ul>
+      <li><b>Partition.</b> The outermost boundary — standard commercial, China, or US government — with separate endpoints and no cross-partition resource sharing.</li>
+      <li><b>Region.</b> A fully independent deployment of AWS services in one geography; owns its own control plane and API endpoints, with no automatic cross-Region replication of anything.</li>
+      <li><b>Availability Zone (name and ID).</b> The smallest unit designed to fail independently; the <em>name</em> is account-specific and shuffled, the <em>ID</em> is physical and stable across accounts.</li>
+      <li><b>Local Zones and Wavelength Zones.</b> Newer, smaller infrastructure extensions placed closer to end users or telecom networks for latency-sensitive workloads — worth knowing exist, rarely the default choice for a typical service.</li>
+      <li><b>The shared responsibility model.</b> Not a resource, but a contract: AWS owns "of the cloud" (facilities, hardware, network infrastructure, the virtualization layer), you own "in the cloud" (guest OS and patching where applicable, network and firewall configuration, IAM, data), and exactly where that line sits shifts with how abstracted the service is.</li>
+      <li><b>AWS account.</b> The billing, resource-namespace, and default IAM boundary — the unit everything else in this hierarchy ultimately sits inside.</li>
+      <li><b>AWS Organizations, OUs, and SCPs.</b> Centralised management across many accounts: Organizational Units group accounts, consolidated billing simplifies payment, and Service Control Policies set a hard ceiling on what any account's own IAM can ever permit.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one design decision through the hierarchy</h2>
+    <p>A team is asked to run a payments service that must survive losing any single Availability Zone, and must be organisationally isolated from the company's non-production workloads. Walk the decision through the hierarchy this chapter just laid out. First, the <em>account</em> question: production payments gets its own AWS account, under the company's AWS Organization, with an SCP applied to the whole production OU that blocks anything resembling disabling CloudTrail or leaving the Region regardless of what any individual engineer's IAM permissions say. That's the logical blast-radius axis settled — a mistake or a compromise in the non-production account can't reach this one. Second, the <em>physical</em> question, entirely separate: within that one account's VPC, resources are spread across three AZs (their real, physical IDs cross-checked, not just three differently-named ones), with the database using Multi-AZ synchronous replication over the private backbone Region-internal AZs share. Losing any one AZ — a real, physical event — leaves two-thirds of the capacity standing and a database that's already failed over automatically. Neither decision could have substituted for the other; the team needed both axes addressed, and the AWS hierarchy is what told them which knob controlled which risk.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>Every command below is a read-only <code>describe-*</code> call — no resources created, no cost, safe to run against a real AWS account. If you don't have one handy, each lab notes what to reason through instead.</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># One-time setup: configure a profile (interactive; enter your own access key, or use SSO).</span>
+aws configure
+aws sts get-caller-identity          <span class="c"># confirms who you are and which account, before anything else</span></code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — see your Regions and AZs, names versus IDs</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Ask AWS directly for the AZ mapping this chapter has been describing, and see the name/ID split with your own account's real data.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>aws ec2 describe-availability-zones --region us-east-1 \
+  --query 'AvailabilityZones[].{Name:ZoneName,Id:ZoneId,State:State}' --output table</code></pre></div>
+        <div class="out"><span class="ol">Output</span>---------------------------------------
+|      DescribeAvailabilityZones       |
++-------------+-----------+-----------+
+|     Name    |    Id     |   State   |
++-------------+-----------+-----------+
+|  us-east-1a |  use1-az1 |  available|
+|  us-east-1b |  use1-az2 |  available|
+|  us-east-1c |  use1-az6 |  available|
++-------------+-----------+-----------+</code></div>
+        <p>Notice the <code>Id</code> column doesn't increment neatly (<code>az1</code>, <code>az2</code>, <code>az6</code>) — that's not a display bug, it's this account's particular shuffle of names to physical buildings, exactly as the earlier recall predicted. Run the same command from a second account and expect a different mapping.</p>
+        <p class="small"><b>No AWS account handy:</b> this exact shuffle — non-sequential IDs behind sequential-looking names — is the whole lesson; you can take it as given and skip straight to reasoning about why an ID-based comparison is the only safe one across accounts.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — opt-in Regions, and your own instance's view of itself</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Not every Region is available to your account by default. Then, contrast the <em>outside</em> view of AZs (what you just queried) with how a workload running <em>inside</em> EC2 discovers its own placement at runtime — and why that second path has to use IMDSv2.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>aws ec2 describe-regions --all-regions \
+  --query 'Regions[].{Region:RegionName,Status:OptInStatus}' --output table | grep -i opt-in</code></pre></div>
+        <div class="out"><span class="ol">Output</span>|  af-south-1  |  not-opted-in  |
+|  ap-east-1   |  not-opted-in  |
+|  me-south-1  |  not-opted-in  |</code></div>
+        <p>Those Regions exist and are real, but your account can't use them until you explicitly enable each one in the console or via <code>aws account enable-region</code> — a real, common cause of "why can't I see anything in this Region" that has nothing to do with permissions or networking. Now, from <em>inside</em> a running EC2 instance (not your laptop — this address only answers on an instance's own link-local network), fetch its own placement the secure way:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Run this ON an EC2 instance. IMDSv2 requires a session token first:</span>
+TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/placement/availability-zone
+curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/placement/availability-zone-id</code></pre></div>
+        <div class="out"><span class="ol">Output</span>us-east-1a
+use1-az1</code></div>
+        <p>Two calls, not one: <code>PUT</code> for a token, then <code>GET</code> with that token attached as a header. <b>IMDSv1</b> allowed the plain <code>GET</code> with no token at all — which meant any request-forgery bug in an application (a URL fetch that follows an attacker-supplied address) could reach the metadata endpoint and pull real IAM credentials off the instance with a single unauthenticated request. IMDSv2's token step closes exactly that hole, and current AWS guidance is to enforce it exclusively via each instance's <code>HttpTokens: required</code> metadata option rather than leaving IMDSv1 merely "also available."</p>
+        <p class="small"><b>No EC2 instance handy:</b> the two-step shape — <code>PUT</code> for a token, <code>GET</code> with it attached — combined with "IMDSv1 was one unauthenticated GET, and that's exactly the gap that got closed" is the transferable fact; treat the output above as representative.</p>
+      </div>
+    </div>
+
+    <details class="recall"><summary>Think first: an application on an EC2 instance has a bug that lets an attacker make it fetch an arbitrary URL on the attacker's behalf (a classic SSRF). With IMDSv2 enforced, does the attacker still learn anything from pointing that bug at <code>169.254.169.254</code>?</summary>
+      <div class="body">
+        <p>Only that the endpoint exists — nothing useful. A single forged <code>GET</code> to a metadata path returns nothing without the session token, and getting that token requires a <code>PUT</code> request with a custom header, which most SSRF vulnerabilities (built around redirects or simple URL fetches) can't forge — many HTTP client libraries don't support attacker-controlled requests specifying an arbitrary method and header for a redirect target the way they'd support a bare GET. That gap between "can trigger a GET somewhere" and "can construct an arbitrary PUT with a specific header" is precisely the security improvement IMDSv2 exists to create. It's not an absolute guarantee against every possible SSRF variant, but it converts the common, low-effort case from "instant credential theft" to "nothing gained," which is why AWS now recommends requiring it on every instance rather than treating it as optional hardening.</p>
+      </div>
+    </details>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — find the single-AZ deploy hiding in your own account</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>You can't make AWS take down a real Availability Zone to test yourself — so the realistic version of this exercise is the audit an SRE actually runs: find out whether you already have a single-AZ exposure without knowing it.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>aws ec2 describe-instances \
+  --query 'Reservations[].Instances[].Placement.AvailabilityZone' --output text \
+  | tr '\t' '\n' | sort | uniq -c | sort -rn</code></pre></div>
+        <div class="out"><span class="ol">Output</span>     14 us-east-1a
+      1 us-east-1b
+      0 us-east-1c</code></div>
+        <p>Fourteen instances in one AZ, one lonely instance in a second, and nothing at all in the third. Before assuming this is fine because "it's probably just dev boxes" — what's the actual risk here, and what would you check next to size it?</p>
+        <details class="recall"><summary>Reveal the reasoning</summary>
+          <div class="body">
+            <p>The risk is exactly what the earlier figure showed: if <code>us-east-1a</code> has a bad day, roughly 93% of this account's instance capacity goes with it, and the one instance in <code>us-east-1b</code> is very unlikely to be a functioning standby for fourteen missing peers. Before treating this as an incident, size it properly: cross-reference against tags or names to see whether those fourteen instances are actually one production service, a pile of unrelated dev/test boxes (lower stakes, still worth flagging), or — worse — several supposedly-independent services that all happened to land in the same AZ because nobody ever set an AZ-spread requirement. Then check whether anything stateful (a database, a message queue) is single-AZ too, since that's usually the harder and more consequential piece to fix. This audit, run against a real production account, is one of the highest-value five minutes an SRE can spend, and it costs nothing to run.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — "IAM says allow" but the call is still denied</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>A teammate with a full-admin IAM policy in their account swears a specific API call should work, and it's still being denied with <code>AccessDenied</code>. Their IAM policy genuinely allows it. What's left to check?</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Read-only, safe in any account that's part of an Organization:</span>
+aws organizations describe-organization 2&gt;&amp;1 | head -5
+aws organizations list-policies --filter SERVICE_CONTROL_POLICY \
+  --query 'Policies[].{Name:Name,Id:Id}' --output table 2&gt;&amp;1</code></pre></div>
+        <p>If those commands succeed (they need to be run from, or granted visibility into, the Organization's management account, or a delegated admin), you'd next inspect the policy content attached to this account's OU. Reason through why a fully-permissive IAM policy inside the account can still lose, before opening the answer.</p>
+        <details class="recall"><summary>Reveal the mechanism</summary>
+          <div class="body">
+            <p>Because a <b>Service Control Policy is a ceiling, not a grant</b>, and it's evaluated completely independently of, and prior to, the account's own IAM. IAM answers "does this identity's policy allow the action," but the <em>effective</em> permission is the intersection of that answer with every SCP attached to the account, its OU, and every OU above it up to the Organization root. An SCP that denies an action outright, or an SCP written as an allow-list that simply never mentions this action, wins regardless of how permissive the account's own admin policy is — even a policy with <code>"Action": "*", "Resource": "*"</code> can't override an SCP. The fix is never inside the account's own IAM; it's finding which SCP, attached at which level of the OU hierarchy, is doing the blocking, and either changing it (if you're allowed to) or accepting that this account was deliberately fenced in by a decision made above it.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — design the account and AZ layout for a regulated service</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>You're asked to design the account structure and AZ strategy for a new payments service. Requirements: it must survive losing any single AZ with no manual intervention; production must be blast-radius isolated from every other workload the company runs, including other production services; and auditors need a guardrail that no individual engineer, however senior, can accidentally or deliberately weaken. Design it before opening the answer.</p>
+        <details class="recall"><summary>Reveal a defensible design</summary>
+          <div class="body">
+            <p><b>Accounts, not just IAM roles.</b> Give payments its own AWS account, separate from the general production account and from every non-production account, all under one AWS Organization. This means a misconfiguration or a compromised credential anywhere else in the company can't reach payments' resources at all — no IAM policy inside another account can grant access across the account boundary without an explicit, auditable trust relationship this team controls.</p>
+            <p><b>An SCP the account's own admins can't touch.</b> Attach a Service Control Policy at the OU level (above the individual account, so no in-account administrator can modify it) that blocks the specific dangerous actions auditors care about — disabling logging, leaving the approved Region, deleting the account's own guardrail policies. Because it's a ceiling enforced above the account, it holds even against a fully-privileged in-account identity, malicious or mistaken.</p>
+            <p><b>Real AZ spread, verified by ID, not assumed.</b> Inside that one account's VPC, place compute across three AZs and confirm with <code>describe-availability-zones</code> that you're actually spreading across three distinct AZ <em>IDs</em> — not just three differently-named zones that happen to coincidentally be fine, since names alone tell you nothing across a re-created VPC or a different account. Use a database or data store with synchronous Multi-AZ replication so a lost AZ triggers automatic failover rather than a manual runbook at 3 a.m.</p>
+            <p>The two failure modes stay genuinely independent throughout this design: the account/SCP layer only ever addresses who-can-touch-what, and the AZ layer only ever addresses what-survives-a-physical-outage. A design that only did one of these would satisfy half the requirements and quietly fail the audit or the outage, respectively.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · a single-AZ deploy that shouldn't be</div>
+      <p><b>Symptom:</b> an Availability Zone has a degraded event, and one specific service goes fully down while everything else in the same account keeps running fine. <b>First cut:</b> <code>aws ec2 describe-instances</code> (and the equivalent for the data layer) grouped by AZ for that service specifically. <b>Confirm:</b> every instance, or the only database replica, sits in the affected AZ. <b>Cause is usually:</b> the service was originally deployed as a quick single-AZ proof of concept and nobody circled back to spread it, or an Auto Scaling group's subnets were never configured across more than one AZ.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · IAM policy is correct, call still denied</div>
+      <p><b>Symptom:</b> <code>AccessDenied</code> on a call an engineer's own IAM policy clearly permits. <b>First cut:</b> is this account part of an AWS Organization with SCPs attached above it? <b>Confirm:</b> <code>aws organizations list-policies --filter SERVICE_CONTROL_POLICY</code> and read the OU hierarchy this account sits under. <b>Cause is usually:</b> an SCP ceiling the requester didn't know existed, often added by a platform or security team without every downstream engineer being told.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · comparing AZs by name across accounts or Regions</div>
+      <p><b>Symptom:</b> a cross-account design (a shared VPC, a peering setup, capacity planning between two teams' accounts) behaves unexpectedly — resources "in the same AZ" by name turn out to have different latency or failure characteristics than expected. <b>First cut:</b> compare AZ <em>IDs</em>, not names, for every account involved. <b>Confirm:</b> the same name maps to different IDs across the accounts in question. <b>Cause is usually:</b> a design that assumed AZ names are a stable, cross-account identifier, when only AZ IDs actually are.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Design for AZ loss as the normal case, not the exception</b> — this is the core idea behind the Amazon Builders' Library's guidance on static stability: a system should survive losing an AZ using only capacity it <em>already has provisioned</em> in the surviving AZs, not capacity it plans to acquire dynamically once the failure starts. The reasoning is uncomfortable but correct: the same event that takes out an AZ often also strains the exact automated systems (scaling APIs, control planes) you'd be counting on to react to it, at the worst possible moment. Pre-provisioning each AZ to independently absorb its share of a lost peer's load, rather than relying on a scale-out reaction after the fact, is the difference between an AZ failure being a non-event and it being an incident.</p>
+    <p><b>Treat the account boundary as a real security control, not an org chart.</b> Splitting workloads by account is one of the few boundaries AWS gives you that holds even against a fully-compromised identity inside another account — a leaked credential, a supply-chain compromise in a CI pipeline, a misconfigured IAM policy — none of it crosses an account line without an explicit trust relationship. Use it deliberately for your highest-stakes workloads, not just for billing convenience.</p>
+    <p><b>Know exactly where the shared-responsibility line sits for each service you use,</b> because it moves. On EC2, you patch the guest OS; on RDS, AWS patches the database engine but you still own access control, schema, and data; on Lambda or Fargate, AWS owns the runtime and OS entirely and you own only your code and its configuration. <b>Common mistakes:</b> assuming "Multi-AZ" was configured somewhere just because the account has multiple AZs available; comparing AZ names across accounts as if they were stable; treating SCPs as something only the security team needs to know about; and discovering a Region is opt-in only after a deploy silently does nothing there.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>Every "how many nines" conversation you'll have starts here. The Amazon Builders' Library's static-stability framing generalises well past AWS: any system that depends on a healthy control plane to react correctly <em>during</em> the exact failure that control plane might also be affected by is fragile in a way that's easy to miss until the one day it matters — pre-provisioned redundancy beats reactive redundancy for anything you actually can't afford to lose. The account-versus-AZ distinction is the first concrete instance, in this book, of a pattern you'll meet again and again: blast-radius containment and physical failure isolation are different problems, addressed by different mechanisms, and a mature design always names both explicitly rather than assuming one implies the other. Everything from here through the rest of Part VI — VPCs, load balancing, IAM, EKS itself — is built as a layer on top of the guarantees this chapter just made explicit.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's the difference between a Region and an Availability Zone?</summary>
+        <div class="a"><p>A Region is a fully independent geographic deployment of AWS — its own control plane, its own APIs, nothing replicated to or from other Regions unless you configure it yourself. An Availability Zone is one or more physically distinct data centers within a Region, each with its own power, cooling, and networking, designed so a failure in one doesn't affect its siblings. AZs within a Region are linked by a private, low-latency backbone specifically so synchronous replication across them is practical, which is why "Multi-AZ" is the standard high-availability pattern within one Region, while cross-Region designs are inherently asynchronous.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Explain the shared responsibility model with concrete examples across a couple of services.</summary>
+        <div class="a"><p>AWS is responsible for security "of the cloud" — the physical facilities, the hardware, the network infrastructure, and the virtualization layer underneath everything. The customer is responsible for security "in the cloud" — how they configure and use what AWS provides. Where that line sits shifts with the service's abstraction level. On EC2, AWS secures the physical host and hypervisor, but you patch the guest operating system, configure security groups and NACLs, and manage your own IAM and data. On RDS, AWS goes further and patches the database engine itself, but you're still responsible for access control, schema design, query patterns, and what data you put in it. On Lambda or Fargate, AWS manages the entire runtime and underlying OS, and your responsibility narrows to your code, its IAM permissions, and its configuration. The practical use of this model isn't philosophical — it's knowing precisely which failures are yours to prevent and which ones you're trusting AWS's own operational practices for, for every specific service you adopt.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>What does "static stability" mean in an AZ-failure context, and why does it matter?</summary>
+        <div class="a"><p>Static stability, as the Amazon Builders' Library frames it, means a system keeps working through the loss of an AZ using only the capacity and configuration it already has running in the surviving AZs — not capacity it plans to provision reactively once the failure is detected. The reasoning is that the same event causing the AZ failure — a regional power issue, a network disruption, a control-plane degradation — can also degrade or slow down the exact automated systems, like an Auto Scaling group calling the EC2 API, that a reactive design depends on to respond, right when you need them most and least trust them to work quickly. A statically stable design instead pre-provisions each surviving AZ to independently absorb its share of the lost AZ's load — running at, say, 150% of steady-state capacity per AZ across three AZs so that losing any one still leaves each survivor at 100%, rather than running each AZ at exactly steady-state and hoping a scale-out reaction completes fast enough. It matters because it converts an AZ failure from an active incident requiring automation (or a human) to work correctly under stress into a non-event that's already been paid for in advance.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A senior engineer with a full-admin IAM policy in their account can't perform an action that policy clearly allows, and insists it's an AWS bug. How do you investigate?</summary>
+        <div class="a"><p>My first move isn't to doubt their IAM policy — it's to check whether the account sits inside an AWS Organization with Service Control Policies attached above it, because that's the one thing capable of denying an action regardless of how permissive the account's own IAM is. I'd run <code>aws organizations describe-organization</code> and, if I have visibility, <code>list-policies --filter SERVICE_CONTROL_POLICY</code> to see what's attached at this account's OU and every OU above it up the tree, since SCPs are evaluated as an intersection with IAM, not layered on top of it optionally. If an SCP explicitly denies the action, or is written as an allow-list that never mentions it, that's the answer, and it's not an AWS bug — it's a deliberate guardrail, likely placed by a platform or security team, that this specific account's administrators were never meant to be able to override on their own. From there it's a conversation about whether the guardrail is correct as written, not a permissions debugging exercise inside the account.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>Why does AWS bother randomising which AZ name maps to which physical AZ, per account?</summary>
+        <div class="a"><p>To spread load evenly across the real physical infrastructure. If every account's "first" AZ, <code>us-east-1a</code>, mapped to the same physical building, that building would attract a disproportionate share of every new customer's "just pick the first one" default placement, while other physical AZs in the same Region sat comparatively underused — a self-inflicted hot-spot with no benefit to anyone. By shuffling the name-to-physical mapping independently per account, AWS ensures that "everyone's AZ-a" is actually spread across all the real buildings roughly evenly. The cost of that design is exactly what this chapter covers: names are not a valid way to compare AZs across accounts, and anyone who needs a stable, comparable identifier has to use the AZ ID instead.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>A Region is a fully independent AWS deployment with its own control plane and no automatic cross-Region replication. An Availability Zone is a physically distinct facility within a Region, designed to fail independently of its siblings, linked to them by a private backbone fast enough to make synchronous replication practical — which is why Multi-AZ, not multi-Region, is the default high-availability pattern. AZ <em>names</em> are shuffled per account to spread load evenly across real buildings; AZ <em>IDs</em> are the stable, physical, cross-account identifier — use IDs whenever "same physical AZ" actually matters. The shared responsibility model splits "of the cloud" (AWS: facilities, hardware, virtualization) from "in the cloud" (you: OS where applicable, network config, IAM, data), and the line moves with the service's abstraction level. An AWS account is a hard security and billing boundary that nothing crosses without explicit trust; AWS Organizations manages many accounts centrally, and Service Control Policies set a ceiling no in-account IAM policy can exceed. IMDSv2's token-based flow closes the SSRF-to-credential-theft path IMDSv1 left open. Blast-radius isolation (accounts) and physical failure isolation (AZs) are independent axes — a real design addresses both, explicitly.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>A Region is fully independent; nothing replicates across Regions unless you explicitly configure it.</li>
+      <li>An AZ is a physically distinct facility designed to fail independently, linked to its siblings by a private backbone.</li>
+      <li>AZ names are shuffled per account to spread load; AZ IDs are the stable, physical, cross-account identifier.</li>
+      <li>Newer Regions can be opt-in — enable them explicitly, or your account simply can't use them.</li>
+      <li>Shared responsibility: AWS secures "of the cloud"; you secure "in the cloud" — and the line moves by service abstraction level.</li>
+      <li>An AWS account is a hard blast-radius and billing boundary; nothing crosses it without explicit trust.</li>
+      <li>AWS Organizations centralises billing and management; Service Control Policies set a ceiling no in-account IAM can exceed.</li>
+      <li>IMDSv2 requires a token (PUT, then GET with it attached); IMDSv1's unauthenticated GET is the legacy SSRF risk it closes.</li>
+      <li>Static stability: design each AZ to absorb a lost peer's load with capacity already provisioned, not capacity you'll request during the failure.</li>
+      <li>Blast-radius isolation (accounts) and physical failure isolation (AZs) are two independent axes — address both on purpose.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds toward:</span>
+      <a href="ch50-vpc-foundations-cidr-subnets-route-tables-igw.html"><b>Ch 50</b> VPC foundations</a>
+      <a href="ch54-iam-and-sts.html"><b>Ch 54</b> IAM &amp; STS</a>
+      <a href="ch57-eks-architecture.html"><b>Ch 57</b> EKS architecture</a>
+      <a href="ch88-reliability-engineering.html"><b>Ch 88</b> Reliability engineering</a>
+      <a href="ch90-disaster-recovery.html"><b>Ch 90</b> Disaster recovery</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>AWS documentation — <a href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-regions-availability-zones.html">Regions and Availability Zones</a>: the formal definitions this chapter is built on, including AZ IDs.</li>
+      <li>AWS — <a href="https://aws.amazon.com/about-aws/global-infrastructure/">AWS Global Infrastructure</a>: the partition/Region/AZ hierarchy and newer Local Zones and Wavelength.</li>
+      <li>Amazon Builders' Library — <a href="https://aws.amazon.com/builders-library/static-stability-using-availability-zones/">Static stability using Availability Zones</a> (Becky Weiss &amp; Colm MacCárthaigh): the reliability framing this chapter's production section relies on.</li>
+      <li>AWS — <a href="https://aws.amazon.com/compliance/shared-responsibility-model/">Shared Responsibility Model</a>: the official split between AWS's and the customer's obligations, by service category.</li>
+      <li>AWS documentation — <a href="https://docs.aws.amazon.com/organizations/latest/userguide/orgs_introduction.html">AWS Organizations</a>: accounts, OUs, and Service Control Policies as a permission ceiling.</li>
+      <li>AWS documentation — <a href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-metadata.html">Instance metadata and user data</a>: the IMDSv2 token flow and why it replaced IMDSv1.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch48-pod-to-internet-and-the-full-synthesis.html"><span class="dir">← Prev</span><div class="ti">Ch 48 — Pod to Internet and the full synthesis</div></a>
+      <a class="nx" href="ch50-vpc-foundations-cidr-subnets-route-tables-igw.html"><span class="dir">Next →</span><div class="ti">Ch 50 — VPC foundations: CIDR, subnets, route tables, IGW, NAT GW</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 49 of 121 · Part VI · AWS &amp; EKS for SREs. Every account, subnet, and load balancer in the chapters ahead lives somewhere on the map this chapter just drew.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Region, AZs, failure</a>
+    <a href="#internals">The hierarchy</a>
+    <a href="#components">The components</a>
+    <a href="#flow">One design decision</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

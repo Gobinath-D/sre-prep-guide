@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 59 — AWS integrations</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part VI · AWS &amp; EKS &nbsp;·&nbsp; Chapter 59</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part VI · AWS &amp; EKS for SREs · Chapter 59</div>
+      <h1>AWS integrations</h1>
+      <p class="tagline">A raw EKS cluster from the last two chapters can run pods and address them — but it still can't provision a load balancer, get a DNS name, mount a durable volume, or add a node on its own. Something has to translate Kubernetes intent into AWS API calls, authenticated as something more specific than "the whole node." That something is a set of in-cluster controllers, and the credential underneath every one of them is this chapter's spine.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~48 min read · EKS cluster (or eksctl/aws eks describe)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain how a pod gets its own scoped AWS permissions via IRSA or EKS Pod Identity, and say which one you'd reach for today.</li>
+          <li>Trace what happens from annotating an Ingress to a working ALB actually routing traffic.</li>
+          <li>Tell the EBS and EFS CSI drivers apart by what they can do on Fargate and what access mode they give you.</li>
+          <li>Describe how Karpenter provisions nodes differently from a fixed-shape Auto Scaling group, and why that matters for cost and speed.</li>
+          <li>Diagnose "the load balancer never appears" from first principles instead of guessing at annotations.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>Kubernetes objects don't reach outside the cluster</h2>
+    <p>Create an <code>Ingress</code> on plain Kubernetes and nothing happens — it's just a record sitting in etcd until something reads it and acts. Create a <code>PersistentVolumeClaim</code> and it stays <code>Pending</code> forever unless something provisions real storage for it. Create a pod that doesn't fit anywhere and it stays unschedulable unless something adds capacity. Kubernetes describes desired state; it never once promised to reach out to a cloud provider's API on your behalf.</p>
+    <p>On EKS, a handful of controllers exist purely to close that gap: the <b>AWS Load Balancer Controller</b> turns an <code>Ingress</code> into a real ALB, <b>ExternalDNS</b> turns a Service or Ingress into a Route 53 record, the <b>EBS</b> and <b>EFS CSI drivers</b> turn a <code>PersistentVolumeClaim</code> into a real volume, <b>Karpenter</b> turns an unschedulable pod into a freshly-launched EC2 instance, and the <b>CloudWatch Observability</b> add-on turns cluster activity into metrics and logs somewhere you can actually query them. Every one of them runs as an ordinary pod inside your cluster and needs to make real, authenticated AWS API calls — <code>ec2:RunInstances</code>, <code>route53:ChangeResourceRecordSets</code>, <code>elasticloadbalancing:CreateLoadBalancer</code>.</p>
+    <p>That leaves one question underneath all five integrations: how does a pod get AWS credentials without either baking a long-lived access key into an image (never do this) or inheriting the entire node's IAM role (way too broad — every pod on that node would share it)? The answer is <b>IRSA</b> — IAM Roles for Service Accounts — and its newer, simpler sibling <b>EKS Pod Identity</b>. Understand that one mechanism well and the rest of this chapter is just "which controller watches which object, and what does it do with the AWS access it's been handed."</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>Every integration in this chapter follows the identical shape: a controller pod watches a Kubernetes object, and when it sees one it cares about, it makes a scoped, authenticated AWS API call to make reality match it. That's the exact same reconciliation loop from <a href="ch31-the-reconciliation-loop-controllers-informers.html">Chapter 31</a> — the only thing that changed is that the "external system" being reconciled against is AWS instead of another in-cluster object.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: embassies inside a foreign country</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Picture your cluster as a foreign country, and each controller as a small <b>embassy</b> planted inside it. The embassy doesn't try to run the country — it watches for its own citizens' paperwork (an <code>Ingress</code>, a <code>PersistentVolumeClaim</code>, an unschedulable pod) and, when it sees a form it recognizes, picks up the phone and does business back home on that citizen's behalf.</p>
+      <p>To make that call, the embassy needs <b>diplomatic credentials</b> — not a passport that opens every door in the home country, just a scoped set of privileges good for exactly the business this embassy handles. That credential is an IAM role, and the mechanism that hands it out safely is <b>IRSA</b> or <b>EKS Pod Identity</b>. Before honoring the call, the home country's switchboard checks the credential at a kind of <b>passport control</b> — a trust-policy condition that confirms this specific embassy, and no impostor claiming to be it, is the one calling. Get that check wrong and either the embassy can't do its job, or worse, some other tenant of the building can pretend to be it.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In AWS / EKS</th></tr>
+      <tr><td>A small embassy watching for its citizens' paperwork</td><td>An in-cluster controller (LB Controller, ExternalDNS, a CSI driver, Karpenter)</td></tr>
+      <tr><td>The paperwork it watches for</td><td>The Kubernetes object it watches: Ingress, Service, PVC, an unschedulable Pod</td></tr>
+      <tr><td>Doing business back home</td><td>Calling an AWS API: ELB, Route 53, EC2, CloudWatch</td></tr>
+      <tr><td>Scoped diplomatic credentials, not a universal passport</td><td>An IAM role, assumed via IRSA or EKS Pod Identity — not the node's own role</td></tr>
+      <tr><td>Passport control confirming this exact embassy</td><td>The trust-policy condition on <code>:aud</code>/<code>:sub</code> (IRSA) or the Pod Identity association</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>In-cluster controllers calling AWS APIs</h2>
+    <p>Every controller in this chapter has the same two halves: a pod inside the cluster, and a scoped IAM role outside it, joined by IRSA or Pod Identity. Here's the whole cast at once:</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 460" role="img" aria-label="Five in-cluster controllers, each with a ServiceAccount bound to a scoped IAM role via IRSA or Pod Identity, calling their own AWS APIs">
+        <defs>
+          <marker id="i1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="i2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" style="fill:var(--muted)"/></marker>
+        </defs>
+        <rect x="16" y="20" width="360" height="400" rx="12" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="32" y="42" style="fill:var(--accent2);font:700 12px sans-serif;letter-spacing:.04em">YOUR CLUSTER — five controller pods</text>
+
+        <rect x="32" y="56" width="328" height="46" rx="7" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="46" y="73" style="fill:var(--ink);font:600 11.5px sans-serif">AWS Load Balancer Controller</text>
+        <text x="46" y="89" style="fill:var(--muted);font:9.5px sans-serif">watches: Ingress, Service (LoadBalancer), Gateway</text>
+
+        <rect x="32" y="110" width="328" height="46" rx="7" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="46" y="127" style="fill:var(--ink);font:600 11.5px sans-serif">ExternalDNS</text>
+        <text x="46" y="143" style="fill:var(--muted);font:9.5px sans-serif">watches: Ingress, Service — syncs Route 53 records</text>
+
+        <rect x="32" y="164" width="328" height="46" rx="7" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="46" y="181" style="fill:var(--ink);font:600 11.5px sans-serif">EBS / EFS CSI drivers</text>
+        <text x="46" y="197" style="fill:var(--muted);font:9.5px sans-serif">watches: PersistentVolumeClaim</text>
+
+        <rect x="32" y="218" width="328" height="46" rx="7" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="46" y="235" style="fill:var(--ink);font:600 11.5px sans-serif">Karpenter</text>
+        <text x="46" y="251" style="fill:var(--muted);font:9.5px sans-serif">watches: unschedulable Pods</text>
+
+        <rect x="32" y="272" width="328" height="46" rx="7" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="46" y="289" style="fill:var(--ink);font:600 11.5px sans-serif">CloudWatch Observability add-on</text>
+        <text x="46" y="305" style="fill:var(--muted);font:9.5px sans-serif">watches: cluster metrics, pod logs</text>
+
+        <rect x="32" y="336" width="328" height="66" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.4"/>
+        <text x="196" y="358" text-anchor="middle" style="fill:var(--accent);font:700 11.5px sans-serif">each pod's ServiceAccount</text>
+        <text x="196" y="376" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">annotated eks.amazonaws.com/role-arn (IRSA)</text>
+        <text x="196" y="392" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">or a Pod Identity association — never the node role</text>
+
+        <rect x="404" y="20" width="300" height="200" rx="12" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="420" y="42" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.03em">TRUST BROKER</text>
+        <rect x="420" y="56" width="268" height="56" rx="7" style="fill:var(--panel);stroke:var(--accent)"/>
+        <text x="554" y="78" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">OIDC provider (IRSA)</text>
+        <text x="554" y="94" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">checks :aud / :sub, signs a token</text>
+        <rect x="420" y="122" width="268" height="56" rx="7" style="fill:var(--panel);stroke:var(--accent)"/>
+        <text x="554" y="144" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">EKS Pod Identity Agent</text>
+        <text x="554" y="160" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">serves creds from an association, no OIDC edits</text>
+
+        <rect x="404" y="240" width="300" height="180" rx="12" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="420" y="262" style="fill:var(--accent2);font:700 12px sans-serif;letter-spacing:.03em">AWS APIs — one scoped role each</text>
+        <rect x="420" y="276" width="120" height="40" rx="6" style="fill:var(--chip);stroke:var(--line)"/><text x="480" y="300" text-anchor="middle" style="fill:var(--ink);font:10px sans-serif">ELB / EC2</text>
+        <rect x="548" y="276" width="140" height="40" rx="6" style="fill:var(--chip);stroke:var(--line)"/><text x="618" y="300" text-anchor="middle" style="fill:var(--ink);font:10px sans-serif">Route 53</text>
+        <rect x="420" y="324" width="120" height="40" rx="6" style="fill:var(--chip);stroke:var(--line)"/><text x="480" y="348" text-anchor="middle" style="fill:var(--ink);font:10px sans-serif">EBS / EFS</text>
+        <rect x="548" y="324" width="140" height="40" rx="6" style="fill:var(--chip);stroke:var(--line)"/><text x="618" y="348" text-anchor="middle" style="fill:var(--ink);font:10px sans-serif">EC2 RunInstances</text>
+        <rect x="420" y="372" width="268" height="36" rx="6" style="fill:var(--chip);stroke:var(--line)"/><text x="554" y="394" text-anchor="middle" style="fill:var(--ink);font:10px sans-serif">CloudWatch Logs / Metrics</text>
+
+        <line x1="360" y1="79" x2="402" y2="79" style="stroke:var(--accent);stroke-width:1.6" marker-end="url(#i1)"/>
+        <line x1="554" y1="220" x2="554" y2="238" style="stroke:var(--accent2);stroke-width:1.6" marker-end="url(#i1)"/>
+        <text x="380" y="70" style="fill:var(--muted);font:8.5px sans-serif">sts:AssumeRoleWithWebIdentity</text>
+        <text x="490" y="230" style="fill:var(--muted);font:8.5px sans-serif">scoped call, IAM-authenticated</text>
+      </svg>
+      <figcaption>Five controllers, one shared pattern: watch a Kubernetes object, exchange a ServiceAccount-bound identity for a scoped IAM role through IRSA or Pod Identity, then call exactly the AWS API that controller owns — never the node's own broader role.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>Almost every "it worked in one cluster but not this one" ticket for these integrations is a scoping mismatch: the controller's role is missing a permission, the trust policy doesn't match this exact ServiceAccount, or the controller was installed without any role at all and is quietly running with whatever the node happens to have. Once you know the shared shape — object watched, identity exchanged, scoped API call made — every one of these integrations debugs the same way.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>IRSA, Pod Identity, and what each controller actually does</h2>
+
+    <h4>1 · IRSA — the original mechanism</h4>
+    <p>Every EKS cluster gets its own OIDC issuer, registered as an IAM identity provider in your account. A pod's ServiceAccount, when annotated with <code>eks.amazonaws.com/role-arn</code>, gets a projected, signed token mounted into it (a <code>ProjectedServiceAccountToken</code>, not the old non-expiring service-account token) alongside <code>AWS_ROLE_ARN</code> and <code>AWS_WEB_IDENTITY_TOKEN_FILE</code> environment variables. Any AWS SDK that reads the default credential chain calls <code>sts:AssumeRoleWithWebIdentity</code> with that token, and STS hands back temporary credentials — but only if the target role's trust policy explicitly allows it, gated by two conditions: <code>&lt;oidc-provider&gt;:aud</code> must equal <code>sts.amazonaws.com</code>, and <code>&lt;oidc-provider&gt;:sub</code> must equal <code>system:serviceaccount:&lt;namespace&gt;:&lt;name&gt;</code>. Get that <code>:sub</code> condition even slightly wrong — wrong namespace, wrong name — and the role simply refuses the call. The signing key behind the whole exchange rotates every 7 days on the EKS side.</p>
+
+    <h4>2 · EKS Pod Identity — the newer, simpler path</h4>
+    <p>Pod Identity removes the OIDC trust-policy bookkeeping entirely. The role's trust policy just trusts the <code>pods.eks.amazonaws.com</code> service principal for <code>sts:AssumeRole</code> and <code>sts:TagSession</code> — the same trust statement for every role, every cluster. What actually connects a ServiceAccount to a role is a separate object, a <b>Pod Identity association</b> (<code>aws eks create-pod-identity-association --cluster-name X --namespace ns --service-account name --role-arn ...</code>), created and changed purely through the EKS API. An <b>EKS Pod Identity Agent</b> DaemonSet on each node serves credentials to pods locally. AWS now recommends Pod Identity for anything new: no OIDC provider math, roles are reusable across clusters without editing their trust policy, and associations are visible and auditable as first-class EKS objects rather than buried in a role's trust document. IRSA isn't going away — it's what you'll still find on older setups and what you need outside EKS — but Pod Identity is the path of least friction today.</p>
+
+    <h4>3 · AWS Load Balancer Controller</h4>
+    <p>This controller watches <code>Ingress</code> objects and <code>Service</code> objects of type <code>LoadBalancer</code>, plus (from v2.14+) the Kubernetes <code>Gateway</code> API. An <code>Ingress</code> becomes an <b>ALB</b>. A <code>Service</code> of type <code>LoadBalancer</code> becomes an <b>NLB</b> — and since controller version 2.5, it's the <em>default</em> handler for those Services, via a mutating webhook that sets <code>spec.loadBalancerClass</code> to <code>service.k8s.aws/nlb</code>, rather than falling back to the legacy in-tree AWS cloud provider (which only ever made Classic Load Balancers, and which you should not be relying on in 2026). NLBs can target either EC2 instances or pod IPs directly (<code>ip</code> mode) since controller 2.3.0. Every behavior — which subnets, which certificate, internal versus internet-facing, health-check path — is set through annotations on the Kubernetes object; the controller reads them and translates them into ELB API calls.</p>
+    <p>Auto-discovery of subnets depends entirely on <b>tags</b>: public subnets need <code>kubernetes.io/role/elb: 1</code>, private ones need <code>kubernetes.io/role/internal-elb: 1</code>, both alongside <code>kubernetes.io/cluster/&lt;cluster-name&gt;: shared</code> (or <code>owned</code>). <code>eksctl</code>-created VPCs get these automatically; hand-rolled or Terraform-managed VPCs frequently don't — and an untagged subnet is one of the single most common reasons a load balancer never provisions.</p>
+
+    <h4>4 · ExternalDNS</h4>
+    <p>ExternalDNS watches the same objects — <code>Ingress</code> and <code>Service</code> — for a hostname, and keeps a DNS provider in sync with whatever address the LB Controller (or anything else) assigned. On Route 53 it writes an alias or CNAME record, plus a <b>TXT record</b> recording that <em>it</em> owns that name — so it can tell "a record I created" apart from "a record some other process or team owns," and refuses to overwrite the latter. Multiple clusters sharing one hosted zone need distinct <code>--txt-owner-id</code> values so their ExternalDNS instances don't fight over the same names. Its IAM role needs to be scoped to specific hosted zone IDs, not "every zone in the account" — a controller that can rewrite DNS for zones it has no business touching is a bigger blast radius than most teams intend to grant.</p>
+
+    <h4>5 · EBS and EFS CSI drivers</h4>
+    <p>The <b>EBS CSI driver</b> provisions block storage: one volume, one pod, <code>ReadWriteOnce</code>. It cannot attach a volume to a Fargate pod at all, and its node component (the part that actually mounts volumes) only runs on EC2 — Fargate has no node for it to run on. The <b>EFS CSI driver</b> provisions NFS-backed storage, so it supports <code>ReadWriteMany</code> — many pods, same volume, at once. It works with Fargate for <b>static</b> provisioning (point at an existing EFS file system), but <b>dynamic</b> provisioning (the driver creates a new access point per claim) needs driver 1.2+ and doesn't run on Fargate. Both drivers need their own scoped role — <code>AmazonEBSCSIDriverPolicyV2</code> or <code>AmazonEFSCSIDriverPolicy</code> — bound to the driver's controller ServiceAccount via IRSA or Pod Identity; skip that step and the very first PVC you create fails with <code>could not create volume in EC2: UnauthorizedOperation</code>, not because anything about the PVC is wrong.</p>
+
+    <h4>6 · Karpenter</h4>
+    <p>Karpenter watches for <b>unschedulable pods</b> and reasons directly from their requirements — CPU/memory requests, node selectors, affinities, tolerations — to the right EC2 instance, instead of asking a fixed-shape Auto Scaling group to grow and hoping the shape matches. You define a <code>NodePool</code> (constraints: instance types, capacity type, taints, limits) and an <code>EC2NodeClass</code> (the AWS-specific detail: AMI, subnets, security groups); Karpenter provisions directly against EC2, often in under a minute. <b>Consolidation</b> (<code>consolidationPolicy: WhenEmptyOrUnderutilized</code>, tuned with <code>consolidateAfter</code>) continuously looks for cheaper or more tightly-packed arrangements and replaces nodes to get there; a pod annotated <code>karpenter.sh/do-not-disrupt</code> is exempt. For Spot capacity, Karpenter handles <b>interruption</b> natively — including the two-minute Spot reclaim notice — by watching an SQS queue you provide via <code>--interruption-queue</code>, tainting and draining the node ahead of the actual termination (the same SQS mechanics from <a href="ch56-compute-and-data-services-for-sres.html">Chapter 56</a>, put to a very different use). Karpenter's own controller pods must run somewhere it doesn't manage — a small static node group or a Fargate profile — because a node can't safely be responsible for deciding to remove itself.</p>
+
+    <h4>7 · CloudWatch Observability</h4>
+    <p>Clusters on Kubernetes 1.28+ get a small set of control-plane and scheduler metrics in the <code>AWS/EKS</code> namespace for free, with no add-on installed at all. The <b>Amazon CloudWatch Observability</b> EKS add-on (an operator) goes further: it installs the agents that produce <b>Container Insights</b> (per-node, per-pod, per-container metrics and logs) and <b>Application Signals</b> (traces), across both Linux and Windows nodes. Like every other controller here, its permission to call <code>PutMetricData</code> and write logs comes from a role bound to its own ServiceAccount, not the node's.</p>
+
+    <details class="recall"><summary>Think first: your teammate's chart installs cleanly on their cluster's LB Controller but yours refuses every Ingress with an IAM error. Same chart, same version. What's almost certainly different?</summary>
+      <div class="body">
+        <p>Not the chart — the identity. The controller pod on your cluster is either missing its IRSA annotation / Pod Identity association entirely, or it has one pointing at a role whose trust policy doesn't match this exact ServiceAccount (wrong namespace or name in the <code>:sub</code> condition, for IRSA), or the role exists but is missing the ELB/EC2 permissions the controller actually needs. Confirm with <code>kubectl describe sa aws-load-balancer-controller -n kube-system</code> for the annotation, or <code>aws eks list-pod-identity-associations</code> for an association, then check the role's trust policy and attached policy directly in IAM. The chart is never the problem here — the identity binding is cluster-specific by design.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, named</h2>
+    <ul>
+      <li><b>OIDC provider / Pod Identity Agent.</b> The trust broker — verifies a pod's identity claim and hands STS something it will actually honor. Owns: the credential exchange, not the permissions themselves.</li>
+      <li><b>ServiceAccount + role binding.</b> An IRSA annotation or a Pod Identity association tying one Kubernetes identity to one IAM role. Owns: which pods may assume which role.</li>
+      <li><b>AWS Load Balancer Controller.</b> Owns: turning Ingress/Service/Gateway objects into real ALBs and NLBs, and keeping their target groups in sync with pod or node membership.</li>
+      <li><b>ExternalDNS.</b> Owns: keeping Route 53 (or another provider) in sync with the addresses Kubernetes objects actually have, with TXT-based ownership so it never clobbers records it doesn't manage.</li>
+      <li><b>EBS / EFS CSI drivers.</b> Owns: turning a PVC into a real, attached (EBS) or mounted (EFS) volume, and knowing what Fargate can and can't do.</li>
+      <li><b>Karpenter — NodePool + EC2NodeClass.</b> Owns: deciding what capacity to add for a specific set of unschedulable pods, and when to consolidate it away again.</li>
+      <li><b>CloudWatch Observability add-on.</b> Owns: getting metrics, logs, and traces out of the cluster and into something queryable.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>From an annotated Ingress to a working ALB</h2>
+    <p>You apply an <code>Ingress</code> annotated <code>alb.ingress.kubernetes.io/scheme: internet-facing</code> and a few more. The LB Controller's informer sees the create event. Using its IRSA/Pod-Identity-issued credentials, it calls the ELB API to create a load balancer and a target group, discovering subnets by their <code>kubernetes.io/role/elb</code> tags. Because the target type defaults to <code>ip</code>, it registers pod IPs directly — the exact VPC-CNI addresses from <a href="ch58-vpc-cni-the-deep-one.html">Chapter 58</a> — as targets, skipping kube-proxy and NodePorts entirely. Health checks against those pod IPs begin; once they pass, the controller writes the new ALB's DNS name into the Ingress's <code>status.loadBalancer</code> field.</p>
+    <p>ExternalDNS, watching that same Ingress, notices the status now has an address. It calls Route 53 to create an alias record for your hostname pointing at the ALB, plus its TXT ownership marker. DNS propagates — instantly for most resolvers, since alias records track the target automatically — and a request from the actual internet now resolves your hostname straight to the ALB, which forwards to a healthy pod. Every step here was one controller reacting to a change another controller (or you) made; nothing was manually wired together, and this exact chain is what <a href="ch60-end-to-end-synthesis-internet-to-alb.html">Chapter 60</a> traces packet-by-packet from the other direction.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>These labs assume an EKS cluster with an OIDC provider enabled. Every lab notes what to read instead if you're working from <code>aws eks describe-cluster</code> against an existing cluster rather than standing up your own.</p>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — install the LB Controller with a real, scoped role</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Create the IAM role first, then install via Helm — the recommended path, and a preview of <a href="ch61-helm.html">Chapter 61</a>.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>eksctl create iamserviceaccount --cluster my-cluster \
+  --namespace kube-system --name aws-load-balancer-controller \
+  --role-name AmazonEKSLoadBalancerControllerRole \
+  --attach-policy-arn arn:aws:iam::111122223333:policy/AWSLoadBalancerControllerIAMPolicy \
+  --approve
+
+helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+  -n kube-system --set clusterName=my-cluster \
+  --set serviceAccount.create=false \
+  --set serviceAccount.name=aws-load-balancer-controller
+
+kubectl get deployment -n kube-system aws-load-balancer-controller</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME                         READY   UP-TO-DATE   AVAILABLE
+aws-load-balancer-controller  2/2     2            2</code></div>
+        <p><b>Reading an existing install instead:</b> <code>kubectl describe sa aws-load-balancer-controller -n kube-system</code> shows the IRSA annotation directly; <code>aws iam get-role --role-name AmazonEKSLoadBalancerControllerRole --query Role.AssumeRolePolicyDocument</code> shows exactly which ServiceAccount its trust policy honors.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — annotate an Ingress and watch the ALB appear</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>One Ingress, three annotations, and a real address a few minutes later.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+spec:
+  ingressClassName: alb
+  rules:
+  - http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service: { name: web, port: { number: 80 } }
+EOF
+
+kubectl get ingress web -w</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME   CLASS   HOSTS   ADDRESS                                    PORTS
+web    alb     *       k8s-default-web-1a2b3c4d.us-east-1.elb.amazonaws.com   80</code></div>
+        <p>Confirm the same load balancer independently, from the AWS side: <code>aws elbv2 describe-load-balancers --query 'LoadBalancers[?contains(LoadBalancerName,`k8s-default-web`)]'</code>. Two different tools, same object — which is exactly the habit you want when something in this chain doesn't match up.</p>
+      </div>
+    </div>
+
+    <details class="recall"><summary>Think first: the target type in that annotation is "ip." What's different about the request path compared to "instance" mode, and which chapter already taught you why?</summary>
+      <div class="body">
+        <p>With <code>ip</code> targets, the ALB registers pod IPs directly and sends traffic straight to a pod's real VPC address — the exact addresses the VPC CNI hands out in <a href="ch58-vpc-cni-the-deep-one.html">Chapter 58</a>. There's no NodePort and no kube-proxy hop. With <code>instance</code> targets, the ALB instead targets a node's NodePort, and kube-proxy's iptables rules DNAT that packet to whichever pod gets picked — an extra hop, plus health checks that test the node's proxying rather than the pod itself. <code>ip</code> mode is the modern default for exactly this reason: fewer hops, and a health check that means what you think it means.</p>
+      </div>
+    </details>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — an Ingress that never gets an address</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Reproduce the single most common integration failure on purpose: remove the subnet tags the controller relies on for auto-discovery.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>aws ec2 delete-tags --resources subnet-0abc123 --tags Key=kubernetes.io/role/elb
+kubectl delete ingress web &amp;&amp; kubectl apply -f web-ingress.yaml
+kubectl get ingress web</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME   CLASS   HOSTS   ADDRESS   PORTS
+web    alb     *                 80</code></div>
+        <p><code>ADDRESS</code> stays empty indefinitely. Before revealing, check the one place that always has the real reason: the controller's own logs.</p>
+        <details class="recall"><summary>Reveal where the error actually lives</summary>
+          <div class="body">
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl logs -n kube-system deployment/aws-load-balancer-controller | tail -20</code></pre></div>
+            <div class="out"><span class="ol">Output</span>{"level":"error","msg":"failed to build LoadBalancer",
+"error":"unable to resolve at least one subnet (0 match VPC and AZ)"}</code></div>
+            <p>The Ingress object itself has no useful error surface here — the controller's log is where the actual cause lives. This particular message is the subnet-tag failure specifically; the other three shapes to know by the exact wording: an IAM <code>AccessDenied</code> means the controller's role is missing a permission; a webhook/annotation parse error means a typo'd annotation key; and if the controller never even attempts a call, check whether it's actually the active controller at all — the legacy in-tree cloud provider can still be silently handling <code>LoadBalancer</code> Services if the LB Controller was installed without disabling it.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — a PVC stuck Pending on the EBS CSI driver</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Create a claim against a ServiceAccount that has no CSI role behind it, and read the failure the way you'd have to at 3am.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl apply -f pvc.yaml
+kubectl describe pvc data-pvc | sed -n '/Events/,$p'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>Warning  ProvisioningFailed  persistentvolume-controller
+  failed to provision volume with StorageClass "ebs-sc": rpc error: code = Internal
+  desc = could not create volume in EC2: UnauthorizedOperation</code></div>
+        <p><code>UnauthorizedOperation</code> — not a quota problem, not a subnet problem. Before opening the answer, decide what you'd check next and why.</p>
+        <details class="recall"><summary>Reveal the check and the fix</summary>
+          <div class="body">
+            <p>Confirm which identity the driver's controller pod is actually running as:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl describe sa ebs-csi-controller-sa -n kube-system
+aws eks list-pod-identity-associations --cluster-name my-cluster</code></pre></div>
+            <p>No IRSA annotation and no Pod Identity association means the driver is quietly running with whatever the node's own instance role allows — usually nothing close to <code>ec2:CreateVolume</code>. The fix is exactly Lab 1's pattern applied to the CSI driver: create a role with <code>AmazonEBSCSIDriverPolicyV2</code>, bind it to <code>ebs-csi-controller-sa</code>, and the very next reconcile succeeds with no other change.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — size a NodePool and reason through a Spot interruption</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>Given this <code>NodePool</code> requirements block, work out what Karpenter will and won't do before opening the answer.</p>
+        <div class="codewrap"><span class="lang">yaml</span><pre><code>requirements:
+- key: karpenter.sh/capacity-type
+  operator: In
+  values: ["spot"]
+- key: node.kubernetes.io/instance-type
+  operator: In
+  values: ["m5.large", "m5.xlarge", "c5.large", "c5.xlarge"]
+disruption:
+  consolidationPolicy: WhenEmptyOrUnderutilized
+  consolidateAfter: 1m</code></pre></div>
+        <p>A batch of pods needing 2 CPU / 4Gi each goes Pending. A critical pod is annotated <code>karpenter.sh/do-not-disrupt</code>. Ten minutes later a Spot reclaim notice arrives for one of the nodes. Reason through what happens at each point, then check yourself.</p>
+        <details class="recall"><summary>Reveal the reasoning</summary>
+          <div class="body">
+            <p>Karpenter provisions from the four allowed instance types on Spot capacity only — it will pick whichever satisfies the pending pods' requests using the Price-Capacity-Optimized allocation strategy, most likely an <code>m5.large</code> or <code>c5.large</code> for a 2 CPU/4Gi pod, and it does this directly against EC2, not through an ASG. Once the batch finishes and a node sits empty (or badly underutilized) for a full minute, consolidation kicks in and Karpenter drains and terminates it to save cost — <em>except</em> a node holding the <code>do-not-disrupt</code> pod is exempt from that removal entirely, by design. When the Spot reclaim notice lands, Karpenter — watching the interruption queue you configured with <code>--interruption-queue</code> — taints and starts draining that node immediately, well ahead of the actual two-minute reclaim deadline, and provisions a replacement in parallel rather than waiting for the pod to fail first. Nothing here touches a fixed ASG desired-count at any point; every decision is made directly against the pending or interrupted pods.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · the load balancer never provisions</div>
+      <p><b>Symptom:</b> an Ingress or LoadBalancer Service sits with no <code>ADDRESS</code> indefinitely. <b>First cut:</b> <code>kubectl logs</code> on the LB Controller deployment — the real reason always lives there, never on the Kubernetes object itself. <b>The four usual causes, in the order to check them:</b> (1) missing or mis-scoped IRSA/Pod Identity permissions — look for <code>AccessDenied</code>; (2) subnets not tagged with <code>kubernetes.io/role/elb</code> or <code>internal-elb</code> — look for "unable to resolve at least one subnet"; (3) a typo'd or unsupported annotation key, which the webhook usually rejects with a clear parse error; (4) the legacy in-tree cloud provider still active instead of the LB Controller, quietly doing nothing or making a Classic Load Balancer you didn't ask for.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · PVC stuck Pending with UnauthorizedOperation</div>
+      <p><b>Symptom:</b> <code>kubectl describe pvc</code> shows <code>could not create volume in EC2: UnauthorizedOperation</code> or an EFS equivalent. <b>First cut:</b> check whether the CSI controller's ServiceAccount has an IRSA annotation or Pod Identity association at all. <b>Usual cause:</b> the driver was installed without its IAM role ever being created or bound, so it's running on whatever the node's own role happens to allow. <b>Fix:</b> create and bind the driver-specific managed policy; no change to the PVC or StorageClass is needed.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · ExternalDNS won't touch a record it should own</div>
+      <p><b>Symptom:</b> a hostname never resolves, or resolves to something stale, despite the Ingress having a valid address. <b>First cut:</b> check the ExternalDNS pod's logs for a message about an existing record without a matching TXT owner marker. <b>Usual cause:</b> a record already exists in the zone (created manually, or by another cluster with a different <code>--txt-owner-id</code>) and ExternalDNS is correctly refusing to overwrite something it doesn't own. <b>Fix:</b> resolve the ownership conflict deliberately — delete the stale record or reconcile the owner ID — rather than forcing an overwrite.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Security.</b> Give every controller its own role with only the permissions it actually needs — the AWS-published policy documents for the LB Controller and each CSI driver are already scoped tightly; resist the urge to attach something broader "to save time." Scope ExternalDNS to specific hosted zone IDs, never an account-wide DNS permission. Prefer Pod Identity for anything new — one fewer place (the OIDC trust policy) to get wrong.</p>
+    <p><b>Performance and cost.</b> <code>ip</code>-mode targets are both faster (no kube-proxy hop) and more accurate (health checks test the actual pod); default to them. Karpenter's consolidation is where most of the cost savings over a static ASG-based node group actually show up — give it room to work rather than pinning nodes unnecessarily. EFS adds real per-operation latency compared to EBS; reach for it because you need <code>ReadWriteMany</code> or Fargate compatibility, not as a default choice.</p>
+    <p><b>Common mistakes:</b> installing the LB Controller without disabling the legacy in-tree cloud provider, leaving two systems able to react to the same Service; creating a VPC by hand (or via a Terraform module that doesn't know about EKS conventions) and forgetting the subnet tags <code>eksctl</code> would have added automatically; running Karpenter's own controller on a node Karpenter itself manages; and treating "the chart installed" as proof the underlying IAM binding is correct, when it's a completely separate, cluster-specific step every time.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>Every controller here is the same idea you first met in <a href="ch31-the-reconciliation-loop-controllers-informers.html">Chapter 31</a>, aimed outward: watch an object, reconcile reality toward it, repeat forever. That pattern — "infrastructure as Kubernetes objects, reconciled by a controller" — is the seed of the whole GitOps and infrastructure-as-Kubernetes-API movement you'll meet properly in <a href="ch64-gitops-principles.html">Chapter 64</a>: once you accept that a controller can safely reconcile a <code>NodePool</code> against EC2 or an <code>Ingress</code> against an ALB, there's no principled reason it can't reconcile a database or a DNS zone the same way. The IRSA/Pod-Identity model is also a clean, general answer to a problem every multi-tenant platform hits: how do you hand out narrow, per-workload cloud credentials instead of one broad credential shared by everything running on the same host.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What does the AWS Load Balancer Controller actually do, and why does it need IRSA?</summary>
+        <div class="a"><p>It's a Kubernetes controller that watches Ingress and LoadBalancer-type Service objects and calls the ELB API to create real ALBs and NLBs pointed at your pods or nodes, translating annotations into load-balancer configuration. It needs IRSA (or EKS Pod Identity) because it has to make real, permissioned AWS API calls — CreateLoadBalancer, RegisterTargets — and the only safe way to give one specific pod exactly those permissions, without handing every pod on the node the same access, is to bind a scoped IAM role to its own ServiceAccount rather than relying on the node's broader role.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through what happens from annotating an Ingress to a working ALB.</summary>
+        <div class="a"><p>You apply an Ingress with annotations like scheme and target-type. The LB Controller's informer sees the create event and, authenticated through its IRSA-issued role, calls the ELB API to create a load balancer and target group, discovering subnets by their kubernetes.io/role/elb tags. With the default ip target type it registers pod IPs directly as targets — real VPC-CNI addresses, no NodePort involved — and health checks against them begin. Once targets pass, the controller writes the load balancer's DNS name back into the Ingress's status. Separately, ExternalDNS is watching that same object; once it sees the status populated, it creates an alias record and a TXT ownership marker in Route 53 pointing at that DNS name. From that point, a real client resolving your hostname gets routed straight to the ALB and on to a healthy pod. The whole thing is two independent controllers each reacting to state, not a single script wiring it together.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Compare IRSA and EKS Pod Identity. Which would you use today, and why?</summary>
+        <div class="a"><p>Both solve the same problem — giving one pod a scoped IAM role instead of the node's — but differ in mechanism. IRSA relies on a per-cluster OIDC provider; a pod's ServiceAccount is annotated with a role ARN, gets a projected signed token, and the SDK exchanges it via sts:AssumeRoleWithWebIdentity, gated by trust-policy conditions on the exact OIDC audience and subject. That trust policy is cluster- and ServiceAccount-specific, which means every role needs its own carefully-written condition, and a typo in the namespace or ServiceAccount name silently breaks the whole chain. Pod Identity replaces that with a single, identical trust statement for every role — trust the pods.eks.amazonaws.com principal — and moves the actual binding into a separate, EKS-API-managed association between a namespace/ServiceAccount pair and a role, created and inspected with plain eks: API calls. That's simpler to audit, easier to move a role between clusters without editing its trust policy, and harder to get subtly wrong. I'd default to Pod Identity for anything new today, and keep IRSA in mind for older clusters or for anything outside EKS that still needs OIDC federation.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>You create an Ingress and no ALB ever shows up. How do you debug it?</summary>
+        <div class="a"><p>I go straight to the LB Controller's own logs rather than the Ingress object, because the object itself rarely carries a useful error. From there I check, in order: whether the controller's calls are failing with AccessDenied, which points at a missing or mis-scoped IRSA/Pod Identity permission; whether the log mentions being unable to resolve a subnet, which points at missing kubernetes.io/role/elb or internal-elb tags — very common on hand-built or Terraform-managed VPCs that skipped the tagging convention eksctl applies automatically; whether an annotation was rejected outright, which points at a typo in the annotation key; and finally whether the controller is even the one handling this object at all, since the legacy in-tree AWS cloud provider can still silently pick up LoadBalancer Services if it was never disabled. I'd also independently check the AWS side with describe-load-balancers to confirm nothing partial got created and orphaned.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>How is Karpenter different from the Cluster Autoscaler, and why might you choose it?</summary>
+        <div class="a"><p>Cluster Autoscaler works by adjusting the desired count of existing, fixed-shape Auto Scaling groups — it can only grow or shrink groups that already exist with a predetermined instance type, so matching diverse pod requirements often means maintaining many node groups. Karpenter skips that layer entirely: it watches unschedulable pods directly and provisions EC2 capacity that fits their actual requirements — instance type, zone, capacity type — through a NodePool and EC2NodeClass, and can launch a right-sized node in under a minute without any pre-existing group shaped for that pod. It also owns consolidation natively, continuously looking for cheaper or tighter arrangements and replacing nodes to get there, and handles Spot interruption directly against an SQS notification queue rather than relying on a separate node-termination handler. I'd choose it for workloads with spiky or diverse compute requirements where maintaining a matrix of node groups doesn't scale, and lean on managed node groups instead for steady, predictable capacity where that flexibility isn't buying you anything.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>Nothing outside plain Kubernetes objects happens on its own — a controller has to watch the object and call an AWS API to make it real, and every one of those calls needs a scoped identity delivered by IRSA (OIDC, <code>sts:AssumeRoleWithWebIdentity</code>, <code>:aud</code>/<code>:sub</code> trust conditions) or the simpler EKS Pod Identity (a <code>pods.eks.amazonaws.com</code> trust statement plus an association). The AWS Load Balancer Controller turns Ingress/Service/Gateway objects into ALBs and NLBs, preferring <code>ip</code>-mode targets that skip kube-proxy. ExternalDNS keeps Route 53 in sync using TXT-based ownership. The EBS CSI driver gives ReadWriteOnce block storage with no Fargate support; EFS gives ReadWriteMany and works with Fargate for static provisioning only. Karpenter provisions right-sized EC2 capacity directly against pending pods instead of through a fixed ASG, and consolidates aggressively unless told not to. When a load balancer never appears, the controller's own logs — not the Kubernetes object — hold the answer, and it's almost always one of four things: permissions, subnet tags, annotations, or a leftover legacy controller.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>None of "provision a load balancer, get a DNS name, mount durable storage, or scale nodes" is native Kubernetes — an AWS-facing controller does each one.</li>
+      <li>Every controller needs its own scoped AWS permissions, delivered to its pod via IRSA or the newer EKS Pod Identity — not the node's own role.</li>
+      <li>IRSA uses the cluster's OIDC provider and an STS AssumeRoleWithWebIdentity call, gated by an <code>:aud</code>/<code>:sub</code> trust-policy condition tied to one ServiceAccount.</li>
+      <li>EKS Pod Identity is the simpler successor: a <code>pods.eks.amazonaws.com</code> trust relationship plus an association — no OIDC trust-policy editing per role.</li>
+      <li>The AWS Load Balancer Controller turns an Ingress into an ALB and a Service of type LoadBalancer into an NLB by default (v2.5+); annotations configure everything else.</li>
+      <li>The most common "no ALB appears" causes are: missing IRSA/Pod Identity permissions, un-tagged subnets, wrong annotation keys, and the legacy in-tree provider still active.</li>
+      <li>ExternalDNS watches Service/Ingress objects and keeps Route 53 records in sync, using a TXT record so it never clobbers records it doesn't own.</li>
+      <li>The EBS CSI driver gives ReadWriteOnce block volumes (no Fargate); the EFS CSI driver gives ReadWriteMany NFS volumes (Fargate-friendly, static provisioning only there).</li>
+      <li>Karpenter provisions right-sized EC2 capacity directly against pending pods (NodePool + EC2NodeClass) instead of going through a fixed-shape Auto Scaling group.</li>
+      <li>CloudWatch now ships some EKS control-plane metrics for free (1.28+); the Observability EKS add-on layers on Container Insights and Application Signals.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch31-the-reconciliation-loop-controllers-informers.html"><b>Ch 31</b> Reconciliation &amp; controllers</a>
+      <a href="ch52-load-balancing-alb-nlb-target-groups-health.html"><b>Ch 52</b> Load balancing</a>
+      <a href="ch53-route-53-dns-and-routing-policies.html"><b>Ch 53</b> Route 53</a>
+      <a href="ch55-irsa-and-eks-pod-identity.html"><b>Ch 55</b> IRSA &amp; Pod Identity</a>
+      <a href="ch58-vpc-cni-the-deep-one.html"><b>Ch 58</b> VPC CNI</a>
+      <a href="ch60-end-to-end-synthesis-internet-to-alb.html"><b>Ch 60</b> End-to-end on EKS</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Amazon EKS User Guide — <a href="https://docs.aws.amazon.com/eks/latest/userguide/aws-load-balancer-controller.html">Route internet traffic with AWS Load Balancer Controller</a>: what it provisions and the legacy cloud-provider caveat.</li>
+      <li>Amazon EKS User Guide — <a href="https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html">IAM roles for service accounts</a>: the OIDC/IRSA mechanism end to end.</li>
+      <li>Amazon EKS User Guide — <a href="https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html">EKS Pod Identity</a>: the newer association-based credential model.</li>
+      <li>Amazon EKS User Guide — <a href="https://docs.aws.amazon.com/eks/latest/userguide/ebs-csi.html">Use Kubernetes volume storage with Amazon EBS</a> and <a href="https://docs.aws.amazon.com/eks/latest/userguide/efs-csi.html">with Amazon EFS</a>: driver capabilities and Fargate limits.</li>
+      <li>Amazon EKS User Guide — <a href="https://docs.aws.amazon.com/eks/latest/userguide/autoscaling.html">Scale cluster compute with Karpenter and Cluster Autoscaler</a>: how the two approaches differ.</li>
+      <li>Amazon EKS User Guide — <a href="https://docs.aws.amazon.com/eks/latest/userguide/cloudwatch.html">Monitor cluster data with Amazon CloudWatch</a>: free basic metrics versus the Observability add-on.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch58-vpc-cni-the-deep-one.html"><span class="dir">← Prev</span><div class="ti">Ch 58 — VPC CNI: the deep one</div></a>
+      <a class="nx" href="ch60-end-to-end-synthesis-internet-to-alb.html"><span class="dir">Next →</span><div class="ti">Ch 60 — End-to-end synthesis: Internet to ALB</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 59 of 121 · Part VI · AWS &amp; EKS for SREs. Every integration in this chapter is a controller with a scoped credential. Next: watch one request cross all of them, hop by hop.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Controllers calling AWS</a>
+    <a href="#internals">IRSA, Pod Identity, each controller</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">Ingress to working ALB</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

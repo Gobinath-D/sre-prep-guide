@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 37 — Autoscaling &amp; governance: HPA, VPA, Cluster Autoscaler, Karpenter</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part IV · Kubernetes &nbsp;·&nbsp; Chapter 37</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part IV · Kubernetes — Architecture &amp; Internals · Chapter 37</div>
+      <h1>Autoscaling and governance: HPA, VPA, Cluster Autoscaler, Karpenter</h1>
+      <p class="tagline">Load isn't constant, and neither is your bill. Kubernetes gives you four separate machines for matching capacity to demand — two that change how many pods you run, two that change how many nodes you have — plus quotas to stop any one team from eating the cluster. Wire them up wrong and you get 3&nbsp;a.m. flapping, ten-minute scale-ups, and deploys that get silently rejected.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~45 min read · kind + kubectl</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Write an <code>autoscaling/v2</code> HPA on CPU, and explain the exact formula it uses to pick a replica count.</li>
+          <li>Say when to reach for custom or external metrics instead of CPU, and why a stabilization window stops flapping.</li>
+          <li>Tell HPA, VPA, Cluster Autoscaler and Karpenter apart — what each one moves, and which two must never fight over the same signal.</li>
+          <li>Use <code>ResourceQuota</code> and <code>LimitRange</code> to govern a namespace, and diagnose the "my deploy was rejected" that follows.</li>
+          <li>Treat requests as the one number that drives scheduling, bin-packing, and cost — and right-size them instead of guessing.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>Capacity is a moving target</h2>
+    <p>You deploy a service and pick three replicas. It's fine on Tuesday. Then a marketing email goes out at noon, traffic quadruples for twenty minutes, and three replicas fall over. You bump it to twelve. Now it's fine at noon and wildly over-provisioned every night, and Finance wants to know why the cluster costs what a small yacht costs.</p>
+    <p>Every fixed number you pick is wrong most of the time. Pick it for the peak and you waste money off-peak; pick it for the average and you fall over at the peak. The only right answer is a number that <em>moves</em> — capacity that tracks demand up and down on its own.</p>
+    <p>But "capacity" isn't one thing in Kubernetes, so there isn't one autoscaler. There are two questions, and they're independent. <b>How many copies of this workload should run?</b> — that's replicas, and it's the Horizontal Pod Autoscaler's job. <b>How much CPU and memory should each copy ask for?</b> — that's requests, and it's the Vertical Pod Autoscaler's job. And underneath both: <b>are there even enough nodes to place the pods?</b> — that's the Cluster Autoscaler or Karpenter, which add and remove machines. Pods scaling out is pointless if they land Pending because no node has room.</p>
+    <p>Then there's the other side of the coin. In a shared cluster, an autoscaler that can grow without limit is a way for one team to accidentally consume everything. So the same chapter that teaches you to scale also teaches you to <b>govern</b>: <code>ResourceQuota</code> caps what a namespace may consume, and <code>LimitRange</code> fills in sane defaults so the quota is enforceable. Autoscaling without governance is how a single bad config drains a cluster; governance without autoscaling is how you page someone every launch.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>There is no single "Kubernetes autoscaler." Four distinct controllers act on two different axes: <b>HPA</b> and <b>VPA</b> change your <em>pods</em> (count and size); <b>Cluster Autoscaler</b> and <b>Karpenter</b> change your <em>nodes</em>. They react to different signals and can be composed — but HPA and VPA on the same resource will fight, and pod scaling without node scaling just produces Pending pods.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: staffing a restaurant</h2>
+    <p>Here's the picture to carry through the whole chapter.</p>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>You run a restaurant. On a busy night you need more <b>waiters on the floor</b> — that's <b>horizontal</b> scaling, more identical workers handling more tables in parallel. That's the HPA: watch how slammed the floor is (the queue, the ticket times) and call in or send home waiters to hit a target.</p>
+      <p>Separately, you notice each waiter is being handed a tray built for a child and keeps running back to the kitchen. You give them a <b>bigger tray</b> — that's <b>vertical</b> scaling, making each worker more capable. That's the VPA: it watches what each pod actually uses and resizes its requests so it stops starving or hoarding.</p>
+      <p>But waiters need <b>floor space and tables</b>. When you've called in so many waiters that there's nowhere to put them, you rent the room next door — that's <b>node</b> autoscaling. The <b>Cluster Autoscaler</b> is a landlord with a few fixed room sizes ("small," "medium") who adds another of whatever you pre-picked. <b>Karpenter</b> is a landlord who looks at exactly the party you have waiting and builds a room the right shape on the spot — then knocks down half-empty rooms overnight to save rent.</p>
+      <p>And the <b>ResourceQuota</b> is the fire marshal: this room holds 120 people, full stop, no matter how many waiters you want to cram in. The <b>LimitRange</b> is the rule that every party gets assigned a standard table size unless they ask otherwise — so the fire marshal can actually do the maths.</p>
+    </div>
+    <p>Every piece of that maps onto something concrete:</p>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In Kubernetes</th></tr>
+      <tr><td>More waiters on the floor</td><td>HPA — scales replica <em>count</em> (<code>autoscaling/v2</code>)</td></tr>
+      <tr><td>A bigger tray per waiter</td><td>VPA — scales CPU/memory <em>requests</em> per pod</td></tr>
+      <tr><td>How slammed the floor is</td><td>The metric HPA targets (CPU %, RPS, queue depth)</td></tr>
+      <tr><td>Renting a pre-sized room</td><td>Cluster Autoscaler — grows a node <em>group</em> / ASG</td></tr>
+      <tr><td>Building a room to fit the party</td><td>Karpenter — provisions a right-sized node directly</td></tr>
+      <tr><td>Knocking down half-empty rooms</td><td>Consolidation / scale-down of underused nodes</td></tr>
+      <tr><td>The fire marshal's headcount cap</td><td><code>ResourceQuota</code> — hard ceiling per namespace</td></tr>
+      <tr><td>The standard table size</td><td><code>LimitRange</code> — default requests/limits per container</td></tr>
+    </table>
+
+    <details class="recall"><summary>Think first: your HPA scaled a Deployment from 4 to 20 replicas, but 12 of the new pods are stuck Pending. Did the HPA fail?</summary>
+      <div class="body">
+        <p>No — the HPA did its whole job. It computed that 20 replicas were needed and told the Deployment to run 20; the Deployment created 20 pods. HPA has no idea whether the cluster has room. The 12 Pending pods are a <em>node</em> problem: the scheduler can't place them because no node has the free CPU/memory their requests ask for. That's the Cluster Autoscaler's or Karpenter's cue — they watch for exactly this (unschedulable pods) and add nodes. If neither is installed, or a <code>ResourceQuota</code> or the cloud account's instance limit is blocking new capacity, the pods sit Pending forever. This is the single most common autoscaling surprise: pod scaling and node scaling are two separate systems, and the first is useless without the second.</p>
+      </div>
+    </details>
+
+    <h2 id="arch"><span class="beat">Architecture</span>Two axes, four controllers</h2>
+    <p>Both axes are the same control loop you met in <a href="ch31-the-reconciliation-loop-controllers-informers.html">Chapter 31</a>: observe a signal, compare to desired, act, repeat. The pod axis observes a metric and writes a replica count. The node axis observes <em>unschedulable pods</em> and writes new machines into existence. The diagram shows both.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 452" role="img" aria-label="Top: metrics feed the HPA which sets replicas on a Deployment. Bottom: unschedulable pods trigger the node autoscaler to add a node.">
+        <defs>
+          <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="ag" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+          <marker id="ad" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--deep)"/></marker>
+        </defs>
+        <!-- POD AXIS band -->
+        <rect x="14" y="14" width="692" height="176" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="30" y="36" style="fill:var(--accent);font:700 12px sans-serif;letter-spacing:.05em">POD AXIS — how many, how big</text>
+        <!-- metrics -->
+        <rect x="34" y="60" width="176" height="104" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="122" y="88" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">metrics API</text>
+        <text x="122" y="108" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">metrics.k8s.io (CPU)</text>
+        <text x="122" y="124" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">custom.metrics.k8s.io</text>
+        <text x="122" y="140" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">external.metrics.k8s.io</text>
+        <!-- HPA -->
+        <rect x="272" y="60" width="176" height="104" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="360" y="92" text-anchor="middle" style="fill:var(--ink);font:600 14px sans-serif">HPA controller</text>
+        <text x="360" y="112" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">every 15s: read metric,</text>
+        <text x="360" y="128" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">compute desired replicas,</text>
+        <text x="360" y="144" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">write to /scale</text>
+        <!-- Deployment/replicas -->
+        <rect x="510" y="60" width="176" height="104" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="598" y="86" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">Deployment</text>
+        <text x="598" y="104" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">replicas: 3 → 6</text>
+        <rect x="528" y="118" width="30" height="34" rx="5" style="fill:var(--chip);stroke:var(--accent2)"/>
+        <rect x="566" y="118" width="30" height="34" rx="5" style="fill:var(--chip);stroke:var(--accent2)"/>
+        <rect x="604" y="118" width="30" height="34" rx="5" style="fill:var(--chip);stroke:var(--accent2)"/>
+        <rect x="642" y="118" width="30" height="34" rx="5" style="fill:var(--chip);stroke:var(--line);stroke-dasharray:3 3"/>
+        <line x1="212" y1="112" x2="268" y2="112" style="stroke:var(--accent);stroke-width:2" marker-end="url(#ar)"/>
+        <line x1="450" y1="112" x2="506" y2="112" style="stroke:var(--accent);stroke-width:2" marker-end="url(#ar)"/>
+        <!-- NODE AXIS band -->
+        <rect x="14" y="204" width="692" height="234" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="30" y="228" style="fill:var(--accent2);font:700 12px sans-serif;letter-spacing:.05em">NODE AXIS — is there room?</text>
+        <!-- unschedulable pod -->
+        <rect x="34" y="252" width="176" height="150" rx="8" style="fill:var(--chip);stroke:var(--deep);stroke-width:1.5"/>
+        <text x="122" y="284" text-anchor="middle" style="fill:var(--deep);font:600 13px sans-serif">Pending pod</text>
+        <text x="122" y="304" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">Unschedulable:</text>
+        <text x="122" y="320" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">"Insufficient cpu"</text>
+        <text x="122" y="344" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">no node has room</text>
+        <text x="122" y="360" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">for its requests</text>
+        <!-- node autoscaler -->
+        <rect x="272" y="252" width="176" height="150" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="360" y="282" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">node autoscaler</text>
+        <text x="360" y="304" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">Cluster Autoscaler:</text>
+        <text x="360" y="320" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">grow a node group</text>
+        <text x="360" y="342" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">Karpenter:</text>
+        <text x="360" y="358" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">fit a node to the pods</text>
+        <!-- new node -->
+        <rect x="510" y="252" width="176" height="150" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="598" y="284" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">new node joins</text>
+        <text x="598" y="306" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">kubelet registers,</text>
+        <text x="598" y="322" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">scheduler places pod</text>
+        <rect x="548" y="342" width="100" height="44" rx="6" style="fill:var(--chip);stroke:var(--accent2)"/>
+        <text x="598" y="369" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">Node · Ready</text>
+        <line x1="212" y1="327" x2="268" y2="327" style="stroke:var(--deep);stroke-width:2" marker-end="url(#ad)"/>
+        <text x="240" y="318" text-anchor="middle" style="fill:var(--deep);font:600 10px sans-serif">watch</text>
+        <line x1="450" y1="327" x2="506" y2="327" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#ag)"/>
+        <text x="478" y="318" text-anchor="middle" style="fill:var(--accent2);font:600 10px sans-serif">provision</text>
+      </svg>
+      <figcaption>The pod axis (top) turns a metric into a replica count. The node axis (bottom) turns Pending pods into machines. They meet in the scheduler: HPA makes pods, the node autoscaler makes room for them.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>These four controllers are where "the site is slow" and "the cloud bill doubled" meet. When a launch melts down, the question is almost always <em>which loop didn't fire</em>: did the HPA not see the metric (no metrics-server, no requests set), or did it scale pods that then sat Pending because the node autoscaler was too slow or capped? When the bill balloons, the question is which loop scaled up and never came back down. You'll spend more on-call minutes reading HPA status and node-autoscaler logs than almost any other Kubernetes surface.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>How the HPA actually decides</h2>
+    <p>The HPA is deliberately simple, and knowing its exact arithmetic is what separates "I set a target and hope" from "I know why it picked 7." The HPA controller runs a loop, by default every <b>15 seconds</b> (<code>--horizontal-pod-autoscaler-sync-period</code>). Each tick:</p>
+    <ol class="steps">
+      <li><b>Read the metric for every pod in the target.</b> For a CPU utilization target it pulls per-pod CPU from <code>metrics.k8s.io</code> (served by metrics-server), then divides each pod's usage by that pod's CPU <em>request</em> to get a utilization percentage. No request set means no denominator — and the HPA reports <code>&lt;unknown&gt;</code> and refuses to scale.</li>
+      <li><b>Average across ready pods</b> to get the current metric value. Pods that aren't Ready, or have no metric yet, are handled conservatively so a warming-up pod doesn't cause a spurious scale.</li>
+      <li><b>Apply the ratio formula.</b> This is the whole brain: <code>desiredReplicas = ceil( currentReplicas × currentMetric / targetMetric )</code>. Target 50% CPU, currently 8 pods at 90%? <code>ceil(8 × 90 / 50) = ceil(14.4) = 15</code>. It's proportional control, nothing fancier.</li>
+      <li><b>Skip tiny changes.</b> If the ratio is within a tolerance of 1.0 — <b>10% by default</b> — the HPA does nothing. This is the first line of defence against flapping: a wobble from 49% to 52% won't trigger a scale.</li>
+      <li><b>Clamp and stabilize.</b> The result is clamped to <code>minReplicas</code>/<code>maxReplicas</code>. Then a <b>stabilization window</b> is applied — for scale-<em>down</em>, 300 seconds by default: the HPA takes the highest recommendation over the last 5 minutes, so it won't shrink on a momentary dip. Scale-<em>up</em> has a 0-second window by default, so it grows fast and shrinks slow.</li>
+      <li><b>Write the new count</b> to the target's <code>/scale</code> subresource. The Deployment (or StatefulSet, or anything with a scale subresource) takes it from there. The HPA never creates pods itself — it only moves one number.</li>
+    </ol>
+    <p>Under <code>autoscaling/v2</code> you can target more than CPU. <b>Resource</b> metrics (CPU/memory) are the common case. <b>Pods</b> metrics average a custom per-pod value (say, in-flight requests). <b>Object</b> metrics read a single value off any object (an Ingress's requests-per-second). <b>External</b> metrics read something outside the cluster entirely (an SQS queue depth, a Kafka lag). CPU is the default reflex; it's also frequently the wrong signal, because a queue-worker's real backlog is queue depth, not how hard the CPU is spinning while it waits.</p>
+    <div class="box keypoint"><div class="h">CPU is a proxy, not the goal</div>
+      <p>Targeting CPU works when CPU is genuinely the bottleneck (compute-bound services). For an I/O-bound API or a queue consumer, CPU can sit at 20% while latency and backlog climb — scale on CPU and you'll never add pods when it matters. Scale on the thing your users actually feel: request latency, concurrency, or queue depth, via custom/external metrics. That's the whole reason <code>autoscaling/v2</code> exists.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: your HPA targets 50% CPU. It's steady at 8 replicas around 55%. Why isn't it scaling up to chase 50%?</summary>
+      <div class="body">
+        <p>Because 55/50 = 1.10, which is right at the 10% tolerance. The HPA treats anything within ±10% of the target as "close enough" and holds. This is by design — without it, an autoscaler chasing an exact number would add and remove a pod every cycle as the metric jitters. If you genuinely need it tighter, you don't lower the target randomly; you either accept the band or (on recent clusters) set a per-HPA tolerance in the <code>behavior</code> block. The lesson: the HPA is intentionally a little lazy near the target, and that laziness is a feature that keeps it from flapping.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, named</h2>
+    <ul>
+      <li><b>HPA (<code>autoscaling/v2</code>).</b> A built-in controller in the controller-manager. Watches a metric, writes a replica count to a target's <code>/scale</code>. Needs a metrics source; for CPU/memory that's <b>metrics-server</b>, which is not installed by default on many clusters (including kind).</li>
+      <li><b>metrics-server &amp; the metrics APIs.</b> metrics-server scrapes the kubelet's summary API and serves <code>metrics.k8s.io</code> (this is what <code>kubectl top</code> uses). Custom and external metrics come from an adapter you install (commonly the Prometheus Adapter) serving <code>custom.metrics.k8s.io</code> / <code>external.metrics.k8s.io</code>.</li>
+      <li><b>VPA.</b> Not built in — you install it (it lives in the Kubernetes autoscaler project). Three parts: the <b>Recommender</b> watches usage and computes recommended requests; the <b>Updater</b> evicts pods whose requests are off so they get recreated with new values; the <b>Admission Controller</b> mutates new pods to inject the recommended requests. Historically it scales by <em>eviction</em>, which is disruptive — in-place pod resize (beta in recent releases) is starting to change that.</li>
+      <li><b>Cluster Autoscaler.</b> Watches for Pending/unschedulable pods and scales a <b>node group</b> (an EC2 Auto Scaling Group, a GKE node pool) up; scales down nodes that are underutilized and whose pods can move. It picks from node groups <em>you</em> defined, so node shapes are fixed in advance.</li>
+      <li><b>Karpenter.</b> A groupless node autoscaler (CNCF, originally AWS). You declare a <code>NodePool</code> (constraints: instance families, zones, capacity type) and it provisions right-sized nodes directly from the cloud API to fit the pending pods — no pre-baked groups. It also <b>consolidates</b>: it will delete or replace underused nodes to pack workloads tighter and cut cost. The current API is <code>karpenter.sh/v1</code>.</li>
+      <li><b>ResourceQuota.</b> A namespaced object capping aggregate consumption: total <code>requests.cpu</code>/<code>requests.memory</code>, total limits, object counts (pods, services, PVCs), and storage. Enforced at admission — over the cap, the create is rejected.</li>
+      <li><b>LimitRange.</b> A namespaced object setting default requests/limits (and min/max) per container. Its real job is to make quotas usable: with a limits quota in place, a pod that specifies no requests would be rejected — the LimitRange quietly supplies defaults so normal deploys still work.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one traffic spike end to end</h2>
+    <p>Traffic to an API quadruples at noon. Requests are set (250m CPU each), an HPA targets 50% CPU, min 3 / max 30, and Karpenter is watching. Here's the whole cascade:</p>
+    <ol class="steps">
+      <li>Load lands on the 3 running pods. Each climbs from ~40% to ~160% of its CPU request; the kernel throttles them at the limit and latency rises.</li>
+      <li>Within 15s the HPA loop reads ~160% average against a 50% target: <code>ceil(3 × 160 / 50) = ceil(9.6) = 10</code>. It writes 10 to the Deployment's scale.</li>
+      <li>The Deployment controller creates 7 new pods. The scheduler places what it can; say 4 fit on existing nodes and 3 are Pending with "Insufficient cpu."</li>
+      <li>Karpenter sees the 3 unschedulable pods, sums their requests, and provisions a single node sized to hold all three (cheaper than three half-used nodes). The node boots, the kubelet registers it Ready.</li>
+      <li>The scheduler places the 3 Pending pods on the new node. Now 10 pods share the load; average CPU falls back toward 50%. The HPA holds.</li>
+      <li>At 12:20 the spike ends. CPU drops to ~15%. The HPA computes a lower count but the 300s scale-down stabilization window holds the higher number for 5 minutes so a brief lull doesn't cause churn. After the window, it steps down toward 3.</li>
+      <li>As pods drain off the extra node, Karpenter's consolidation notices the node is now underused, checks that its remaining pods can move elsewhere (respecting PodDisruptionBudgets), drains it, and terminates it. Capacity — and cost — return to baseline.</li>
+    </ol>
+    <p>Every arrow in that chain is a separate controller reacting to a separate signal. When one link is missing — no metrics-server, no node autoscaler, a quota in the way — the chain stalls at exactly that link, and knowing the chain tells you where to look.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>Everything runs locally on <code>kind</code>. Create a cluster and install metrics-server (kind's kubelet serves metrics over a self-signed cert, so metrics-server needs <code>--kubelet-insecure-tls</code>):</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>kind create cluster --name scale
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+<span class="c"># kind: let metrics-server trust the kubelet's self-signed cert</span>
+kubectl patch deployment metrics-server -n kube-system --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+kubectl -n kube-system rollout status deploy/metrics-server</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — an HPA on CPU</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Deploy the classic CPU-burner demo, give it a CPU request (the HPA needs it), then attach an <code>autoscaling/v2</code> HPA.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl create deployment php-apache --image=registry.k8s.io/hpa-example
+kubectl set resources deploy/php-apache --requests=cpu=200m --limits=cpu=500m
+kubectl expose deployment php-apache --port=80</code></pre></div>
+        <div class="codewrap"><span class="lang">yaml</span><pre><code><span class="c"># hpa.yaml — target 50% of the CPU request, 1..10 replicas</span>
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: php-apache }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: php-apache }
+  minReplicas: 1
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target: { type: Utilization, averageUtilization: 50 }</code></pre></div>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl apply -f hpa.yaml
+kubectl get hpa php-apache</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME         REFERENCE               TARGETS       MINPODS   MAXPODS   REPLICAS
+php-apache   Deployment/php-apache   cpu: 0%/50%   1         10        1</code></div>
+        <p><code>0%/50%</code> means current-over-target: the pod is idle, so it's at 0% of its 200m request, well under the 50% target, so one replica is enough. You've built a working control loop. If <code>TARGETS</code> shows <code>&lt;unknown&gt;/50%</code>, metrics-server isn't ready yet — give it a minute and re-check.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — drive load and watch it scale</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Generate load from an in-cluster pod that hammers the service in a loop, and watch the HPA react in another terminal.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># terminal 1 — a load generator</span>
+kubectl run load --image=busybox:1.36 --restart=Never -- \
+  /bin/sh -c "while true; do wget -q -O- http://php-apache; done"
+
+<span class="c"># terminal 2 — watch the HPA and the metric climb</span>
+kubectl get hpa php-apache --watch</code></pre></div>
+        <div class="out"><span class="ol">Output (terminal 2, over ~3 minutes)</span>NAME         TARGETS         REPLICAS
+php-apache   cpu: 0%/50%     1
+php-apache   cpu: 214%/50%   1
+php-apache   cpu: 214%/50%   4
+php-apache   cpu: 118%/50%   7
+php-apache   cpu: 88%/50%    9
+php-apache   cpu: 52%/50%    9</code></div>
+        <p>Read the arithmetic live. At 214% with 1 replica the HPA wanted <code>ceil(1 × 214/50) = 5</code>, capped by its scale-up steps, and climbed toward equilibrium where 9 pods each sit near the 50% target. Confirm the reasoning with the detailed view:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl describe hpa php-apache | sed -n '/Conditions/,/Events/p'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>Conditions:
+  Type            Status   Reason              Message
+  AbleToScale     True     ReadyForNewScale    recommended size matches current
+  ScalingActive   True     ValidMetricFound    the HPA was able to compute...
+  ScalingLimited  False    DesiredWithinRange  the desired count is within range</code></div>
+        <p>Those three conditions are your first read on any HPA: can it scale, is it getting a metric, and is it being clamped by min/max. Stop the load (<code>kubectl delete pod load</code>) and watch it drift back down — slowly, because of the scale-down window you'll meet in Lab 4.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — the HPA that shows &lt;unknown&gt;</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>This is the most common HPA support ticket. Deploy a workload with <em>no</em> CPU request and put an HPA on it:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl create deployment norq --image=registry.k8s.io/hpa-example
+kubectl expose deployment norq --port=80
+kubectl autoscale deployment norq --cpu-percent=50 --min=1 --max=5
+sleep 30
+kubectl get hpa norq</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME   REFERENCE            TARGETS              MINPODS   MAXPODS   REPLICAS
+norq   Deployment/norq      cpu: &lt;unknown&gt;/50%    1         5         1</code></div>
+        <p>It never scales, no matter the load. <code>&lt;unknown&gt;</code> is not "metrics-server is down" — you just proved metrics-server works in Lab 2. Look closer before revealing: <code>kubectl describe hpa norq</code> and read the <code>ScalingActive</code> condition and events.</p>
+        <details class="recall"><summary>Reveal the cause</summary>
+          <div class="body">
+            <p>A CPU <em>utilization</em> target is a percentage of the pod's CPU <b>request</b>. This Deployment has no request, so there's no denominator — the HPA literally cannot compute a percentage and reports <code>&lt;unknown&gt;</code>. The describe output says it plainly: <code>FailedGetResourceMetric ... missing request for cpu</code>. The fix is on the workload, not the HPA:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl set resources deploy/norq --requests=cpu=200m
+sleep 30 &amp;&amp; kubectl get hpa norq   <span class="c"># TARGETS now shows a real number</span></code></pre></div>
+            <p>This is why "always set requests" is not a style rule — the HPA, the scheduler, and your bill all depend on it. A utilization target with no request is a dead autoscaler.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — flapping, and the fix</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>An on-call reports the <code>php-apache</code> HPA "bouncing between 3 and 8 all night," waking them with rollout noise. Reproduce the shape by pulsing load on and off, then watch the replica count with timestamps:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl run pulse --image=busybox:1.36 --restart=Never -- /bin/sh -c \
+  "while true; do timeout 40 sh -c 'while :; do wget -q -O- http://php-apache; done'; sleep 40; done"
+kubectl get hpa php-apache -w -o custom-columns=TIME:.metadata.managedFields[0].time,REPLICAS:.status.currentReplicas</code></pre></div>
+        <p>You'll see the replica count ratchet up under load, then — with a naive config — drop fast when the pulse pauses, then jump again. The user's instinct is "the target is wrong." Before you touch the target, ask what governs how <em>fast</em> it's allowed to shrink and grow.</p>
+        <details class="recall"><summary>Reveal the cause and the fix</summary>
+          <div class="body">
+            <p>Flapping is a <b>scale-down</b> problem far more often than a target problem. If down-scaling reacts as fast as up-scaling, every brief lull collapses the fleet and the next pulse rebuilds it. The cure is the <code>behavior</code> block — specifically a longer scale-down stabilization window and a bounded down-step, so the HPA grows fast but shrinks patiently:</p>
+            <div class="codewrap"><span class="lang">yaml</span><pre><code>spec:
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0        <span class="c"># react to spikes immediately</span>
+      policies: [{ type: Percent, value: 100, periodSeconds: 30 }]
+    scaleDown:
+      stabilizationWindowSeconds: 300       <span class="c"># hold peak for 5 min before shrinking</span>
+      policies: [{ type: Pods, value: 1, periodSeconds: 120 }]  <span class="c"># at most 1 pod off / 2 min</span></code></pre></div>
+            <p>Now the HPA takes the highest recommendation over the last 5 minutes when deciding to shrink, and removes at most one pod every two minutes. Spikes are still caught in seconds; the fleet stops sawtoothing. The default scale-down window is already 300s — flapping usually means someone lowered it, or the load itself is genuinely oscillating and needs a smoother metric (average latency) instead of raw CPU.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — a ResourceQuota that blocks a deploy</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>Governance time. Create a namespace with a quota on aggregate requests and pod count, then try to deploy into it the way a normal team would:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl create namespace team-a
+kubectl apply -n team-a -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: ResourceQuota
+metadata: { name: team-a-quota }
+spec:
+  hard:
+    requests.cpu: "1"
+    requests.memory: 1Gi
+    limits.cpu: "2"
+    pods: "10"
+EOF
+kubectl create deployment web -n team-a --image=nginx:1.27-alpine --replicas=3</code></pre></div>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl get deploy,rs,pods -n team-a</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME                  READY   UP-TO-DATE   AVAILABLE
+deployment.apps/web   0/3     0            0
+NAME                             DESIRED   CURRENT   READY
+replicaset.apps/web-6b7f...      3         0         0
+<span class="c"># ...and zero pods. The Deployment exists but nothing runs.</span></code></div>
+        <p>The Deployment reports <code>0/3</code> and there are no pods at all — but no error came back from <code>kubectl create</code>. A junior engineer concludes "the image is broken." You know better: find out <em>who</em> rejected the pods and why. Investigate the ReplicaSet before revealing.</p>
+        <details class="recall"><summary>Reveal the cause and the fix</summary>
+          <div class="body">
+            <p>The Deployment created a ReplicaSet, but the ReplicaSet's attempts to create pods are being <b>rejected at admission by the quota</b>. The evidence is on the ReplicaSet's events, not the Deployment:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl describe rs -n team-a | grep -A2 FailedCreate</code></pre></div>
+            <div class="out"><span class="ol">Output</span>Warning  FailedCreate  ...  Error creating: pods "web-..." is forbidden:
+  failed quota: team-a-quota: must specify limits.cpu,requests.cpu,requests.memory</code></div>
+            <p>Once a namespace has a quota on <code>requests.cpu</code>/<code>limits.cpu</code>, <b>every pod must declare those values</b> or it's forbidden — and the nginx Deployment declares none. The pods never get created, so there's nothing to describe, which is exactly why beginners chase the wrong thing. The right fix is not to loosen the quota; it's a <code>LimitRange</code> that supplies defaults so ordinary deploys satisfy the quota automatically:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl apply -n team-a -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: LimitRange
+metadata: { name: team-a-defaults }
+spec:
+  limits:
+  - type: Container
+    default: { cpu: 200m, memory: 128Mi }         <span class="c"># becomes the limit</span>
+    defaultRequest: { cpu: 100m, memory: 64Mi }   <span class="c"># becomes the request</span>
+EOF
+kubectl rollout restart deploy/web -n team-a
+kubectl get pods -n team-a   <span class="c"># pods now admitted and Running</span></code></pre></div>
+            <p>Quota + LimitRange is the standard pairing: the quota sets the ceiling, the LimitRange makes every workload countable against it. Deploy one without the other and you get exactly this silent-rejection outage. Clean up with <code>kind delete cluster --name scale</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · the HPA that won't scale</div>
+      <p><b>Symptom:</b> traffic is up, latency is up, but replicas are flat. <b>First cut:</b> <code>kubectl get hpa</code> — is <code>TARGETS</code> a real number or <code>&lt;unknown&gt;</code>? <b>Confirm:</b> <code>kubectl describe hpa</code> and read <code>ScalingActive</code>. <b>Cause is usually:</b> metrics-server not installed/healthy, the workload has no CPU request (utilization can't be computed), or the HPA is targeting CPU on an I/O-bound service whose CPU never rises — the metric is wrong, so switch to latency or queue depth.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · slow scale-up during a spike</div>
+      <p><b>Symptom:</b> pods do scale, but minutes too late, and the service sheds load in the gap. <b>First cut:</b> are the new pods Pending? <code>kubectl get pods</code>. <b>Confirm:</b> if Pending, it's the node autoscaler that's slow — check its logs and how long a node takes to boot and join. <b>Cause is usually:</b> waiting on a whole new node (a node boot is 1–3 minutes; Karpenter is faster than Cluster Autoscaler's node groups but not instant), a slow image pull on the fresh node, or the <code>scaleUp</code> policy capping the step. The fix is headroom — over-provision a little, or keep warm capacity — because you cannot boot a node inside a 10-second spike.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · quota-blocked deploys</div>
+      <p><b>Symptom:</b> a Deployment sits at <code>0/N</code> with no pods and no obvious error. <b>First cut:</b> <code>kubectl describe rs</code> — look for <code>FailedCreate ... exceeded quota</code> or <code>must specify requests</code>. <b>Confirm:</b> <code>kubectl describe quota -n &lt;ns&gt;</code> to see used-vs-hard. <b>Cause is usually:</b> the namespace hit its <code>ResourceQuota</code>, or the quota requires requests the workload doesn't set and no <code>LimitRange</code> supplies defaults. The error hides on the ReplicaSet, never on the Deployment — that's the whole trap.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Never point HPA and VPA at the same resource.</b> If both act on CPU, the VPA raises requests while the HPA scales on utilization-of-request — they chase each other and neither converges. The supported combination is VPA on memory (or in recommendation-only "Off" mode) with HPA on a non-resource metric, or HPA on CPU with VPA left off CPU. Pick one controller per signal.</p>
+    <p><b>Requests are the number that matters, and most clusters get them wrong in both directions.</b> Over-request and the scheduler reserves capacity nobody uses — you pay for nodes that sit at 20% real utilization because everything's requests say they're full. Under-request and pods get OOMKilled or CPU-throttled under load, and the HPA's utilization maths goes haywire. Right-sizing is a first-class SRE task: read actual usage (VPA's recommender, or Prometheus) and set requests near the real p90, with limits giving burst headroom. Cost is not a report you read after the fact; it's a constraint you design to, and requests are the dial.</p>
+    <p><b>Cluster Autoscaler vs Karpenter is a real decision.</b> Cluster Autoscaler is simple and battle-tested but boxed into the node groups you pre-define, so you either run many groups or waste money on ill-fitting shapes. Karpenter provisions the right instance for the pending pods and consolidates aggressively, which usually cuts cost 20–50% on spiky, heterogeneous workloads — at the price of more churn (nodes come and go, which stresses anything that assumes stable node identity). Protect workloads from that churn with <b>PodDisruptionBudgets</b>, or consolidation will happily drain a node out from under your only two replicas.</p>
+    <p><b>Governance is how a shared cluster survives.</b> Every namespace should have a <code>ResourceQuota</code> and a <code>LimitRange</code> from day one. Without them, one team's runaway HPA (or a fork-bomb of a CronJob) starves everyone else, and there's no admission-time backstop. With them, the blast radius of a bad config stops at the namespace boundary. The common mistake is adding a quota without a LimitRange and then wondering why every team's deploys break — you've met that one in Lab 5.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>Autoscaling is the concrete mechanism behind "design for horizontal scale" (<a href="ch95-scaling-patterns.html">Chapter 95</a>). Stateless services scale cleanly because any replica handles any request — which is why the whole system-design reflex is to push state out to a data tier and keep the compute layer a herd of identical, disposable pods the HPA can multiply freely. The moment a service holds local state, horizontal scaling gets hard, and that trade-off is the heart of many design interviews.</p>
+    <p>It also forces you to think about the <em>signal</em> you scale on, which is really a question about your SLOs (<a href="ch80-sli-slo-sla-and-error-budgets.html">Chapter 80</a>): if your SLO is latency, scaling on CPU is a proxy that can betray you, and mature platforms scale on the SLI itself. And node autoscaling is where reliability meets the cloud bill directly — the same consolidation that saves money increases node churn, so capacity planning (<a href="ch89-capacity-planning-and-performance.html">Chapter 89</a>) becomes a live control problem, not a spreadsheet you fill in once a quarter. When you reach EKS, this all lands on real infrastructure and the node autoscaler starts arguing with the VPC's IP budget (<a href="ch58-vpc-cni-the-deep-one.html">Chapter 58</a>).</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Open each one only after you've answered it in your head.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's the difference between the HPA, the VPA, and the Cluster Autoscaler?</summary>
+        <div class="a"><p>They act on different things. The HPA changes the <em>number</em> of pod replicas based on a metric like CPU or requests-per-second. The VPA changes the <em>size</em> of each pod — its CPU and memory requests — based on observed usage. The Cluster Autoscaler changes the number of <em>nodes</em>, adding machines when pods can't be scheduled and removing underused ones. Rule of thumb: HPA and CA compose well (more pods, then more nodes to hold them); HPA and VPA must not both target the same resource or they fight. Karpenter is an alternative to the Cluster Autoscaler that provisions right-sized nodes directly instead of scaling fixed node groups.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through exactly how an HPA decides how many replicas to run.</summary>
+        <div class="a"><p>Every 15 seconds the HPA controller reads the target metric for the pods in the workload. For a CPU utilization target it pulls per-pod CPU from metrics-server and divides by each pod's CPU request to get a percentage, then averages across ready pods. It applies the ratio formula: desired equals ceil of current-replicas times current-metric over target-metric — so 8 pods at 90% against a 50% target gives ceil(8 × 90/50) = 15. If the ratio is within a 10% tolerance of 1.0 it does nothing, which prevents flapping near the target. It clamps to min and max replicas, applies a stabilization window — 300 seconds for scale-down by default, so it holds the recent peak before shrinking — and writes the result to the workload's scale subresource. It never creates pods itself; the Deployment does. The two things people miss: it needs a request set or utilization is undefined, and it grows fast but shrinks slow on purpose.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>When is targeting CPU the wrong choice, and what do you do instead?</summary>
+        <div class="a"><p>CPU is only a good scaling signal when CPU is the actual bottleneck — compute-bound services. For an I/O-bound API or a queue consumer, CPU can idle at 20% while latency climbs and the backlog grows, because the pods are mostly waiting on the network or a downstream. Scale on CPU there and you never add capacity when it hurts. The fix is <code>autoscaling/v2</code>'s other metric types: a Pods metric averaging in-flight requests or connections per pod, an Object metric reading requests-per-second off an Ingress, or an External metric reading the queue depth from the broker itself. These come from a custom-metrics adapter, commonly the Prometheus Adapter, serving <code>custom.metrics.k8s.io</code> or <code>external.metrics.k8s.io</code>. The principle is to scale on the thing your users feel — latency or backlog — not a proxy that happens to be easy to collect. For a queue worker, scaling on messages-per-pod gives you a direct, honest control loop.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A launch spikes traffic 5x. Pods scaled but half are Pending for four minutes and the site sheds load. What happened and how do you prevent it?</summary>
+        <div class="a"><p>The HPA fired correctly and created the replicas, but the cluster had no room, so the extra pods went Pending with "Insufficient cpu," and they only became schedulable once the node autoscaler booted new machines — which takes one to three minutes for a node to provision, join, and pull images. That gap is the outage. The HPA can react in seconds; a node cannot. So the fix isn't the HPA. First, keep <b>headroom</b> — run enough spare node capacity (or low-priority "pause" pods that get evicted to make room instantly) so the first wave of pods schedules immediately while nodes boot behind them. Second, speed the node axis: Karpenter provisions faster than Cluster Autoscaler node groups, and pre-pulled images cut the boot-to-ready time. Third, if the spike is predictable (a launch, a daily peak), pre-scale on a schedule rather than reacting. The staff-level point is that you can't autoscale your way out of a cold-start latency — for sudden spikes you buy time with warm capacity.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>How do ResourceQuota and LimitRange work together, and what breaks if you use only one?</summary>
+        <div class="a"><p>A <code>ResourceQuota</code> caps a namespace's aggregate consumption — total CPU/memory requests and limits, object counts, storage — and enforces it at admission. A <code>LimitRange</code> sets per-container defaults and min/max within the namespace. They're a pair: once a quota constrains, say, <code>requests.cpu</code>, Kubernetes requires <em>every</em> pod to declare a CPU request, or it rejects the pod as forbidden. Most workloads don't set requests explicitly, so a quota alone silently breaks ordinary deploys — the Deployment sits at 0/N with the real error buried on the ReplicaSet's <code>FailedCreate</code> events. The LimitRange fixes that by injecting default requests so every pod is countable against the quota. Use the quota without the LimitRange and you get mysterious rejected deploys; use the LimitRange without the quota and you have defaults but no ceiling. In production you want both on every namespace from the start.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>Capacity is a moving target, so Kubernetes gives you four autoscalers on two axes. The HPA changes replica count from a metric using <code>ceil(current × currentMetric / targetMetric)</code>, with a 10% tolerance and a 300s scale-down window to stop flapping; it needs a request set or CPU utilization is <code>&lt;unknown&gt;</code>, and CPU is often the wrong signal for I/O-bound work. The VPA changes per-pod requests and must never share a resource with the HPA. The Cluster Autoscaler grows fixed node groups when pods go Pending; Karpenter provisions right-sized nodes directly and consolidates for cost, at the price of churn you fence off with PodDisruptionBudgets. Pod scaling is useless without node scaling, and a node boot is minutes — so sudden spikes need headroom, not just an autoscaler. Governance keeps a shared cluster alive: <code>ResourceQuota</code> caps a namespace and <code>LimitRange</code> supplies the defaults that make the quota enforceable, and a quota without a LimitRange is a silent-rejection outage.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>Four autoscalers, two axes: HPA/VPA move pods (count/size); Cluster Autoscaler/Karpenter move nodes.</li>
+      <li>HPA math: <code>desired = ceil(currentReplicas × currentMetric / targetMetric)</code>, on <code>autoscaling/v2</code>.</li>
+      <li>A CPU <em>utilization</em> target needs a CPU <em>request</em>; with none, the HPA shows <code>&lt;unknown&gt;</code> and never scales.</li>
+      <li>Default 10% tolerance near target and a 300s scale-down window are anti-flapping features, not bugs.</li>
+      <li>CPU is a proxy; scale I/O-bound services and queue workers on latency, concurrency, or queue depth.</li>
+      <li>HPA and VPA on the same resource fight — pick one controller per signal.</li>
+      <li>Pod scaling without node scaling just makes Pending pods; the two axes are separate systems.</li>
+      <li>You cannot boot a node inside a 10-second spike — keep headroom or warm capacity for sudden load.</li>
+      <li>Karpenter fits nodes to pods and consolidates for cost; guard replicas with PodDisruptionBudgets against the churn.</li>
+      <li>ResourceQuota + LimitRange belong on every namespace; a quota without defaults silently blocks deploys.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch36-scheduling-deep.html"><b>Ch 36</b> Scheduling &amp; requests</a>
+      <a href="ch33-workloads-i-pod-replicaset-deployment.html"><b>Ch 33</b> Deployments &amp; the scale subresource</a>
+      <a href="ch31-the-reconciliation-loop-controllers-informers.html"><b>Ch 31</b> The control loop</a>
+      <a href="ch80-sli-slo-sla-and-error-budgets.html"><b>Ch 80</b> Scaling on SLIs</a>
+      <a href="ch89-capacity-planning-and-performance.html"><b>Ch 89</b> Capacity planning</a>
+      <a href="ch58-vpc-cni-the-deep-one.html"><b>Ch 58</b> Nodes &amp; the IP budget</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/">Horizontal Pod Autoscaling</a>: the algorithm, tolerance, and the <code>autoscaling/v2</code> metric types, from the source.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale-walkthrough/">HPA walkthrough</a>: the php-apache demo and the <code>behavior</code> block for scale-up/scale-down policies.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/workloads/autoscaling/">Autoscaling Workloads</a>: how HPA, VPA, and in-place resize relate, and when to use each.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/cluster-administration/cluster-autoscaling/">Cluster Autoscaling</a>: the node-scaling model, Pending pods as the trigger, and scale-down safety.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/policy/resource-quotas/">Resource Quotas</a> and <a href="https://kubernetes.io/docs/concepts/policy/limit-ranges/">Limit Ranges</a>: the governance pair and why they're used together.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/">Managing Resources for Containers</a>: requests vs limits, and how they drive scheduling and QoS.</li>
+      <li>Karpenter — <a href="https://karpenter.sh/docs/concepts/">Concepts</a>: NodePools, provisioning right-sized nodes, and consolidation/disruption.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch36-scheduling-deep.html"><span class="dir">← Prev</span><div class="ti">Ch 36 — Scheduling deep</div></a>
+      <a class="nx" href="ch38-storage-volumes-pv-pvc-storageclass-csi.html"><span class="dir">Next →</span><div class="ti">Ch 38 — Storage: volumes, PV, PVC, StorageClass, CSI</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 37 of 121 · Part IV · Kubernetes — Architecture &amp; Internals. Scaling and governing are the same skill from two ends: match capacity to demand, then bound it so no one team can take the whole cluster.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Two axes, four controllers</a>
+    <a href="#internals">How the HPA decides</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">Following a spike</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

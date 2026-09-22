@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 5 — Users, Groups, Permissions &amp; Capabilities</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part I · Linux &nbsp;·&nbsp; Chapter 5</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part I · Linux &amp; OS Foundations · Chapter 5</div>
+      <h1>Users, groups, permissions &amp; capabilities</h1>
+      <p class="tagline">"Just run it as root" is the most expensive shortcut in infrastructure. Linux gives you a far better deal: split root's absolute power into single-purpose keys, and hand a process only the one it needs. A web server can bind port 80 without ever being able to reformat your disks — once you know how the check actually works.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~38 min read · Linux lab (Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Read <code>id</code> output and any <code>ls -l</code> mode string without hesitation.</li>
+          <li>Trace the kernel's permission check — owner, group, other, and the first-match rule that surprises people.</li>
+          <li>Explain setuid/setgid/sticky bits and umask, and what each does on files versus directories.</li>
+          <li>Say what a Linux capability is, why it beats setuid-root, and use <code>CAP_NET_BIND_SERVICE</code> to bind port 80 as a normal user.</li>
+          <li>Debug an <code>EACCES</code> to its real cause — mode bits, ownership, or a missing directory-traversal bit.</li>
+          <li>Drop capabilities and set <code>no_new_privs</code> to run a container with least privilege.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem: one machine, many users, one root</h2>
+    <p>A machine is shared — by real people, by services, by a hundred processes that don't trust each other. You need to answer, on every single file access, network bind, and privileged operation: is <em>this</em> actor allowed to do <em>this</em> thing? Get it wrong one way and a log shipper reads your private keys; get it wrong the other way and a service can't open its own config.</p>
+    <p>The classic Unix answer is simple and gets you 80% of the way: every process runs as a <b>user</b> (a uid) belonging to one or more <b>groups</b> (gids), every file records an owner, a group, and a nine-bit rule of who may read, write, or execute it, and one all-powerful user — <b>root</b>, uid 0 — bypasses the rules entirely. That model has run the internet for fifty years.</p>
+    <p>But "root bypasses everything" is a blunt instrument, and it's the source of most privilege-related incidents. A web server needs exactly one privileged power — bind a port below 1024 — yet the old way to get it was to run the whole server as root, handing it the ability to also read every file, kill every process, load kernel modules, and wipe the disk. If that server is ever exploited, the attacker inherits <em>all</em> of root's power, not just the port bind. Linux fixes this with <b>capabilities</b>: root's monolithic power chopped into about forty independent pieces, so you can grant just <code>CAP_NET_BIND_SERVICE</code> and nothing else. That single idea is what makes a hardened container possible.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>There are two permission systems stacked here, and you need both. The <b>mode bits</b> (owner/group/other × read/write/execute) govern access to <em>files</em>. <b>Capabilities</b> govern <em>privileged operations</em> that used to require being root — binding low ports, changing file ownership, mounting filesystems, changing the clock. "Can this process read <code>/etc/passwd</code>?" is a mode-bits question. "Can this process bind port 80?" is a capabilities question.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: badges, door locks, and a ring of keys</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Think of an office building. Everyone has an <b>ID badge</b> showing an employee number (your <b>uid</b>) and which departments they're in (their <b>groups</b>). Every door — every file — has a small posted rule: what the <b>owner</b> may do, what people in the door's <b>department</b> may do, and what <b>everyone else</b> may do. Those three tiers, each allowing some combination of enter/modify/use, are the <b>mode bits</b>.</p>
+      <p>The <b>building superintendent</b> (root) has traditionally carried a single master key that opens every door and overrides every posted rule. Convenient, and terrifying — lose that key and you lose the building. So the modern building replaced the master key with a <b>ring of single-purpose keys</b>: one that opens the low-numbered phone jacks (<code>CAP_NET_BIND_SERVICE</code>), one that lets you reassign who owns a door (<code>CAP_CHOWN</code>), one that opens the storage rooms (<code>CAP_SYS_ADMIN</code>). Now you hand a contractor exactly the one key their job needs, and nothing more. Those keys are <b>capabilities</b>.</p>
+      <p>A few special doors have quirks. A <b>setuid</b> door temporarily lends you the owner's badge while you're inside, so you can do one supervised privileged task (that's how the password-change room lets an ordinary employee edit the guarded shadow file). A <b>sticky</b> shared closet lets anyone drop things in, but only the person who put an item there can take it back out (that's <code>/tmp</code>). And a <b>one-way switch on your badge</b> — <code>no_new_privs</code> — can be flipped so that from that moment on, no door you walk through can ever grant you more authority than you already hold, slamming shut the setuid escalation trick for good.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the building</th><th>In Linux</th></tr>
+      <tr><td>Badge employee number</td><td>uid (user ID)</td></tr>
+      <tr><td>Departments on your badge</td><td>gid + supplementary groups</td></tr>
+      <tr><td>A door's posted owner/department/everyone rule</td><td>Mode bits (owner/group/other × rwx)</td></tr>
+      <tr><td>The superintendent's master key</td><td>root (uid 0) — historically bypasses everything</td></tr>
+      <tr><td>A ring of single-purpose keys</td><td>Capabilities (root's power, split ~40 ways)</td></tr>
+      <tr><td>The low-phone-jack key</td><td><code>CAP_NET_BIND_SERVICE</code> (bind ports &lt; 1024)</td></tr>
+      <tr><td>A door that lends you the owner's badge</td><td>setuid / setgid bit on an executable</td></tr>
+      <tr><td>The shared closet, take-only-your-own</td><td>Sticky bit (e.g. <code>/tmp</code>)</td></tr>
+      <tr><td>Default lock setting on new doors</td><td>umask</td></tr>
+      <tr><td>One-way "no more authority" badge switch</td><td><code>no_new_privs</code></td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>The permission check path</h2>
+    <p>Every access decision runs the same short algorithm inside the kernel. A process carries <b>credentials</b> — an effective uid, an effective gid, a list of supplementary groups, and its capability sets. A file carries an owner uid, a group gid, and its mode bits. When the process asks to read, write, or execute, the kernel walks this path:</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 440" role="img" aria-label="Decision path for a Linux file permission check">
+        <defs>
+          <marker id="p1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--muted)"/></marker>
+          <marker id="p2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+        </defs>
+        <!-- start -->
+        <rect x="200" y="16" width="300" height="42" rx="21" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="350" y="42" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">process wants r / w / x on an inode</text>
+        <!-- d1 root/cap -->
+        <rect x="200" y="78" width="300" height="52" rx="9" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.4"/>
+        <text x="350" y="100" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">euid 0, or holds CAP_DAC_OVERRIDE /</text>
+        <text x="350" y="118" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">CAP_DAC_READ_SEARCH?</text>
+        <!-- d2 owner -->
+        <rect x="200" y="160" width="300" height="46" rx="9" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="350" y="188" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">euid == file's owner uid?</text>
+        <!-- d3 group -->
+        <rect x="200" y="236" width="300" height="46" rx="9" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="350" y="264" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">file's group in your group set?</text>
+        <!-- other -->
+        <rect x="200" y="312" width="300" height="46" rx="9" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="350" y="340" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">use OTHER bits</text>
+        <!-- right allow/class boxes -->
+        <rect x="556" y="82" width="134" height="44" rx="9" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="623" y="102" text-anchor="middle" style="fill:var(--accent2);font:700 12px sans-serif">ALLOW</text>
+        <text x="623" y="118" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">root / cap override</text>
+        <rect x="556" y="162" width="134" height="42" rx="9" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="623" y="188" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">use OWNER bits</text>
+        <rect x="556" y="238" width="134" height="42" rx="9" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="623" y="264" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">use GROUP bits</text>
+        <!-- final check -->
+        <rect x="200" y="384" width="300" height="44" rx="9" style="fill:var(--panel);stroke:var(--deep);stroke-width:1.4"/>
+        <text x="350" y="405" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">chosen class has the requested bit?</text>
+        <text x="350" y="421" text-anchor="middle" style="fill:var(--deep);font:600 11px sans-serif">yes → ALLOW &nbsp;·&nbsp; no → EACCES</text>
+        <!-- down arrows (no) -->
+        <line x1="350" y1="130" x2="350" y2="158" style="stroke:var(--muted);stroke-width:1.6" marker-end="url(#p1)"/><text x="362" y="148" style="fill:var(--muted);font:10px sans-serif">no</text>
+        <line x1="350" y1="206" x2="350" y2="234" style="stroke:var(--muted);stroke-width:1.6" marker-end="url(#p1)"/><text x="362" y="224" style="fill:var(--muted);font:10px sans-serif">no</text>
+        <line x1="350" y1="282" x2="350" y2="310" style="stroke:var(--muted);stroke-width:1.6" marker-end="url(#p1)"/><text x="362" y="300" style="fill:var(--muted);font:10px sans-serif">no</text>
+        <line x1="350" y1="58" x2="350" y2="76" style="stroke:var(--muted);stroke-width:1.6" marker-end="url(#p1)"/>
+        <!-- right arrows (yes) -->
+        <line x1="500" y1="104" x2="554" y2="104" style="stroke:var(--accent2);stroke-width:1.6" marker-end="url(#p2)"/><text x="512" y="97" style="fill:var(--accent2);font:10px sans-serif">yes</text>
+        <line x1="500" y1="183" x2="554" y2="183" style="stroke:var(--accent2);stroke-width:1.6" marker-end="url(#p2)"/><text x="512" y="176" style="fill:var(--accent2);font:10px sans-serif">yes</text>
+        <line x1="500" y1="259" x2="554" y2="259" style="stroke:var(--accent2);stroke-width:1.6" marker-end="url(#p2)"/><text x="512" y="252" style="fill:var(--accent2);font:10px sans-serif">yes</text>
+        <!-- class boxes to final -->
+        <line x1="500" y1="335" x2="500" y2="384" style="stroke:var(--muted);stroke-width:1.2" marker-end="url(#p1)"/>
+      </svg>
+      <figcaption>The kernel picks the <em>first</em> matching class — owner, then group, then other — and checks the requested bit against only that class. The first-match rule is why a more-permissive "group" or "other" tier can't rescue an owner the owner bits deny.</figcaption>
+    </figure>
+
+    <p>That last point is the one that bites people. The classes are checked in order and the <em>first</em> match wins, even when a later class would have been more permissive. If a file's owner bits say "no write" but the group bits say "write," the owner still can't write — because as the owner, only the owner bits apply to you. We'll make you feel this in the lab; it's a five-minute confusion that has cost people hours.</p>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>Two of the most common permission incidents are opposite failures. One is <code>EACCES</code> where a service can't reach a file it "obviously" owns — and the real cause is a missing execute bit on a <em>parent directory</em>, not the file at all. The other is a service running as root "because it needs port 80," which quietly hands an attacker the whole box if that service is ever compromised. This chapter fixes both: you'll debug the first with <code>strace</code> in seconds, and kill the second with one capability.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>Credentials, mode bits, and capabilities</h2>
+    <h3>Process credentials and mode bits</h3>
+    <ol class="steps">
+      <li><b>Every process carries credentials.</b> Real, effective, and saved UID and GID, plus supplementary groups and capability sets. The <b>effective</b> uid/gid is what the kernel checks for file access; the saved set exists so a program can temporarily drop and regain privilege.</li>
+      <li><b>Mode bits are twelve bits.</b> Nine are three <code>rwx</code> triples for owner/group/other — <code>0644</code> is <code>rw-r--r--</code>, <code>0755</code> is <code>rwxr-xr-x</code>. Three more are the special bits, written as a leading octal digit: <b>setuid</b> (4000), <b>setgid</b> (2000), and <b>sticky</b> (1000). So <code>4755</code> is a setuid executable.</li>
+      <li><b>Bits mean different things on directories.</b> On a file, <code>x</code> means "executable." On a directory, <code>x</code> means "may traverse/search it" (resolve a path through it), <code>r</code> means "may list its names," and <code>w</code> means "may create or delete entries in it." You can have <code>r</code> without <code>x</code> on a directory and be able to see the names but not <code>cd</code> into it — a genuine source of confusion.</li>
+      <li><b>umask sets defaults.</b> New files are born with a base mode masked by the process's umask. The common <code>022</code> yields <code>644</code> files and <code>755</code> directories; <code>077</code> yields <code>600</code>/<code>700</code> (private). umask is a per-process setting daemons often set explicitly so their files aren't world-readable.</li>
+    </ol>
+    <h3>setuid, and why capabilities replaced most of it</h3>
+    <p>A <b>setuid</b> executable runs with the effective uid of its <em>owner</em>, not the caller. The textbook example is <code>/usr/bin/passwd</code>: owned by root, setuid, so when you run it your process becomes effectively root just long enough to edit the root-owned shadow file. It's powerful and dangerous — a bug in a setuid-root program is an instant root exploit, because the whole program runs with full root power to do one small privileged thing.</p>
+    <p><b>Capabilities</b> are the fix. Root's power is divided into independent units, and a process has capability sets — <b>permitted</b> (what it may use), <b>effective</b> (what's active now), <b>inheritable</b>/<b>ambient</b> (what survives an <code>exec</code>), and a <b>bounding</b> set (the ceiling of what it can ever hold). You can attach a capability to a binary as a <b>file capability</b> with <code>setcap</code>, so on <code>exec</code> the process gains just that one power — no setuid-root, no master key. A web server given only <code>CAP_NET_BIND_SERVICE</code> can bind port 80 and do nothing else privileged; compromise it and the attacker gets a port-binding power, not the disk.</p>
+    <p>The capabilities worth memorising: <code>CAP_NET_BIND_SERVICE</code> (low ports), <code>CAP_CHOWN</code> (change ownership), <code>CAP_DAC_OVERRIDE</code> (ignore file mode bits — nearly as good as root for reading anything), <code>CAP_SETUID</code>/<code>CAP_SETGID</code> (change identity), <code>CAP_KILL</code> (signal any process), <code>CAP_NET_ADMIN</code> (configure networking), <code>CAP_SYS_PTRACE</code> (attach a debugger), and <code>CAP_SYS_ADMIN</code> — the grab-bag that grants so much it's often called "the new root." Handing a container <code>CAP_SYS_ADMIN</code> undoes most of the benefit of dropping the others.</p>
+    <h3>no_new_privs</h3>
+    <p><code>no_new_privs</code> is a one-way per-process flag (set via <code>prctl</code>). Once on, an <code>execve</code> can never grant the process more privilege than it already has — setuid bits and file capabilities are ignored for privilege-gain. It's cheap, irreversible, and inherited by children, which is why systemd (<code>NoNewPrivileges=yes</code>) and container runtimes (<code>--security-opt=no-new-privileges</code>) use it as a baseline hardening switch. It also gates unprivileged seccomp (Chapter 1) — you can't install a seccomp filter as non-root without it.</p>
+
+    <details class="recall"><summary>Think first: why is giving a container <code>CAP_NET_BIND_SERVICE</code> so much safer than running its process as root, if both let it bind port 80?</summary>
+      <div class="body">
+        <p>Because they grant wildly different amounts of power for the same result. Running as root gives the process the <em>entire</em> capability set — it can bind port 80, yes, but also read every file (<code>CAP_DAC_OVERRIDE</code>), change ownership, kill any process, load kernel modules, mount filesystems, and change the clock. If that process is ever exploited, the attacker inherits all of it. Granting only <code>CAP_NET_BIND_SERVICE</code> gives it exactly one privileged power — bind a low port — and nothing else; an exploit yields a process that can bind ports and is otherwise as constrained as any unprivileged program. Same functional outcome, dramatically smaller blast radius. That's the whole argument for least privilege, and it's why "run as non-root, add the one capability you need" is the container security default.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, and what each owns</h2>
+    <ul>
+      <li><b>uid / gid and the account databases.</b> <code>/etc/passwd</code> (users → uid, shell, home), <code>/etc/group</code> (groups → members), <code>/etc/shadow</code> (password hashes, root-only). A process's <em>effective</em> uid/gid is what's checked; the real/saved pair lets it drop and regain privilege.</li>
+      <li><b>Mode bits + special bits.</b> Nine <code>rwx</code> bits plus setuid/setgid/sticky. Set with <code>chmod</code>, owned via <code>chown</code>/<code>chgrp</code>, defaulted by <code>umask</code>.</li>
+      <li><b>Capability sets on a process.</b> Permitted, effective, inheritable, ambient, and the bounding ceiling. Read them from <code>/proc/&lt;pid&gt;/status</code> (<code>CapEff</code>, <code>CapPrm</code>, <code>CapBnd</code>…) and decode with <code>capsh --decode</code>.</li>
+      <li><b>File capabilities.</b> Capabilities attached to an executable with <code>setcap</code> and read with <code>getcap</code>; the alternative to setuid for granting one narrow power on <code>exec</code>.</li>
+      <li><b>no_new_privs.</b> The irreversible "no privilege gain on exec" flag; a baseline for systemd units and containers.</li>
+      <li><b>MAC layers (context).</b> On top of all this, SELinux or AppArmor add mandatory access control — a separate policy that can deny even when Unix permissions and capabilities would allow. When a permission failure makes no sense under Unix rules, a MAC denial (in <code>dmesg</code>/audit logs) is the usual explanation.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following a non-root server binding port 80</h2>
+    <p>Trace what happens when a web server tries to listen on port 80, first the wrong way and then the right way:</p>
+    <ol class="steps">
+      <li>The process calls <code>bind()</code> on port 80. Ports below 1024 are privileged, so the kernel doesn't just check "are you root" — it checks whether the process holds <code>CAP_NET_BIND_SERVICE</code> in its effective set.</li>
+      <li><b>The anti-pattern:</b> run the whole server as root. Its effective uid is 0, so it has the full capability set, including <code>CAP_NET_BIND_SERVICE</code> — the bind succeeds, but the process can now also do everything else root can. Some servers then <code>setuid</code> to an unprivileged user <em>after</em> binding, which helps but still means all that code ran as root during startup.</li>
+      <li><b>The right way:</b> give the binary the one capability with <code>setcap 'cap_net_bind_service=+ep' ./server</code>. Now a completely non-root user runs it; on <code>exec</code> the process picks up <code>CAP_NET_BIND_SERVICE</code> in its permitted and effective sets, and nothing else.</li>
+      <li>The <code>bind()</code> capability check passes — the process has exactly the key for this door. The server listens on port 80 as an unprivileged user with no other privileged powers.</li>
+      <li>If the capability is missing, the kernel returns <code>EACCES</code> ("Permission denied") from <code>bind()</code> — the exact error you'll debug in the lab.</li>
+    </ol>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>Start a container. We compile a tiny C server for the capability lab, so install a compiler and the capability tools:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>docker run --rm -it --cap-add=SYS_PTRACE ubuntu:24.04 bash
+apt-get update &amp;&amp; apt-get install -y libcap2-bin strace procps gcc python3 sudo</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — identities and mode bits</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>See who you are, make a user, and read/change file ownership and mode.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>id                                  <span class="c"># uid, gid, and all your groups</span>
+useradd -m -s /bin/bash app         <span class="c"># a normal, unprivileged user</span>
+echo "secret config" &gt; /etc/app.conf
+chown app:app /etc/app.conf
+chmod 640 /etc/app.conf             <span class="c"># owner rw, group r, other nothing</span>
+ls -l /etc/app.conf</code></pre></div>
+        <div class="out"><span class="ol">Output</span>uid=0(root) gid=0(root) groups=0(root)
+-rw-r----- 1 app app 14 ... /etc/app.conf</code></pre></div>
+        <p>Read the mode string left to right: type (<code>-</code> file), then owner <code>rw-</code>, group <code>r--</code>, other <code>---</code>. That's <code>640</code>. Now feel the classes by switching users:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>useradd -m teammate
+usermod -aG app teammate            <span class="c"># put teammate in the 'app' group</span>
+sudo -u app      cat /etc/app.conf   <span class="c"># owner: allowed (rw-)</span>
+sudo -u teammate cat /etc/app.conf   <span class="c"># group member: allowed (r--)</span>
+useradd -m stranger
+sudo -u stranger cat /etc/app.conf   <span class="c"># other: DENIED (---)</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>secret config
+secret config
+cat: /etc/app.conf: Permission denied</code></pre></div>
+        <p>Owner and group member read it; the stranger gets <code>Permission denied</code> because the "other" class has no read bit. Three identities, three different outcomes, one file.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — the first-match rule, and setuid</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Now the counterintuitive part: a file where "other" is <em>more</em> permissive than "group," proving that the first matching class wins. Make a file owned by <code>app:app</code> with mode <code>604</code> — owner <code>rw</code>, group <code>---</code>, other <code>r--</code>:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>echo data &gt; /tmp/weird
+chown app:app /tmp/weird
+chmod 604 /tmp/weird              <span class="c"># owner rw-, group ---, other r--</span>
+ls -l /tmp/weird
+sudo -u teammate cat /tmp/weird   <span class="c"># teammate is in group 'app' — what happens?</span>
+sudo -u stranger cat /tmp/weird   <span class="c"># stranger is 'other' — what happens?</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>-rw----r-- 1 app app 5 ... /tmp/weird
+cat: /tmp/weird: Permission denied      # teammate (GROUP class) — DENIED
+data                                    # stranger (OTHER class) — ALLOWED</code></pre></div>
+        <p>The group member is <em>denied</em> while a stranger is <em>allowed</em>. Because <code>teammate</code> matches the group class first, only the group bits (<code>---</code>) apply — the more-permissive "other" bits never get consulted. This is the rule the diagram warned about, and now you've watched it happen. Next, setuid in the wild:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>ls -l /usr/bin/passwd            <span class="c"># the classic setuid-root binary</span>
+stat -c '%A %U' /usr/bin/passwd</code></pre></div>
+        <div class="out"><span class="ol">Output</span>-rwsr-xr-x 1 root root ... /usr/bin/passwd
+-rwsr-xr-x root</code></pre></div>
+        <p>The <code>s</code> where the owner's <code>x</code> would be is the setuid bit. That's why an ordinary user running <code>passwd</code> can edit the root-owned shadow file: for the duration of that program, their effective uid becomes root's. Powerful, and exactly the pattern capabilities exist to shrink.</p>
+      </div>
+    </div>
+
+    <details class="recall"><summary>Think first: a file is <code>-rw-r--r--</code> and owned by you, yet you get <code>EACCES</code> opening it by its full path. How is that possible?</summary>
+      <div class="body">
+        <p>Because path access needs the <b>execute (search) bit on every directory</b> along the way, and one of the parents is denying you. Reading <code>/data/private/app.conf</code> requires <code>x</code> on <code>/</code>, <code>/data</code>, and <code>/data/private</code> — if <code>/data/private</code> is mode <code>700</code> owned by someone else, you can't traverse into it, so you never even reach the file whose own bits look fine. The file's permissions are innocent; a parent directory is the wall. This is the single most common "but I own the file!" confusion, and <code>namei -l /data/private/app.conf</code> (which prints the mode of every component) or an <code>strace</code> showing which <code>openat</code>/<code>stat</code> returns <code>EACCES</code> pins it immediately.</p>
+      </div>
+    </details>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — an EACCES with a hidden cause</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>A service can't read a config file it owns. Reproduce the exact trap from the recall prompt, then debug it the way you would in production — don't guess, let <code>strace</code> tell you.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>mkdir -p /data/private
+echo "db_password=hunter2" &gt; /data/private/app.conf
+chown app:app /data/private/app.conf
+chmod 644 /data/private/app.conf     <span class="c"># the FILE is world-readable...</span>
+chmod 700 /data/private              <span class="c"># ...but the DIRECTORY is locked to its owner</span>
+chown root:root /data/private        <span class="c"># owned by root, so 'app' can't traverse it</span>
+
+<span class="c"># 'app' tries to read its own file and fails. Why?</span>
+sudo -u app cat /data/private/app.conf</code></pre></div>
+        <div class="out"><span class="ol">Output</span>cat: /data/private/app.conf: Permission denied</code></pre></div>
+        <p>The file is <code>644</code> and owned by <code>app</code>, so the naive conclusion — "fix the file's permissions" — is wrong. Find the truth before revealing:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>sudo -u app strace -f -e trace=openat,stat,newfstatat cat /data/private/app.conf 2&gt;&amp;1 | grep -i eacces
+namei -l /data/private/app.conf      <span class="c"># prints the mode of EVERY path component</span></code></pre></div>
+        <details class="recall"><summary>Reveal the cause and the fix</summary>
+          <div class="body">
+            <p><code>strace</code> shows the <code>EACCES</code> lands while resolving the path, not on the file's own <code>open</code>, and <code>namei -l</code> shows the culprit component:</p>
+            <div class="out"><span class="ol">Output</span>openat(AT_FDCWD, "/data/private/app.conf", O_RDONLY) = -1 EACCES (Permission denied)
+f: /data/private/app.conf
+ drwxr-xr-x root root /
+ drwxr-xr-x root root data
+ drwx------ root root private        # &lt;-- 700, root-owned: 'app' cannot traverse
+ -rw-r--r-- app  app  app.conf       # the file itself is fine</code></pre></div>
+            <p><code>/data/private</code> is mode <code>700</code> owned by root, so <code>app</code> lacks the execute (search) bit needed to traverse into it — the request dies before the file's own permissions are ever consulted. The fix is on the <em>directory</em>, not the file: give <code>app</code> traversal, e.g. <code>chmod 750 /data/private &amp;&amp; chgrp app /data/private</code> (group execute), or make the directory owned appropriately. The lesson is a reflex: on any <code>EACCES</code>, <code>strace</code> to see <em>which</em> syscall on <em>which</em> path failed, and check the whole directory chain with <code>namei -l</code> before touching the file.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — bind port 80 as a non-root user</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>The run-as-root anti-pattern, and its cure. Compile a minimal server that binds port 80, then run it as an unprivileged user.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>cat &gt; /tmp/bind80.c &lt;&lt;'EOF'
+#include &lt;stdio.h&gt;
+#include &lt;netinet/in.h&gt;
+#include &lt;sys/socket.h&gt;
+#include &lt;unistd.h&gt;
+int main(void){
+  int s = socket(AF_INET, SOCK_STREAM, 0);
+  struct sockaddr_in a = { .sin_family=AF_INET, .sin_port=htons(80) };
+  if (bind(s, (struct sockaddr*)&amp;a, sizeof a) &lt; 0){ perror("bind"); return 1; }
+  printf("bound port 80 as uid %d — listening\n", getuid());
+  listen(s, 16); pause(); return 0;
+}
+EOF
+gcc -o /tmp/bind80 /tmp/bind80.c
+sysctl net.ipv4.ip_unprivileged_port_start   <span class="c"># confirm it's 1024 (privileged &lt;1024)</span>
+
+<span class="c"># Run as the unprivileged 'app' user — this should fail:</span>
+sudo -u app /tmp/bind80</code></pre></div>
+        <div class="out"><span class="ol">Output</span>net.ipv4.ip_unprivileged_port_start = 1024
+bind: Permission denied</code></pre></div>
+        <p><code>EACCES</code> — the unprivileged user can't bind a low port. You could "fix" this by running as root. Don't. Grant the one capability the job needs and run it unprivileged. Work out the command, then reveal.</p>
+        <details class="recall"><summary>Reveal the capability fix and how to verify it</summary>
+          <div class="body">
+            <p>Attach <code>CAP_NET_BIND_SERVICE</code> to the binary as a file capability, then run it as the non-root user:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>setcap 'cap_net_bind_service=+ep' /tmp/bind80   <span class="c"># +ep = permitted + effective</span>
+getcap /tmp/bind80                              <span class="c"># confirm the capability is attached</span>
+sudo -u app /tmp/bind80                         <span class="c"># now it works, as an unprivileged user</span></code></pre></div>
+            <div class="out"><span class="ol">Output</span>/tmp/bind80 cap_net_bind_service=ep
+bound port 80 as uid 1001 — listening</code></pre></div>
+            <p>Uid 1001 — not root — bound port 80. The process holds exactly one privileged power and nothing else: no ability to read arbitrary files, kill processes, or touch the disk. Prove it by inspecting the running process's capability sets:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>PID=$(pgrep -n bind80)
+grep -E 'Cap(Eff|Prm|Bnd)' /proc/$PID/status
+capsh --decode=$(grep CapEff /proc/$PID/status | awk '{print $2}')</code></pre></div>
+            <div class="out"><span class="ol">Output</span>CapEff:	0000000000000400
+cap_net_bind_service</code></pre></div>
+            <p>The effective set decodes to precisely <code>cap_net_bind_service</code>. That's the model for every service that needs a low port: run non-root, grant the one capability, verify with <code>getcap</code>/<code>capsh</code>. In Kubernetes you express the same thing in the pod's <code>securityContext.capabilities.add</code> — the container image doesn't even need setcap.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — audit and drop a container's privileges</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>You inherit a service that runs as root in its container "because it always has." Your job: find out what privileges it actually holds, then run it with the least it needs. First, audit a default container.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># In a DEFAULT container, look at what root here can do:</span>
+grep -E 'Cap(Eff|Bnd)|NoNewPrivs' /proc/self/status
+capsh --decode=$(grep CapEff /proc/self/status | awk '{print $2}')</code></pre></div>
+        <div class="out"><span class="ol">Output (Docker defaults)</span>CapEff:	00000000a80425fb
+NoNewPrivs:	0
+cap_chown, cap_dac_override, cap_fowner, cap_kill, cap_setgid,
+cap_setuid, cap_net_bind_service, cap_net_raw, cap_sys_chroot, ...</code></pre></div>
+        <p>That's a lot of keys on the ring — chown anything, override file permissions, change identity, kill processes. The senior question: how do you shrink this to nothing-but-what's-needed, and verify it? Design the run, then reveal.</p>
+        <details class="recall"><summary>Reveal the least-privilege recipe and verification</summary>
+          <div class="body">
+            <p>Run non-root, drop every capability, add back only the one you need, forbid privilege escalation, and make the root filesystem read-only:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>docker run --rm -it \
+  --user 1000:1000 \
+  --cap-drop=ALL \
+  --cap-add=NET_BIND_SERVICE \
+  --security-opt=no-new-privileges \
+  --read-only \
+  ubuntu:24.04 bash
+
+<span class="c"># Verify from inside: effective caps should be just one, NoNewPrivs on.</span>
+grep -E 'Uid|Cap(Eff|Bnd)|NoNewPrivs' /proc/self/status
+capsh --decode=$(grep CapEff /proc/self/status | awk '{print $2}')</code></pre></div>
+            <div class="out"><span class="ol">Output</span>Uid:	1000	1000	1000	1000
+CapEff:	0000000000000400
+CapBnd:	0000000000000400
+NoNewPrivs:	1
+cap_net_bind_service</code></pre></div>
+            <p>Now the container runs as uid 1000, its <em>bounding</em> set is capped at a single capability (so it can never gain more, even via a setuid binary), <code>no_new_privs</code> is on, and the root filesystem is read-only. Compromising this process yields almost nothing. In Kubernetes this is a <code>securityContext</code>: <code>runAsNonRoot: true</code>, <code>capabilities: {drop: ["ALL"], add: ["NET_BIND_SERVICE"]}</code>, <code>allowPrivilegeEscalation: false</code>, <code>readOnlyRootFilesystem: true</code>. The audit-then-minimise loop — read <code>CapEff</code>/<code>CapBnd</code> from <code>/proc/self/status</code>, decode with <code>capsh</code>, drop what's unused — is exactly the container-hardening work we go deep on in <a href="ch27-container-security-and-process-to-container-to.html">Chapter 27</a>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · EACCES that isn't about the file</div>
+      <p><b>Symptom:</b> a service logs "permission denied" opening a file it owns with sensible mode bits. <b>First cut:</b> <code>strace -f -e openat,stat</code> to see which syscall on which exact path returns <code>EACCES</code>. <b>Confirm:</b> <code>namei -l &lt;path&gt;</code> to print every directory's mode — look for a parent missing the execute/search bit for your uid. <b>Usual cause:</b> a locked-down parent directory (mode <code>700</code>, wrong owner), not the file. Secondary suspects: the process's effective uid isn't what you think (it dropped privileges), or a MAC layer (SELinux/AppArmor) denial visible in <code>dmesg</code>/audit. <b>Fix:</b> grant directory traversal or correct ownership; don't chmod the file.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · the run-as-root anti-pattern</div>
+      <p><b>Symptom:</b> a service runs as root "because it needs a low port / to write somewhere / it was easier." <b>Why it's a problem:</b> the process holds the full capability set, so any RCE or path-traversal bug becomes full host compromise — read every secret, tamper with any file, and (in a container) a much shorter path to escape. <b>First cut:</b> check the running uid and <code>CapEff</code>; ask what privileged operation it actually needs. <b>Fix:</b> run as a dedicated non-root user and grant only the specific capability (usually <code>CAP_NET_BIND_SERVICE</code>), or move the low-port need behind a proxy/load balancer. The cost of fixing this is minutes; the cost of not fixing it is the whole box.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · over-privileged containers</div>
+      <p><b>Symptom:</b> containers run as root with Docker's full default capability set and no <code>no_new_privs</code> — or worse, <code>--privileged</code> or <code>CAP_SYS_ADMIN</code>. <b>First cut:</b> <code>capsh --decode</code> of <code>/proc/1/status</code>'s <code>CapEff</code> inside the container; inspect the pod's <code>securityContext</code>. <b>Usual cause:</b> copy-pasted run commands and images that assume root. <b>Fix:</b> <code>runAsNonRoot</code>, <code>drop: ["ALL"]</code> then add only what's needed, <code>allowPrivilegeEscalation: false</code>, read-only rootfs. Treat <code>CAP_SYS_ADMIN</code> and <code>--privileged</code> as "this is basically root on the host" — because they are. Full treatment in <a href="ch27-container-security-and-process-to-container-to.html">Chapter 27</a>.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Least privilege is a default, not a project.</b> Every service should run as a dedicated non-root user with only the capabilities it provably needs. This is the single highest-impact security control you own as an SRE, and it costs almost nothing: a user, a capability or two, <code>no_new_privs</code>, and a read-only root filesystem. The habit to build is "start from zero privilege and add back the minimum," never "start as root and hope."</p>
+    <p><b>Know the dangerous grants.</b> <code>CAP_SYS_ADMIN</code>, <code>CAP_DAC_OVERRIDE</code>, <code>CAP_SETUID</code>, and <code>--privileged</code> each hand back most of what dropping capabilities bought you. If a workload "needs" <code>CAP_SYS_ADMIN</code>, that's a design smell worth pushing on — it's usually one specific operation (a mount, a sysctl) that has a narrower solution.</p>
+    <p><b>Permissions on secrets are load-bearing.</b> A key file that's <code>644</code> instead of <code>600</code> is readable by every process on the box. Set a tight <code>umask</code> for daemons, keep secret material <code>600</code>/owner-only, and remember that group membership is transitive through supplementary groups — adding a service account to a broad group can silently widen what it can read.</p>
+    <p><b>Common mistakes:</b> chmod-ing a file when the real block is a parent directory's missing <code>x</code>; running as root for one low port; leaving Docker's default capabilities on a workload that needs none of them; confusing "readable directory" (<code>r</code>) with "traversable directory" (<code>x</code>); and forgetting that SELinux/AppArmor can deny even when Unix says yes.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>The principle here — grant the minimum authority for the job, and contain the blast radius when something is compromised — is the same principle that reappears at every layer of a platform. It's IAM roles scoped to one action on one resource (<a href="ch54-iam-and-sts.html">Chapter 54</a>), it's IRSA giving a pod exactly one AWS role instead of node-wide credentials (<a href="ch55-irsa-and-eks-pod-identity.html">Chapter 55</a>), it's Kubernetes RBAC and Pod Security admission (<a href="ch39-security-rbac-admission-policy-securitycontext.html">Chapter 39</a>), and it's mutual-TLS service identity in a mesh (<a href="ch69-istio-security.html">Chapter 69</a>). Capabilities are where you first meet it, on a single host: the realisation that "all or nothing" privilege is a design failure, and that safety comes from decomposing power into the smallest useful pieces and handing out exactly one. Every security review you'll sit in is, at its core, someone asking "why does this need that permission?" — and this chapter is where you learn to answer.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What does mode <code>0755</code> mean, and how is it different from <code>0644</code>?</summary>
+        <div class="a"><p><code>0755</code> is three permission triples: owner <code>rwx</code> (read, write, execute), group <code>r-x</code>, and other <code>r-x</code>. So the owner can do everything, and everyone else can read and execute but not modify — typical for an executable or a directory you want others to traverse. <code>0644</code> is owner <code>rw-</code>, group <code>r--</code>, other <code>r--</code>: readable by all, writable only by the owner, executable by none — typical for a regular data or config file. The leading zero is the special-bits slot (setuid/setgid/sticky), zero here meaning none set. On a directory the execute bit means "may traverse," which is why data files are usually <code>644</code> but directories are <code>755</code>.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through how the kernel decides whether a process may read a file.</summary>
+        <div class="a"><p>The process carries an effective uid, effective gid, and a set of supplementary groups; the file carries an owner uid, a group gid, and its mode bits. The kernel first checks the privileged path: if the process is root or holds the relevant capability — <code>CAP_DAC_OVERRIDE</code> for read/write, <code>CAP_DAC_READ_SEARCH</code> for read and directory search — it's allowed outright. Otherwise it selects exactly one class by the first match: if the effective uid equals the file's owner, it uses the owner bits; else if the file's group is among the process's groups, it uses the group bits; else it uses the other bits. Then it checks whether that chosen class has the requested bit set — read, in this case — and returns success or <code>EACCES</code>. The subtlety worth stating is that the first matching class is the only one consulted, so a more-permissive group or other tier can't help someone who matches an earlier, stricter class. And path resolution needs the execute/search bit on every parent directory, which is why an <code>EACCES</code> is often really a locked parent directory rather than the file itself.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>What are Linux capabilities, and why are they better than setuid-root?</summary>
+        <div class="a"><p>Capabilities split root's historically monolithic power into about forty independent units — bind low ports (<code>CAP_NET_BIND_SERVICE</code>), change ownership (<code>CAP_CHOWN</code>), bypass file permissions (<code>CAP_DAC_OVERRIDE</code>), configure networking (<code>CAP_NET_ADMIN</code>), and so on. A process has several capability sets: permitted (what it may use), effective (what's active), inheritable/ambient (what survives an exec), and a bounding set that caps what it can ever hold. The advantage over setuid-root is blast radius. A setuid-root program runs the entire program with full root power to accomplish one small privileged task, so any bug in it is a total root compromise. With capabilities you attach just the one power the program needs — as a file capability via <code>setcap</code>, or granted by a container runtime — and the process runs otherwise unprivileged, often as a non-root uid. A web server given only <code>CAP_NET_BIND_SERVICE</code> can bind port 80 and do nothing else privileged; an exploit yields a port-binding power, not the disk and every secret. Pair that with <code>no_new_privs</code>, which makes exec unable to grant new privilege, and a tight bounding set, and you've decomposed "all of root" into "exactly this one thing," which is the entire point of container and service hardening. The one caveat is <code>CAP_SYS_ADMIN</code>, which is so broad it's effectively root — granting it undoes most of the benefit.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A service owned by its user, with a <code>644</code> config, gets <code>EACCES</code> reading it. How do you debug?</summary>
+        <div class="a"><p>I wouldn't touch the file's permissions, because a <code>644</code> file owned by the running user should be readable — the failure is almost certainly elsewhere. I'd <code>strace -f -e trace=openat,stat</code> the service (or run its exact command under strace as the same user) to see precisely which syscall on which path returns <code>EACCES</code>; that usually shows the denial happening during path resolution, not on the file's own open. Then <code>namei -l</code> on the full path prints the mode and owner of every directory component, which nearly always reveals a parent directory missing the execute/search bit for that uid — a <code>700</code> directory owned by someone else is the classic. If the directory chain is clean, I'd verify the process's <em>effective</em> uid is actually what I think (it may have dropped privileges to a different user than expected), and I'd check <code>dmesg</code> or the audit log for an SELinux/AppArmor denial, since a MAC layer can refuse even when Unix permissions allow. The fix follows the finding: fix the directory traversal, correct the runtime user, or adjust the MAC policy — but I let strace and namei tell me which before changing anything.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>How do you run a container with least privilege, and why does it matter?</summary>
+        <div class="a"><p>I run it as a non-root user (<code>runAsNonRoot</code> / <code>--user</code>), drop all capabilities and add back only the ones the workload provably needs (<code>--cap-drop=ALL --cap-add=NET_BIND_SERVICE</code>, or the pod's <code>securityContext.capabilities</code>), set <code>no_new_privs</code> (<code>allowPrivilegeEscalation: false</code>) so a setuid binary inside can't escalate, and make the root filesystem read-only. I verify by decoding <code>/proc/1/status</code>'s <code>CapEff</code> and <code>CapBnd</code> with <code>capsh</code> from inside the container. It matters because a container is just a process on the shared host kernel — the isolation is capabilities plus namespaces plus seccomp, not a second kernel — so an over-privileged container is a short hop from host compromise, especially anything with <code>CAP_SYS_ADMIN</code> or <code>--privileged</code>. Least privilege shrinks what an attacker gets from a successful exploit down to almost nothing, and it's cheap to apply, so it's a baseline I'd enforce with admission policy rather than leave to each team's discretion.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>Linux stacks two permission systems. Mode bits govern file access: owner/group/other × read/write/execute, plus setuid/setgid/sticky, defaulted by umask, and read straight off <code>ls -l</code>. The kernel picks the <em>first</em> matching class — owner, then group, then other — and checks only that class, which is why a permissive group/other tier can't rescue a stricter owner match, and why path access needs execute on every parent directory. The second system is capabilities: root's power split into ~40 independent units, so you grant <code>CAP_NET_BIND_SERVICE</code> to bind port 80 without any of root's other powers. Attach capabilities to binaries with <code>setcap</code>/<code>getcap</code>, read a process's sets from <code>/proc/&lt;pid&gt;/status</code> and decode with <code>capsh</code>, and lock the door behind you with <code>no_new_privs</code>. The production reflex: run non-root, drop all capabilities, add back the minimum — and on any <code>EACCES</code>, let <code>strace</code> and <code>namei -l</code> name the real cause before you change a thing.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>A process runs as a uid with groups; a file has an owner, a group, and nine <code>rwx</code> mode bits plus setuid/setgid/sticky.</li>
+      <li>The kernel uses the <em>first</em> matching class — owner, then group, then other — and checks only that class's bits.</li>
+      <li>On a directory, <code>x</code> means traverse/search, <code>r</code> means list names, <code>w</code> means create/delete entries — not the same as on a file.</li>
+      <li>Path access needs the execute bit on every parent directory; a locked parent is the usual hidden <code>EACCES</code>.</li>
+      <li>setuid runs a program as its owner's uid (that's how <code>passwd</code> edits shadow); powerful and a big attack surface.</li>
+      <li>Capabilities split root into ~40 units, so you grant one power (e.g. <code>CAP_NET_BIND_SERVICE</code>) instead of all of root.</li>
+      <li>Use <code>setcap</code>/<code>getcap</code> for file capabilities; read a process's <code>CapEff</code>/<code>CapBnd</code> from <code>/proc</code> and decode with <code>capsh</code>.</li>
+      <li><code>no_new_privs</code> makes <code>exec</code> unable to grant new privilege — a cheap, irreversible hardening default.</li>
+      <li>Debug <code>EACCES</code> with <code>strace</code> (which syscall/path/errno) and <code>namei -l</code> (every directory's mode) — don't guess.</li>
+      <li>Least privilege in containers: run non-root, drop ALL caps, add only what's needed, <code>no_new_privs</code>, read-only rootfs — beware <code>CAP_SYS_ADMIN</code>.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Connects to:</span>
+      <a href="ch01-kernel-and-system-calls.html"><b>Ch 1</b> Syscalls, seccomp &amp; caps</a>
+      <a href="ch04-filesystems-inodes-file-descriptors-disk-i-o.html"><b>Ch 4</b> Permissions live on the inode</a>
+      <a href="ch06-systemd-journald-cron-service-lifecycle.html"><b>Ch 6</b> Units, User=, NoNewPrivileges</a>
+      <a href="ch27-container-security-and-process-to-container-to.html"><b>Ch 27</b> Container security</a>
+      <a href="ch39-security-rbac-admission-policy-securitycontext.html"><b>Ch 39</b> K8s securityContext &amp; RBAC</a>
+      <a href="ch54-iam-and-sts.html"><b>Ch 54</b> IAM least privilege</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man7/capabilities.7.html">capabilities(7)</a>: the authoritative list of capabilities and the permitted/effective/inheritable/ambient/bounding sets.</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man7/credentials.7.html">credentials(7)</a> (real/effective/saved uid, groups) and <a href="https://man7.org/linux/man-pages/man2/chmod.2.html">chmod(2)</a> (mode bits, setuid/setgid/sticky).</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man3/getcap.3.html">getcap/setcap</a> and <a href="https://man7.org/linux/man-pages/man2/prctl.2.html">prctl(2)</a> (<code>PR_SET_NO_NEW_PRIVS</code>).</li>
+      <li>The Open Group — <a href="https://pubs.opengroup.org/onlinepubs/9699919799/">POSIX.1-2017</a>: the base standard for file permissions and process credentials.</li>
+      <li>Google — <a href="https://sre.google/sre-book/table-of-contents/"><i>Site Reliability Engineering</i></a> (first-party): the least-privilege and access-control practices these primitives implement.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch04-filesystems-inodes-file-descriptors-disk-i-o.html"><span class="dir">← Prev</span><div class="ti">Ch 4 — Filesystems, inodes, file descriptors, disk I/O</div></a>
+      <a class="nx" href="ch06-systemd-journald-cron-service-lifecycle.html"><span class="dir">Next →</span><div class="ti">Ch 6 — systemd, journald, cron, service lifecycle</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 5 of 121 · Part I · Linux &amp; OS Foundations. Run the labs in a container; the reflexes are the point.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">The check path</a>
+    <a href="#internals">Bits &amp; capabilities</a>
+    <a href="#components">The components</a>
+    <a href="#flow">Binding port 80</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 41 — The Kubernetes network model and CNI</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part V · K8s networking &nbsp;·&nbsp; Chapter 41</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part V · Kubernetes Networking at Packet Level · Chapter 41</div>
+      <h1>The Kubernetes network model and CNI</h1>
+      <p class="tagline">Calico, Cilium, Flannel, the AWS VPC CNI — four products with almost nothing in common under the hood, and every one of them satisfies the exact same one-page contract. Kubernetes never asks how a network plugin does its job; it only ever checks whether four rules hold. Learn the contract and no CNI is a black box again.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~45 min read · kind + kubectl lab</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>State the Kubernetes network model's four rules from memory, and explain why flat, routable pod IPs won over per-node NAT.</li>
+          <li>Explain the difference between the Kubernetes network model (the <em>what</em>) and the CNI specification (the <em>how</em>) — two documents from two different projects, constantly confused as one.</li>
+          <li>Read a CNI plugin's config from <code>/etc/cni/net.d</code> and know exactly what each field controls.</li>
+          <li>Say precisely what a CNI plugin owns — IPAM, the veth, host-side routes — and name the things it explicitly does not own.</li>
+          <li>Diagnose a CNI DaemonSet that isn't ready and a cluster that's run out of pod IP address space, from their distinct symptoms.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>One rulebook, any contractor</h2>
+    <p>You already know from <a href="ch25-container-networking.html">Chapter 25</a> how a single Docker host wires containers up: a bridge, veth pairs, private addresses, and NAT to hide those addresses behind the host's own IP. That works for one machine. Put fifty machines in a cluster and it collapses immediately — if every node hands out its own private <code>172.17.x.x</code> range, every node hands out the <em>same</em> range, addresses collide across the cluster, and a pod on node 3 can never uniquely name a pod on node 41. You'd be back to publishing ports and chasing NAT tables for every pod-to-pod call, which doesn't survive a service with a thousand replicas across a hundred nodes.</p>
+    <p>Kubernetes' answer was to write down a small, non-negotiable contract and refuse to ship its own implementation of it. The contract is four rules:</p>
+    <ul>
+      <li>Every pod gets its own unique IP address, valid cluster-wide.</li>
+      <li>Any pod can reach any other pod's IP directly, <b>without NAT</b> — the destination sees the source's real IP.</li>
+      <li>Agents on a node (the kubelet, system daemons) can reach every pod on that node.</li>
+      <li>A pod's own view of its IP matches everyone else's view of it — it is never secretly translated.</li>
+    </ul>
+    <p>Kubernetes itself doesn't implement any of this. It defines the rules, then delegates the actual wiring to a pluggable component invoked at exactly one moment — when a pod's sandbox is created — through a generic, pre-existing interface called the <b>Container Network Interface (CNI)</b>. This is the detail almost everyone glosses over: the four rules above are <em>Kubernetes'</em> requirement, published in Kubernetes' own docs, while CNI is a separate specification from a separate project that predates Kubernetes adopting it and has nothing Kubernetes-specific in it at all. Kubernetes just happens to be CNI's most famous customer. Keeping those two documents distinct in your head is most of what this chapter is trying to teach.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>The Kubernetes network model is the <em>what</em>: four rules, owned by Kubernetes, non-negotiable for anything calling itself a conformant cluster. The CNI specification is the <em>how</em>: a generic plugin contract, owned by an independent project, that Kubernetes delegates to so it never has to ship — or pick a winner among — network implementations. Any plugin that honors the contract is free to satisfy the rules however it wants underneath.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a building code and a standard contractor agreement</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>A property developer writes a <b>building code</b> every unit in every building must meet, no matter who builds it: every unit gets its own real, unique street address; any unit's front door reaches any other unit directly, with no forwarding desk translating the visitor in between; building staff can reach every unit in their own building; and the address on your mailbox is the same address everyone else uses to find you. That code is the <b>Kubernetes network model</b> — four fixed requirements, owned by the developer, and every building must meet them regardless of who wires it.</p>
+      <p>The developer doesn't do the wiring. Instead, they hire under a <b>standard electrician contract</b> that says: "when a unit is being fitted out, we'll call you with a work order — <code>ADD</code> — and you run the cable, set the meter, and tell us the unit's assigned address; when the unit is vacated, we call you with <code>DEL</code> and you disconnect it." Any electrician who signs that standard contract can take the job — one crew might run copper through a shared conduit, another might use a wireless mesh, another might tap directly into the city grid with its own numbering. The developer never inspects <em>how</em> the wiring was run. They only ever check that the building code holds. That contract is <b>CNI</b>, and it's generic enough that it was never written with buildings — or Kubernetes — specifically in mind; it's just the interface Kubernetes chose to hire electricians through.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In Kubernetes</th></tr>
+      <tr><td>The building code (four fixed requirements)</td><td>The Kubernetes network model</td></tr>
+      <tr><td>The developer who insists on the code</td><td>Kubernetes / the kubelet</td></tr>
+      <tr><td>The standard electrician contract, signed by any crew</td><td>The CNI specification (<a href="https://www.cni.dev/">cni.dev</a>) — not Kubernetes-specific</td></tr>
+      <tr><td>The work order: "fit out this unit" → address assigned back</td><td><code>cmdADD</code>, invoked by the kubelet at pod sandbox creation</td></tr>
+      <tr><td>The work order to disconnect a vacated unit</td><td><code>cmdDEL</code>, invoked at pod teardown</td></tr>
+      <tr><td>The crew's own choice of cable, conduit, or mesh</td><td>What the plugin owns: IPAM, the veth, host-side routes</td></tr>
+      <tr><td>Any licensed crew can take the same contract</td><td>Calico, Cilium, Flannel, the AWS VPC CNI — interchangeable</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>Invocation, then wiring — and the promise it produces</h2>
+    <p>Two things happen in sequence: the kubelet invokes a plugin at one specific moment, and that invocation produces a piece of wiring that must keep the model's four promises for as long as the pod lives. The figure below shows both — the invocation across the top, and the resulting flat, no-NAT reachability across the bottom, which is the entire point of doing the invocation at all.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 760 500" role="img" aria-label="At pod sandbox creation the kubelet creates an empty network namespace and invokes the CNI plugin with cmdADD, passing the network namespace and reading its config from etc cni net dot d; the plugin performs IPAM, creates a veth pair, and wires host-side routes, then returns the pod IP; the result on every node is a pod with a real cluster-routable IP reachable from any other pod on any other node without NAT">
+        <defs>
+          <marker id="cni-ar" markerWidth="10" markerHeight="10" refX="7.5" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" style="fill:var(--accent)"/></marker>
+          <marker id="cni-ar2" markerWidth="10" markerHeight="10" refX="7.5" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" style="fill:var(--applied)"/></marker>
+        </defs>
+        <text x="380" y="18" text-anchor="middle" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">AT SANDBOX CREATION: KUBELET INVOKES THE CNI PLUGIN</text>
+
+        <rect x="16" y="46" width="104" height="76" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="68" y="78" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">kubelet</text>
+        <text x="68" y="96" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">asks the CRI for</text>
+        <text x="68" y="108" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">a pod sandbox</text>
+
+        <rect x="140" y="46" width="150" height="76" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="215" y="70" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">Create sandbox</text>
+        <text x="215" y="88" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">pause container,</text>
+        <text x="215" y="102" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">empty netns + lo (down)</text>
+
+        <rect x="310" y="46" width="210" height="76" rx="8" style="fill:var(--panel);stroke:var(--violet);stroke-width:1.5"/>
+        <text x="415" y="66" text-anchor="middle" style="fill:var(--violet);font:600 11.5px sans-serif">Invoke CNI plugin: cmdADD</text>
+        <text x="415" y="84" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">netns path on stdin · config</text>
+        <text x="415" y="98" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">read from /etc/cni/net.d</text>
+        <text x="415" y="112" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">binary from /opt/cni/bin</text>
+
+        <rect x="540" y="46" width="204" height="76" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="642" y="70" text-anchor="middle" style="fill:var(--accent2);font:600 11.5px sans-serif">Plugin does the work</text>
+        <text x="642" y="88" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">IPAM + veth + routes</text>
+        <text x="642" y="102" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">→ pod IP as JSON on stdout</text>
+
+        <g style="stroke:var(--accent);stroke-width:2">
+          <line x1="120" y1="84" x2="138" y2="84" marker-end="url(#cni-ar)"/>
+          <line x1="290" y1="84" x2="308" y2="84" marker-end="url(#cni-ar)"/>
+          <line x1="520" y1="84" x2="538" y2="84" marker-end="url(#cni-ar)"/>
+        </g>
+        <path d="M642,122 L642,138 L68,138 L68,124" style="fill:none;stroke:var(--accent2);stroke-width:1.5;stroke-dasharray:4 3" marker-end="url(#cni-ar)"/>
+        <text x="355" y="152" text-anchor="middle" style="fill:var(--accent2);font:600 10px sans-serif">pod IP recorded → this becomes .status.podIP</text>
+
+        <line x1="14" y1="182" x2="746" y2="182" style="stroke:var(--line);stroke-width:1;stroke-dasharray:4 4"/>
+        <text x="380" y="204" text-anchor="middle" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">THE RESULT: FLAT, ROUTABLE, NO-NAT — WHAT ANY CNI MUST DELIVER</text>
+
+        <rect x="16" y="222" width="336" height="242" rx="12" style="fill:none;stroke:var(--line);stroke-width:1.5"/>
+        <text x="30" y="242" style="fill:var(--muted);font:700 10.5px sans-serif;letter-spacing:.04em">NODE 1</text>
+        <rect x="30" y="254" width="150" height="56" rx="7" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="105" y="273" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">/etc/cni/net.d config</text>
+        <text x="105" y="289" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">/opt/cni/bin plugin</text>
+        <rect x="204" y="254" width="128" height="70" rx="7" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="268" y="274" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">pod A</text>
+        <text x="268" y="290" text-anchor="middle" style="fill:var(--accent);font:9.5px ui-monospace,monospace">10.244.0.5</text>
+        <text x="268" y="304" text-anchor="middle" style="fill:var(--muted);font:8.5px sans-serif">eth0 ↔ veth (Ch 42)</text>
+        <text x="105" y="440" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">IPAM assigns from this</text>
+        <text x="105" y="454" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">node's slice of the pod CIDR</text>
+
+        <rect x="408" y="222" width="336" height="242" rx="12" style="fill:none;stroke:var(--line);stroke-width:1.5"/>
+        <text x="422" y="242" style="fill:var(--muted);font:700 10.5px sans-serif;letter-spacing:.04em">NODE 2</text>
+        <rect x="422" y="254" width="150" height="56" rx="7" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="497" y="273" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">/etc/cni/net.d config</text>
+        <text x="497" y="289" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">/opt/cni/bin plugin</text>
+        <rect x="596" y="254" width="128" height="70" rx="7" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="660" y="274" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">pod B</text>
+        <text x="660" y="290" text-anchor="middle" style="fill:var(--accent2);font:9.5px ui-monospace,monospace">10.244.1.6</text>
+        <text x="660" y="304" text-anchor="middle" style="fill:var(--muted);font:8.5px sans-serif">eth0 ↔ veth (Ch 42)</text>
+
+        <line x1="332" y1="289" x2="406" y2="289" style="stroke:var(--applied);stroke-width:2" marker-end="url(#cni-ar2)"/>
+        <line x1="406" y1="299" x2="332" y2="299" style="stroke:var(--applied);stroke-width:2" marker-end="url(#cni-ar2)"/>
+        <text x="369" y="330" text-anchor="middle" style="fill:var(--applied);font:600 9.5px sans-serif">flat —</text>
+        <text x="369" y="343" text-anchor="middle" style="fill:var(--applied);font:600 9.5px sans-serif">no NAT</text>
+
+        <rect x="30" y="358" width="302" height="90" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="42" y="378" style="fill:var(--ink);font:9.5px sans-serif">Every CNI must deliver this,</text>
+        <text x="42" y="392" style="fill:var(--ink);font:9.5px sans-serif">regardless of how it wires it:</text>
+        <text x="42" y="410" style="fill:var(--ink);font:9.5px sans-serif">unique IP · reachable without</text>
+        <text x="42" y="424" style="fill:var(--ink);font:9.5px sans-serif">NAT · node agents reach it · IP</text>
+        <text x="42" y="438" style="fill:var(--ink);font:9.5px sans-serif">never secretly translated.</text>
+      </svg>
+      <figcaption>Top: the kubelet's one call to the CNI plugin at sandbox creation. Bottom: the promise that call must produce — a real, cluster-routable IP that any pod on any node can reach with no translation, no matter which plugin, which node, or which underlying wiring built it.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>This split is why swapping a CNI is a real, done-in-production migration rather than a rewrite. Moving from Flannel to Calico, or to the AWS VPC CNI, changes IPAM, the wiring, and which optional extras (like NetworkPolicy enforcement) you get — but no application changes, because no application was ever allowed to depend on anything beyond the four rules. When someone says "we're migrating CNIs," this is the guarantee that makes it a platform-team project instead of an every-team fire drill.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>What actually happens when the kubelet calls the plugin</h2>
+    <p>"Invoke the plugin" is one box in the figure above. Here's the literal mechanism, because the CNI spec is short enough to actually read in full and worth doing once:</p>
+    <ol class="steps">
+      <li><b>The kubelet asks the container runtime to create the pod's sandbox.</b> The CRI creates the <code>pause</code> container and an empty network namespace — no interfaces except a loopback, and it starts down. Nothing is wired yet.</li>
+      <li><b>The kubelet (or the runtime, on its behalf) reads the CNI configuration.</b> It looks in <code>/etc/cni/net.d/</code> for a <code>.conflist</code> (or a single <code>.conf</code>) file. If several exist, the one that sorts first lexically by filename wins — a fact that causes real incidents when an upgrade leaves an old config file behind alongside a new one. The chosen config names one or more plugins by <code>type</code>, plus a <code>subnet</code>/IPAM block, and any plugin-specific parameters like MTU.</li>
+      <li><b>It executes the plugin binary from <code>/opt/cni/bin/</code></b> matching that <code>type</code>, setting environment variables the spec defines — <code>CNI_COMMAND=ADD</code>, <code>CNI_CONTAINERID</code>, <code>CNI_NETNS</code> (the namespace path), <code>CNI_IFNAME</code> (usually <code>eth0</code>) — and feeding the JSON config to the plugin's stdin. This is the entire interface: environment variables plus JSON over standard streams, nothing Kubernetes-specific about any of it.</li>
+      <li><b>The plugin does its job.</b> For a typical plugin this means three things: run <b>IPAM</b> to obtain an address (often by delegating to a separate IPAM plugin, like <code>host-local</code>, which tracks allocations in files on disk), create a <b>veth pair</b> and move one end into the pod's namespace as <code>eth0</code>, and wire the <b>host-side routes</b> (or bridge membership) so the address is reachable — the exact same three nouns Chapter 42 goes deep on.</li>
+      <li><b>If the config file is a <code>.conflist</code>, plugins run in a chain.</b> A connectivity plugin (bridge, Calico, Cilium, whichever) runs first and does the real wiring; smaller "meta" plugins can run after it against the same interface — <code>portmap</code> to implement a pod's <code>hostPort</code>, <code>bandwidth</code> to apply traffic shaping, <code>tuning</code> to set sysctls on the interface. Each one only modifies what the previous plugin already built; none of them do IPAM or create the veth themselves.</li>
+      <li><b>The plugin prints a result to stdout</b> — the assigned IP, routes, and DNS info, as JSON — and exits. The kubelet reads that result and records the address; this is, mechanically, where a pod's <code>.status.podIP</code> comes from. Only now does the kubelet tell the runtime to start the actual application containers, into a namespace that already has a real, working network identity.</li>
+      <li><b>Teardown is the mirror image.</b> When the pod is deleted, the kubelet invokes the same binary with <code>CNI_COMMAND=DEL</code>, and the plugin releases the IPAM allocation and removes what it created. <code>CHECK</code> and <code>VERSION</code> are two smaller commands the spec also defines, for verifying an existing attachment and negotiating protocol versions.</li>
+    </ol>
+    <div class="box keypoint"><div class="h">The CNI spec is generic — Kubernetes is just its most famous caller</div>
+      <p>Nothing in steps 1–7 mentions a Pod object, a kubelet, or etcd. The CNI specification defines a protocol for "wire up a network namespace" and "tear it down," full stop — it was built to be usable by any container runtime, and Kubernetes adopted it rather than inventing its own. That's why a CNI plugin's config and binary have no idea what a Kubernetes Service or a NetworkPolicy even is unless the specific plugin chooses to also watch the Kubernetes API on the side and layer that behavior in — which is exactly what Calico and Cilium do, and exactly what a bare <code>bridge</code>+<code>host-local</code> setup does not.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: a node's <code>/etc/cni/net.d/</code> has both <code>05-flannel.conflist</code> (from an old install) and <code>10-calico.conflist</code> (from a botched migration) sitting side by side. Which one actually runs?</summary>
+      <div class="body">
+        <p><code>05-flannel.conflist</code> — the kubelet picks the config file that sorts first lexically by filename, and <code>05</code> sorts before <code>10</code>. Every new pod on that node gets wired by Flannel, silently, even though the team believes they've migrated to Calico. This is a real, recurring class of incident: nothing crashes, nothing errors, pods get IPs and appear to work — until something that depends on Calico-specific behavior (a NetworkPolicy, an encryption feature) quietly doesn't apply, and nobody notices until a security review or an outage exposes it. The fix is procedural as much as technical: a CNI migration has to explicitly remove the old config (and ideally the old binary) from every node, not just install the new one alongside it, and it's worth checking <code>ls /etc/cni/net.d/</code> on more than one node before declaring a migration done.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, and who owns which</h2>
+    <ul>
+      <li><b>The Kubernetes network model.</b> The four rules, owned and documented by Kubernetes itself. No plugin, no config file — it's a design requirement any conformant cluster must meet, checked by conformance tests, not by any single piece of software.</li>
+      <li><b>The CNI specification</b> (<a href="https://www.cni.dev/">cni.dev</a>). A general-purpose contract for wiring and tearing down a network namespace: the commands (<code>ADD</code>/<code>DEL</code>/<code>CHECK</code>/<code>VERSION</code>), the execution protocol (env vars, JSON on stdin/stdout), and the config file formats. Owned by an independent project, usable by any container runtime, not just Kubernetes.</li>
+      <li><b>CNI config files</b> — <code>/etc/cni/net.d/*.conf</code> or <code>*.conflist</code>. Which plugin (or chain of plugins) runs, in what order, with what subnet, IPAM type, and MTU. The first file by filename sort order wins.</li>
+      <li><b>CNI plugin binaries</b> — <code>/opt/cni/bin/*</code>. The actual executables: connectivity plugins (<code>bridge</code>, <code>ptp</code>, or a vendor's own like Calico's or Cilium's), IPAM plugins (<code>host-local</code>, or a cloud-delegating one), and meta plugins (<code>portmap</code>, <code>bandwidth</code>, <code>tuning</code>).</li>
+      <li><b>IPAM plugins.</b> A specific category of plugin whose only job is address assignment — handed the same config, called with the same commands, but responsible only for "give me an address" and "release this address," not for any wiring.</li>
+      <li><b>The kubelet and the container runtime (CRI).</b> The callers. The kubelet drives the pod's lifecycle and triggers sandbox creation; the runtime creates the sandbox and network namespace the CNI plugin is handed.</li>
+      <li><b>The pod sandbox / <code>pause</code> container.</b> Holds the network namespace open for the pod's whole life, so the CNI attachment and the assigned IP survive individual app containers restarting inside it.</li>
+      <li><b>What a CNI plugin explicitly does <em>not</em> own.</b> Service virtual IPs and their DNAT rules (kube-proxy's job, <a href="ch43-services-and-the-datapath-pod-to-service.html">Chapter 43</a>), DNS resolution (CoreDNS, <a href="ch45-coredns-and-service-discovery.html">Chapter 45</a>), and — unless the specific plugin chooses to add it — NetworkPolicy enforcement, which is an optional extra some CNIs implement and some don't.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following the promise from ADD to every later chapter</h2>
+    <p>A pod is scheduled to a node. The runtime creates its sandbox and empty namespace; the kubelet reads that node's CNI config, execs the plugin with <code>ADD</code>, and the plugin runs IPAM against this node's slice of the cluster's pod CIDR, creates the veth, wires the host side, and hands back an address — say <code>10.244.1.6</code>. The kubelet records it as <code>.status.podIP</code>. From this exact moment, the model's four rules are now live promises about that address: it's unique across the whole cluster, not just this node; any other pod, anywhere, can open a connection to it and this pod will see that peer's real address, untranslated; the kubelet and any node-level agent on this node can reach it directly; and every consumer of that IP — a Service's endpoint list, a NetworkPolicy selector, a monitoring scrape target — sees the same address this pod sees itself.</p>
+    <p>Everything Part V covers after this chapter is really just an account of how that promise gets kept and used. <a href="ch42-pod-networking-internals-pod-to-pod.html">Chapter 42</a> is the mechanism behind "reachable without NAT," in full: the veth, the same-node bridge or routes, the cross-node native routing or overlay. <a href="ch43-services-and-the-datapath-pod-to-service.html">Chapter 43</a> builds a virtual, load-balanced address on top of a list of these real ones. None of it works if the CNI plugin didn't keep this chapter's promise at ADD time — which is exactly why "is the CNI healthy" is the first thing to check when pod networking looks broken anywhere in the stack.</p>
+
+    <details class="recall"><summary>Think first: a brand-new, custom-written CNI plugin passes every test you throw at it — pods get IPs, pod-to-pod pings work, everything looks fine on one node. What haven't you actually verified yet?</summary>
+      <div class="body">
+        <p>Whether it holds up <em>across</em> nodes, and whether it's really not translating anything. Same-node connectivity can work by pure accident — even a plugin that quietly NATs traffic through the node's own IP can still pass a same-node ping, because the reply finds its way back regardless of whose address is on it. The model's actual claims only get tested by a cross-node call where you inspect what address the destination pod actually sees the source as, and by checking that a node-local agent (not just another pod) can reach the pod directly. A CNI that's never been checked against all four rules specifically, only against "does networking seem to work," is exactly how a subtly broken plugin ships to production and breaks something three layers up — a NetworkPolicy that never matches because the source IP it sees isn't the real one, for instance — weeks later.</p>
+      </div>
+    </details>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>A plain two-node <code>kind</code> cluster, using its default CNI, <b>kindnet</b> — a real, if minimal, CNI plugin, not a simulation of one.</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>kind create cluster --name cnilab --config - &lt;&lt;'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+EOF</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — read the actual CNI config and binaries on a node</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Stop treating the CNI as a black box. A kind node is just a Docker container, so read the files directly:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker exec cnilab-worker ls /etc/cni/net.d/
+docker exec cnilab-worker cat /etc/cni/net.d/10-kindnet.conflist</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>10-kindnet.conflist
+
+{
+  "cniVersion": "0.3.1",
+  "name": "kindnet",
+  "plugins": [
+  {
+    "type": "ptp",
+    "ipMasq": false,
+    "ipam": { "type": "host-local", "dataDir": "/run/cni-ipam-state",
+              "ranges": [[{"subnet": "10.244.1.0/24"}]] },
+    "mtu": 1500
+  },
+  { "type": "portmap", "capabilities": {"portMappings": true} }
+  ]
+}</code></div>
+        <p>Read it like a sentence: one <code>.conflist</code>, so this is a plugin chain. <code>ptp</code> is the connectivity plugin — a point-to-point veth style, not a bridge (which is exactly what let you predict, back in Chapter 42's terms, that this CNI forwards same-node traffic with routes, not a <code>cni0</code> bridge). Its <code>ipam</code> block says <code>host-local</code>, handing out addresses from <code>10.244.1.0/24</code> — this node's own slice. <code>portmap</code> runs second, purely to implement <code>hostPort</code>; it never touches IPAM or the veth. Now find the binaries that actually get executed:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker exec cnilab-worker ls /opt/cni/bin/</code></pre></div>
+        <div class="out"><span class="ol">Output</span>bridge  host-local  loopback  portmap  ptp  ...</code></div>
+        <p><code>ptp</code> and <code>host-local</code> and <code>portmap</code> are right there — ordinary executables, not daemons, run once per pod and exiting immediately after. This is the entire "CNI plugin" for this node: two files and a handful of binaries.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — every node's slice, and the no-NAT promise, empirically</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>The config file said <code>10.244.1.0/24</code> for this one node. Confirm the cluster hands each node a distinct slice, and that pod IPs really do land inside it:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"  "}{.spec.podCIDR}{"\n"}{end}'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>cnilab-control-plane  10.244.0.0/24
+cnilab-worker         10.244.1.0/24</code></div>
+        <p>Deploy pods on each node and check where their IPs actually fall:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl run a --image=busybox:1.36 --overrides='{"spec":{"nodeName":"cnilab-worker"}}' --command -- sleep 3600
+kubectl run b --image=busybox:1.36 --overrides='{"spec":{"nodeName":"cnilab-control-plane"}}' --command -- sleep 3600
+kubectl wait --for=condition=Ready pod/a pod/b --timeout=60s
+kubectl get pods -o wide</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME  READY  STATUS   IP            NODE
+a     1/1    Running  10.244.1.2    cnilab-worker
+b     1/1    Running  10.244.0.4    cnilab-control-plane</code></div>
+        <p>Exactly the slices the config predicted. Now prove the model's second rule — no NAT — without touching a packet capture yet; a plain connection is enough to show the destination sees a real, unmodified peer address:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>B_IP=$(kubectl get pod b -o jsonpath='{.status.podIP}')
+kubectl exec a -- wget -T3 -qO- "$B_IP" 2&gt;&amp;1 | head -1 || true
+kubectl exec a -- ping -c2 "$B_IP"</code></pre></div>
+        <div class="out"><span class="ol">Output</span>PING 10.244.0.4: 2 packets transmitted, 2 packets received, 0% packet loss</code></div>
+        <p>Two pods, two nodes, a direct connection, no port mapping, no gateway you configured by hand. Exactly how that packet actually crosses from one node's veth to the other's is Chapter 42's whole subject — this lab only needed to prove that the promise holds, not yet how it's kept.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — a CNI DaemonSet that isn't ready</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>The CNI plugin binary only runs when the kubelet calls it — but something has to keep the config and binaries in place and healthy on every node, and for most real CNIs that's a DaemonSet. Take it down on one node and watch what breaks, and what doesn't:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl -n kube-system get pods -l app=kindnet -o wide
+<span class="c"># find the kindnet pod on cnilab-worker and delete it, then immediately try a new pod there:</span>
+KPOD=$(kubectl -n kube-system get pods -l app=kindnet -o jsonpath='{range .items[?(@.spec.nodeName=="cnilab-worker")]}{.metadata.name}{end}')
+kubectl -n kube-system delete pod "$KPOD" --grace-period=0 --force
+kubectl run c --image=busybox:1.36 --overrides='{"spec":{"nodeName":"cnilab-worker"}}' --command -- sleep 3600
+kubectl get pod c -w</code></pre></div>
+        <p>Before you look at the new pod's status, predict two things: does pod <code>a</code>, already running on that same node from Lab 2, notice anything at all? And does the new pod <code>c</code> behave the same way? Reason about what the CNI actually did at ADD time versus what it would need to do again, then check.</p>
+        <details class="recall"><summary>Reveal what happens to each</summary>
+          <div class="body">
+            <div class="out"><span class="ol">Output</span>NAME   READY   STATUS              RESTARTS   AGE
+c      0/1     ContainerCreating   0          75s</code></div>
+            <p>Pod <code>a</code> is untouched — its ADD already happened, its veth and routes already exist in the kernel, and none of that depends on kindnet's pod still running afterward. Pod <code>c</code> is a brand-new sandbox that needs a brand-new <code>ADD</code> call, and if the CNI's own components aren't healthy on that node, that call either fails outright or never gets attempted, so <code>c</code> sits in <code>ContainerCreating</code> indefinitely. Confirm from the events, then bring kindnet back — the DaemonSet controller (<a href="ch31-the-reconciliation-loop-controllers-informers.html">Chapter 31</a>) reschedules it automatically:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl describe pod c | grep -A2 Events
+kubectl -n kube-system get pods -l app=kindnet -o wide   <span class="c"># wait for it to come back Running</span>
+kubectl delete pod c</code></pre></div>
+            <p>This is the shape of the real incident named in this chapter's opening: a CNI DaemonSet crash-looping or not-yet-scheduled on a node makes that one node unable to network <em>new</em> pods, while doing nothing at all to the pods already wired there — which is exactly why the symptom is "new pods stuck, old pods fine, on one specific node" rather than a clean, obvious network outage.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — run out of address space to hand out</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>IPAM exhaustion doesn't require filling up 254 addresses one pod at a time — the cheapest way to see it is to start a cluster whose total pod-IP pool is smaller than what its nodes need. Build one on purpose:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kind create cluster --name tinynet --config - &lt;&lt;'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  podSubnet: "10.245.0.0/26"
+nodes:
+  - role: control-plane
+  - role: worker
+EOF
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"  "}{.spec.podCIDR}{"\n"}{end}'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>tinynet-control-plane  10.245.0.0/24
+tinynet-worker
+
+</code></div>
+        <p>One node has a <code>podCIDR</code>; the other has nothing at all — an empty field. A <code>/26</code> is only 64 addresses total, and the default per-node allocation needs a full <code>/24</code>, so the pool ran out after the first node. Before revealing, work out what this does to any pod scheduled onto the empty-CIDR node, and what you'd check first if you found this in a real cluster with no idea it had been misconfigured at creation time.</p>
+        <details class="recall"><summary>Reveal the symptom chain and the fix</summary>
+          <div class="body">
+            <p>Schedule a pod onto the starved node and it never gets networked at all:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl run stuck --image=busybox:1.36 --overrides='{"spec":{"nodeName":"tinynet-worker"}}' --command -- sleep 3600
+kubectl describe pod stuck | grep -A3 Events</code></pre></div>
+            <div class="out"><span class="ol">Output</span>Warning  FailedCreatePodSandBox  ...  failed to set up sandbox container ...
+  network: failed to allocate for range 0: no IP addresses available in range ...</code></div>
+            <p>The error names the exact failure — IPAM has nothing left to hand out, because the node was never even given a CIDR to allocate from. In a real cluster you'd never see the empty <code>podCIDR</code> as obviously as this lab makes it — you'd only see "pods on this node never leave ContainerCreating with a sandbox-allocation error," so <code>kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.podCIDR}{"\n"}{end}'</code> is the one command that turns "networking seems broken" into "this node was never given address space" in a single line. The fix is always sizing the pool before launch: choose a <code>podSubnet</code> large enough for <code>(expected node count) × (per-node CIDR size)</code> with real headroom for growth, because changing it after nodes already hold CIDR allocations is disruptive on most clusters, not a live edit. This is the cluster-CIDR-pool flavor of IPAM exhaustion; the AWS VPC CNI's flavor is different in mechanism — it runs out of secondary IPs per ENI, not out of a CIDR to slice — but it's the same shape of incident, and you'll meet it directly in <a href="ch58-vpc-cni-the-deep-one.html">Chapter 58</a>. Clean up: <code>kind delete cluster --name tinynet</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — capacity looks fine, but pods won't land on one node</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>Back on the original <code>cnilab</code> cluster. A team reports: "one of our nodes has plenty of free CPU and memory, but new pods just won't schedule there — everything else looks healthy." No commands yet: given everything in this chapter, list every mechanically distinct cause you'd consider before touching the cluster, in the order you'd check them.</p>
+        <details class="recall"><summary>Reveal the reasoning and the check for each</summary>
+          <div class="body">
+            <p>"Won't schedule" and "won't get an IP" are different failures with different owners, so separate them first — this is exactly the isolate step from <a href="ch40-kubernetes-troubleshooting-methodology.html">Chapter 40</a>'s framework, applied here. Three genuinely distinct, ordered hypotheses:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># 1. Is the node schedulable at all — cordoned, tainted, or NotReady?</span>
+kubectl get node cnilab-worker -o jsonpath='{.spec.taints}{"\n"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+
+<span class="c"># 2. Has the node hit its pod-COUNT ceiling — nothing to do with IP space at all?</span>
+kubectl get node cnilab-worker -o jsonpath='{.status.allocatable.pods}{"\n"}'
+kubectl get pods -A --field-selector spec.nodeName=cnilab-worker --no-headers | wc -l
+
+<span class="c"># 3. Has the node's CNI IPAM pool specifically run out, even though its podCIDR is fine?</span>
+kubectl get node cnilab-worker -o jsonpath='{.spec.podCIDR}{"\n"}'
+docker exec cnilab-worker sh -c 'ls /run/cni-ipam-state/*/  2&gt;/dev/null | wc -l'</code></pre></div>
+            <p>Each check rules a specific cause in or out with evidence, not with a guess: a taint or <code>NotReady</code> means the scheduler never even considers the node — CPU and memory being free is irrelevant if nothing gets placed there in the first place. A pod count already at <code>.status.allocatable.pods</code> (the kubelet's own ceiling, 110 by default, entirely independent of address space — a node with a roomy <code>/24</code> of 254 addresses can still refuse a 111th pod on count alone) explains "healthy CPU/memory, no new pods" perfectly without any networking cause at all. Only if the first two are clean do you look at IPAM specifically — a full <code>host-local</code> allocation directory with a healthy <code>podCIDR</code> otherwise. The trap this scenario is built to catch: assuming any pod-placement failure on a network-adjacent-sounding symptom must be a CNI or IP problem, when a kubelet-level pod-count cap produces the exact same user-visible complaint and has nothing to do with addressing at all.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · CNI DaemonSet not ready</div>
+      <p><b>Symptom:</b> new pods stuck in <code>ContainerCreating</code> on one or a few specific nodes, with a sandbox-creation error in events, while already-running pods on those same nodes are completely unaffected. <b>First cut:</b> is the CNI's own DaemonSet pod <code>Running</code> and healthy on the affected node? <b>Confirm:</b> its logs, and whether the node shows a related condition. <b>Usual cause:</b> the CNI DaemonSet pod crash-looping, evicted, or not yet scheduled on a freshly-joined node — the ADD call has nowhere healthy to land, but nothing retroactively breaks pods that already completed ADD successfully.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · IPAM / CIDR exhaustion</div>
+      <p><b>Symptom:</b> a sandbox-creation error naming IP allocation specifically ("no IP addresses available"), or a node with an entirely empty <code>.spec.podCIDR</code>. <b>First cut:</b> <code>kubectl get nodes -o jsonpath</code> for <code>podCIDR</code> across every node — an empty one means the cluster-wide pool ran out before this node got its share. <b>Usual cause:</b> a <code>podSubnet</code> sized without headroom for the eventual node count, discovered only once the cluster actually grows to fill it — the fix is a bigger pool from the start, since resizing it live is disruptive on most clusters.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · stale CNI config left behind by a migration</div>
+      <p><b>Symptom:</b> a CNI migration is declared complete, but some security or policy feature the new plugin should provide silently isn't applying — no errors, pods get IPs, everything "works." <b>First cut:</b> <code>ls /etc/cni/net.d/</code> on more than one node. <b>Usual cause:</b> the old plugin's config file was never removed, sorts first by filename, and is quietly still the one actually running — the new plugin's binary may not even be invoked at all. The fix is deleting the old config (and ideally the old binary) from every node as part of the migration, not just installing the new one alongside it.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Choosing a CNI is mostly about the optional extras, because the mandatory floor is identical everywhere.</b> Every conformant CNI already gives you the four rules — that part isn't a differentiator. What actually differs, and what you're really evaluating, is what each plugin adds on top: NetworkPolicy enforcement (some CNIs implement it, some silently no-op unenforced policies — a dangerous gap if you assume otherwise), encryption between nodes, observability and flow logs, and the performance profile of native routing versus an overlay's encapsulation tax (<a href="ch42-pod-networking-internals-pod-to-pod.html">Chapter 42</a>).</p>
+    <p><b>Size the pod CIDR before launch, not after.</b> The per-node allocation size (how big a slice each node gets) and the overall pool have to cover your expected node count with real headroom, because most clusters treat this as effectively fixed at creation time — Lab 4's starved cluster is what happens when nobody did this math, and in production it shows up months later as the cluster grows into a ceiling nobody knew existed.</p>
+    <p><b>Verify a new or custom CNI actually keeps all four promises before trusting it.</b> A broken or half-finished plugin that silently NATs pod-to-pod traffic, or leaks a node's private range onto pod addresses, breaks assumptions in every chapter above this one — Services, NetworkPolicy, DNS, a mesh sidecar — none of which re-verify the model themselves; they all just assume it holds. <b>Common mistakes:</b> treating "which CNI" as a single interchangeable checkbox rather than a real decision about optional extras; picking a small pod CIDR "to keep things tidy" and hitting exhaustion at the worst time; leaving an old CNI's config file on disk during a migration; and assuming any pod-placement failure near networking must be the CNI, when a kubelet pod-count ceiling produces an identical symptom for a completely unrelated reason.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>The what/how split in this chapter is the same decoupling pattern <a href="ch38-storage-volumes-pv-pvc-storageclass-csi.html">Chapter 38</a> showed for storage: a fixed contract (PV/PVC there, the four network rules here) lets a completely different implementation sit underneath without touching a single application. That's why "swap the CNI" is a real platform-level lever — moving to Calico or Cilium for policy enforcement, or to the AWS VPC CNI for native VPC-routable pod IPs (<a href="ch58-vpc-cni-the-deep-one.html">Chapter 58</a>, where ENIs and cloud IPAM replace veths and host-local entirely, while still honoring these exact same four rules) — without a migration touching application code. When you design a platform, this chapter is where you decide how much of the optional surface (policy, encryption, observability) you need before you even open a CNI's feature comparison page, because the mandatory floor was never the interesting part of the decision.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first, then open it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What are the four rules of the Kubernetes network model, and who enforces them?</summary>
+        <div class="a"><p>Every pod gets a unique, cluster-wide IP; any pod can reach any other pod's IP directly with no NAT; a node's own agents can reach every pod on that node; and a pod's view of its own IP matches everyone else's — it's never secretly translated. Kubernetes defines these rules and checks for them via conformance testing, but doesn't implement them itself — it delegates the actual wiring to a CNI plugin, invoked once per pod at sandbox creation. Any plugin that keeps these four promises is a valid choice; how it keeps them is entirely up to it.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk through what happens, mechanically, from the kubelet scheduling a pod to that pod having a usable IP.</summary>
+        <div class="a"><p>The kubelet asks the container runtime to create the pod's sandbox — a pause container holding an empty network namespace with just a loopback, nothing wired yet. The kubelet then reads the CNI configuration from /etc/cni/net.d, picking the file that sorts first by name if more than one exists, and executes the plugin binary from /opt/cni/bin that the config names, passing CNI_COMMAND=ADD, the container ID, and the namespace path as environment variables, with the JSON config on stdin — that's the entire interface the CNI spec defines, nothing Kubernetes-specific about it. The plugin runs IPAM to get an address from this node's slice of the pod CIDR, creates a veth pair with one end moved into the pod's namespace as eth0, wires the host side so the address is reachable, and prints the assigned IP back as JSON on stdout. The kubelet records that as the pod's status.podIP and only then starts the actual application containers. Teardown calls the same binary with CNI_COMMAND=DEL to release the address and undo the wiring.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>What's the actual difference between "the Kubernetes network model" and "the CNI specification" — why are they two separate things?</summary>
+        <div class="a"><p>The Kubernetes network model is Kubernetes' own design requirement — four specific rules about pod IP uniqueness and NAT-free reachability, published in Kubernetes' documentation and checked by Kubernetes' own conformance tests. It says nothing about how those rules get satisfied. The CNI specification is a completely separate, general-purpose contract from an independent project for wiring up and tearing down any network namespace — commands, environment variables, a JSON protocol over stdin/stdout — with nothing Kubernetes-specific anywhere in it; it predates its adoption by Kubernetes and is used by other container runtimes too. Kubernetes chose CNI as the mechanism to satisfy its own model rather than writing a bespoke plugin interface, which is why you'll never find "pod" or "Service" mentioned in the CNI spec itself. The practical reason this distinction matters: when you're evaluating a CNI plugin, you're really checking two different things — does it satisfy the fixed, non-negotiable model (nearly all mainstream ones do), and what optional behavior does it add on top, which is where the real differences between Calico, Cilium, Flannel, and the AWS VPC CNI actually live.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A node's CPU and memory both show plenty of headroom, but new pods won't schedule there while other nodes take load fine. What do you check, and in what order?</summary>
+        <div class="a"><p>I'd separate "won't schedule" from "won't get networked," because they have different owners. First, is the node schedulable at all — cordoned, tainted, or reporting NotReady? That alone would explain the symptom regardless of free capacity, since the scheduler never places anything there in the first place. Second, and easy to miss: has the node hit its own pod-count ceiling, the kubelet's allocatable pod limit, which defaults to 110 and has nothing to do with IP address space — a node can have a roomy CIDR and still refuse further pods purely on count. Only third would I look at CNI-specific IPAM exhaustion on that node specifically, checking whether its podCIDR is actually populated and whether its local allocation state still has room. I check in that order because the first two explain the exact same user-visible symptom without touching networking at all, and jumping straight to "it's the CNI" because the complaint sounds network-adjacent is the mistake this scenario is built to catch.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>Name two things a CNI plugin is explicitly not responsible for, and say who is.</summary>
+        <div class="a"><p>Service virtual IPs and their load balancing — a CNI plugin never creates or DNATs a ClusterIP; that's kube-proxy, watching Services and EndpointSlices and programming the node's iptables, IPVS, or nftables rules, entirely independent of whichever CNI is installed. And NetworkPolicy enforcement is not universally a CNI responsibility either — it's an optional capability some CNIs choose to implement (Calico, Cilium) and others simply don't (a bare bridge-and-host-local setup, and Flannel without an add-on), so a NetworkPolicy object can exist, look correctly written, and be silently unenforced if the underlying CNI never implements that part of the API at all. Both are easy to assume are "the CNI's job" because they're networking-adjacent, and both assumptions are wrong in ways that matter operationally.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>Kubernetes defines a network model — four rules: unique pod IPs, no NAT pod-to-pod, node agents reach their pods, and no secretly-translated addresses — and delegates satisfying it to a CNI plugin rather than implementing it itself. The CNI specification is a separate, generic contract, not Kubernetes-specific, defining a plugin invoked with environment variables and JSON over stdin/stdout for exactly two moments: <code>ADD</code> at pod sandbox creation and <code>DEL</code> at teardown. The kubelet reads the config from <code>/etc/cni/net.d</code> (first file wins by name), execs the binary from <code>/opt/cni/bin</code>, and the plugin runs IPAM, creates a veth, and wires host-side routes before returning the pod's IP — which becomes <code>.status.podIP</code>. A <code>.conflist</code> chains plugins: one does real connectivity, others (<code>portmap</code>, <code>bandwidth</code>, <code>tuning</code>) only modify what it built. A CNI plugin owns IPAM, the veth, and host routes; it does not own Services, DNS, or NetworkPolicy enforcement unless it specifically chooses to add that. This split is why swapping a CNI is a real, application-transparent migration, and why sizing the pod CIDR pool before launch matters — running out of it, or losing a healthy CNI DaemonSet on even one node, breaks new pods while leaving already-wired ones completely unaffected.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>The Kubernetes network model (four rules) is Kubernetes' own requirement; CNI is a separate, generic plugin contract it delegates to.</li>
+      <li>The four rules: unique pod IPs, no NAT pod-to-pod, node agents reach their pods, no secretly-translated addresses.</li>
+      <li>The kubelet invokes the CNI plugin exactly twice per pod's life: <code>ADD</code> at sandbox creation, <code>DEL</code> at teardown.</li>
+      <li>Config lives in <code>/etc/cni/net.d</code> (first file by name wins); binaries live in <code>/opt/cni/bin</code>; the interface is env vars + JSON on stdin/stdout.</li>
+      <li>A <code>.conflist</code> chains plugins — one does IPAM/veth/wiring, others (<code>portmap</code>, <code>bandwidth</code>, <code>tuning</code>) only modify what it built.</li>
+      <li>A CNI plugin owns IPAM, the veth, and host-side routes — never Services, DNS, or (unless it opts in) NetworkPolicy enforcement.</li>
+      <li>A pod's <code>.status.podIP</code> is literally the plugin's ADD result, recorded by the kubelet — nothing more mysterious than that.</li>
+      <li>A CNI DaemonSet down on one node blocks <em>new</em> pods there; it does nothing to pods whose ADD already succeeded.</li>
+      <li>IPAM/CIDR exhaustion shows up as an empty <code>.spec.podCIDR</code> or a sandbox error naming IP allocation — size the pool before launch.</li>
+      <li>A pod-placement failure isn't automatically a CNI problem — a kubelet pod-count ceiling (default 110) produces the identical symptom.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch25-container-networking.html"><b>Ch 25</b> Container networking</a>
+      <a href="ch18-the-linux-network-stack-internals.html"><b>Ch 18</b> The Linux network stack</a>
+      <a href="ch42-pod-networking-internals-pod-to-pod.html"><b>Ch 42</b> Pod-to-Pod internals</a>
+      <a href="ch43-services-and-the-datapath-pod-to-service.html"><b>Ch 43</b> Services &amp; the datapath</a>
+      <a href="ch47-networkpolicy-deep.html"><b>Ch 47</b> NetworkPolicy</a>
+      <a href="ch58-vpc-cni-the-deep-one.html"><b>Ch 58</b> VPC CNI</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/cluster-administration/networking/">Cluster Networking</a>: the network model and its four requirements, from the source.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/network-plugins/">Network Plugins</a>: how the kubelet locates and invokes a CNI plugin.</li>
+      <li>CNI — <a href="https://www.cni.dev/">the Container Network Interface specification</a>: the plugin protocol, commands, and config format, independent of any one caller.</li>
+      <li>CNI — <a href="https://www.cni.dev/plugins/current/">Plugins</a>: the reference implementations — <code>bridge</code>, <code>ptp</code>, <code>host-local</code> IPAM, and the meta plugins like <code>portmap</code> and <code>bandwidth</code>.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/setup/best-practices/cluster-large/">Considerations for Large Clusters</a>: node and pod count ceilings, including the kubelet's default <code>max-pods</code>.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch40-kubernetes-troubleshooting-methodology.html"><span class="dir">← Prev</span><div class="ti">Ch 40 — Kubernetes troubleshooting methodology</div></a>
+      <a class="nx" href="ch42-pod-networking-internals-pod-to-pod.html"><span class="dir">Next →</span><div class="ti">Ch 42 — Pod networking internals: Pod → Pod</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 41 of 121 · Part V · Kubernetes Networking at Packet Level. Four rules, one invocation, any contractor — everything else in this Part is that promise getting kept.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Invocation &amp; wiring</a>
+    <a href="#internals">What the kubelet actually does</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">Following the promise</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

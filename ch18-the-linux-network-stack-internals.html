@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 18 — The Linux network stack internals</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part II · Networking &nbsp;·&nbsp; Chapter 18</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part II · Networking from First Principles · Chapter 18</div>
+      <h1>The Linux network stack internals</h1>
+      <p class="tagline">A Kubernetes pod is not magic. It's a network namespace, a virtual cable, a software switch, and a pile of firewall rules — all primitives that ship in the kernel and that you can assemble by hand in ten commands. Build it once and container networking stops being a black box for the rest of your career.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~50 min read · ip/nft lab (Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Build two network namespaces joined by a veth pair over a Linux bridge, by hand, and ping across them.</li>
+          <li>Name the five netfilter hooks and say which one DNAT, SNAT, conntrack, and filtering each run at.</li>
+          <li>Trace a packet through <code>PREROUTING → routing → FORWARD/INPUT → POSTROUTING</code> and know where it can be dropped or rewritten.</li>
+          <li>Read <code>conntrack -L</code> and explain how return traffic and NAT find their way back.</li>
+          <li>Point at any pod's networking and say "that's a netns, a veth, a bridge, and iptables — I know exactly what each does."</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem: many isolated networks on one host</h2>
+    <p>You have one machine with one network card, and you want to run fifty containers on it. Each needs its own IP, its own routing table, its own view of the network — as if each were its own little host — yet they all have to share that single physical NIC and reach the outside world. And you need to control what talks to what: this container may reach the database, that one may not. On a physical network you'd solve this with separate machines, cables, a switch, and a firewall. Linux gives you all four in software.</p>
+    <p>The kernel provides <b>network namespaces</b> (each a private network stack — its own interfaces, routes, and firewall), <b>veth pairs</b> (virtual cables that connect one namespace to another), <b>bridges</b> (a software Ethernet switch), <b>netfilter</b> (the hook framework where iptables and nftables enforce rules and do NAT), and <b>conntrack</b> (a table that remembers connections so replies get back and NAT is consistent). Stack those and you have exactly what a container runtime gives a pod. There is no extra layer.</p>
+    <div class="box keypoint"><div class="h">Key point — read this twice</div>
+      <p>This chapter is the foundation of everything in Parts III and V. A container's network is a network namespace joined to the host by a veth pair (<a href="ch25-container-networking.html">Chapter 25</a>). A Kubernetes pod's network is the same veth-into-a-bridge (or a routed variant) that a CNI plugin sets up (<a href="ch42-pod-networking-internals-pod-to-pod.html">Chapter 42</a>). A Kubernetes Service is a pile of NAT rules in netfilter that kube-proxy writes (<a href="ch43-services-and-the-datapath-pod-to-service.html">Chapter 43</a>). When you understand the primitives here, those three chapters become "oh, it's just this again."</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: an office building's wiring</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Think of one big office building (the host) that you're subdividing into independent tenant suites (the containers). Each suite gets its own <b>internal phone system and wiring</b> that can't see the neighbours' — that's a <b>network namespace</b>. To connect a suite to the building's shared infrastructure you run a <b>patch cable</b> with a plug at each end: one end in the suite, one in the wiring closet. That two-ended cable is a <b>veth pair</b> — whatever goes in one end comes out the other.</p>
+      <p>In the wiring closet sits a <b>switch</b> that all the suite cables plug into, so any suite can reach any other. That's the <b>Linux bridge</b>. And at the building's front door sits a <b>security desk</b> with a rulebook — who may enter, who may leave, who gets redirected to a different floor. That desk is <b>netfilter</b>, and the rulebook is what iptables or nftables writes. The desk also keeps a <b>visitor logbook</b>: when someone leaves the building it remembers them, so when their reply courier arrives it knows which suite to send it to without re-checking every rule. That logbook is <b>conntrack</b>.</p>
+      <p>The reason this matters: a pod is a tenant suite. When you debug "pod A can't reach service B," you're asking whether the cable is plugged in, whether the switch learned the address, and whether the security desk dropped or misrouted the packet. Same four questions, every time.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In the Linux stack</th></tr>
+      <tr><td>A tenant suite's private phone/wiring</td><td>A <b>network namespace</b> — private interfaces, routes, ARP, firewall</td></tr>
+      <tr><td>The two-ended patch cable</td><td>A <b>veth pair</b> (one end in each namespace)</td></tr>
+      <tr><td>The switch in the wiring closet</td><td>A <b>Linux bridge</b> (<code>br0</code>) — learns MACs, forwards frames</td></tr>
+      <tr><td>The security desk + rulebook</td><td><b>netfilter</b> hooks + iptables/nftables rules</td></tr>
+      <tr><td>The visitor logbook</td><td><b>conntrack</b> — the connection-tracking table</td></tr>
+      <tr><td>Redirecting a visitor to another floor</td><td><b>NAT</b> — DNAT (change destination) / SNAT (change source)</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>How a packet actually travels</h2>
+    <p>Here's the whole picture: two namespaces plugged into a bridge, and the netfilter hooks a packet crosses when it heads for the outside world. Trace it left to right, top to bottom.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 760 520" role="img" aria-label="Two network namespaces joined by veth pairs to a Linux bridge, and a packet traversing the netfilter hooks PREROUTING, routing decision, FORWARD, POSTROUTING out to the uplink">
+        <defs>
+          <marker id="ar" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="ag" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+          <marker id="av" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" style="fill:var(--violet)"/></marker>
+        </defs>
+        <!-- SECTION A: L2 topology -->
+        <text x="24" y="28" style="fill:var(--muted);font:700 11px sans-serif;letter-spacing:.06em">L2 — THE WIRING (namespaces · veth · bridge)</text>
+        <!-- ns1 -->
+        <rect x="24" y="40" width="170" height="66" rx="10" style="fill:var(--chip);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="109" y="62" text-anchor="middle" style="fill:var(--ink);font:700 13px sans-serif">netns ns1</text>
+        <text x="109" y="82" text-anchor="middle" style="fill:var(--muted);font:11.5px sans-serif">eth0 · 10.0.0.11/24</text>
+        <text x="109" y="98" text-anchor="middle" style="fill:var(--muted);font:11.5px sans-serif">default via 10.0.0.1</text>
+        <!-- ns2 -->
+        <rect x="24" y="150" width="170" height="66" rx="10" style="fill:var(--chip);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="109" y="172" text-anchor="middle" style="fill:var(--ink);font:700 13px sans-serif">netns ns2</text>
+        <text x="109" y="192" text-anchor="middle" style="fill:var(--muted);font:11.5px sans-serif">eth0 · 10.0.0.12/24</text>
+        <text x="109" y="208" text-anchor="middle" style="fill:var(--muted);font:11.5px sans-serif">default via 10.0.0.1</text>
+        <!-- bridge -->
+        <rect x="300" y="86" width="150" height="86" rx="10" style="fill:var(--panel);stroke:var(--accent2);stroke-width:2"/>
+        <text x="375" y="118" text-anchor="middle" style="fill:var(--ink);font:700 14px sans-serif">bridge br0</text>
+        <text x="375" y="138" text-anchor="middle" style="fill:var(--muted);font:11.5px sans-serif">L2 switch · 10.0.0.1</text>
+        <text x="375" y="154" text-anchor="middle" style="fill:var(--muted);font:11.5px sans-serif">learns MACs (fdb)</text>
+        <!-- veth links -->
+        <line x1="194" y1="73" x2="300" y2="110" style="stroke:var(--accent);stroke-width:2.2" marker-end="url(#ar)"/>
+        <line x1="194" y1="183" x2="300" y2="148" style="stroke:var(--accent);stroke-width:2.2" marker-end="url(#ar)"/>
+        <text x="228" y="80" style="fill:var(--accent);font:600 10.5px sans-serif">veth1↔eth0</text>
+        <text x="228" y="182" style="fill:var(--accent);font:600 10.5px sans-serif">veth2↔eth0</text>
+        <!-- from bridge into host stack -->
+        <line x1="450" y1="129" x2="540" y2="129" style="stroke:var(--accent2);stroke-width:2.2" marker-end="url(#ag)"/>
+        <text x="470" y="122" style="fill:var(--accent2);font:600 10.5px sans-serif">to host stack</text>
+        <rect x="540" y="104" width="196" height="50" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="638" y="125" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">host network namespace</text>
+        <text x="638" y="142" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">routing table · uplink eth0</text>
+        <line x1="24" y1="234" x2="736" y2="234" style="stroke:var(--line);stroke-width:1;stroke-dasharray:4 4"/>
+        <!-- SECTION B: netfilter hook flow -->
+        <text x="24" y="262" style="fill:var(--muted);font:700 11px sans-serif;letter-spacing:.06em">L3 — THE HOOKS (a packet from ns1 heading to the Internet)</text>
+        <!-- ingress -->
+        <rect x="24" y="286" width="86" height="150" rx="9" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="67" y="356" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">ingress</text>
+        <text x="67" y="374" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">from veth</text>
+        <!-- PREROUTING -->
+        <rect x="130" y="286" width="150" height="150" rx="9" style="fill:var(--panel);stroke:var(--deep);stroke-width:1.6"/>
+        <text x="205" y="308" text-anchor="middle" style="fill:var(--deep);font:700 13px sans-serif">PREROUTING</text>
+        <text x="205" y="332" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">raw</text>
+        <text x="205" y="350" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">conntrack (track)</text>
+        <text x="205" y="368" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">mangle</text>
+        <text x="205" y="386" text-anchor="middle" style="fill:var(--violet);font:700 11px sans-serif">DNAT (-100)</text>
+        <text x="205" y="410" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">priority: low → high</text>
+        <!-- routing diamond -->
+        <path d="M370,300 L420,361 L370,422 L320,361 Z" style="fill:var(--chip);stroke:var(--accent);stroke-width:1.6"/>
+        <text x="370" y="356" text-anchor="middle" style="fill:var(--ink);font:700 11.5px sans-serif">routing</text>
+        <text x="370" y="372" text-anchor="middle" style="fill:var(--ink);font:700 11.5px sans-serif">decision</text>
+        <line x1="280" y1="361" x2="318" y2="361" style="stroke:var(--accent);stroke-width:2" marker-end="url(#ar)"/>
+        <line x1="110" y1="361" x2="128" y2="361" style="stroke:var(--accent);stroke-width:2" marker-end="url(#ar)"/>
+        <!-- INPUT branch (up) -->
+        <line x1="370" y1="300" x2="370" y2="270" style="stroke:var(--accent2);stroke-width:1.8" marker-end="url(#ag)"/>
+        <text x="378" y="284" style="fill:var(--accent2);font:600 10px sans-serif">dst=local → INPUT → process</text>
+        <!-- FORWARD -->
+        <rect x="452" y="286" width="130" height="150" rx="9" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.4"/>
+        <text x="517" y="330" text-anchor="middle" style="fill:var(--accent);font:700 13px sans-serif">FORWARD</text>
+        <text x="517" y="356" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">mangle</text>
+        <text x="517" y="374" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">filter</text>
+        <text x="517" y="392" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">(policy DROP here</text>
+        <text x="517" y="406" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">blocks routing)</text>
+        <line x1="420" y1="361" x2="450" y2="361" style="stroke:var(--accent);stroke-width:2" marker-end="url(#ar)"/>
+        <!-- POSTROUTING -->
+        <rect x="600" y="286" width="136" height="150" rx="9" style="fill:var(--panel);stroke:var(--deep);stroke-width:1.6"/>
+        <text x="668" y="322" text-anchor="middle" style="fill:var(--deep);font:700 12.5px sans-serif">POSTROUTING</text>
+        <text x="668" y="348" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">mangle</text>
+        <text x="668" y="366" text-anchor="middle" style="fill:var(--violet);font:700 11px sans-serif">SNAT / masq (+100)</text>
+        <text x="668" y="386" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">conntrack confirm</text>
+        <text x="668" y="410" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">→ out uplink eth0</text>
+        <line x1="582" y1="361" x2="600" y2="361" style="stroke:var(--accent);stroke-width:2" marker-end="url(#ar)"/>
+        <line x1="668" y1="436" x2="668" y2="470" style="stroke:var(--violet);stroke-width:2.4" marker-end="url(#av)"/>
+        <text x="676" y="462" style="fill:var(--violet);font:700 11px sans-serif">Internet</text>
+        <text x="24" y="500" style="fill:var(--muted);font:12px sans-serif">Locally destined traffic goes PREROUTING → INPUT. Locally generated goes OUTPUT → POSTROUTING. Routed traffic goes PREROUTING → FORWARD → POSTROUTING.</text>
+      </svg>
+      <figcaption>The wiring (top) and the hooks (bottom) are two views of the same host. Every container platform builds both — the wiring with veth+bridge, the hooks with iptables/nftables.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>When a pod can't reach a Service, this diagram is your map. Is the veth up and the bridge learning the MAC (L2, top)? Did a NetworkPolicy or kube-proxy rule drop or misroute it (the hooks, bottom)? Did the conntrack table fill up and start dropping <em>established</em> connections (a real, brutal outage we'll reproduce)? You can't debug what you can't picture, and this is the picture under every Kubernetes networking problem you'll ever get paged for.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>The netfilter hooks, in order</h2>
+    <p>netfilter is five hook points the kernel exposes in the packet path. iptables and nftables don't invent anything — they register rules at these hooks. There are exactly five, and the order a packet meets them depends on <em>where it's going</em>, which the kernel decides at the <b>routing decision</b> in the middle.</p>
+    <ol class="steps">
+      <li><b>A packet arrives</b> on an interface (a veth, a physical NIC). Before anything, the kernel runs the <b>PREROUTING</b> hook.</li>
+      <li><b>PREROUTING</b> runs, in priority order: <code>raw</code> (mark packets to skip tracking), then <b>conntrack</b> which looks the packet up in the connection table and tags it NEW / ESTABLISHED / RELATED, then <code>mangle</code>, then <b>DNAT</b> (destination NAT — this is where a Service VIP becomes a real pod IP). DNAT happens <em>before</em> routing on purpose, so the routing decision uses the real destination.</li>
+      <li><b>The routing decision.</b> The kernel looks at the (possibly rewritten) destination and asks: is this for me, or does it need forwarding? This split is the fork in the diagram.</li>
+      <li><b>If destined for a local address → INPUT</b>, then up to a local process (your nginx, sshd). If the packet is to be <b>forwarded</b> to another interface → <b>FORWARD</b>, where the <code>filter</code> rules decide whether routing between namespaces/interfaces is even allowed. A pod-to-pod packet crossing the host takes the FORWARD path, which is why <code>net.ipv4.ip_forward=1</code> must be on.</li>
+      <li><b>Locally generated packets skip PREROUTING</b> and start at <b>OUTPUT</b> (which also runs raw/conntrack/mangle/DNAT), then hit the routing decision.</li>
+      <li><b>POSTROUTING</b> is the last stop before the wire, for both forwarded and locally generated traffic. It runs <code>mangle</code>, then <b>SNAT / MASQUERADE</b> (source NAT — rewrite the source so replies come back to this host), then conntrack <b>confirms</b> the connection into the table. Then the frame goes out the egress interface.</li>
+    </ol>
+    <p>The priorities are fixed and worth memorising because they explain <em>why</em> rules fire in the order they do. From the netfilter project itself: conntrack runs at priority −200 (early), <code>raw</code> at −300 (before conntrack, to opt out), <code>mangle</code> at −150, DNAT at −100, <code>filter</code> at 0, SNAT at +100, and the conntrack "confirm" step runs last in INPUT and POSTROUTING. Lower number = earlier.</p>
+    <div class="box keypoint"><div class="h">Conntrack is why NAT and stateful firewalls work at all</div>
+      <p>Conntrack records each connection as two tuples: the <em>original</em> direction and the expected <em>reply</em>. When a reply packet arrives, conntrack matches it to an existing entry and marks it <code>ESTABLISHED</code>, so your firewall can say "allow established/related" and only scrutinise NEW packets. It's also how NAT is reversible: the entry remembers that <code>10.0.0.11:52840 → 93.184.x.x:443</code> was masqueraded to <code>&lt;host-ip&gt;:PORT</code>, so the reply to the host gets rewritten straight back to the pod. No conntrack, no return path. This is also its weakness — the table is finite, and when it fills, new connections are dropped.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: you set the FORWARD chain's policy to DROP and suddenly your two namespaces can't ping each other, even though the veth and bridge are fine. Why?</summary>
+      <div class="body">
+        <p>Because a packet from ns1 to ns2 isn't <em>for</em> the host — it's being routed <em>through</em> it from one interface to another, so it takes the FORWARD path, not INPUT. With FORWARD policy DROP and no accept rule, the kernel drops it after the routing decision. The L2 wiring is irrelevant here; the packet made it onto the bridge fine. This is the exact shape of a NetworkPolicy denying pod-to-pod traffic: the wiring is intact, the <em>hook</em> said no. Fix it with a rule that accepts the forwarded traffic (and <code>ip_forward=1</code>), which is precisely what a CNI plugin does for you.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, named</h2>
+    <ul>
+      <li><b>Network namespace.</b> A private copy of the entire network stack: its own interfaces, routing table, ARP/neighbour table, conntrack table, and firewall rules. <code>ip netns</code> manages the named ones; every container gets one whether it's named or not.</li>
+      <li><b>veth pair.</b> Two interfaces that are the two ends of one virtual cable. A frame written to one end appears on the other. You put one end in the container's namespace (it becomes <code>eth0</code> there) and leave the other in the host, usually enslaved to a bridge.</li>
+      <li><b>Bridge.</b> A software Ethernet switch. Enslave veth ends to it and it learns which MAC is behind which port (the forwarding database, <code>fdb</code>) and forwards frames accordingly — exactly like a physical switch.</li>
+      <li><b>netfilter + iptables/nftables.</b> netfilter is the kernel hook framework; iptables and nftables are the userspace tools that program it. On modern distros <code>iptables</code> is actually <code>iptables-nft</code> — a compatibility shim that writes nftables rules underneath. New work should use <code>nft</code> directly.</li>
+      <li><b>conntrack.</b> The connection-tracking table (module <code>nf_conntrack</code>). Inspect it with <code>conntrack -L</code>; size it with <code>net.netfilter.nf_conntrack_max</code>.</li>
+      <li><b>The routing table + neighbour table.</b> <code>ip route</code> decides the next hop; <code>ip neigh</code> is the ARP cache mapping next-hop IPs to MACs (<a href="ch11-l2-ethernet-mac-arp-switching.html">Chapter 11</a>).</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one packet: ns1 pings ns2</h2>
+    <p>ns1 wants to reach <code>10.0.0.12</code>. Its routing table says that's on-link via <code>eth0</code>, so it needs the MAC for <code>10.0.0.12</code>. It broadcasts an ARP request out its veth; the bridge floods it to all ports; ns2 replies; ns1 caches the MAC in its neighbour table. Now ns1 sends the ICMP echo to that MAC. The frame goes ns1's <code>eth0</code> → veth → bridge; the bridge has learned ns2's MAC is on veth2, so it forwards the frame straight there → ns2's <code>eth0</code>. ns2 replies the same way in reverse. That's pure L2 — the packet never left the bridge, so it never touched a routing decision or the FORWARD hook. Contrast that with ns1 reaching the Internet: that destination isn't on-link, so ns1 sends it to its default gateway (<code>10.0.0.1</code>, the bridge), the host routes it toward the uplink (the FORWARD path), and POSTROUTING masquerades the source so replies come home. The labs below build exactly this and let you watch each step.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>These need <code>CAP_NET_ADMIN</code>, so run a privileged container (the cleanest way to get the capabilities without touching your host's real network):</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># --privileged gives us netns/bridge/nft; --rm throws it all away on exit.</span>
+docker run --rm -it --privileged ubuntu:24.04 bash
+apt-get update &amp;&amp; apt-get install -y iproute2 nftables iptables conntrack tcpdump iputils-ping</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — two namespaces, a veth each, one bridge</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>This is the whole point of the chapter. Build the topology from the diagram: a bridge in the host, and two namespaces each cabled to it.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>ip netns add ns1 &amp;&amp; ip netns add ns2
+
+<span class="c"># The bridge acts as the switch and the gateway (10.0.0.1)</span>
+ip link add br0 type bridge &amp;&amp; ip link set br0 up
+ip addr add 10.0.0.1/24 dev br0
+
+<span class="c"># For each namespace: a veth whose far end is created directly inside the ns as eth0</span>
+for n in 1 2; do
+  ip link add veth$n type veth peer name eth0 netns ns$n
+  ip link set veth$n master br0          <span class="c"># plug the host end into the switch</span>
+  ip link set veth$n up
+  ip netns exec ns$n ip addr add 10.0.0.1$n/24 dev eth0
+  ip netns exec ns$n ip link set eth0 up
+  ip netns exec ns$n ip link set lo up
+  ip netns exec ns$n ip route add default via 10.0.0.1
+done</code></pre></div>
+        <p>Check the switch learned both ports, and look at ns1 from the inside:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>bridge link                          <span class="c"># which veths are enslaved to br0</span>
+ip netns exec ns1 ip -br addr</code></pre></div>
+        <div class="out"><span class="ol">Output</span>3: veth1@br0: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; ... master br0 state forwarding
+4: veth2@br0: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; ... master br0 state forwarding
+lo               UNKNOWN        127.0.0.1/8 ::1/128
+eth0@if3         UP             10.0.0.11/24 fe80::b022:eff:fe16:166c/64</code></div>
+        <p><code>eth0@if3</code> tells you ns1's eth0 is one half of veth pair index 3 — the other half is <code>veth1</code> in the host. <code>state forwarding</code> means the bridge port is live. You've built a two-host network in software.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — ping across, then watch ARP and MAC learning</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Ping ns2 from ns1 and then inspect what that one ping created in the two tables that make L2 work.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>ip netns exec ns1 ping -c2 10.0.0.12
+ip netns exec ns1 ip neigh          <span class="c"># ns1's ARP cache: who did it learn?</span>
+bridge fdb show br br0 | grep -v permanent   <span class="c"># the switch's MAC table</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>2 packets transmitted, 2 received, 0% packet loss, time 1034ms
+rtt min/avg/max/mdev = 0.110/0.524/0.938/0.416 ms
+
+10.0.0.12 dev eth0 lladdr d2:8c:33:f2:e0:07 REACHABLE
+b2:22:0e:16:16:6c dev veth1 master br0
+d2:8c:33:f2:e0:07 dev veth2 master br0</code></div>
+        <p>Three things to read. The ping worked — pure L2 across the bridge. ns1's neighbour table now maps <code>10.0.0.12</code> to ns2's MAC, marked <code>REACHABLE</code> (that's the ARP resolution from <a href="ch11-l2-ethernet-mac-arp-switching.html">Chapter 11</a>, live). And the bridge's <code>fdb</code> learned both MACs and which port each sits behind — that's how a switch forwards without flooding. This is the entire L2 datapath, visible in three commands.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Understand — write the five hooks, and see conntrack</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Now the L3 side. Program a small nftables ruleset with base chains at every hook, and watch conntrack record a connection. First, a firewall + NAT ruleset:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>nft -f - &lt;&lt;'EOF'
+table inet filter {
+  chain input   { type filter hook input priority filter; policy drop;
+                  ct state established,related accept; iif "lo" accept; }
+  chain forward { type filter hook forward priority filter; policy drop;
+                  ct state established,related accept; }
+  chain output  { type filter hook output priority filter; policy accept; }
+}
+table ip nat {
+  chain postrouting { type nat hook postrouting priority srcnat; policy accept;
+                      oifname "eth0" masquerade; }
+}
+EOF
+nft list ruleset</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>table inet filter {
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+		ct state established,related accept
+	}
+	chain input {
+		type filter hook input priority filter; policy drop;
+		ct state established,related accept
+		iif "lo" accept
+	}
+}
+table ip nat {
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname "eth0" masquerade
+	}
+}</code></div>
+        <p>Notice nftables predefines <em>no</em> chains — unlike legacy iptables, which always had INPUT/FORWARD/OUTPUT sitting there. You attach a base chain to a hook explicitly, with a priority. Now generate a connection and read the tracking table:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>ip netns exec ns1 ping -c1 10.0.0.12 &gt;/dev/null
+conntrack -L 2&gt;/dev/null</code></pre></div>
+        <div class="out"><span class="ol">Output</span>icmp   1 29 src=10.0.0.11 dst=10.0.0.12 type=8 code=0 id=8 src=10.0.0.12 dst=10.0.0.11 type=0 code=0 id=8 mark=0 use=1
+conntrack v1.4.6: 1 flow entries have been shown.</code></div>
+        <p>One entry, two tuples: the <em>original</em> direction (<code>src=.11 dst=.12</code>) and the expected <em>reply</em> (<code>src=.12 dst=.11</code>). That reply tuple is how return traffic is matched and how NAT knows what to undo. For a TCP flow you'd see the state (<code>ESTABLISHED</code>) and <code>[ASSURED]</code> once traffic flowed both ways.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Break — the ping stops working</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Reach outside the bridge now — have ns1 route through the host to a fictional external host — but first sabotage one setting. Run this and investigate as if you inherited the box:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>sysctl -w net.ipv4.ip_forward=0        <span class="c"># the sabotage</span>
+<span class="c"># From ns1, try to reach something that must be ROUTED (not on the bridge):</span>
+ip netns exec ns1 ping -c2 -W1 8.8.8.8</code></pre></div>
+        <div class="out"><span class="ol">Output</span>2 packets transmitted, 0 received, 100% packet loss, time 1015ms</code></div>
+        <p>The packet leaves ns1 fine, arrives at the host, and then vanishes. Pings <em>within</em> the bridge still work. What single thing would you check, and why does on-bridge traffic survive while routed traffic dies? Work it out before revealing.</p>
+        <details class="recall"><summary>Reveal — the diagnosis</summary>
+          <div class="body">
+            <p>On-bridge traffic (ns1→ns2) is pure L2 and never needs the host to <em>route</em>, so it's unaffected. But <code>8.8.8.8</code> isn't on <code>10.0.0.0/24</code>, so ns1 sends it to the gateway and the host must forward it from the bridge toward the uplink — the FORWARD path. With <code>ip_forward=0</code> the kernel refuses to route between interfaces and silently drops it. Confirm and fix:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>sysctl net.ipv4.ip_forward           <span class="c"># reads 0 — there's your cause</span>
+sysctl -w net.ipv4.ip_forward=1      <span class="c"># and it routes again</span></code></pre></div>
+            <p>This is the number-one "my pods have no internet" cause on a hand-built or misconfigured node. Every CNI turns forwarding on; when someone's custom node image resets it, this is the symptom. The tell is that pod-to-pod on the same node works while anything routed fails.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — "nf_conntrack: table full, dropping packet"</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>This is one of the nastiest production incidents in container land, because it drops <em>healthy, established</em> connections, not just new ones. Shrink the table to force it:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>sysctl net.netfilter.nf_conntrack_max          <span class="c"># the ceiling (often ~262144 on a real node)</span>
+cat /proc/sys/net/netfilter/nf_conntrack_count <span class="c"># how many entries right now</span>
+sysctl -w net.netfilter.nf_conntrack_max=8      <span class="c"># tiny, to reproduce fast</span>
+<span class="c"># now open a burst of connections and watch the kernel log</span>
+dmesg | tail -3</code></pre></div>
+        <div class="out"><span class="ol">Output</span>net.netfilter.nf_conntrack_max = 8
+[ 1123.44 ] nf_conntrack: nf_conntrack: table full, dropping packet</code></div>
+        <p>The senior scenario: a busy node under load starts dropping a small fraction of packets; latency spikes, retries pile on, and it gets <em>worse</em> as traffic grows. Health checks flap. How do you confirm conntrack is the cause and fix it without just restarting nodes and hoping? Think first.</p>
+        <details class="recall"><summary>Reveal an approach</summary>
+          <div class="body">
+            <p>Confirm by comparing count to max and checking for the drop counter, then look at <em>what's</em> filling the table:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>cat /proc/sys/net/netfilter/nf_conntrack_count   <span class="c"># vs nf_conntrack_max</span>
+conntrack -S                                     <span class="c"># per-cpu 'insert_failed' / 'drop' counters</span>
+conntrack -L | awk '{print $1}' | sort | uniq -c <span class="c"># which protocol dominates</span></code></pre></div>
+            <p>If count is pinned at max and <code>drop</code>/<code>insert_failed</code> are climbing, that's it. The usual causes: a client opening thousands of short-lived connections without reuse (each leaves a conntrack entry in <code>TIME_WAIT</code> for a while), an unclosed connection leak, or a SNAT/masquerade path (every masqueraded flow is tracked). Fixes, in order: raise <code>nf_conntrack_max</code> and the hashtable size to give headroom; fix the app to reuse connections/pools; and for pure L3/L4 forwarding that doesn't need NAT, mark packets <code>notrack</code> in the <code>raw</code> table so they never consume an entry. On Kubernetes this exact failure shows up as random pod connection drops under load, and it's why large clusters tune conntrack on every node — you'll see it again in <a href="ch43-services-and-the-datapath-pod-to-service.html">Chapter 43</a>. Reset with <code>sysctl -w net.netfilter.nf_conntrack_max=262144</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · conntrack table full</div>
+      <p><b>Symptom:</b> a node drops a small, growing fraction of packets under load; established connections break, not just new ones; latency and retries climb. <b>First cut:</b> <code>dmesg | grep nf_conntrack</code> and compare <code>nf_conntrack_count</code> to <code>nf_conntrack_max</code>. <b>Confirm:</b> count pinned at max, <code>conntrack -S</code> shows rising drops. <b>Cause is usually:</b> connection churn without reuse, a leak, or heavy NAT. Raise the limit for breathing room, fix the client, and consider <code>notrack</code> for flows that don't need tracking.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · forwarding disabled</div>
+      <p><b>Symptom:</b> containers/pods on a node reach each other but have no external connectivity. <b>First cut:</b> <code>sysctl net.ipv4.ip_forward</code>. <b>Confirm:</b> it reads <code>0</code>. <b>Cause is usually:</b> a hardened node image or a sysctl drop-in that reset it, undoing what the CNI set. The tell is that on-node pod-to-pod works while anything routed fails.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · missing MASQUERADE</div>
+      <p><b>Symptom:</b> pods can send packets out but get no replies; captures show the SYN leaving with the pod's private source IP. <b>First cut:</b> <code>nft list ruleset</code> or <code>iptables -t nat -L POSTROUTING -n</code> for a masquerade/SNAT rule on the uplink. <b>Confirm:</b> no SNAT rule, so the far end tries to reply to an unroutable private address. <b>Cause:</b> a wiped or misordered NAT table — exactly what happens if something flushes iptables on a node running kube-proxy.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Performance and scale.</b> Two limits bite real clusters. First, <b>conntrack</b>: it's a fixed-size hash table, and both its max entries (<code>nf_conntrack_max</code>) and bucket count (<code>nf_conntrack_hashsize</code>) must be sized for the node's connection volume, or you get the table-full outage above. Second, <b>iptables rule scaling</b>: kube-proxy in iptables mode writes O(services × endpoints) linear rules, and on clusters with thousands of Services the rule set gets large enough that programming and matching cost real CPU — which is why IPVS mode and, increasingly, eBPF-based dataplanes (Cilium) exist. Know that the primitive is the same; only how the rules are stored and matched changes.</p>
+    <p><b>Security.</b> Namespaces isolate the <em>view</em> of the network but not the <em>kernel</em> — all namespaces share one netfilter/conntrack engine, so a rule or a table-exhaustion in one place can affect others on the host. The FORWARD chain is where cross-namespace policy lives; a NetworkPolicy is ultimately rules at that hook. And because <code>iptables</code> is now <code>iptables-nft</code> on most distros, mixing legacy-iptables and nft tooling on the same host is a genuine footgun — pick one.</p>
+    <p><b>Common mistakes:</b> flushing iptables on a node and wondering why every Service broke (you deleted kube-proxy's rules); forgetting <code>ip_forward</code> on a custom image; assuming a dropped ping is L2 when it's the FORWARD policy; and reading <code>iptables -L</code> output as if it showed NAT (it doesn't — you need <code>-t nat</code>). Each of those is an afternoon lost until you've built the stack by hand once.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>Everything above <em>is</em> the container and Kubernetes datapath — there's no separate technology to learn later, only these primitives arranged differently. A container's network is a namespace on a veth (<a href="ch25-container-networking.html">Chapter 25</a>). Pod-to-pod networking is veth-into-a-bridge or a routed CNI overlay (<a href="ch42-pod-networking-internals-pod-to-pod.html">Chapter 42</a>). A Service is DNAT rules that turn a stable VIP into a live pod IP, plus SNAT so replies return — written by kube-proxy at exactly the PREROUTING/POSTROUTING hooks you programmed above (<a href="ch43-services-and-the-datapath-pod-to-service.html">Chapter 43</a>). A NetworkPolicy is filter rules at FORWARD. When you architect a cluster's networking — choosing a CNI, sizing conntrack, deciding iptables vs IPVS vs eBPF — you're making decisions about these components at scale. This chapter is the vocabulary for all of Part V.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What is a veth pair and what is it for?</summary>
+        <div class="a"><p>A veth pair is two virtual network interfaces that act as the two ends of a single cable — a frame written to one end comes out the other. You use it to connect a network namespace to something outside it: put one end inside a container's namespace where it becomes <code>eth0</code>, and leave the other end in the host, usually enslaved to a bridge. That's how a container, which lives in its own network namespace, gets a link to the host's network. It's the fundamental building block of container networking.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Trace a packet through the netfilter hooks and say where NAT and filtering happen.</summary>
+        <div class="a"><p>A packet arriving on an interface hits <b>PREROUTING</b> first, where conntrack looks it up and DNAT can rewrite the destination — DNAT is before routing so the routing decision uses the real target. Then the kernel makes the <b>routing decision</b>: if the destination is a local address it goes to <b>INPUT</b> and up to a local process; if it needs forwarding to another interface it goes to <b>FORWARD</b>, where the filter rules decide whether that's allowed. Locally generated packets skip PREROUTING and start at <b>OUTPUT</b>, then hit the routing decision too. Everything heading out ends at <b>POSTROUTING</b>, where SNAT or masquerade rewrites the source and conntrack confirms the connection into its table, before the frame goes on the wire. So: DNAT in PREROUTING, filtering in INPUT/FORWARD, SNAT in POSTROUTING, and conntrack early in PREROUTING and confirmed at the end. That mapping is the whole model.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Why does conntrack matter, and how can it take down a node?</summary>
+        <div class="a"><p>Conntrack makes stateful firewalling and NAT possible: it stores each connection as an original tuple and an expected reply tuple, so return packets are matched to <code>ESTABLISHED</code> and NAT is reversible — the entry remembers what was rewritten so the reply can be un-rewritten. The catch is that it's a fixed-size hash table. Under high connection churn — think a client opening thousands of short-lived connections, all masqueraded — entries pile up (including TIME_WAIT stragglers) and the table fills. When it's full the kernel logs "nf_conntrack: table full, dropping packet" and drops packets, including ones belonging to <em>established</em> healthy connections, so the failure looks like random latency and resets that get worse under load. You confirm it by comparing <code>nf_conntrack_count</code> to <code>nf_conntrack_max</code> and watching <code>conntrack -S</code> drops. You fix it by sizing the table up, fixing the client to reuse connections, and marking flows that don't need tracking as <code>notrack</code>. On large Kubernetes clusters this is a standard node-tuning item.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>Two pods on the same node can talk, but neither can reach the internet. Walk me through it.</summary>
+        <div class="a"><p>Pod-to-pod on one node working tells me L2 is fine — the veths are up and the bridge is forwarding — so the problem is in routing or NAT, the L3 path. I'd check three things in order. First, <code>sysctl net.ipv4.ip_forward</code>; if it's 0 the kernel won't route from the pod bridge to the uplink, which is my top suspect and matches the symptom exactly. Second, the NAT table — <code>iptables -t nat -L POSTROUTING -n</code> or <code>nft list ruleset</code> — for a masquerade rule on the egress interface; without SNAT the far end tries to reply to a private pod IP and can't. Third, conntrack and the FORWARD policy, in case a rule is dropping the routed traffic. I'd confirm with a capture on the uplink to see whether the SYN even leaves and with what source IP. The reasoning is that same-node pod traffic is L2 and unaffected, so I focus entirely on the forward-and-NAT path.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>How does all this relate to a Kubernetes pod?</summary>
+        <div class="a"><p>A pod is exactly this: a network namespace connected to the node by a veth pair, with the host end wired into a bridge or a routed CNI setup — the same commands from Lab 1, run by a CNI plugin instead of by me. The pod's <code>eth0</code> is one end of a veth; the node holds the other. A Service is netfilter rules: kube-proxy programs DNAT in PREROUTING to turn the Service VIP into a real pod IP and SNAT in POSTROUTING for return traffic, at the same hooks we used. A NetworkPolicy becomes filter rules at the FORWARD hook. So debugging pod networking is debugging namespaces, veths, bridges, and netfilter — there's nothing else under it. That's why building it by hand once makes the whole of Kubernetes networking legible.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>Linux builds many isolated networks on one host from five primitives. A <b>network namespace</b> is a private stack (interfaces, routes, ARP, conntrack, firewall). A <b>veth pair</b> is a virtual cable joining namespaces. A <b>bridge</b> is a software switch that learns MACs. <b>netfilter</b> exposes five hooks — PREROUTING, INPUT, FORWARD, OUTPUT, POSTROUTING — and iptables/nftables register rules there: DNAT in PREROUTING (before the routing decision), filtering in INPUT/FORWARD, SNAT/masquerade in POSTROUTING. <b>conntrack</b> records each connection as original+reply tuples so replies match and NAT is reversible — and its fixed-size table, when full, drops even established packets. On-bridge traffic is pure L2 and never routes; cross-subnet traffic takes the FORWARD path and needs <code>ip_forward=1</code>. Every container and every Kubernetes pod is built from precisely these pieces.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>A network namespace is a complete private network stack; every container gets one.</li>
+      <li>A veth pair is a two-ended virtual cable — one end in the namespace (eth0), one in the host.</li>
+      <li>A Linux bridge is a software switch: enslave veth ends to it and it learns MACs into its fdb.</li>
+      <li>There are five netfilter hooks: PREROUTING, INPUT, FORWARD, OUTPUT, POSTROUTING.</li>
+      <li>DNAT runs in PREROUTING (before routing); SNAT/masquerade runs in POSTROUTING (last).</li>
+      <li>The routing decision splits traffic: local → INPUT, forwarded → FORWARD, out → POSTROUTING.</li>
+      <li>Cross-subnet/pod-to-internet traffic takes FORWARD and needs <code>net.ipv4.ip_forward=1</code>.</li>
+      <li>conntrack stores original+reply tuples; it's why stateful firewalls and reversible NAT work.</li>
+      <li>A full conntrack table drops <em>established</em> packets — a growing, load-dependent outage.</li>
+      <li>Containers and Kubernetes pods, Services, and NetworkPolicies are all just these primitives.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds toward:</span>
+      <a href="ch11-l2-ethernet-mac-arp-switching.html"><b>Ch 11</b> Ethernet, MAC, ARP</a>
+      <a href="ch12-l3-ip-cidr-subnetting-routing-nat.html"><b>Ch 12</b> IP routing &amp; NAT</a>
+      <a href="ch25-container-networking.html"><b>Ch 25</b> Container networking</a>
+      <a href="ch42-pod-networking-internals-pod-to-pod.html"><b>Ch 42</b> Pod-to-Pod</a>
+      <a href="ch43-services-and-the-datapath-pod-to-service.html"><b>Ch 43</b> Services &amp; the datapath</a>
+      <a href="ch47-networkpolicy-deep.html"><b>Ch 47</b> NetworkPolicy</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>The netfilter project — <a href="https://wiki.nftables.org/wiki-nftables/index.php/Netfilter_hooks">Netfilter hooks</a>: the authoritative hook order, priorities, and packet-flow diagram.</li>
+      <li>The netfilter project — <a href="https://www.netfilter.org/projects/nftables/index.html">nftables</a> and <a href="https://wiki.nftables.org/wiki-nftables/index.php/Main_Page">nftables wiki</a> for the rule model and NAT.</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man8/ip-netns.8.html">ip-netns(8)</a>, <a href="https://man7.org/linux/man-pages/man4/veth.4.html">veth(4)</a>, and <a href="https://man7.org/linux/man-pages/man7/network_namespaces.7.html">network_namespaces(7)</a>.</li>
+      <li>The Linux Kernel documentation — <a href="https://docs.kernel.org/networking/bridge.html">the Ethernet bridge</a> and the <a href="https://docs.kernel.org/networking/index.html">networking</a> section.</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man8/conntrack.8.html">conntrack(8)</a> for the connection-tracking table and its counters.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch17-tls-and-pki.html"><span class="dir">← Prev</span><div class="ti">Ch 17 — TLS and PKI</div></a>
+      <a class="nx" href="ch19-capstone-trace-curl-https-example-com.html"><span class="dir">Next →</span><div class="ti">Ch 19 — Capstone trace: curl https://example.com</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 18 of 121 · Part II · Networking from First Principles. Build the two-namespace bridge by hand — it's the whole of container networking in ten commands.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">How a packet travels</a>
+    <a href="#internals">The five hooks</a>
+    <a href="#components">The components</a>
+    <a href="#flow">Following one packet</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 34 — Workloads II: StatefulSet, DaemonSet, Job, CronJob</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part IV · Kubernetes &nbsp;·&nbsp; Chapter 34</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part IV · Kubernetes — Architecture &amp; Internals · Chapter 34</div>
+      <h1>Workloads II: StatefulSet, DaemonSet, Job, CronJob</h1>
+      <p class="tagline">A Deployment treats Pods as interchangeable, which is exactly wrong for a database that needs a stable name and its own disk, a node agent that needs one copy per machine, or a batch job that needs to finish and stop. Three more controllers cover those three shapes — and each has a failure mode a Deployment never had.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~40 min read · kind</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain what a StatefulSet gives that a Deployment can't: stable identity, stable per-Pod storage, and ordered rollout.</li>
+          <li>Wire a StatefulSet to a headless Service and know why pod DNS names work.</li>
+          <li>Use a DaemonSet to run one Pod per node, and a Job/CronJob for run-to-completion and scheduled work.</li>
+          <li>Read <code>completions</code>, <code>parallelism</code>, <code>backoffLimit</code>, and CronJob <code>concurrencyPolicy</code> correctly.</li>
+          <li>Diagnose the two incidents these bring: a stuck StatefulSet Pod that halts the whole ordered rollout, and a Job that fails, backs off, and piles up.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem: not every workload is a herd of clones</h2>
+    <p>The Deployment model from <a href="ch33-workloads-i-pod-replicaset-deployment.html">Chapter 33</a> is built on one assumption: Pods are interchangeable. Any Pod can serve any request, they can start and stop in any order, and none of them owns anything that must survive. That assumption is perfect for a stateless web service and wrong for three common shapes of work.</p>
+    <p>A <b>replicated database</b> breaks all of it. The primary and the replicas are not interchangeable — a client that connected to <code>db-0</code> as the primary needs to keep finding <em>that</em> member, each member owns a specific slice of data on a specific disk that must follow it across restarts, and the cluster must bootstrap in order (the first member forms the cluster, the rest join it). A <b>node agent</b> — a log shipper, a metrics exporter, a CNI daemon — needs exactly one Pod on every node, including nodes that join later, which "keep N replicas somewhere" can't express. And <b>batch work</b> — a nightly report, a data migration, a queue drain — needs to run to completion and <em>stop</em>, with retries on failure, not run forever like a service.</p>
+    <p>Kubernetes gives each shape its own controller. A <b>StatefulSet</b> adds stable identity, stable storage, and ordered lifecycle. A <b>DaemonSet</b> runs one Pod per matching node. A <b>Job</b> runs Pods to successful completion; a <b>CronJob</b> creates Jobs on a schedule. Same reconcile machinery underneath (<a href="ch31-the-reconciliation-loop-controllers-informers.html">Chapter 31</a>) — different guarantees on top.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>The three controllers here exist to relax the "Pods are interchangeable" assumption in three directions: give Pods <em>durable identity and storage</em> (StatefulSet), pin Pods to <em>every node</em> (DaemonSet), or make Pods <em>finish and stop</em> (Job/CronJob). Each guarantee brings a matching failure mode — ordered rollout can stall on one bad Pod, and run-to-completion can retry itself into a pile of failures.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: temps, named staff, caretakers, and errands</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Go back to the shop from the last chapter, where a Deployment hired interchangeable <b>temps</b> — any of them, any order, nothing personal. Now add the other kinds of worker a real business needs.</p>
+      <p>A <b>StatefulSet</b> is your <b>named, permanent staff</b>. Each has an assigned desk and a personal locker (<code>db-0</code>, <code>db-1</code>, <code>db-2</code>, each with its own storage), you can phone any of them by name (stable DNS), and you onboard them <em>in order</em> — the senior forms the team before the juniors join, and if you downsize you let the most junior go first. Their lockers stay locked and reserved even while they're on leave (the disk survives a restart), and you don't clear a locker just because someone's out sick.</p>
+      <p>A <b>DaemonSet</b> is the <b>caretaker on every floor</b>: exactly one per floor, and when the building adds a floor, a caretaker appears there automatically — no headcount to manage, the rule is "one per floor." A <b>Job</b> is an <b>errand with a definition of done</b>: "post these 100 letters," and when they're posted the errand is complete and the runner goes home; if a letter bounces, they retry, but only so many times before giving up. A <b>CronJob</b> is the <b>calendar</b> that sends someone on that errand every night at 2 a.m. — and you have to decide what it does if last night's errand is still running when tonight's is due.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In Kubernetes</th></tr>
+      <tr><td>Interchangeable temps, any order</td><td><b>Deployment</b> (Chapter 33) — fungible Pods</td></tr>
+      <tr><td>Named staff with assigned lockers, hired in order</td><td><b>StatefulSet</b> — ordinal identity + per-Pod PVC + ordered rollout</td></tr>
+      <tr><td>Phoning a staff member by name</td><td>Stable pod DNS via a <b>headless Service</b></td></tr>
+      <tr><td>One caretaker per floor, auto-added to new floors</td><td><b>DaemonSet</b> — one Pod per matching node</td></tr>
+      <tr><td>An errand with a definition of done, limited retries</td><td><b>Job</b> — <code>completions</code>, <code>parallelism</code>, <code>backoffLimit</code></td></tr>
+      <tr><td>The calendar that dispatches the errand nightly</td><td><b>CronJob</b> — <code>schedule</code>, <code>concurrencyPolicy</code></td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>A StatefulSet: identity, storage, and DNS</h2>
+    <p>The StatefulSet is the one with real machinery, so the figure shows it: a headless Service in front, ordinal Pods each with their own PersistentVolumeClaim, and the stable DNS names those two facts produce. A DaemonSet, by contrast, is just "one Pod per node," and a Job is "Pods until done" — simple enough to hold in your head without a diagram.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 400" role="img" aria-label="A StatefulSet named db fronted by a headless Service, with three ordinal pods db-0, db-1, db-2 created in order, each bound to its own persistent volume claim, and each addressable by a stable DNS name">
+        <defs>
+          <marker id="s1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="s2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+        </defs>
+        <!-- headless service -->
+        <rect x="250" y="24" width="220" height="56" rx="10" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="360" y="47" text-anchor="middle" style="fill:var(--accent);font:700 12px sans-serif">headless Service · db</text>
+        <text x="360" y="65" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">clusterIP: None → per-pod DNS</text>
+
+        <!-- ordinal pods -->
+        <g>
+        <rect x="40" y="150" width="180" height="58" rx="9" style="fill:var(--chip);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="130" y="174" text-anchor="middle" style="fill:var(--ink);font:700 12px sans-serif">db-0 (created 1st)</text>
+        <text x="130" y="192" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">db-0.db.ns.svc.cluster.local</text>
+        <rect x="270" y="150" width="180" height="58" rx="9" style="fill:var(--chip);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="360" y="174" text-anchor="middle" style="fill:var(--ink);font:700 12px sans-serif">db-1 (created 2nd)</text>
+        <text x="360" y="192" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">db-1.db.ns.svc.cluster.local</text>
+        <rect x="500" y="150" width="180" height="58" rx="9" style="fill:var(--chip);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="590" y="174" text-anchor="middle" style="fill:var(--ink);font:700 12px sans-serif">db-2 (created 3rd)</text>
+        <text x="590" y="192" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">db-2.db.ns.svc.cluster.local</text>
+        </g>
+        <line x1="320" y1="80" x2="150" y2="148" style="stroke:var(--accent);stroke-width:1.2" marker-end="url(#s1)"/>
+        <line x1="360" y1="80" x2="360" y2="148" style="stroke:var(--accent);stroke-width:1.2" marker-end="url(#s1)"/>
+        <line x1="400" y1="80" x2="570" y2="148" style="stroke:var(--accent);stroke-width:1.2" marker-end="url(#s1)"/>
+
+        <!-- ordering arrow -->
+        <line x1="220" y1="179" x2="268" y2="179" style="stroke:var(--muted);stroke-width:1.2;stroke-dasharray:4 3" marker-end="url(#s2)"/>
+        <line x1="450" y1="179" x2="498" y2="179" style="stroke:var(--muted);stroke-width:1.2;stroke-dasharray:4 3" marker-end="url(#s2)"/>
+        <text x="360" y="128" text-anchor="middle" style="fill:var(--muted);font:italic 9.5px sans-serif">created 0→N-1, deleted N-1→0, each waits Ready</text>
+
+        <!-- PVCs -->
+        <rect x="55" y="270" width="150" height="56" rx="9" style="fill:var(--panel);stroke:var(--applied);stroke-width:1.5"/>
+        <text x="130" y="293" text-anchor="middle" style="fill:var(--applied);font:700 11px sans-serif">PVC data-db-0</text>
+        <text x="130" y="311" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">own disk · survives restart</text>
+        <rect x="285" y="270" width="150" height="56" rx="9" style="fill:var(--panel);stroke:var(--applied);stroke-width:1.5"/>
+        <text x="360" y="293" text-anchor="middle" style="fill:var(--applied);font:700 11px sans-serif">PVC data-db-1</text>
+        <text x="360" y="311" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">own disk · survives restart</text>
+        <rect x="515" y="270" width="150" height="56" rx="9" style="fill:var(--panel);stroke:var(--applied);stroke-width:1.5"/>
+        <text x="590" y="293" text-anchor="middle" style="fill:var(--applied);font:700 11px sans-serif">PVC data-db-2</text>
+        <text x="590" y="311" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">own disk · survives restart</text>
+        <line x1="130" y1="208" x2="130" y2="268" style="stroke:var(--applied);stroke-width:1.5" marker-end="url(#s2)"/>
+        <line x1="360" y1="208" x2="360" y2="268" style="stroke:var(--applied);stroke-width:1.5" marker-end="url(#s2)"/>
+        <line x1="590" y1="208" x2="590" y2="268" style="stroke:var(--applied);stroke-width:1.5" marker-end="url(#s2)"/>
+        <text x="360" y="356" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">volumeClaimTemplates → one PVC per ordinal, bound for the Pod's whole life</text>
+      </svg>
+      <figcaption>A StatefulSet's guarantees come from two facts: a headless Service turns each ordinal into a stable DNS name, and <code>volumeClaimTemplates</code> gives each ordinal its own PVC that follows it across restarts. Pods are created 0→N-1 and deleted N-1→0, each waiting to be Ready before the next moves.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>The per-Pod PVC is the sharpest edge in production. When you scale a StatefulSet <em>down</em>, Kubernetes deletes the Pods but <b>keeps the PVCs</b> by default — deliberately, so you don't lose data by fat-fingering a replica count. That means scaling <code>db</code> from 5 to 3 leaves <code>data-db-3</code> and <code>data-db-4</code> (and their disks, and their cloud cost) sitting around until you clean them up or set a retention policy. Half of "why is our storage bill climbing?" traces back to orphaned StatefulSet PVCs.</p>
+    </div>
+
+    <h2 id="identity"><span class="beat">Internal working</span>Identity, DaemonSets, and run-to-completion</h2>
+
+    <h4>1 · StatefulSet: stable identity and storage</h4>
+    <p>A StatefulSet gives each Pod a <b>stable ordinal identity</b>: names are <code>&lt;set&gt;-0</code>, <code>&lt;set&gt;-1</code>, … and a Pod keeps its name and its storage across restarts and reschedules. Three guarantees flow from that:</p>
+    <ul>
+      <li><b>Stable network identity.</b> Paired with a <b>headless Service</b> (<code>clusterIP: None</code>), each Pod gets a DNS record <code>&lt;pod&gt;.&lt;service&gt;.&lt;namespace&gt;.svc.cluster.local</code> that resolves straight to that Pod. A normal Service load-balances across a random Pod; a headless Service lets clients address a <em>specific</em> member — which is what clustered databases need to find the primary.</li>
+      <li><b>Stable storage.</b> <code>volumeClaimTemplates</code> creates one PVC per Pod (<code>data-db-0</code>, <code>data-db-1</code>, …). When <code>db-1</code> is rescheduled to another node, it re-attaches <em>its</em> PVC — same data. The PVC is not deleted when the Pod is (that's the orphaning cost above), and by default not when the set scales down.</li>
+      <li><b>Ordered lifecycle.</b> Under the default <code>podManagementPolicy: OrderedReady</code>, Pods are created one at a time in ordinal order (0, then 1, then 2), each waiting until the previous is Running and Ready. Deletion and scale-down go in reverse (highest ordinal first). Rolling updates also go in reverse ordinal order, and you can pause them at an ordinal with the <code>partition</code> field for canary-style updates. <code>podManagementPolicy: Parallel</code> drops the ordering when your app doesn't need it.</li>
+    </ul>
+    <p>The <code>persistentVolumeClaimRetentionPolicy</code> field (stable since 1.27) lets you opt into deleting PVCs <code>whenScaled</code> or <code>whenDeleted</code> — the modern, explicit way to avoid orphaned disks instead of cleaning up by hand.</p>
+
+    <h4>2 · DaemonSet: one Pod per node</h4>
+    <p>A DaemonSet's desired state isn't a count — it's "one Pod on every node that matches." The DaemonSet controller watches nodes, and when a node appears (a scale-up, a new node pool), it schedules the Pod there; when a node leaves, that Pod goes with it. To land on control-plane nodes or otherwise-tainted nodes, the DaemonSet Pod carries the matching <b>tolerations</b> (<a href="ch36-scheduling-deep.html">Chapter 36</a>) — which is why the CNI and kube-proxy DaemonSets, which must run everywhere, tolerate all taints. DaemonSets roll updates node by node with their own <code>updateStrategy</code> (<code>RollingUpdate</code> with a <code>maxUnavailable</code>, or <code>OnDelete</code>). This is how every node-level agent runs: log shippers, metrics exporters, the CSI node plugin, the CNI.</p>
+
+    <h4>3 · Job: run to completion</h4>
+    <p>A Job creates Pods and tracks them until a target number succeed. The knobs:</p>
+    <ol class="steps">
+      <li><b><code>completions</code></b> — how many successful Pod runs make the Job done (default 1). With <code>completions: 5</code>, the Job isn't finished until five Pods have exited 0.</li>
+      <li><b><code>parallelism</code></b> — how many Pods may run at once. <code>parallelism: 3, completions: 5</code> runs three at a time until five succeed.</li>
+      <li><b><code>backoffLimit</code></b> — how many Pod failures the Job tolerates before it gives up and is marked <code>Failed</code> (default 6). Retries are delayed with exponential backoff (10s, 20s, 40s…).</li>
+      <li><b><code>restartPolicy</code></b> — must be <code>OnFailure</code> or <code>Never</code> for a Job (never <code>Always</code>). <code>Never</code> creates a fresh Pod per attempt; <code>OnFailure</code> restarts the container in place.</li>
+      <li><b><code>ttlSecondsAfterFinished</code></b> — auto-delete the Job (and its Pods) this long after it finishes, so completed Jobs don't accumulate.</li>
+    </ol>
+    <p>For finer control there's <code>activeDeadlineSeconds</code> (a hard wall-clock timeout), an <b>Indexed</b> completion mode (each Pod gets a fixed index, for partitioned work), and a <b>Pod failure policy</b> to decide which exit codes count as retryable versus terminal — so a Job can fail fast on a bad config (exit 1) but retry a transient network error.</p>
+
+    <h4>4 · CronJob: Jobs on a schedule</h4>
+    <p>A CronJob wraps a Job template with a cron <code>schedule</code> and, critically, a <b>concurrencyPolicy</b> that decides what happens when a run is due while the previous one is still going:</p>
+    <ul>
+      <li><b><code>Allow</code></b> (default) — let them overlap. Fine for idempotent work, dangerous if two runs step on each other.</li>
+      <li><b><code>Forbid</code></b> — skip the new run if the previous is still active. Use for jobs that must not overlap (a report that would double-count, a migration).</li>
+      <li><b><code>Replace</code></b> — kill the running one and start the new. Use when only the latest run matters.</li>
+    </ul>
+    <p><code>startingDeadlineSeconds</code> bounds how late a missed run may still start (if the controller was down past that window, the run is skipped), and <code>successfulJobsHistoryLimit</code>/<code>failedJobsHistoryLimit</code> cap how many finished Jobs are kept. CronJobs interpret the schedule in the cluster's time zone unless you set <code>spec.timeZone</code>.</p>
+
+    <details class="recall"><summary>Think first: you scale a 5-replica StatefulSet down to 3, then back up to 5 an hour later. Do <code>db-3</code> and <code>db-4</code> come back with their old data?</summary>
+      <div class="body">
+        <p>Yes — and that's the design. Scaling down to 3 deletes Pods <code>db-4</code> then <code>db-3</code> (reverse order) but <b>keeps their PVCs</b> (<code>data-db-3</code>, <code>data-db-4</code>) by default. When you scale back to 5, the StatefulSet recreates <code>db-3</code> and <code>db-4</code> with the <em>same</em> names and re-binds them to those same PVCs, so each comes back to exactly the data it had. That's the whole point of stable identity plus stable storage: a StatefulSet member is a durable thing, not a fungible clone, so shrinking and growing the set is non-destructive. The flip side is the cost from the callout: if you scaled down permanently and never cleaned up, those PVCs (and their real disks) linger and bill forever. If you <em>want</em> the disks reclaimed on scale-down, set <code>persistentVolumeClaimRetentionPolicy.whenScaled: Delete</code> — but then scaling down really does destroy that member's data, so choose deliberately.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, named</h2>
+    <ul>
+      <li><b>StatefulSet</b> — <code>apps/v1</code>; ordinal-named Pods with stable identity, per-Pod PVCs via <code>volumeClaimTemplates</code>, and ordered create/delete/update.</li>
+      <li><b>Headless Service</b> — a Service with <code>clusterIP: None</code>; produces per-Pod DNS records so members are individually addressable.</li>
+      <li><b>volumeClaimTemplates &amp; persistentVolumeClaimRetentionPolicy</b> — the per-ordinal PVCs and the (opt-in) policy for deleting them on scale-down or set deletion.</li>
+      <li><b>DaemonSet</b> — <code>apps/v1</code>; one Pod per matching node, driven by node events, using tolerations to reach tainted nodes.</li>
+      <li><b>Job</b> — <code>batch/v1</code>; runs Pods until <code>completions</code> succeed, bounded by <code>parallelism</code> and <code>backoffLimit</code>.</li>
+      <li><b>CronJob</b> — <code>batch/v1</code>; creates Jobs on a cron <code>schedule</code> with a <code>concurrencyPolicy</code> and history limits.</li>
+      <li><b>podManagementPolicy</b> — <code>OrderedReady</code> (default, one-at-a-time) vs <code>Parallel</code> (all at once) for StatefulSet Pod creation/deletion.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following a StatefulSet from zero to three</h2>
+    <p>You apply a StatefulSet <code>db</code> with 3 replicas, a headless Service, and a <code>volumeClaimTemplate</code>:</p>
+    <ol class="steps">
+      <li>The controller creates PVC <code>data-db-0</code> and Pod <code>db-0</code>. It waits for <code>db-0</code> to be Running and Ready before doing anything else.</li>
+      <li><code>db-0</code>'s PVC binds to a PersistentVolume (dynamically provisioned by the StorageClass — <a href="ch38-storage-volumes-pv-pvc-storageclass-csi.html">Chapter 38</a>), the volume attaches to the node, and the Pod mounts it. DNS record <code>db-0.db.ns.svc.cluster.local</code> now resolves to it.</li>
+      <li>Only once <code>db-0</code> is Ready does the controller create <code>data-db-1</code> and <code>db-1</code>, then wait again. Then <code>db-2</code>. Ordered, one at a time.</li>
+      <li>A clustered app uses this: <code>db-0</code> bootstraps the cluster, <code>db-1</code> and <code>db-2</code> join by resolving <code>db-0</code>'s stable DNS name. The ordering guarantees the primary exists before replicas try to join.</li>
+      <li>Reschedule <code>db-1</code> (its node dies): the controller recreates a Pod named <code>db-1</code>, re-binds it to <code>data-db-1</code>, and it comes back with its data and its name. To the rest of the cluster, member 1 simply blinked.</li>
+      <li>Scale down to 2: the controller deletes <code>db-2</code> (highest ordinal) but keeps <code>data-db-2</code> for a possible scale-up — unless a retention policy says otherwise.</li>
+    </ol>
+    <p>Every guarantee — the DNS name that stays put, the disk that follows the Pod, the strict ordering — is what turns "a set of Pods" into "a database cluster's members." Remove any one and clustered software breaks.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>A two-node kind cluster lets the DaemonSet lab show one Pod per node.</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>cat &lt;&lt;'EOF' | kind create cluster --name wl2 --config=-
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+- role: worker
+- role: worker
+EOF
+kubectl get nodes</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — a StatefulSet with per-Pod storage and stable DNS</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Create a headless Service and a 3-replica StatefulSet with a <code>volumeClaimTemplate</code>, then observe ordinal names, ordered creation, and per-Pod PVCs.</p>
+        <div class="codewrap"><span class="lang">yaml</span><pre><code><span class="c"># sts.yaml</span>
+apiVersion: v1
+kind: Service
+metadata: { name: db }
+spec:
+  clusterIP: None                 <span class="c"># headless → per-pod DNS</span>
+  selector: { app: db }
+  ports: [{ port: 80 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: db }
+spec:
+  serviceName: db
+  replicas: 3
+  selector: { matchLabels: { app: db } }
+  template:
+    metadata: { labels: { app: db } }
+    spec:
+      containers:
+      - name: web
+        image: nginx:1.27-alpine
+        volumeMounts: [{ name: data, mountPath: /usr/share/nginx/html }]
+  volumeClaimTemplates:
+  - metadata: { name: data }
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources: { requests: { storage: 100Mi } }</code></pre></div>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl apply -f sts.yaml
+kubectl get pods -l app=db --watch    <span class="c"># Ctrl-C once all 3 are Running</span>
+kubectl get pvc</code></pre></div>
+        <div class="out"><span class="ol">Output</span>db-0   0/1   Pending   →   Running        <span class="c"># created first, waits Ready</span>
+db-1   0/1   Pending   →   Running        <span class="c"># only after db-0 is Ready</span>
+db-2   0/1   Pending   →   Running
+NAME         STATUS   VOLUME   CAPACITY   ACCESS MODES
+data-db-0    Bound    pvc-..   100Mi      RWO
+data-db-1    Bound    pvc-..   100Mi      RWO
+data-db-2    Bound    pvc-..   100Mi      RWO</code></pre></div>
+        <p>Ordinal names, one PVC per Pod, created in order. Now prove stable DNS from another Pod:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl run dns --rm -it --restart=Never --image=busybox:1.36 -- \
+  nslookup db-0.db.default.svc.cluster.local</code></pre></div>
+        <div class="out"><span class="ol">Output</span>Name:      db-0.db.default.svc.cluster.local
+Address 1: 10.244.1.5 db-0.db.default.svc.cluster.local</code></pre></div>
+        <p>That name resolves to <code>db-0</code> specifically — not a random member. Write a file into <code>db-0</code>'s volume, delete the Pod, and confirm the data survives on the new <code>db-0</code>:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl exec db-0 -- sh -c 'echo i-am-zero &gt; /usr/share/nginx/html/id'
+kubectl delete pod db-0
+kubectl wait --for=condition=Ready pod/db-0 --timeout=60s
+kubectl exec db-0 -- cat /usr/share/nginx/html/id</code></pre></div>
+        <div class="out"><span class="ol">Output</span>i-am-zero        <span class="c"># same name, same PVC, same data — identity survived the restart</span></code></pre></div>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — a DaemonSet lands one Pod per node</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Deploy a DaemonSet and watch it place exactly one Pod on each worker node — and none extra as long as node count is fixed.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: { name: agent }
+spec:
+  selector: { matchLabels: { app: agent } }
+  template:
+    metadata: { labels: { app: agent } }
+    spec:
+      containers:
+      - { name: agent, image: busybox:1.36, command: ["sh","-c","sleep 1d"] }
+EOF
+kubectl get ds agent
+kubectl get pods -l app=agent -o wide</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME    DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE
+agent   2         2         2       2            2
+NAME          READY   STATUS    NODE
+agent-4k2p    1/1     Running   wl2-worker
+agent-9xr7    1/1     Running   wl2-worker2</code></pre></div>
+        <p><code>DESIRED</code> is 2 because there are two worker nodes — the DaemonSet controller derived the count from the nodes, not from a replica field. The Pods skipped the control-plane node because they don't tolerate its taint; a real node agent like the CNI would carry a broad toleration to run there too. Add a node and a third Pod would appear automatically.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — a Job that fails and exhausts its backoffLimit</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Run a Job whose Pod always exits non-zero, and watch it retry with backoff and then give up as <code>Failed</code>.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: batch/v1
+kind: Job
+metadata: { name: flaky }
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - { name: work, image: busybox:1.36, command: ["sh","-c","echo trying; exit 1"] }
+EOF
+sleep 90
+kubectl get job flaky
+kubectl get pods -l job-name=flaky</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME    STATUS   COMPLETIONS   DURATION   AGE
+flaky   Failed   0/1           80s        90s
+NAME          READY   STATUS   RESTARTS   AGE
+flaky-abc     0/1     Error    0          88s
+flaky-def     0/1     Error    0          70s
+flaky-ghi     0/1     Error    0          40s
+flaky-jkl     0/1     Error    0          8s        <span class="c"># backoffLimit: 3 → 4 attempts, then give up</span></code></pre></div>
+        <p>With <code>restartPolicy: Never</code>, each failure creates a <em>new</em> Pod (that's why you see four Error Pods, not one with rising restarts), and the delay between them grows — 10s, 20s, 40s — that's the exponential backoff. After <code>backoffLimit</code> failures the Job is marked <code>Failed</code> and stops trying. Check <em>why</em> it's failed, the way you would in production:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl describe job flaky | grep -A2 Conditions
+kubectl logs -l job-name=flaky --tail=1</code></pre></div>
+        <div class="out"><span class="ol">Output</span>Conditions:
+  Type    Status   Reason
+  Failed  True     BackoffLimitExceeded
+trying</code></pre></div>
+        <p>The condition <code>BackoffLimitExceeded</code> is the fingerprint of "the Job gave up," and the Pod logs and exit code tell you the real cause. Left with <code>restartPolicy: Never</code> and no <code>ttlSecondsAfterFinished</code>, those failed Pods stick around — which is how a flaky CronJob quietly buries a namespace in dead Pods.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — a stuck StatefulSet Pod halts the rollout</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Break the middle ordinal and watch the ordered guarantee turn into a stall: nothing past the broken Pod updates. Trigger a rolling update with an image that won't start on <code>db-1</code> onward by pointing the whole set at a bad image.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl set image statefulset/db web=nginx:v-nope
+kubectl rollout status statefulset/db --timeout=30s
+kubectl get pods -l app=db</code></pre></div>
+        <div class="out"><span class="ol">Output</span>Waiting for partitioned roll out to finish: 0 out of 3 new pods have been updated...
+error: timed out waiting for the condition
+NAME   READY   STATUS             RESTARTS   AGE
+db-0   1/1     Running            0          20m       <span class="c"># still old image</span>
+db-1   1/1     Running            0          20m       <span class="c"># still old image</span>
+db-2   0/1     ImagePullBackOff   0          40s       <span class="c"># highest ordinal, updated first, stuck</span></code></pre></div>
+        <p>StatefulSet rolling updates go in <em>reverse</em> ordinal order, so <code>db-2</code> was updated first — and it's stuck on the bad image. Now the important part: <code>db-1</code> and <code>db-0</code> are frozen on the old version and won't update. Why, and what's the safe recovery? Reason before revealing.</p>
+        <details class="recall"><summary>Reveal the diagnosis and the fix</summary>
+          <div class="body">
+            <p>The default <code>podManagementPolicy: OrderedReady</code> means the StatefulSet will not update the next ordinal until the current one is Running <em>and Ready</em>. <code>db-2</code> can never become Ready (its image doesn't exist), so the controller refuses to touch <code>db-1</code> — the rollout is blocked at <code>db-2</code> forever. This is the guarantee working as designed: for a database you would <em>not</em> want the controller to keep rolling and take down a second member while the first is broken. But it means a single bad ordinal wedges the whole update. Confirm the cause on the stuck Pod, then roll back:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl describe pod db-2 | grep -A2 Events | head
+kubectl rollout undo statefulset/db
+kubectl rollout status statefulset/db --timeout=60s</code></pre></div>
+            <div class="out"><span class="ol">Output</span>  Warning  Failed   Failed to pull image "nginx:v-nope": not found
+statefulset rolling update rolled back
+partitioned roll out complete: 3 new pods have been updated...</code></pre></div>
+            <p>The distinguishing lesson from Chapter 33's Deployment stall: a Deployment stalls but the <em>old</em> Pods keep fully serving; a StatefulSet stall <em>freezes the whole set</em> at the failed ordinal, with the higher ordinals down and the lower ones un-updated. That's stricter and can be scarier during an incident, so for StatefulSets you lean even harder on testing images before rollout, and you use the <code>partition</code> field to canary one ordinal at a time. If a single member is genuinely stuck (bad node, corrupt disk) rather than a bad image, you delete that Pod (and, if needed, its PVC) so it's recreated cleanly — but only after confirming the data is safe or replicated.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — a CronJob that overlaps and piles up</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>A nightly CronJob runs a report that usually takes 5 minutes but occasionally takes 90 when the source database is slow. It's configured with the default settings and no history limits. Over a bad week it created dozens of overlapping Jobs, doubled some numbers in the report, and left hundreds of Pods behind. Diagnose what's wrong with the defaults and specify the correct configuration. Reason first.</p>
+        <details class="recall"><summary>Reveal the approach</summary>
+          <div class="body">
+            <p>Three defaults are biting. First, <code>concurrencyPolicy</code> defaults to <b><code>Allow</code></b>, so when a 90-minute run is still going and the next nightly trigger fires, a <em>second</em> report starts on the same data — that's the double-counting. A report that reads shared state and must not overlap needs <code>concurrencyPolicy: Forbid</code> (skip the new run while one is active) or <code>Replace</code> (kill the old, keep only the latest) if only the freshest result matters. Second, there are no <b>history limits</b>, and if the Job template uses <code>restartPolicy: Never</code>, every finished and failed Job keeps its Pods around — hence hundreds of dead Pods. Set <code>successfulJobsHistoryLimit</code> and <code>failedJobsHistoryLimit</code> to small numbers, and put <code>ttlSecondsAfterFinished</code> on the Job template so finished Jobs and their Pods are garbage-collected automatically. Third, there's no bound on a runaway run: add <code>activeDeadlineSeconds</code> so a report that hangs past a sane limit is killed rather than blocking the next window forever, and set a realistic <code>backoffLimit</code> so a hard failure doesn't retry endlessly.</p>
+            <p>The corrected CronJob: <code>concurrencyPolicy: Forbid</code>, a <code>startingDeadlineSeconds</code> so a run missed because the controller was briefly down is skipped rather than fired late in a burst, <code>activeDeadlineSeconds</code> to cap runtime, and history/TTL limits so Pods don't accumulate. The general principle: CronJobs fail in the seams between runs — overlap, pileup, missed schedules — so the settings that matter most are the ones governing what happens when a run is late, long, or still going. Clean up: <code>kind delete cluster --name wl2</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · a StatefulSet rollout frozen at one ordinal</div>
+      <p><b>Symptom:</b> a StatefulSet update stops partway — a high ordinal is down (ImagePullBackOff, CrashLoop, unschedulable) and the lower ordinals are stuck on the old version, not updating. <b>Cause:</b> <code>OrderedReady</code> won't proceed until the current ordinal is Ready, so one bad Pod wedges the whole set. <b>First cut:</b> <code>kubectl describe</code> the stuck ordinal for the real reason (image, resources, PVC not binding, node gone). <b>Fix:</b> roll back or fix the image; if a single member is genuinely stuck, delete that Pod (and its PVC only if the data is replicated/safe) to force a clean recreate — never blanket-delete PVCs on a StatefulSet.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · a Job or CronJob piling up failed Pods</div>
+      <p><b>Symptom:</b> a namespace fills with Error/Completed Pods; a CronJob has dozens of active or leftover Jobs. <b>Causes:</b> <code>restartPolicy: Never</code> with no <code>ttlSecondsAfterFinished</code> (dead Pods never cleaned up), <code>concurrencyPolicy: Allow</code> with runs that outlast their interval (overlap pileup), or a Job retrying to its <code>backoffLimit</code> repeatedly. <b>First cut:</b> <code>kubectl get jobs</code> and the CronJob's <code>lastScheduleTime</code>/active count. <b>Fix:</b> set TTL and history limits, choose <code>Forbid</code>/<code>Replace</code> for non-overlapping work, and read the Pod logs for the underlying failure.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · orphaned StatefulSet PVCs and storage cost</div>
+      <p><b>Symptom:</b> storage spend climbs; there are PVCs like <code>data-db-7</code> for a set that's only 3 replicas now. <b>Cause:</b> scaling a StatefulSet down keeps the PVCs by default, so shrunk sets leave disks behind. <b>Confirm:</b> <code>kubectl get pvc</code> and match ordinals to current replicas. <b>Fix:</b> delete the orphaned PVCs deliberately, or set <code>persistentVolumeClaimRetentionPolicy</code> so scale-down reclaims them — understanding that then scale-down is destructive.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>StatefulSets need PVC lifecycle discipline.</b> The per-Pod PVC is the feature and the trap: it's why members keep their data, and why scaling down silently leaves disks and cost behind. Decide your <code>persistentVolumeClaimRetentionPolicy</code> up front — keep PVCs (the safe default) and clean up manually, or reclaim on scale-down and accept that shrinking destroys that member's data. Use the <code>partition</code> field to canary updates one ordinal at a time on critical data stores, and remember that <code>OrderedReady</code> makes a single bad ordinal freeze the whole rollout — so test images hard before you roll a database. A headless Service is mandatory for stable DNS; forgetting it is why "the replicas can't find the primary."</p>
+    <p><b>DaemonSets touch every node, so their resource footprint multiplies.</b> A DaemonSet that requests 200Mi runs on 500 nodes and that's 100Gi cluster-wide — size requests and limits carefully, because a node agent that leaks memory takes down node after node. Give DaemonSets appropriate tolerations if they must run on control-plane or tainted nodes, and a sensible <code>updateStrategy</code> <code>maxUnavailable</code> so a rolling update of a critical agent (CNI, CSI) doesn't disrupt too many nodes at once. Because DaemonSet Pods are often infrastructure, they frequently need broader permissions than a normal workload — scope those tightly (a metrics exporter does not need host root).</p>
+    <p><b>Jobs and CronJobs fail in the gaps.</b> Always set <code>ttlSecondsAfterFinished</code> so finished Jobs don't accumulate, a realistic <code>backoffLimit</code> so a hard failure doesn't retry forever, and <code>activeDeadlineSeconds</code> so a hung run is killed. For CronJobs, choose <code>concurrencyPolicy</code> based on whether overlap is safe — <code>Forbid</code> for anything touching shared state — and set <code>startingDeadlineSeconds</code> so a run missed during a controller outage is skipped rather than fired in a thundering catch-up burst. Set <code>spec.timeZone</code> explicitly if your schedule is business-time-sensitive. Make Job work <b>idempotent</b>: a Job can run its Pod more than once (retries, node failure mid-run), so "process these records" must tolerate being partially re-run.</p>
+    <p><b>Common mistakes:</b> a StatefulSet without a headless Service; blanket-deleting StatefulSet PVCs and losing data; a DaemonSet with unbounded resources multiplying across the fleet; Jobs with no TTL burying namespaces in dead Pods; a CronJob left on <code>Allow</code> that overlaps and double-processes; and non-idempotent batch work that corrupts data when a Job retries.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>These controllers are where "run it on Kubernetes" meets the hard parts of system design. StatefulSets are the on-cluster answer to running stateful systems — databases, message brokers, quorum-based coordination stores — and the choice to run those on Kubernetes at all is a real design decision (<a href="ch86-the-data-layer-mysql-and-postgresql.html">Chapter 86</a>): you get stable identity, storage, and ordered lifecycle, but you inherit the operational weight of running a database, which is why many teams use a managed data service instead and keep only stateless workloads on the cluster. When you do run stateful workloads, the ordinal-plus-headless-Service pattern is exactly how distributed systems bootstrap and discover peers (<a href="ch83-coordination-leader-election-consensus-locks-clocks.html">Chapter 83</a>), and the per-Pod PVC ties directly into the storage layer (<a href="ch38-storage-volumes-pv-pvc-storageclass-csi.html">Chapter 38</a>). Jobs and CronJobs are the primitive under batch and asynchronous processing — the queue-worker and scheduled-pipeline patterns of <a href="ch98-project-distributed-job-and-queue-processing.html">Chapter 98</a> — where the design questions are all about idempotency, retries, and what happens when a worker dies mid-task, which are precisely the knobs this chapter names. DaemonSets are the deployment model for the platform's own nervous system: the observability agents, log shippers, CNI, and CSI node plugins that must exist on every node are all DaemonSets, so understanding "one Pod per node, follows node lifecycle" is understanding how the cluster instruments itself (<a href="ch78-logging.html">Chapter 78</a>). Pick the wrong controller — a Deployment for a database, a Job that isn't idempotent, a CronJob on <code>Allow</code> for non-overlapping work — and the failure isn't a crash, it's silent data corruption or runaway cost.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>When would you use a StatefulSet instead of a Deployment?</summary>
+        <div class="a"><p>When Pods aren't interchangeable — when each needs a stable identity, its own durable storage, or an ordered lifecycle. Databases and other clustered stateful systems are the classic case: a member needs a stable DNS name so peers can find it, its own PVC that follows it across restarts so its data survives, and ordered startup so the cluster bootstraps correctly. A Deployment gives you none of that — its Pods are fungible with random names and shared or no storage — so it's right for stateless services and wrong for anything that owns data or has per-instance identity.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Explain how a StatefulSet provides stable identity and storage.</summary>
+        <div class="a"><p>Two mechanisms. For identity, Pods are named by ordinal — <code>db-0</code>, <code>db-1</code>, <code>db-2</code> — and a Pod keeps its name across restarts and reschedules. Paired with a headless Service (<code>clusterIP: None</code>), each Pod also gets a DNS record <code>pod.service.namespace.svc.cluster.local</code> that resolves directly to that specific Pod, so peers can address individual members rather than a random one behind a load balancer. For storage, <code>volumeClaimTemplates</code> creates one PVC per ordinal — <code>data-db-0</code>, <code>data-db-1</code> — and when a Pod is rescheduled, the StatefulSet re-binds it to <em>its</em> PVC, so the data follows the identity. The lifecycle is ordered too: under the default <code>OrderedReady</code> policy, Pods are created 0 through N-1 one at a time, each waiting until the previous is Ready, and deleted and updated in reverse. The one gotcha I'd flag: scaling down keeps the PVCs by default, so orphaned disks accumulate unless you clean them up or set a retention policy — and the ordered-Ready guarantee means one un-Ready ordinal freezes the whole rollout.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Explain <code>completions</code>, <code>parallelism</code>, and <code>backoffLimit</code>, and why Job idempotency matters.</summary>
+        <div class="a"><p><code>completions</code> is how many Pods must exit successfully for the Job to be done; <code>parallelism</code> is how many may run at once. So <code>completions: 10, parallelism: 3</code> runs three Pods at a time until ten have succeeded — a simple work-fan-out. <code>backoffLimit</code> is how many Pod failures the Job tolerates before it's marked Failed, with exponential backoff between retries; with <code>restartPolicy: Never</code> each retry is a fresh Pod, with <code>OnFailure</code> the container restarts in place. Idempotency matters because a Job can run the same unit of work more than once even when everything is "working": a Pod can fail after doing half its side effects and get retried, or a node can die mid-run and the Pod is rescheduled, or in indexed mode a completion can be re-attempted. If the work isn't idempotent — say it appends to a ledger or sends emails without a dedup key — those re-runs double-charge, double-send, or corrupt data. So batch work must be written so that running it twice on the same input produces the same result as running it once, typically with idempotency keys, upserts, or checkpointing. For finer failure handling there's a Pod failure policy to treat some exit codes as terminal (fail fast on a bad config) and others as retryable (transient network), plus <code>activeDeadlineSeconds</code> as a hard timeout and <code>ttlSecondsAfterFinished</code> for cleanup.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A StatefulSet update is stuck: the top ordinal is in ImagePullBackOff and the others haven't updated. What's happening and what do you do?</summary>
+        <div class="a"><p>The default <code>OrderedReady</code> policy updates ordinals in reverse and won't move to the next until the current one is Running and Ready. The top ordinal can't become Ready because its image doesn't exist, so the whole rollout is frozen there — and that's by design, because for a stateful cluster you don't want the controller to keep taking members down while one is already broken. My first move is to confirm the real cause on the stuck Pod with <code>kubectl describe</code> — image typo, registry auth, resources, PVC not binding — rather than assume. If it's a bad image or config, I roll back with <code>kubectl rollout undo statefulset/...</code>, which is safe because the update never progressed past the top ordinal, so the lower members are untouched. If instead a single member is stuck for a node or storage reason, I'd delete that specific Pod so it's recreated cleanly, and only delete its PVC if I've confirmed the data is safe or replicated elsewhere — never blanket-delete StatefulSet PVCs. The contrast I'd draw with a Deployment: a Deployment stall leaves the old Pods fully serving, but a StatefulSet stall freezes the set with the top member down, so it's stricter and warrants canarying with the <code>partition</code> field and testing images before rollout.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>How does a DaemonSet decide how many Pods to run, and how do you make one run on control-plane nodes?</summary>
+        <div class="a"><p>A DaemonSet has no replica count — its desired state is "one Pod per node that matches its node selector and tolerations." The controller watches the node list, and the count is derived: two schedulable nodes means two Pods, add a node and a third Pod appears there automatically, remove a node and its Pod goes away. That's exactly what node agents need — log shippers, metrics exporters, the CNI and CSI node plugins — because they must be present wherever workloads run, including nodes that join later. To run on control-plane nodes, which carry a taint like <code>node-role.kubernetes.io/control-plane:NoSchedule</code>, the DaemonSet Pod needs a matching toleration; the CNI and kube-proxy DaemonSets tolerate essentially all taints because they have to run everywhere for the cluster to function at all. You can also narrow a DaemonSet to a subset of nodes with a <code>nodeSelector</code> or node affinity — say, only GPU nodes for a GPU device plugin. Because DaemonSet Pods land on every node, their resource requests multiply across the fleet, so sizing them is a real capacity concern.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>Three controllers relax the "Pods are interchangeable" assumption. A <b>StatefulSet</b> gives Pods stable ordinal identity (<code>db-0</code>, <code>db-1</code>), stable per-Pod storage via <code>volumeClaimTemplates</code>, and ordered create/delete/update; paired with a headless Service it produces per-Pod DNS so clustered software can find specific members. Scale-down keeps PVCs by default (orphaned-disk cost) and <code>OrderedReady</code> means one un-Ready ordinal freezes the whole rollout. A <b>DaemonSet</b> runs one Pod per matching node, derived from the node list, using tolerations to reach tainted nodes — the model for every node agent. A <b>Job</b> runs Pods until <code>completions</code> succeed, bounded by <code>parallelism</code> and <code>backoffLimit</code>, and must be idempotent because Pods can re-run. A <b>CronJob</b> creates Jobs on a schedule, and its <code>concurrencyPolicy</code> (Allow/Forbid/Replace) decides what happens when a run is due while the last is still going — the usual source of overlap and pileup. Set TTLs and history limits or dead Pods accumulate.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>StatefulSet Pods have stable ordinal names and keep their identity across restarts and reschedules.</li>
+      <li>A headless Service (<code>clusterIP: None</code>) gives each StatefulSet Pod a stable DNS name so peers can address specific members.</li>
+      <li><code>volumeClaimTemplates</code> gives each ordinal its own PVC that follows the Pod — stable storage, not shared.</li>
+      <li>Scaling a StatefulSet down keeps the PVCs by default; orphaned disks cost money until cleaned up or a retention policy reclaims them.</li>
+      <li><code>OrderedReady</code> creates/updates Pods one at a time in ordinal order, so a single un-Ready ordinal freezes the whole rollout.</li>
+      <li>A DaemonSet runs one Pod per matching node, derived from the node list, and needs tolerations to run on tainted/control-plane nodes.</li>
+      <li>A Job runs to completion: <code>completions</code> successes needed, <code>parallelism</code> at once, <code>backoffLimit</code> failures tolerated before Failed.</li>
+      <li>Job work must be idempotent — Pods can re-run on retry or node failure, so re-running must not double-process.</li>
+      <li>CronJob <code>concurrencyPolicy</code> Allow/Forbid/Replace controls overlap; use Forbid for anything touching shared state.</li>
+      <li>Set <code>ttlSecondsAfterFinished</code> and history limits, or finished Jobs and their Pods pile up in the namespace.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch33-workloads-i-pod-replicaset-deployment.html"><b>Ch 33</b> Workloads I</a>
+      <a href="ch36-scheduling-deep.html"><b>Ch 36</b> Taints &amp; tolerations</a>
+      <a href="ch38-storage-volumes-pv-pvc-storageclass-csi.html"><b>Ch 38</b> Storage: PV/PVC</a>
+      <a href="ch45-coredns-and-service-discovery.html"><b>Ch 45</b> DNS &amp; discovery</a>
+      <a href="ch86-the-data-layer-mysql-and-postgresql.html"><b>Ch 86</b> Databases</a>
+      <a href="ch98-project-distributed-job-and-queue-processing.html"><b>Ch 98</b> Jobs &amp; queues</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/">StatefulSets</a>: ordinals, stable identity, ordered lifecycle, <code>partition</code>.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/tasks/run-application/delete-stateful-set/">PVC retention</a> and the <a href="https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/#persistentvolumeclaim-retention">persistentVolumeClaimRetentionPolicy</a> section: what happens to disks on scale-down and delete.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/">DaemonSet</a>: one Pod per node, tolerations, update strategy.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/workloads/controllers/job/">Jobs</a>: <code>completions</code>, <code>parallelism</code>, <code>backoffLimit</code>, indexed jobs, Pod failure policy, TTL.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/">CronJob</a>: schedule syntax, <code>concurrencyPolicy</code>, <code>startingDeadlineSeconds</code>, time zones.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/services-networking/service/#headless-services">Headless Services</a>: how <code>clusterIP: None</code> produces per-Pod DNS.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch33-workloads-i-pod-replicaset-deployment.html"><span class="dir">← Prev</span><div class="ti">Ch 33 — Workloads I: Pod, ReplicaSet, Deployment</div></a>
+      <a class="nx" href="ch35-config-and-identity-configmap-secret-serviceaccount-namespace.html"><span class="dir">Next →</span><div class="ti">Ch 35 — Config and identity: ConfigMap, Secret, ServiceAccount, Namespace</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 34 of 121 · Part IV · Kubernetes — Architecture &amp; Internals. You can now run stateful, per-node, and batch workloads. Next: how workloads get their config and identity — ConfigMap, Secret, ServiceAccount, Namespace.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">StatefulSet architecture</a>
+    <a href="#identity">Identity, DS, Jobs</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">Following a StatefulSet</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

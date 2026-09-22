@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 53 — Route 53: DNS &amp; routing policies</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part VI · AWS &amp; EKS &nbsp;·&nbsp; Chapter 53</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part VI · AWS &amp; EKS for SREs · Chapter 53</div>
+      <h1>Route 53 — DNS and routing policies</h1>
+      <p class="tagline">DNS is the first thing every request does and the last thing anyone checks. Route 53 turns the phone book into a control plane — where a routing policy and a TTL quietly decide whether your failover takes 60 seconds or an hour.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~30 min read · AWS CLI / LocalStack</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain hosted zones, delegation, and the difference between an alias record and a CNAME — and why alias is the right answer at a zone apex.</li>
+          <li>Pick the right routing policy from the eight, and say what each one optimises for.</li>
+          <li>Wire up active-passive failover with health checks, and predict how long a real cutover takes.</li>
+          <li>Diagnose the two DNS incidents that catch everyone: a failover that "didn't work" and a cutover that was slow because of TTL.</li>
+          <li>Reason about where DNS routing ends and load-balancer routing begins.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem Route 53 solves</h2>
+    <p>Chapter 15 covered how a name becomes an IP. Here's the operational version of the problem. You have a service at <code>api.example.com</code>. It lives behind a load balancer in <code>us-east-1</code>. Three things you now need, and plain DNS gives you none of them.</p>
+    <p>You need <b>failover</b>: if the whole region goes dark, requests should flow to a standby in another region without you editing a zone file at 3am. You need <b>proximity</b>: a user in Frankfurt should hit your European endpoint, not bounce across the Atlantic. And you need <b>controlled rollout</b>: send 5% of traffic to a new stack and 95% to the old one, then dial it up. All three are routing decisions, and the natural place to make them is the moment a name is resolved — before a single packet reaches your infrastructure.</p>
+    <p>That's what <b>Amazon Route 53</b> is: an authoritative DNS service where each record can carry a <em>routing policy</em> and a <em>health check</em>. It answers the same question every DNS server answers — "what's the IP for this name?" — but the answer can depend on who's asking, where they are, whether the target is healthy, and how you've weighted things. DNS stops being a static lookup and becomes the outermost layer of your traffic control.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>Route 53 routing happens at <em>resolution time</em>, once per cache lifetime — not per request. That's its power and its limit. It can steer whole populations of clients toward a region or away from a dead one, but it can't see individual requests, and its decisions are frozen in resolver caches for as long as the TTL. Load balancers route per request; DNS routes per lookup. You need both.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a smart directory operator</h2>
+    <p>Old DNS is a printed phone book: one name, one fixed number, reprinted only when someone edits it. Route 53 is the operator who answers the directory line.</p>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>You call the operator and ask for "Example Corp support." A dumb operator reads one number off a card — that's <b>simple routing</b>. A good operator does better. They know you're calling from Germany, so they give you the Frankfurt line (<b>geolocation / latency</b>). They know the London office phone is off the hook because they just tried it (<b>health check</b>), so they give you the backup line instead (<b>failover</b>). During a trial of a new call centre, they send one in twenty callers there to test it (<b>weighted</b>).</p>
+      <p>But here's the catch that defines DNS: once the operator gives you a number, <b>you write it down and reuse it</b> for a while before calling the directory again. That sticky note is the resolver's cache, and how long you keep it is the <b>TTL</b>. Even if the operator learns the number changed one minute later, you keep dialing the old one until you throw the sticky note away. Every "my DNS change didn't take effect" story is really a story about sticky notes that haven't expired.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In Route 53</th></tr>
+      <tr><td>The directory the operator reads from</td><td>A hosted zone (the authoritative records for a domain)</td></tr>
+      <tr><td>Reading one number off a card</td><td>Simple routing policy</td></tr>
+      <tr><td>Giving the nearest office's line</td><td>Latency / geolocation / geoproximity routing</td></tr>
+      <tr><td>Trying the phone before handing out the number</td><td>Health check attached to a record</td></tr>
+      <tr><td>Handing out the backup line when the main is dead</td><td>Failover routing policy</td></tr>
+      <tr><td>The sticky note you reuse before calling again</td><td>The resolver cache, kept for the record's TTL</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>Hosted zones, records, and a failover decision</h2>
+    <p>A <b>hosted zone</b> is the container for all the records of one domain. Create a public hosted zone for <code>example.com</code> and Route 53 hands you four authoritative name servers (a delegation set); you paste those into your registrar so the internet knows Route 53 is the source of truth for the domain. A <b>private hosted zone</b> is the same idea but bound to one or more VPCs, so <code>internal.example.com</code> resolves only inside your network — split-horizon DNS.</p>
+    <p>Inside a zone you create <b>records</b>. The everyday types: <code>A</code> (name → IPv4), <code>AAAA</code> (name → IPv6), <code>CNAME</code> (name → another name), plus <code>MX</code>, <code>TXT</code>, <code>NS</code>, <code>SOA</code>. And Route 53 adds one that isn't in standard DNS at all: the <b>alias record</b>. Each record can be tagged with a routing policy, and — for many policies — a health check. The figure follows a failover query.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 800 402" role="img" aria-label="A resolver query reaching Route 53, which checks the primary endpoint's health and returns the primary IP when healthy or the secondary IP when not">
+        <defs>
+          <marker id="rr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--deep)"/></marker>
+          <marker id="rg" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+          <marker id="rm" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--muted)"/></marker>
+        </defs>
+        <!-- resolver -->
+        <rect x="12" y="158" width="140" height="80" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="82" y="188" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">recursive resolver</text>
+        <text x="82" y="208" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">query:</text>
+        <text x="82" y="224" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">api.example.com A?</text>
+        <line x1="152" y1="186" x2="192" y2="150" style="stroke:var(--deep);stroke-width:2" marker-end="url(#rr)"/>
+        <!-- return arrow -->
+        <line x1="192" y1="230" x2="154" y2="222" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#rg)"/>
+        <text x="176" y="270" text-anchor="middle" style="fill:var(--accent2);font:10.5px sans-serif">answer: 1.2.3.4</text>
+        <text x="176" y="285" text-anchor="middle" style="fill:var(--accent2);font:10.5px sans-serif">TTL 60s</text>
+        <!-- Route 53 -->
+        <rect x="196" y="40" width="270" height="300" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="210" y="62" style="fill:var(--accent);font:700 11.5px sans-serif;letter-spacing:.04em">ROUTE 53 · hosted zone example.com</text>
+        <rect x="216" y="80" width="232" height="60" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="332" y="104" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">failover policy · api.example.com</text>
+        <text x="332" y="124" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">is PRIMARY health check passing?</text>
+        <rect x="216" y="156" width="232" height="56" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="332" y="178" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">PRIMARY → 1.2.3.4</text>
+        <text x="332" y="196" text-anchor="middle" style="fill:var(--accent2);font:11px sans-serif">us-east-1 · healthy → returned</text>
+        <rect x="216" y="222" width="232" height="56" rx="8" style="fill:var(--panel);stroke:var(--line);stroke-dasharray:5 4"/>
+        <text x="332" y="244" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">SECONDARY → 5.6.7.8</text>
+        <text x="332" y="262" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">us-west-2 · standby (used if primary fails)</text>
+        <text x="332" y="306" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">record chosen at resolution time, then cached for TTL</text>
+        <!-- endpoints -->
+        <rect x="612" y="120" width="176" height="56" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="700" y="142" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">PRIMARY endpoint</text>
+        <text x="700" y="160" text-anchor="middle" style="fill:var(--accent2);font:11px sans-serif">ALB us-east-1 · UP</text>
+        <rect x="612" y="228" width="176" height="56" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="700" y="250" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">SECONDARY endpoint</text>
+        <text x="700" y="268" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">ALB us-west-2 · standby</text>
+        <!-- health checkers -->
+        <rect x="516" y="330" width="272" height="46" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="652" y="349" text-anchor="middle" style="fill:var(--muted);font:600 11px sans-serif">Route 53 health checkers (global)</text>
+        <text x="652" y="365" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">probe every 30s · feed the PASS/FAIL above</text>
+        <line x1="600" y1="345" x2="710" y2="180" style="stroke:var(--muted);stroke-width:1.3;stroke-dasharray:4 4" marker-end="url(#rm)"/>
+        <line x1="640" y1="330" x2="700" y2="286" style="stroke:var(--muted);stroke-width:1.3;stroke-dasharray:4 4" marker-end="url(#rm)"/>
+        <line x1="466" y1="184" x2="608" y2="148" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#rg)"/>
+      </svg>
+      <figcaption>Route 53 chooses a record when it answers the query. With failover, the primary is returned while its health check passes; the resolver then caches that answer for the TTL.</figcaption>
+    </figure>
+
+    <p>The <b>alias record</b> deserves its own paragraph because it's the one every AWS deployment uses and the one interviews probe. A <code>CNAME</code> can't exist at a zone apex — you cannot make <code>example.com</code> a CNAME, because the apex must also hold the zone's <code>SOA</code> and <code>NS</code> records, and DNS forbids a CNAME coexisting with other records at the same name. But you very much want <code>example.com</code> (not just <code>www</code>) to point at your ALB. Alias solves exactly this: it's a Route 53 extension that points a name at an AWS resource — an ALB/NLB, CloudFront, S3 website, API Gateway, or another record in the same zone — and resolves to that resource's current IPs at query time. It works at the apex, it follows the target's IP changes automatically, and Route 53 doesn't charge for alias queries to AWS resources. Use alias for anything pointing at an AWS endpoint; use CNAME only for pointing one external hostname at another.</p>
+
+    <h2 id="internals"><span class="beat">Internal working</span>The eight routing policies, and how failover really decides</h2>
+    <p>A routing policy is a property of a <em>record set</em> — several records can share a name and differ by policy. Here are the eight, each with the one thing it optimises for.</p>
+    <ol class="steps">
+      <li><b>Simple.</b> One record, one or more values, no health checks and no conditions. Route 53 returns the value(s) and the client picks. Use it when there's exactly one place to send traffic.</li>
+      <li><b>Weighted.</b> Several records for the same name, each with an integer weight; Route 53 returns them in proportion to weight. Weight 90/10 sends ~10% to the new stack — this is your canary and blue/green lever at the DNS layer. Weight 0 takes a record out without deleting it.</li>
+      <li><b>Latency.</b> Records tagged with AWS Regions; Route 53 returns the Region that gives the lowest network latency to the user's resolver, based on its own latency measurements. The point is speed, not geography — the fastest Region, which is usually but not always the nearest.</li>
+      <li><b>Failover.</b> Exactly two roles — primary and secondary — each usually with a health check. The primary is returned while healthy; when its health check fails, Route 53 returns the secondary. Classic active-passive DR.</li>
+      <li><b>Geolocation.</b> Route by where the user is — continent, country, or US state — with an optional default record for locations you didn't specify. Use it for compliance ("EU users must hit EU infrastructure") or content localisation, not for latency.</li>
+      <li><b>Geoproximity.</b> Route by the distance between user and resource, with a <em>bias</em> you can turn up or down to grow or shrink a resource's catchment area. Use it when you want to deliberately shift the boundary between two sites.</li>
+      <li><b>Multivalue answer.</b> Return up to eight healthy records chosen at random, each optionally health-checked. A lightweight way to spread load and drop dead endpoints at the DNS layer — but it is not a load balancer; it can't do per-request balancing or connection draining.</li>
+      <li><b>IP-based.</b> Route by the CIDR block the query comes from — you map client IP ranges to specific endpoints. Useful when you know your users' networks (an ISP, a corporate range) and want to pin them.</li>
+    </ol>
+
+    <p>Now the mechanism behind failover, because it's the one whose timing surprises people. Route 53 runs a fleet of <b>health checkers</b> distributed globally. For an endpoint check they hit your URL (HTTP/HTTPS/TCP) on an interval — standard is every 30s, fast is every 10s. An endpoint is considered unhealthy after a configurable number of consecutive failures (the <em>failure threshold</em>, default 3). A health check can also watch a CloudWatch alarm, or be a <em>calculated</em> check that combines child checks with AND/OR logic. A record with an associated health check is only eligible to be returned when its check is healthy — that's the wiring that makes failover, weighted, and multivalue "route around dead things."</p>
+
+    <details class="recall"><summary>Think first: with a standard 30s health check and a 3-failure threshold, how long from "primary dies" to "a new resolver gets the secondary"?</summary>
+      <div class="body">
+        <p>Two delays stack. First, <b>detection</b>: three consecutive failed checks at 30s each is up to ~90s before Route 53 marks the primary unhealthy and starts handing out the secondary. Second, <b>propagation to existing clients</b>: any resolver that already cached the primary answer keeps returning it until the record's <b>TTL</b> expires — so a 300s TTL means some users keep hitting the dead primary for up to five more minutes after Route 53 switched. Total worst case for a cached client ≈ detection + TTL. That's why DR records use short TTLs (60s) and often the fast 10s health-check interval: you're buying down both terms. Alias records to an ELB with "evaluate target health" get Route 53's own fast internal handling, which is why alias-to-ALB failover feels quicker than a raw A-record setup.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, and what each owns</h2>
+    <ul>
+      <li><b>Hosted zone.</b> The authoritative container of records for one domain. Public (internet) or private (VPC-scoped). Owns the delegation — the four NS records that make Route 53 authoritative.</li>
+      <li><b>Record set.</b> One or more records sharing a name and type, differentiated by routing policy. Owns the name→value mapping and the TTL.</li>
+      <li><b>Alias target.</b> A pointer to an AWS resource resolved at query time. Owns the "point at the apex / follow the resource's IPs / free queries" behaviour that CNAME can't give you.</li>
+      <li><b>Routing policy.</b> The rule for choosing which record(s) to return. Owns the traffic-steering logic — weight, region, geography, IP, health.</li>
+      <li><b>Health check.</b> A globally-run probe (endpoint, CloudWatch alarm, or calculated) that gates whether a record is eligible. Owns failure detection at the DNS layer.</li>
+      <li><b>TTL.</b> Seconds a resolver may cache the answer. Owns the trade-off between query volume and how fast a change reaches already-cached clients.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one failover from healthy to cut-over</h2>
+    <p>Steady state: <code>api.example.com</code> is a failover record. The primary (an alias to the <code>us-east-1</code> ALB) is healthy, so every resolution returns it, cached for 60s. Now <code>us-east-1</code> has a bad afternoon and the ALB stops answering. Route 53's health checkers see three failures in a row over ~90 seconds and mark the primary unhealthy. From that instant, every <em>new</em> resolution returns the secondary — the <code>us-west-2</code> alias. Clients whose resolvers still hold the cached primary keep hitting the dead region until their 60s TTL lapses, then re-query and get the secondary. Within about detection (90s) plus TTL (60s) — call it two to three minutes — traffic has drained to the standby, no zone file edited, no human paged into a console. When <code>us-east-1</code> recovers and the primary's check passes again, resolutions flow back. That whole loop is what "multi-region failover" means in practice, and its speed is set entirely by the two numbers you chose: health-check interval and TTL.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>These use the Route 53 API via the AWS CLI. A public hosted zone costs $0.50/month plus per-query charges, so where you want zero spend, each lab notes a <b>no-cost local alternative</b> — LocalStack emulates the Route 53 API, and <code>dig</code> against it (or a diagram walkthrough) shows the same behaviour. Set up once:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>export AWS_REGION=us-east-1
+aws route53 list-hosted-zones --query 'HostedZones[].{name:Name,id:Id}'
+
+<span class="c"># No-cost local alt: LocalStack speaks the Route 53 API.</span>
+<span class="c"># docker run --rm -d -p 4566:4566 localstack/localstack</span>
+<span class="c"># add --endpoint-url http://localhost:4566 to the aws route53 commands,</span>
+<span class="c"># and query it with: dig @localhost -p 4566 api.example.com</span></code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — a hosted zone and a simple record</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Create a zone and one A record. Watch the delegation set Route 53 hands back — those NS records are what you'd give your registrar.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>aws route53 create-hosted-zone --name example.com \
+  --caller-reference "$(date +%s)" --query 'DelegationSet.NameServers'
+
+<span class="c"># Add a simple A record via a change batch (Route 53's edit unit).</span>
+aws route53 change-resource-record-sets --hosted-zone-id $ZONE_ID --change-batch '{
+  "Changes": [{ "Action": "UPSERT", "ResourceRecordSet": {
+    "Name": "api.example.com", "Type": "A", "TTL": 60,
+    "ResourceRecords": [{ "Value": "1.2.3.4" }] } }] }'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>[
+  "ns-2048.awsdns-64.com",
+  "ns-2049.awsdns-65.net",
+  "ns-2050.awsdns-66.org",
+  "ns-2051.awsdns-67.co.uk"
+]</code></div>
+        <p>Four name servers across four different TLDs (<code>.com/.net/.org/.co.uk</code>) — deliberate, so a single TLD outage can't make your whole domain unresolvable. Everything you do to records is an <code>UPSERT</code>/<code>DELETE</code> inside a <em>change batch</em>; Route 53 applies it atomically and then propagates to all four name servers. Note the TTL of 60 — you're already deciding how sticky those sticky notes will be.</p>
+        <p class="small"><b>No-cost local alt:</b> run both commands against LocalStack with <code>--endpoint-url</code>, then <code>dig @localhost -p 4566 api.example.com</code> to see the record you just wrote — no registrar, no monthly fee.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — a weighted split for a canary</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Send 10% of traffic to a new stack. Two records, same name, different weights and set identifiers.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>aws route53 change-resource-record-sets --hosted-zone-id $ZONE_ID --change-batch '{
+  "Changes": [
+    { "Action": "UPSERT", "ResourceRecordSet": {
+      "Name": "api.example.com", "Type": "A", "TTL": 60,
+      "SetIdentifier": "stable", "Weight": 90,
+      "ResourceRecords": [{ "Value": "1.2.3.4" }] } },
+    { "Action": "UPSERT", "ResourceRecordSet": {
+      "Name": "api.example.com", "Type": "A", "TTL": 60,
+      "SetIdentifier": "canary", "Weight": 10,
+      "ResourceRecords": [{ "Value": "5.6.7.8" }] } } ] }'
+
+<span class="c"># Resolve it many times and count which IP comes back.</span>
+for i in $(seq 1 50); do dig +short api.example.com; done | sort | uniq -c</code></pre></div>
+        <div class="out"><span class="ol">Output</span>     44 1.2.3.4
+      6 5.6.7.8</code></div>
+        <p>Roughly 90/10, as weighted — the split is statistical, not exact, and per-resolution. Two things to internalise: the weights are relative integers (90/10 behaves the same as 9/1), and <code>SetIdentifier</code> is what lets two records share a name. To roll forward you raise the canary weight; to abort you set it to 0, which stops new traffic immediately for anyone re-resolving — but again, only after their cached TTL expires. This is genuinely how a lot of production canaries are steered.</p>
+        <p class="small"><b>No-cost local alt:</b> same change-batch against LocalStack, then loop <code>dig @localhost -p 4566 +short api.example.com</code>. Or reason it on the diagram: each resolution is a weighted coin flip, so over many lookups the ratio converges to the weights.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — failover that doesn't fail over</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Set up primary/secondary failover, then kill the primary and watch what clients get. Here's a version that's subtly misconfigured on purpose.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Primary + secondary records, but note: only ONE has a health check attached.</span>
+aws route53 change-resource-record-sets --hosted-zone-id $ZONE_ID --change-batch '{
+  "Changes": [
+    { "Action": "UPSERT", "ResourceRecordSet": {
+      "Name": "api.example.com", "Type": "A", "TTL": 60, "SetIdentifier": "primary",
+      "Failover": "PRIMARY",
+      "ResourceRecords": [{ "Value": "1.2.3.4" }] } },
+    { "Action": "UPSERT", "ResourceRecordSet": {
+      "Name": "api.example.com", "Type": "A", "TTL": 60, "SetIdentifier": "secondary",
+      "Failover": "SECONDARY",
+      "ResourceRecords": [{ "Value": "5.6.7.8" }] } } ] }'
+
+<span class="c"># Primary endpoint is now dead. Resolve repeatedly.</span>
+dig +short api.example.com</code></pre></div>
+        <div class="out"><span class="ol">Output</span>1.2.3.4        <span class="c"># still the (dead) primary — failover never happened</span></code></div>
+        <p>The primary is down but Route 53 keeps returning it. Before reading on: the change batch above compiles and looks complete. What's missing that makes failover a no-op?</p>
+        <details class="recall"><summary>Reveal the cause</summary>
+          <div class="body">
+            <p>There's <b>no health check ID on the primary record</b>. Failover routing only fails over when the primary's associated health check reports unhealthy. With no health check attached, Route 53 has no signal that the primary is dead, so it treats it as always healthy and never promotes the secondary. The record set is syntactically valid — that's what makes this bite in production.</p>
+            <p>The fix: create a health check and attach its ID to the primary with <code>"HealthCheckId": "..."</code>. A common variant of the same bug is attaching the check but pointing it at an endpoint that's <em>always</em> up (a static health page on a different host than the real service), so the check passes while the actual service is down. The health check must probe the thing whose failure you care about.</p>
+          </div>
+        </details>
+        <p class="small"><b>No-cost local alt:</b> trace it on the failover diagram — remove the health-checker arrow into the primary, and the "PASS?" box has no input, so it defaults to returning the primary forever.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — the change that "didn't take effect"</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>You updated <code>api.example.com</code> from <code>1.2.3.4</code> to <code>9.9.9.9</code> twenty minutes ago. Route 53 confirms the new value. But half your users are still hitting the old IP, and it's not consistent. Investigate.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># What does Route 53 itself say now? Ask an authoritative NS directly.</span>
+dig @ns-2048.awsdns-64.com api.example.com +noall +answer
+
+<span class="c"># What does a public resolver still have cached, and for how long?</span>
+dig @8.8.8.8 api.example.com +noall +answer</code></pre></div>
+        <div class="out"><span class="ol">Output</span>api.example.com.  3600  IN  A  9.9.9.9     <span class="c"># authoritative: new value, TTL 3600</span>
+api.example.com.  2280  IN  A  1.2.3.4     <span class="c"># resolver: OLD value, 2280s left to live</span></code></pre></div>
+        <p>The authoritative answer is correct; a public resolver is still serving the old IP with 38 minutes left on its cache. Why, and what would you have done differently before the change?</p>
+        <details class="recall"><summary>Reveal the cause and the prevention</summary>
+          <div class="body">
+            <p>The record's <b>TTL is 3600 seconds</b> — one hour. When you made the change, every resolver that had already cached the old value keeps serving it until its individual countdown reaches zero, up to a full hour, and different resolvers cached at different times, which is why it looks random. Route 53 did its job instantly; DNS caching downstream is doing exactly what TTL tells it to.</p>
+            <p>The prevention is a rule for any planned cutover: <b>lower the TTL well in advance</b>. If the record normally runs at 3600s, drop it to 60s at least an hour (one old-TTL) before the change, so caches expire down to 60s. Make the change; now stragglers clear within a minute. Once you're confident, raise the TTL back up to cut query volume. You cannot shorten a TTL retroactively — the value that matters is the one clients cached, not the one live now. This is the single most common "DNS is broken" ticket, and it's never broken; it's TTL working as designed.</p>
+          </div>
+        </details>
+        <p class="small"><b>No-cost local alt:</b> reproduce locally — write a record with TTL 3600 in LocalStack, <code>dig</code> it through a caching resolver, change the value, and watch the cache keep the old answer until the TTL elapses. The mechanism is identical to production.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — multi-region latency + failover together</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>The design ask: users worldwide should hit their lowest-latency region (us-east-1, eu-west-1, ap-southeast-1), and if a region dies, its users should spill to the next-best region — not just get an error. The senior question: how do you compose Route 53 features to get <em>both</em> latency routing and failover, and where does this break?</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Sketch: latency records, EACH gated by a health check for its region.</span>
+aws route53 list-health-checks --query 'HealthChecks[].{id:Id,url:HealthCheckConfig.FullyQualifiedDomainName}'
+<span class="c"># Each region's alias record: Type=A, alias to that region's ALB,</span>
+<span class="c"># Region set for latency routing, HealthCheckId set for that region.</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>[
+  { "id": "hc-use1", "url": "api-use1.example.com" },
+  { "id": "hc-euw1", "url": "api-euw1.example.com" },
+  { "id": "hc-apse1", "url": "api-apse1.example.com" }
+]</code></div>
+        <p>Work out the composition and its failure mode before opening the answer.</p>
+        <details class="recall"><summary>Reveal the design and the gotcha</summary>
+          <div class="body">
+            <p><b>Compose latency routing with per-record health checks.</b> Create one latency record per region, each an alias to that region's ALB, each tagged with its Region and attached to a health check that probes that region's endpoint. Route 53 first filters to <em>healthy</em> records, then among those picks the lowest-latency one for the caller. So a Frankfurt user normally gets eu-west-1; if eu-west-1's health check fails, that record drops out of the candidate set and Route 53 returns the next-lowest-latency <em>healthy</em> region — us-east-1, say. You get proximity and automatic spillover from the same record set, no explicit primary/secondary needed.</p>
+            <p><b>The gotcha</b> is capacity, and it's the one that turns a regional outage into a global one. When a region fails, all its traffic lands on the surviving regions <em>at once</em>. If those regions were each running near capacity, the spillover overloads them and you cascade — the classic failover-induced outage. So the design isn't done until each region can absorb its neighbours' load (or you cap it), and until you've considered that DNS TTL means the shift isn't instantaneous. Latency + health-checked records is the easy part; provisioning for the failed-over state is the engineering.</p>
+          </div>
+        </details>
+        <p class="small"><b>No-cost local alt:</b> this is a design lab — draw three regional records, mark one unhealthy, and trace how the candidate set shrinks and where the load lands. No API needed to find the capacity trap.</p>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · failover didn't fire</div>
+      <p><b>Symptom:</b> the primary region is clearly down but clients still get its dead IP. <b>First cut:</b> does the primary record have a health check attached, and is that check actually failing? <code>aws route53 get-health-check-status</code>. <b>Cause is usually:</b> no health check on the primary, or a check pointed at an always-up endpoint that isn't the real service, so Route 53 believes the primary is healthy.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · slow cutover</div>
+      <p><b>Symptom:</b> you changed a record or failover fired, but a chunk of traffic keeps hitting the old target for many minutes. <b>First cut:</b> <code>dig</code> the record's TTL and compare authoritative vs a public resolver's cached answer. <b>Cause is usually:</b> a high TTL (300s+) freezing the old answer in caches. Fix forward by waiting out the TTL; fix for next time by lowering TTL before planned changes.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · geolocation gaps</div>
+      <p><b>Symptom:</b> some users get <code>SERVFAIL</code> or no answer under a geolocation policy. <b>First cut:</b> is there a <em>default</em> geolocation record? <b>Cause is usually:</b> a location with no matching record and no default, so Route 53 has nothing to return. Geolocation always needs a default record to catch the locations you didn't enumerate.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Security.</b> Protect the zone the way you protect a root credential — whoever can edit records can redirect your whole domain, including intercepting email by rewriting <code>MX</code>. Scope IAM tightly to specific hosted zones. Turn on <b>DNSSEC signing</b> for zones where response forgery is a real threat, so resolvers can verify answers weren't tampered with. Watch for <b>dangling records</b>: an alias or CNAME pointing at a deleted resource (an ALB you tore down, an S3 bucket you released) can be claimed by someone else — subdomain takeover. Audit records whose targets no longer exist.</p>
+    <p><b>Performance and cost.</b> TTL is your main dial. Short TTLs (60s) give fast changes and failover but multiply query volume and cost, since Route 53 bills per million queries; long TTLs cut cost and load but slow every change. Alias queries to AWS resources are free, which is another reason to prefer alias over a chain of CNAMEs. For failover speed, pair short TTLs with the fast 10s health-check interval and accept the higher check cost. Private hosted zones keep internal names off the public internet and resolve only inside your VPCs — use them for service-internal DNS rather than baking IPs into config.</p>
+    <p><b>Common mistakes:</b> trying to CNAME a zone apex (use alias); forgetting the geolocation default record; setting a DR TTL to the same 3600s used for static records, then being shocked that failover takes an hour to reach cached clients; and treating multivalue-answer routing as a load balancer — it drops dead endpoints but does no real balancing, so don't put it in front of something that needs connection-level fairness.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>Route 53 is the outermost ring of every multi-region design. When an interviewer asks you to "make it globally available," the answer starts here: latency or geolocation records to send users to their nearest healthy region, health-checked failover to survive a regional outage, and weighted records to shift traffic during migrations and canaries. It's the layer above the load balancer from <a href="ch52-load-balancing-alb-nlb-target-groups-health.html">Chapter 52</a> — DNS picks the region and the LB picks the instance — and it rests on the DNS fundamentals of <a href="ch15-dns-end-to-end.html">Chapter 15</a>: caching, TTL, authoritative vs recursive. The failover timing math (detection interval + TTL) is a direct input to your recovery-time objective in <a href="ch90-disaster-recovery.html">Chapter 90</a>, and the capacity trap in Lab 5 — that failover concentrates load on survivors — is one of the most important non-obvious lessons in reliability engineering (<a href="ch88-reliability-engineering.html">Chapter 88</a>).</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>Alias record or CNAME — what's the difference and when do you use each?</summary>
+        <div class="a"><p>A CNAME points one name at another name and can't live at a zone apex, because the apex already holds SOA and NS records and DNS forbids a CNAME alongside them. An alias is a Route 53 extension that points a name directly at an AWS resource — an ALB, CloudFront, S3, API Gateway — or another record in the same zone; it works at the apex, resolves to the resource's current IPs at query time, follows IP changes automatically, and Route 53 doesn't charge for alias queries to AWS resources. So: alias for anything pointing at an AWS endpoint (including <code>example.com</code> itself), CNAME only for pointing an external hostname at another external hostname.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Run through the routing policies and when you'd reach for each.</summary>
+        <div class="a"><p>Simple: one destination, no conditions. Weighted: split by integer weights — canaries, blue/green, gradual migration; weight 0 parks a record. Latency: send users to the AWS Region with the lowest measured latency — optimises speed. Failover: active-passive with a health check on the primary — regional DR. Geolocation: route by the user's continent/country/state — for compliance or localisation, and it needs a default record. Geoproximity: route by distance with an adjustable bias to shift the boundary between sites. Multivalue answer: return up to eight healthy records at random — light load-spreading with health checks, but not a real load balancer. IP-based: route by the client's source CIDR when you know their networks. The two I use most are weighted for rollouts and failover (or latency composed with health checks) for resilience. The thing tying them together is that most policies can gate records on health checks, which is how DNS routes around dead endpoints.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>A region dies. Walk me through exactly how long until traffic moves, and why.</summary>
+        <div class="a"><p>Two independent delays add up. First, detection: Route 53's health checkers must see enough consecutive failures. At the standard 30s interval and a 3-failure threshold that's up to ~90 seconds before the record is marked unhealthy and dropped from the candidate set. With the 10s fast interval it's ~30s. Second, cache propagation: any resolver that already answered from cache keeps serving the old target until that record's TTL expires — so a 60s TTL adds up to 60s for cached clients, a 300s TTL up to five minutes. Worst case for an already-cached client is detection plus TTL. New clients with cold caches get the healthy target as soon as detection completes. That's why DR records pair a short TTL with the fast health-check interval — you're minimising both terms. And the subtle point: alias records to an ELB with "evaluate target health" let Route 53 react on its own fast internal signal rather than only the external health checker, so alias-to-ALB failover is typically quicker than an equivalent raw A-record setup.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>You lowered a record's TTL and made a change, but users still hit the old IP. Why?</summary>
+        <div class="a"><p>Because lowering a TTL only affects answers handed out <em>after</em> the change — it can't reach into caches that already hold the old value at the old, longer TTL. If the record was at 3600s and you dropped it to 60s and immediately changed the value, resolvers that cached during that last hour still hold the old IP for up to an hour. The correct sequence is: lower the TTL first, wait at least one <em>old</em> TTL for caches to expire down to the new short value, and only then change the record — now stragglers clear in 60s. I'd confirm the situation by digging the authoritative name server (shows the new value) versus a public resolver (shows the stale value and its remaining TTL). Nothing is broken; it's TTL doing exactly what it promises.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>Where does DNS routing stop and load-balancer routing begin?</summary>
+        <div class="a"><p>DNS routes per resolution and per cache lifetime — coarse, population-level, and frozen for the TTL. It's great for choosing a region or steering whole cohorts, but it can't see individual requests, can't rebalance mid-connection, and can't drain a specific backend gracefully. A load balancer routes per request, sees health in real time, does connection draining and per-request algorithms like least-outstanding-requests. So the layered answer to "make it global and resilient": Route 53 picks the healthy, nearest region; the regional ALB or NLB picks the healthy instance or pod within it. Trying to do fine-grained balancing at the DNS layer — say, multivalue answer as a load balancer — fails because of caching and the lack of per-request visibility. Use each layer for what it's actually good at.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>Route 53 is authoritative DNS where each record carries a routing policy and, usually, a health check, so name resolution becomes traffic control. A hosted zone holds a domain's records and its four-name-server delegation; private zones scope names to VPCs. Alias records are the Route 53 extension you use for AWS endpoints — they work at the apex, follow the target's IPs, and are free to query, unlike a CNAME. The eight policies: simple, weighted (canary/blue-green), latency (fastest region), failover (active-passive DR), geolocation (by user location, needs a default), geoproximity (distance with bias), multivalue answer (up to eight healthy records, not a load balancer), and IP-based (by client CIDR). Health checks — endpoint, CloudWatch alarm, or calculated — gate whether a record is returned, and that's what makes failover work. The two numbers that decide everything: the health-check interval (detection) and the TTL (how long cached clients keep the old answer). Failover time ≈ detection + TTL. Most "DNS didn't work" incidents are a missing health check or a high TTL, never a Route 53 bug.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>Route 53 chooses a record at resolution time, once per cache lifetime — it steers populations, not individual requests.</li>
+      <li>A hosted zone is a domain's authoritative records plus its 4-name-server delegation; private zones are VPC-scoped.</li>
+      <li>Alias &gt; CNAME for AWS endpoints: works at the apex, follows the target's IPs, and is free to query. CNAME can't live at a zone apex.</li>
+      <li>The eight policies: simple, weighted, latency, failover, geolocation, geoproximity, multivalue answer, IP-based.</li>
+      <li>Weighted routing (integer weights, weight 0 = off) is your DNS-layer canary and blue/green lever.</li>
+      <li>Failover only fails over if the primary has a health check that actually probes the real service.</li>
+      <li>Failover time ≈ detection (interval × failure threshold) + TTL (how long cached clients keep the old answer).</li>
+      <li>Lower TTL <em>before</em> a planned change; you can't shorten a TTL clients already cached.</li>
+      <li>Geolocation needs a default record, or unmatched locations get no answer.</li>
+      <li>Multivalue answer drops dead endpoints but is not a load balancer — no per-request balancing or draining.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch15-dns-end-to-end.html"><b>Ch 15</b> DNS end to end</a>
+      <a href="ch52-load-balancing-alb-nlb-target-groups-health.html"><b>Ch 52</b> Load balancing</a>
+      <a href="ch49-the-aws-mental-model-regions-azs-failure.html"><b>Ch 49</b> Regions &amp; AZs</a>
+      <a href="ch88-reliability-engineering.html"><b>Ch 88</b> Reliability engineering</a>
+      <a href="ch90-disaster-recovery.html"><b>Ch 90</b> Disaster recovery</a>
+      <a href="ch102-project-highly-available-multi-region-saas.html"><b>Ch 102</b> Multi-region SaaS</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/routing-policy.html">Choosing a routing policy</a>: the authoritative description of all eight policies.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/hosted-zones-working-with.html">Working with hosted zones</a> and <a href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/ResourceRecordTypes.html">Supported DNS record types</a>.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resource-record-sets-choosing-alias-non-alias.html">Choosing between alias and non-alias records</a>: apex behaviour, free queries, IP-following.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/dns-failover.html">Configuring DNS failover</a> and <a href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/health-checks-types.html">How health checks work</a>: intervals, thresholds, calculated checks.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/dns-configuring-dnssec.html">Configuring DNSSEC signing</a>: verifying answers weren't forged.</li>
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc1034">RFC 1034</a> and <a href="https://www.rfc-editor.org/rfc/rfc1035">RFC 1035</a>: the DNS specification that TTL, caching, and record types come from.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch52-load-balancing-alb-nlb-target-groups-health.html"><span class="dir">← Prev</span><div class="ti">Ch 52 — Load balancing: ALB, NLB, target groups, health</div></a>
+      <a class="nx" href="ch54-iam-and-sts.html"><span class="dir">Next →</span><div class="ti">Ch 54 — IAM and STS</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 53 of 121 · Part VI · AWS &amp; EKS for SREs. Names now resolve to the right place, healthy and near. Next we answer the other gatekeeper's question: are you allowed to do that?
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Zones, records, failover</a>
+    <a href="#internals">The eight policies</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">One failover, end to end</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

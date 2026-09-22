@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 98 — Project: Distributed Job &amp; Queue Processing</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part X · System Design &nbsp;·&nbsp; Chapter 98</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part X · System Design · Chapter 98</div>
+      <h1>Project — distributed job and queue processing</h1>
+      <p class="tagline">A queue looks like it solves overload. Mostly it just moves the overload somewhere quieter and lets it build up out of sight — until a worker sees the same message twice, or never finishes it at all.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~45 min read · kind + Redis + Python lab</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain why almost every real queue gives you at-least-once delivery, never exactly-once, and design workers accordingly.</li>
+          <li>Write an idempotent worker that survives duplicate delivery and a crash mid-job without corrupting state.</li>
+          <li>Explain backpressure in concrete terms: what breaks when producers outrun consumers, and how you bound the damage.</li>
+          <li>Configure a dead-letter queue correctly, and explain why a poison message is a different problem than a slow dependency.</li>
+          <li>Build a real queue and worker pool on <code>kind</code>, then break it on purpose: duplicate delivery, a poison message, and a backlog you can't drain.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem a queue actually solves</h2>
+    <p>Say you're building order checkout. The customer clicks "pay," and behind that click you need to charge a card, write an order record, decrement inventory, email a receipt, and kick off a fulfillment workflow. If you do all of that inside the HTTP request, two things go wrong immediately. First, the customer stares at a spinner for however long the slowest step takes — and email delivery, of all things, is often the slowest. Second, if your server crashes after the charge succeeds but before the email sends, you've silently dropped work with no record that it needs redoing.</p>
+    <p>A queue fixes the coupling problem: the request handler does the one thing that must happen synchronously (charge the card, write the order), then drops a message — "process order 10432" — onto a queue and returns to the customer immediately. Some other process, a worker, picks that message up and does the rest on its own time. The customer isn't waiting on your email provider anymore.</p>
+    <p>That's the pitch. Here's what the pitch leaves out. The queue has to store messages somewhere until a worker is free — so what happens when workers fall behind and messages pile up faster than anyone can drain them? The queue has to guarantee a message survives a worker crashing mid-job — so what happens when it hands the same message to two different workers because it can't tell the difference between "still working on it" and "died and never will"? And the queue has to do something with a message that's fundamentally impossible to process — a malformed order, a card number that will never charge — so what stops that one bad message from being retried forever, burning capacity that healthy messages needed?</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>A queue doesn't remove work. It changes <em>when</em> the work happens and <em>who</em> is accountable for it if it fails partway through. Every guarantee people casually assume — "the message gets processed," "it only happens once," "a bad message gets flagged" — is something you have to build, not something you get for free by adding a queue.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a kitchen order rail</h2>
+    <p>Picture a busy restaurant kitchen with a metal rail by the pass, the kind you've seen in any open kitchen. Waiters clip paper order tickets onto the rail. Cooks pull tickets off, cook the dish, and — this is the part people miss — the ticket doesn't come off the rail the moment a cook grabs it. It moves to a "working" clip. Only when the dish is actually plated and sent out does the cook tear the ticket down for good.</p>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>If a cook grabs a ticket, gets distracted, and walks off the line for ten minutes, the expediter notices that ticket has been sitting in "working" too long with no plate coming out, and hands it to a different cook. That's the entire trick behind reliable queues: a message doesn't vanish when someone <em>picks it up</em>, only when someone <em>finishes it</em> and says so explicitly. Everything else — duplicate cooking, a burnt dish getting sent back twice, an order so garbled the kitchen can't even read it — falls out of that one rule.</p>
+      <p>Now suppose the same ticket somehow gets pulled by two cooks at once, because the first cook was slower than the expediter expected. Both plate the dish. The table gets two identical meals. Nobody's happy, but nobody died — the fix is that the waiter checks "did I already deliver this?" before setting a plate down. That check is exactly what an idempotent worker does with a duplicate message.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In a real job queue</th></tr>
+      <tr><td>A ticket clipped to the rail</td><td>A message in the queue, in the "ready" state</td></tr>
+      <tr><td>A cook pulling a ticket to "working"</td><td>A worker receiving the message — it becomes invisible to other workers for a visibility timeout</td></tr>
+      <tr><td>Tearing the ticket down after plating</td><td>The worker sending an explicit acknowledgment (ack/delete) after successful processing</td></tr>
+      <tr><td>The expediter re-clipping a ticket that sat too long in "working"</td><td>The broker making the message visible again after the visibility timeout expires — a redelivery</td></tr>
+      <tr><td>The waiter double-checking before setting down a second plate</td><td>An idempotency check the worker does before applying side effects</td></tr>
+      <tr><td>A torn, illegible ticket sent to the manager's board instead of retried forever</td><td>A poison message routed to a dead-letter queue after too many failed attempts</td></tr>
+      <tr><td>The line getting backed up faster than any cook can plate</td><td>Backpressure — the queue's depth or age growing because arrival rate exceeds processing rate</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>Producer, broker, workers, and the dead-letter path</h2>
+    <p>Four pieces exist in every job queue, no matter which product implements them (SQS, RabbitMQ, Kafka consumer groups, Redis Streams — all of these below). A <b>producer</b> publishes a message. A <b>broker</b> stores it durably and tracks its state (ready, in-flight, done). A pool of <b>workers</b> pulls messages, does the work, and reports back. And a <b>dead-letter path</b> catches messages that fail too many times to keep retrying.</p>
+    <p>The detail that decides whether your system is correct or quietly broken is what the broker does between "a worker received this" and "a worker finished this." That gap is where duplicates, redeliveries, and stuck messages all live.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 430" role="img" aria-label="Producer publishes to a queue; workers pull messages; success acks and deletes; failure or timeout redelivers; too many failures routes to a dead-letter queue">
+        <rect x="20" y="30" width="130" height="60" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="85" y="56" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">Producer</text>
+        <text x="85" y="74" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">API handler</text>
+
+        <rect x="230" y="14" width="260" height="150" rx="10" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="246" y="34" style="fill:var(--accent);font:700 11.5px sans-serif;letter-spacing:.05em">QUEUE (BROKER)</text>
+        <rect x="246" y="46" width="108" height="98" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="300" y="90" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">ready</text>
+        <text x="300" y="106" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">waiting to be pulled</text>
+        <rect x="366" y="46" width="108" height="98" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="420" y="84" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">in-flight</text>
+        <text x="420" y="100" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">visibility</text>
+        <text x="420" y="114" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">timeout running</text>
+
+        <rect x="40" y="230" width="140" height="58" rx="9" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="110" y="264" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">Worker 1</text>
+        <rect x="290" y="230" width="140" height="58" rx="9" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="360" y="264" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">Worker 2</text>
+        <rect x="540" y="230" width="140" height="58" rx="9" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="610" y="264" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">Worker 3</text>
+
+        <rect x="530" y="336" width="160" height="66" rx="10" style="fill:var(--chip);stroke:var(--deep);stroke-width:1.5"/>
+        <text x="610" y="364" text-anchor="middle" style="fill:var(--deep);font:700 12.5px sans-serif">Dead-letter queue</text>
+        <text x="610" y="382" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">attempts &gt; max</text>
+
+        <defs>
+          <marker id="q1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--deep)"/></marker>
+          <marker id="q2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+          <marker id="q3" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--applied)"/></marker>
+        </defs>
+
+        <line x1="150" y1="60" x2="228" y2="60" style="stroke:var(--deep);stroke-width:2" marker-end="url(#q1)"/>
+        <text x="188" y="50" text-anchor="middle" style="fill:var(--deep);font:600 10.5px sans-serif">publish</text>
+
+        <line x1="300" y1="144" x2="180" y2="228" style="stroke:var(--deep);stroke-width:1.6" marker-end="url(#q1)"/>
+        <line x1="360" y1="164" x2="360" y2="228" style="stroke:var(--deep);stroke-width:1.6" marker-end="url(#q1)"/>
+        <line x1="420" y1="144" x2="560" y2="228" style="stroke:var(--deep);stroke-width:1.6" marker-end="url(#q1)"/>
+        <text x="480" y="190" style="fill:var(--deep);font:600 10.5px sans-serif">deliver, attempts++</text>
+
+        <line x1="180" y1="230" x2="380" y2="150" style="stroke:var(--accent2);stroke-width:1.6;stroke-dasharray:5 4" marker-end="url(#q2)"/>
+        <text x="205" y="205" style="fill:var(--accent2);font:600 10.5px sans-serif">ack → deleted</text>
+
+        <path d="M 610 230 C 610 180 490 150 500 144" style="fill:none;stroke:var(--applied);stroke-width:1.6;stroke-dasharray:3 3" marker-end="url(#q3)"/>
+        <text x="560" y="205" style="fill:var(--applied);font:600 10.5px sans-serif">timeout, no ack → redeliver</text>
+
+        <line x1="450" y1="150" x2="560" y2="338" style="stroke:var(--deep);stroke-width:1.8" marker-end="url(#q1)"/>
+        <text x="500" y="300" style="fill:var(--deep);font:600 10.5px sans-serif">poison</text>
+      </svg>
+      <figcaption>The gap between "delivered" and "acked" is where duplicates and redeliveries come from. Everything in this chapter lives in that gap.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>Almost every managed queue you'll touch in a real job — SQS, RabbitMQ, Kafka with consumer groups, Redis Streams with consumer groups — makes the same promise: <b>at-least-once delivery</b>. None of them promise exactly-once at the message layer, because guaranteeing that would mean coordinating the broker and every worker's side effects transactionally, which nobody does at scale. The moment you accept at-least-once, the correctness of your whole system moves from "does the queue work" to "did I make my worker idempotent." That's the single fact this entire chapter hangs off.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>What actually happens from publish to delete</h2>
+    <p>Here's the lifecycle of one message, the mechanics underneath the kitchen-rail analogy:</p>
+    <ol class="steps">
+      <li><b>Producer publishes.</b> The message is written durably to the broker (replicated to disk, or at minimum to another node) and the producer gets an acknowledgment that it's stored. This write should be fast — it's on the customer's critical path.</li>
+      <li><b>Message sits ready.</b> It's visible to any worker that asks for work. Nothing has claimed it yet.</li>
+      <li><b>A worker receives it.</b> The broker doesn't delete the message here — it marks it invisible to other workers for a <b>visibility timeout</b> (SQS's term; Redis Streams calls the equivalent structure the Pending Entries List, or PEL) and increments a delivery/attempt counter.</li>
+      <li><b>The worker does the actual work</b> — call the payment API, write a row, whatever the job is.</li>
+      <li><b>On success, the worker acks.</b> This is an explicit call — <code>DeleteMessage</code> in SQS, <code>XACK</code> in Redis Streams, a manual ack in RabbitMQ. Only now is the message gone for good.</li>
+      <li><b>On failure or silence, the message comes back.</b> If the worker crashes, hangs, or explicitly says "I couldn't do this," no ack arrives. Once the visibility timeout expires, the broker makes the message ready again — to any worker, possibly the same one, possibly a different one. This is exactly where duplicate processing comes from: the first worker might still be alive and about to finish, unaware a second worker just picked up the same message.</li>
+      <li><b>Too many attempts routes to the DLQ.</b> Once the delivery counter passes a configured maximum, the broker moves the message to a dead-letter queue instead of redelivering it again. The main queue stops wasting worker time on something that keeps failing.</li>
+    </ol>
+    <p>Notice what's missing from that list: nothing in the broker knows or cares <em>why</em> a message failed. A worker that's slow because a downstream API is having a bad day, and a worker that's slow because it's processing a message that will never succeed, look identical to the broker. Telling those two apart is your job, not the queue's — that's what labs 3 and 4 are about.</p>
+
+    <details class="recall"><summary>Think first: a worker picks up a message, starts a database write, and the process is killed by the node's OOM killer halfway through. What does the queue do, and what state is your database in?</summary>
+      <div class="body">
+        <p>The queue does nothing special — it just doesn't get an ack, so once the visibility timeout expires, the message becomes ready again and gets redelivered, probably to a different worker. That part is fine; that's the whole point of the design.</p>
+        <p>The database is the real question, and the queue has no opinion about it. If the write was "increment a counter" and it got halfway applied before the kill, you might have a partial update. If the write was "insert a row with a unique key derived from the message," a partial insert either succeeded (and the redelivered attempt needs to detect that and skip) or didn't (and the redelivered attempt just does it normally). This is why idempotent design has to live in how you write to your own storage, not in the queue — the queue can only promise "you'll get this message again," never "you'll get it in a state you can retry blindly."</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces you'll configure and name in an incident</h2>
+    <ul>
+      <li><b>Visibility timeout.</b> How long a message stays invisible after delivery before the broker assumes the worker died and redelivers it. Set it shorter than your worker's real p99 processing time and you get spurious duplicate work under normal load, not just under failure.</li>
+      <li><b>Delivery/attempt counter.</b> A running count per message of how many times it's been handed to a worker without being acked. This is what a maxReceiveCount or max-retry policy checks against.</li>
+      <li><b>Dead-letter queue (DLQ).</b> A separate queue that receives messages once the attempt counter passes the maximum. It is a safety net for messages your consumers can't process — not a place to dump overflow when producers are simply too fast (that's a different problem, see backpressure below).</li>
+      <li><b>Idempotency key / dedup store.</b> Something outside the queue — a unique constraint in a database, a Redis <code>SETNX</code>, a de-dup table keyed by message ID or a business ID like order number — that lets a worker recognize "I've already done this" and skip re-applying side effects on a duplicate delivery.</li>
+      <li><b>Backpressure signal.</b> A number you actually watch: queue depth (how many messages are waiting) and, more importantly, the age of the oldest unprocessed message. Depth alone hides a queue with one giant backlog of fast jobs versus one stuck on a single slow job.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one order through a flaky payment provider</h2>
+    <p>A customer checks out. The API writes an <code>OrderPlaced</code> message with <code>order_id=10432</code> and an idempotency key equal to the order ID, then returns 200 to the customer immediately. A worker picks up the message and calls the payment provider. The call times out — no response reaches the worker, so it doesn't know whether the charge went through or not. It doesn't ack, since it can't confirm success. The visibility timeout expires; the message redelivers, maybe to the same worker, maybe another.</p>
+    <p>This time the worker calls the payment provider again, passing the <em>same</em> idempotency key it used last time (a key the provider itself understands, separate from your queue's). The provider recognizes the key, sees it already processed that exact charge, and returns "already succeeded" instead of charging twice. The worker marks the order paid and acks the message. One customer, one charge, two attempts — and the only reason it's one charge is that idempotency key, not the queue.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>We'll build this with Redis Streams, because its consumer-group model exposes every mechanic above as a command you can run by hand: <code>XADD</code> to publish, <code>XREADGROUP</code> to deliver (with an implicit visibility window tracked in the Pending Entries List), <code>XACK</code> to confirm, <code>XPENDING</code> to see what's stuck, and <code>XCLAIM</code> to redeliver. The same shapes exist in SQS and RabbitMQ under different names. Everything runs on a local <code>kind</code> cluster.</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Create the cluster and a minimal Redis deployment to act as our broker</span>
+kind create cluster --name jobqueue
+kubectl create deployment redis --image=redis:7-alpine
+kubectl wait --for=condition=available deployment/redis --timeout=90s
+
+<span class="c"># Port-forward it so our local Python scripts can talk to it directly</span>
+kubectl port-forward deployment/redis 6379:6379 &gt; /tmp/pf.log 2&gt;&amp;1 &amp;
+pip install -q redis</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — a stream, a consumer group, a worker</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Create the stream and a consumer group, then publish three jobs:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>python3 - &lt;&lt;'PY'
+import redis
+r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+r.xgroup_create("jobs", "workers", id="0", mkstream=True)
+for order_id in ["1001", "1002", "1003"]:
+    r.xadd("jobs", {"order_id": order_id, "action": "charge"})
+print("stream length:", r.xlen("jobs"))
+PY</code></pre></div>
+        <div class="out"><span class="ol">Output</span>stream length: 3</code></div>
+        <p>Now a worker reads with <code>XREADGROUP</code> — this is the "cook pulls a ticket" step — processes each job, and acks it:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>python3 - &lt;&lt;'PY'
+import redis
+r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+entries = r.xreadgroup("workers", "worker-1", {"jobs": ">"}, count=10)
+for stream, msgs in entries:
+    for msg_id, fields in msgs:
+        print("processing", msg_id, fields)
+        r.xack("jobs", "workers", msg_id)   <span class="c"># the "tear the ticket down" step</span>
+print("pending after ack:", r.xpending("jobs", "workers"))
+PY</code></pre></div>
+        <div class="out"><span class="ol">Output</span>processing 1700000000000-0 {'order_id': '1001', 'action': 'charge'}
+processing 1700000000001-0 {'order_id': '1002', 'action': 'charge'}
+processing 1700000000002-0 {'order_id': '1003', 'action': 'charge'}
+pending after ack: {'pending': 0, 'min': None, 'max': None, 'consumers': []}</code></div>
+        <p>Zero pending means nothing is sitting acked-but-forgotten. That's a healthy queue at rest.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — watch a message sit in-flight</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Publish one more job, but this time read it <em>without</em> acking, to see what "in-flight" actually looks like from the broker's side:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>python3 - &lt;&lt;'PY'
+import redis
+r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+r.xadd("jobs", {"order_id": "1004", "action": "charge"})
+entries = r.xreadgroup("workers", "worker-1", {"jobs": ">"}, count=1)
+print("delivered, not acked:", entries)
+print(r.xpending("jobs", "workers"))
+PY</code></pre></div>
+        <div class="out"><span class="ol">Output</span>delivered, not acked: [['jobs', [('1700000000500-0', {'order_id': '1004', 'action': 'charge'})]]]
+{'pending': 1, 'min': '1700000000500-0', 'max': '1700000000500-0', 'consumers': [{'name': 'worker-1', 'pending': 1}]}</code></div>
+        <p>That one pending entry is a message worker-1 has claimed but hasn't finished — exactly the ticket sitting on the "working" clip. Check how long it's been sitting there with <code>XPENDING</code>'s idle time, which is the number an operator watches in production:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>python3 -c "
+import redis
+r = redis.Redis(host='localhost', port=6379, decode_responses=True)
+print(r.xpending_range('jobs', 'workers', min='-', max='+', count=10))
+"</code></pre></div>
+        <div class="out"><span class="ol">Output</span>[{'message_id': '1700000000500-0', 'consumer': 'worker-1', 'time_since_delivered': 3400, 'times_delivered': 1}]</code></div>
+        <p><code>time_since_delivered</code> is in milliseconds. That number, watched across every pending message, is your visibility-timeout clock — and it's the field a real reaper process checks to decide when to redeliver.</p>
+      </div>
+    </div>
+
+    <details class="recall"><summary>Think first: if <code>times_delivered</code> for a pending message is 1, and nobody has acked it, is that message stuck?</summary>
+      <div class="body">
+        <p>Not yet — it just means it's been delivered once and is still within a normal processing window. It becomes worth worrying about once <code>time_since_delivered</code> exceeds what a healthy worker should ever take for that job type. A payment call that normally finishes in 400ms and has been "pending" for 90 seconds is a worker that's hung, crashed without triggering a redelivery yet, or waiting on a downstream call with no timeout of its own. Watching the age, not just the count, is the difference between noticing this in a dashboard and noticing it from a customer complaint.</p>
+      </div>
+    </details>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — force a duplicate delivery</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>We'll simulate a worker that the broker gives up on too early, and a naive worker that isn't idempotent. First, a "ledger" that just counts how many times each order got charged — the wrong way:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>python3 - &lt;&lt;'PY'
+import redis, time
+r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+r.delete("charged_count")
+r.xadd("jobs", {"order_id": "2001", "action": "charge"})
+
+<span class="c"># worker-A reads it and gets stuck (simulating a slow network call)</span>
+entries = r.xreadgroup("workers", "worker-A", {"jobs": ">"}, count=1)
+msg_id = entries[0][1][0][0]
+print("worker-A holding", msg_id, "-- simulating it's still 'working' but slow")
+
+<span class="c"># meanwhile, an operator (or an over-eager reaper) claims it as timed out</span>
+time.sleep(1)
+claimed = r.xclaim("jobs", "workers", "worker-B", min_idle_time=500, message_ids=[msg_id])
+print("worker-B claimed:", claimed)
+for _, fields in claimed:
+    r.incr("charged_count")
+    r.xack("jobs", "workers", msg_id)
+    print("worker-B charged order", fields["order_id"])
+
+<span class="c"># now worker-A, unaware it was reassigned, finishes its "slow" call too</span>
+r.incr("charged_count")
+print("worker-A also charged order 2001 -- it never knew it lost the message")
+print("total charges recorded:", r.get("charged_count"))
+PY</code></pre></div>
+        <div class="out"><span class="ol">Output</span>worker-A holding 1700000000900-0 -- simulating it's still 'working' but slow
+worker-B claimed: [('1700000000900-0', {'order_id': '2001', 'action': 'charge'})]
+worker-B charged order 2001
+worker-A also charged order 2001 -- it never knew it lost the message
+total charges recorded: 2</code></div>
+        <p>Before you read on: one order, one queue, one ack — so why does the ledger say 2? Think about what worker-A actually knows at the moment it finishes.</p>
+        <details class="recall"><summary>Reveal the cause</summary>
+          <div class="body">
+            <p>Worker-A was never told it lost the message. Claiming a pending entry with <code>XCLAIM</code> reassigns ownership in the broker, but it can't reach into worker-A's process and cancel the in-flight call it's already making. Both workers believe they're the one responsible for order 2001, and both increment the counter. This is not a Redis bug — SQS's visibility timeout and Kafka's rebalance-during-processing have the exact same failure shape. Any system with a timeout-based ownership transfer can produce this.</p>
+            <p>The fix isn't to make the timeout longer (that just delays the same race) or shorter (that makes it happen more often). The fix is to make "charge order 2001" idempotent: before charging, check a dedup store keyed by order ID for "already charged" — a unique constraint in Postgres, or a Redis <code>SETNX charged:2001 1</code> that only one of the two workers can win. Whichever worker loses that check skips the charge and just acks. The queue guarantees delivery; your storage layer has to guarantee the side effect only lands once.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — find the poison message</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Publish a batch where one message is malformed, and run a worker that crashes on it every time:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>python3 - &lt;&lt;'PY'
+import redis
+r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+for order_id in ["3001", "3002"]:
+    r.xadd("jobs", {"order_id": order_id, "action": "charge"})
+r.xadd("jobs", {"order_id": "", "action": "charge"})   <span class="c"># malformed: empty order_id, will never parse</span>
+r.xadd("jobs", {"order_id": "3004", "action": "charge"})
+PY
+
+<span class="c"># a worker loop that "processes" everything, but blows up on empty order_id,
+# and -- badly -- just leaves the message pending on every crash</span>
+for i in 1 2 3 4 5; do
+python3 - &lt;&lt;'PY'
+import redis
+r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+entries = r.xreadgroup("workers", "worker-1", {"jobs": ">"}, count=10)
+for stream, msgs in entries:
+    for msg_id, fields in msgs:
+        try:
+            assert fields["order_id"], "empty order_id"
+            r.xack("jobs", "workers", msg_id)
+        except AssertionError as e:
+            print("FAILED", msg_id, "-", e, "(left pending, no ack)")
+PY
+done
+python3 -c "
+import redis
+r = redis.Redis(host='localhost', port=6379, decode_responses=True)
+print(r.xpending_range('jobs', 'workers', min='-', max='+', count=10))
+"</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>FAILED 1700000001200-0 - empty order_id (left pending, no ack)
+FAILED 1700000001200-0 - empty order_id (left pending, no ack)
+FAILED 1700000001200-0 - empty order_id (left pending, no ack)
+FAILED 1700000001200-0 - empty order_id (left pending, no ack)
+FAILED 1700000001200-0 - empty order_id (left pending, no ack)
+[{'message_id': '1700000001200-0', 'consumer': 'worker-1', 'time_since_delivered': 40, 'times_delivered': 5}]</code></div>
+        <p>Five failed attempts on the same message, and it's still sitting there ready to be retried a sixth time, forever. In a real deployment this worker is now spending part of every poll cycle re-reading a message that can never succeed — investigate why <code>times_delivered</code> keeps climbing with no ceiling before you look at the fix.</p>
+        <details class="recall"><summary>Reveal the fix</summary>
+          <div class="body">
+            <p>The worker has no concept of "give up." It treats every failure as retryable, which is correct for a network timeout and wrong for a message that's structurally invalid — no amount of retrying fixes an empty <code>order_id</code>. The fix is a delivery-count check: read <code>times_delivered</code> from <code>XPENDING</code> (or track your own counter), and once it passes a threshold — 3, 5, whatever your job tolerates — ack the poison message to remove it from the pending list, and separately <code>XADD</code> it to a <code>jobs:dlq</code> stream for a human or a batch job to inspect later.</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>python3 - &lt;&lt;'PY'
+import redis
+r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+pending = r.xpending_range("jobs", "workers", min="-", max="+", count=10)
+for p in pending:
+    if p["times_delivered"] &gt;= 5:
+        r.xadd("jobs:dlq", {"original_id": p["message_id"], "reason": "max_retries_exceeded"})
+        r.xack("jobs", "workers", p["message_id"])
+        print("moved", p["message_id"], "to DLQ")
+PY</code></pre></div>
+            <p>This is the difference between a slow dependency and a poison message: retries fix the first and never fix the second, and the only way to tell them apart automatically is a bounded attempt count with a real off-ramp.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Senior challenge — backlog you can't drain</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>Flood the stream far faster than a deliberately slow worker can drain it, and watch the backlog build:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>python3 - &lt;&lt;'PY'
+import redis
+r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+for i in range(5000):
+    r.xadd("jobs", {"order_id": str(4000+i), "action": "charge"})
+print("published 5000, stream length now:", r.xlen("jobs"))
+PY
+
+<span class="c"># a "worker" that takes 50ms per job -- 20/sec, nowhere near enough</span>
+timeout 5 python3 - &lt;&lt;'PY'
+import redis, time
+r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+while True:
+    entries = r.xreadgroup("workers", "worker-1", {"jobs": ">"}, count=5)
+    if not entries or not entries[0][1]:
+        break
+    for _, msgs in entries:
+        for msg_id, _ in msgs:
+            time.sleep(0.05)
+            r.xack("jobs", "workers", msg_id)
+PY
+python3 -c "
+import redis
+r = redis.Redis(host='localhost', port=6379, decode_responses=True)
+print('remaining backlog:', r.xlen('jobs'))
+"</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>published 5000, stream length now: 5001
+remaining backlog: 4501</code></div>
+        <p>In five seconds a single slow worker cleared roughly 500 jobs out of 5,000. At that rate the backlog doesn't drain — it grows if publishing continues at all, and even if publishing stopped, you're minutes away from empty. The senior question: in production, what actually breaks first, and what do you change — add workers, or something else?</p>
+        <details class="recall"><summary>Reveal an approach</summary>
+          <div class="body">
+            <p>Adding workers helps only if the bottleneck is worker count, not something workers all share — a downstream database or a payment provider with its own rate limit will choke just as hard with 50 workers as with 5, and now you've turned a backlog into a downstream outage. Before scaling workers, check what they're actually waiting on.</p>
+            <p>The number that matters more than queue depth is <b>age of the oldest unprocessed message</b>. Depth of 4,500 could mean "4,500 fast jobs, clears in 8 seconds once we add capacity" or "4,500 jobs behind one stuck job that's blocking nothing else, because they're independent." For an SLA, you care about "how old is the oldest thing still waiting," because that's what turns into a customer-visible delay.</p>
+            <p>The real production fix has three parts: autoscale workers on backlog age, not raw depth; put a producer-side circuit breaker in front of the queue so that once age or depth crosses a threshold, new requests get shed or slowed at the API layer instead of queued indefinitely (this is the same reasoning as <a href="ch97-project-distributed-rate-limiter.html">Chapter 97</a>'s rate limiter, one layer up the stack); and cap the stream length so a runaway producer can't grow the backlog into an out-of-memory event on the broker itself.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · the retry storm</div>
+      <p><b>Symptom:</b> a downstream API that was merely slow becomes fully unavailable within minutes. <b>First cut:</b> check the request rate to that downstream against its normal baseline — a spike that lines up with a deploy or a queue backlog is the tell. <b>Confirm:</b> the queue's consumers are retrying failed calls immediately, with no backoff, so every failure produces another attempt within milliseconds. <b>Cause is usually:</b> a worker written to retry a failure in a tight loop rather than with exponential backoff and jitter, so a brief blip turns into self-inflicted overload on the thing that was already struggling.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · the silent double-charge</div>
+      <p><b>Symptom:</b> a handful of customers report being charged twice for one order, with no error visible in your logs. <b>First cut:</b> check whether the payment call was retried — a timeout on a call that actually succeeded server-side, followed by a retry with no idempotency key, produces exactly this. <b>Cause is usually:</b> the worker treats the queue's redelivery as a fresh attempt with no memory of the first one, instead of carrying an idempotency key through to the downstream provider.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · the DLQ nobody watched</div>
+      <p><b>Symptom:</b> weeks later, someone notices thousands of messages sitting in a dead-letter queue, representing real customer actions that silently never completed. <b>Cause is usually:</b> a DLQ was configured correctly, but nothing alerts on its depth or age — a DLQ without an alert is just a slower, quieter way to lose data than having no DLQ at all.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Security.</b> Anything that can publish to your queue can trigger real work — treat the publish endpoint with the same authentication rigor as any other write path, and don't assume "it's internal" is enough. Message bodies often carry customer data; if you log message payloads for debugging, you're logging PII into your log pipeline, which has its own retention and access rules to worry about.</p>
+    <p><b>Performance.</b> Size your visibility timeout from measured p99 processing time, not a guess — too short and you get spurious redeliveries under completely normal load, which look exactly like duplicate-delivery bugs until you check the timing. Batch acknowledgments where the broker supports it; acking one at a time when you could ack ten in one call multiplies your round trips for no benefit.</p>
+    <p><b>Common mistakes.</b> Treating queue depth as the only autoscaling signal, when oldest-message age tells you what customers actually feel. Retrying without a maximum, so a poison message runs forever. Skipping the DLQ alert, so the safety net catches messages nobody ever looks at. And building a worker's happy path first, then bolting on idempotency later — it's much cheaper to design the dedup check in from the start than to retrofit it once duplicates are already reaching customers.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>Every "design a system that processes X asynchronously" interview question — video transcoding, email delivery, order fulfillment, webhook ingestion — is this chapter with different nouns. The interviewer is checking whether you reach for at-least-once plus idempotency by default, whether you can explain what a visibility timeout protects against, and whether backpressure is something you designed for or something you'll discover in production. This also feeds straight into <a href="ch99-project-notification-system.html">Chapter 99</a>, where the "worker" is specifically a channel sender with its own provider failures, and into <a href="ch84-async-and-flow-control.html">Chapter 84</a>'s broader treatment of flow control between producers and consumers that don't share a clock.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Open each one only after you've answered it in your head.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's the difference between at-least-once and exactly-once delivery, and which should you design for?</summary>
+        <div class="a"><p>At-least-once means a message might be delivered more than once — after a timeout, a crash, or a redelivery — but never silently dropped. Exactly-once means each message is processed precisely one time, which almost no real broker guarantees end-to-end, because it would require the broker and every consumer's side effects to commit atomically together. In practice you design for at-least-once delivery plus an idempotent worker, which gives you the same observable outcome — no duplicate side effects — without needing a guarantee the infrastructure can't actually make.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through what happens to a message from publish to a worker crashing mid-processing.</summary>
+        <div class="a"><p>The producer publishes and the broker stores it durably, marking it ready. A worker receives it — the broker doesn't delete it yet, it marks it invisible to other workers for a visibility timeout and bumps a delivery counter. The worker starts processing and crashes before it can ack. Nothing about the broker's state changes at that instant — the message just sits invisible until the timeout expires. Once it does, the broker makes it ready again, and some worker — possibly a different one — receives it as a fresh delivery, with the counter now at two. If that worker succeeds, it acks, and the message is finally deleted. The key things I'd call out: the broker only knows "delivered" versus "acked," never "the actual side effect happened," so any gap between finishing the work and sending the ack is a window where a crash produces a redelivery and a possible duplicate.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>How do you size a visibility timeout, and what breaks if you get it wrong in each direction?</summary>
+        <div class="a"><p>Measure your worker's real p99 processing time for that job type under production-like load, and set the timeout comfortably above it — often 3 to 6 times the p99, because you want margin for a slow downstream call, not just the median case. Too short, and the broker gives up on healthy workers that are simply still working, redelivering messages that are about to succeed anyway — this produces duplicate processing under completely normal load, which is confusing because it looks like a bug rather than a config problem. Too long, and a worker that actually crashed leaves its message invisible for a long time before anyone else picks it up, which inflates end-to-end latency during real failures exactly when you can least afford it. Some systems solve this better with a heartbeat-based extension — the worker periodically tells the broker "still alive, give me more time" — rather than a single fixed timeout guessed up front.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>Queue depth is climbing and on-call just got paged. Walk through your triage.</summary>
+        <div class="a"><p>First I check the age of the oldest message, not just the depth — that tells me whether this is "a lot of fast jobs momentarily behind" or "something is actually stuck." Then I check whether the arrival rate spiked (a traffic surge, a retry storm from upstream) or the processing rate dropped (a downstream dependency got slow, a worker deploy introduced a bug, workers themselves got scaled down by mistake). I'd look at per-worker throughput and error rate before touching anything — if errors are climbing, adding workers just applies more pressure to whatever's failing downstream. If it's a genuine traffic surge with healthy processing, scaling workers or shedding load at the producer are both reasonable; if it's a downstream outage, no amount of worker scaling fixes it, and I'd rather let the backlog build safely than retry into a dependency that's already down.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>How would you handle a message that can never succeed differently from one failing due to a temporary outage?</summary>
+        <div class="a"><p>I'd track delivery attempts per message and treat crossing a threshold as the signal to stop retrying and route to a dead-letter queue instead — that handles both cases mechanically the same way, which is the point: the queue can't tell "malformed data" apart from "downstream is down for ten minutes," so I don't ask it to. What I'd add on top is alerting on DLQ arrivals, because a message that will never succeed needs a human or a corrective batch job, while a burst of DLQ arrivals that all stop once a downstream recovers tells a completely different story — same mechanism, different follow-up action, and the DLQ's alert is what lets you tell those apart after the fact instead of guessing.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>A queue decouples when work happens from who's waiting on it, but it doesn't remove the work or guarantee it happens exactly once. Every mainstream broker gives you at-least-once delivery: a message is invisible while a worker holds it, and only an explicit ack deletes it for good — silence or failure sends it back into rotation after a visibility timeout, which is where duplicates come from. Idempotency has to live in your worker and your storage, not in the queue. A dead-letter queue exists for messages that can never succeed, gated by an attempt counter, and it needs its own alert or it's just a quieter way to lose data. Backpressure is a capacity mismatch between producers and consumers, and the number that matters is the age of the oldest waiting message, not raw depth.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>Real queues are at-least-once. Design workers to be idempotent instead of hoping for exactly-once.</li>
+      <li>A message goes invisible on delivery, not deleted — only an explicit ack removes it for good.</li>
+      <li>The visibility timeout is how long the broker waits before assuming a worker died and redelivering.</li>
+      <li>Duplicate processing happens when a "dead" worker wasn't actually dead, just slow — size timeouts from measured p99, not guesses.</li>
+      <li>Idempotency needs a dedup check outside the queue: a unique constraint, a <code>SETNX</code>, an idempotency key passed to downstream providers.</li>
+      <li>A poison message and a slow dependency look identical to the broker — only a bounded attempt count tells them apart.</li>
+      <li>A dead-letter queue without an alert on its depth or age is a silent way to lose customer actions.</li>
+      <li>Backpressure is arrival rate outpacing processing rate — watch oldest-message age, not just queue depth.</li>
+      <li>Scaling workers only helps if workers are the bottleneck — check what they're waiting on before adding more.</li>
+      <li>Retrying without backoff and jitter turns a brief downstream blip into a self-inflicted overload.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds toward:</span>
+      <a href="ch84-async-and-flow-control.html"><b>Ch 84</b> Async &amp; flow control</a>
+      <a href="ch88-reliability-engineering.html"><b>Ch 88</b> Reliability engineering</a>
+      <a href="ch99-project-notification-system.html"><b>Ch 99</b> Notification system</a>
+      <a href="ch97-project-distributed-rate-limiter.html"><b>Ch 97</b> Distributed rate limiter</a>
+      <a href="ch34-workloads-ii-statefulset-daemonset-job-cronjob.html"><b>Ch 34</b> Jobs &amp; CronJobs</a>
+      <a href="ch103-the-universal-troubleshooting-framework.html"><b>Ch 103</b> Troubleshooting framework</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Amazon Builders' Library — <a href="https://aws.amazon.com/builders-library/avoiding-insurmountable-queue-backlogs/">Avoiding insurmountable queue backlogs</a>. The backpressure and DLQ reasoning in this chapter follows this article closely.</li>
+      <li>Amazon Builders' Library — <a href="https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-apis/">Making retries safe with idempotent APIs</a>.</li>
+      <li>Amazon Builders' Library — <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">Timeouts, retries, and backoff with jitter</a>.</li>
+      <li>Amazon Builders' Library — <a href="https://aws.amazon.com/builders-library/challenges-with-distributed-systems/">Challenges with distributed systems</a>.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/workloads/controllers/job/">Jobs</a> and <a href="https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/">CronJob</a>.</li>
+      <li>Google — <a href="https://sre.google/sre-book/addressing-cascading-failures/"><i>Site Reliability Engineering</i>: Addressing Cascading Failures</a> (first-party): the load-shedding and backpressure reasoning behind Lab 5.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch97-project-distributed-rate-limiter.html"><span class="dir">← Prev</span><div class="ti">Ch 97 — Project: Distributed rate limiter</div></a>
+      <a class="nx" href="ch99-project-notification-system.html"><span class="dir">Next →</span><div class="ti">Ch 99 — Project: Notification system</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 98 of 121 · Part X · System Design. Run the labs against a real cluster; a backlog you caused yourself teaches more than a diagram of one.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Architecture</a>
+    <a href="#internals">Publish to delete</a>
+    <a href="#components">The components</a>
+    <a href="#flow">Following an order</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

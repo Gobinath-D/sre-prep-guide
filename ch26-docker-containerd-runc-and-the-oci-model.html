@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 26 — Docker, containerd, runc &amp; the OCI Model</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part III · Containers &nbsp;·&nbsp; Chapter 26</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part III · Containers &amp; Container Internals · Chapter 26</div>
+      <h1>Docker, containerd, runc &amp; the OCI model</h1>
+      <p class="tagline">"Docker" is not one program, and Kubernetes stopped using it years ago without most people noticing. Underneath sit a daemon, a runtime, a tiny spec-compliant launcher, and a set of open standards — and knowing which does what is the difference between guessing and debugging a node.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~45 min read · Docker + kind lab</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Name every layer — <code>docker</code>, <code>dockerd</code>, <code>containerd</code>, the shim, <code>runc</code> — and say what each one owns.</li>
+          <li>Explain the three OCI specs (image, runtime, distribution) and what a "bundle" is.</li>
+          <li>Describe how the kubelet talks to containerd over the CRI, and what the shim is for.</li>
+          <li>Explain the dockershim removal in Kubernetes 1.24 and what actually changed for operators.</li>
+          <li>Debug containers on a node with <code>crictl</code> and <code>ctr</code> when <code>kubectl</code> isn't enough.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem this stack solves</h2>
+    <p>The first version of Docker was one big binary that did everything: a CLI, a daemon, image building, image storage, networking, and the low-level work of actually creating a container. That's fine for one laptop and a demo. It falls apart the moment other systems want to run containers too. Kubernetes doesn't want Docker's CLI or its build features or its opinions — it just wants to say "run this image with these limits" and get a container. Cloud providers want to swap the piece that talks to the kernel for a more isolated one. And nobody wants an image built by one tool to be un-runnable by another.</p>
+    <p>Two forces broke the monolith apart. The first is <b>separation of concerns</b>: the job of "manage images and container lifecycle for the whole node" is genuinely different from "make the syscalls that create one container," which is different again from "offer a friendly CLI to a developer." Splitting them lets each be replaced independently. The second is <b>standards</b>: if the image format, the way a container is described, and the registry protocol are all open specifications, then any tool that follows them interoperates. Those specifications are the <b>OCI</b> — the Open Container Initiative — and the split components are <code>containerd</code> and <code>runc</code>, which Docker itself donated to become the shared foundation everyone builds on.</p>
+    <p>So today "Docker" the product is a stack of layers over that shared foundation, and Kubernetes talks to the same foundation directly through a stable interface called the <b>CRI</b>, bypassing Docker entirely. Understanding the layers isn't trivia — when a node's containers won't start, the fault is in a specific layer, and you can't fix what you can't name.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>The daemon (<code>containerd</code>) manages images and the lifecycle of many containers over the node's lifetime. The runtime (<code>runc</code>) creates <em>one</em> container — sets up its namespaces and cgroups, execs the process — and then exits. They're different jobs with different lifetimes, and confusing them is the root of most "how does a container actually start" confusion.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a restaurant kitchen</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Think of running containers as a restaurant kitchen. The <b>waiter</b> (the <code>docker</code> CLI, or <code>kubectl</code>) takes your order in friendly language and passes it back. The <b>head chef</b> (<code>containerd</code>) runs the kitchen: keeps the pantry stocked (pulls and stores images), tracks every dish in progress, and decides what happens next — but the head chef doesn't personally cook every plate. For each dish, the head chef hands a precise, standardised <b>recipe card</b> (the OCI bundle) to a <b>line cook</b> (<code>runc</code>), who does the actual cooking for that one plate — assembles it exactly to spec — and then steps away. A <b>runner</b> (the shim) stays by the plate to keep it hot and report when it's done, so the head chef can go manage the rest of the kitchen without babysitting each plate.</p>
+      <p>The point of the recipe card is that it's a <b>standard format</b>. Any line cook who reads OCI recipe cards can cook the dish — you can swap a classic line cook (<code>runc</code>) for a faster one (<code>crun</code>) or an ultra-careful one who works behind glass (a sandboxed runtime) without changing the head chef or the waiter. And the pantry stores ingredients in a standard packaging (OCI images) so a dish prepped by one kitchen can be finished by another.</p>
+      <p>Kubernetes is a different waiter — the <b>kubelet</b> — who skips the Docker-branded front-of-house entirely and hands orders straight to the head chef through a standard order-ticket window: the <b>CRI</b>.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In the container stack</th></tr>
+      <tr><td>The waiter taking orders in plain language</td><td>The <code>docker</code> CLI (or <code>kubectl</code>) — the user-facing front end</td></tr>
+      <tr><td>The Docker-branded front-of-house</td><td><code>dockerd</code> — the Docker daemon (build, CLI API, networking)</td></tr>
+      <tr><td>The head chef running the whole kitchen</td><td><code>containerd</code> — image pull/store, container lifecycle</td></tr>
+      <tr><td>The standard order-ticket window for a second waiter</td><td>The <b>CRI</b> — the gRPC interface the kubelet uses</td></tr>
+      <tr><td>The line cook who assembles one plate to spec</td><td><code>runc</code> — the OCI runtime that creates one container</td></tr>
+      <tr><td>The standardised recipe card</td><td>The <b>OCI runtime spec</b> — a bundle (<code>config.json</code> + rootfs)</td></tr>
+      <tr><td>The runner who keeps the plate hot and reports</td><td>The <b>shim</b> (<code>containerd-shim-runc-v2</code>)</td></tr>
+      <tr><td>Standard ingredient packaging in the pantry</td><td>The <b>OCI image spec</b> — manifest, config, layers by digest</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>The layers, top to bottom</h2>
+    <p>Here's the whole stack in one figure. Follow a Kubernetes request down the left, and note where the Docker CLI path joins the same <code>containerd</code>:</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 400" role="img" aria-label="kubelet talks CRI to containerd, which uses a shim and runc to create a container; the Docker CLI path joins the same containerd">
+        <defs>
+          <marker id="c1" markerWidth="10" markerHeight="10" refX="7.5" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" style="fill:var(--accent)"/></marker>
+          <marker id="c2" markerWidth="10" markerHeight="10" refX="7.5" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" style="fill:var(--muted)"/></marker>
+        </defs>
+        <text x="360" y="20" text-anchor="middle" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">kubelet → CRI → containerd → shim → runc → container</text>
+
+        <!-- main chain row -->
+        <rect x="12" y="60" width="116" height="72" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="70" y="90" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">kubelet</text>
+        <text x="70" y="107" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">on each node</text>
+
+        <rect x="196" y="60" width="176" height="72" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="284" y="86" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">containerd</text>
+        <text x="284" y="103" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">CRI plugin · image store</text>
+        <text x="284" y="118" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">snapshotter (overlayfs)</text>
+
+        <rect x="404" y="60" width="128" height="72" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="468" y="90" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">shim</text>
+        <text x="468" y="107" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">containerd-shim-runc-v2</text>
+
+        <rect x="558" y="60" width="66" height="72" rx="8" style="fill:var(--panel);stroke:var(--applied);stroke-width:1.5"/>
+        <text x="591" y="90" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">runc</text>
+        <text x="591" y="107" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">OCI rt</text>
+
+        <rect x="640" y="60" width="68" height="72" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="674" y="88" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">container</text>
+        <text x="674" y="104" text-anchor="middle" style="fill:var(--muted);font:8.5px sans-serif">ns+cgroups</text>
+
+        <g style="stroke:var(--accent);stroke-width:2">
+          <line x1="128" y1="96" x2="194" y2="96" marker-end="url(#c1)"/>
+          <line x1="372" y1="96" x2="402" y2="96" marker-end="url(#c1)"/>
+          <line x1="532" y1="96" x2="556" y2="96" marker-end="url(#c1)"/>
+          <line x1="624" y1="96" x2="638" y2="96" marker-end="url(#c1)"/>
+        </g>
+        <text x="161" y="82" text-anchor="middle" style="fill:var(--accent);font:600 9.5px sans-serif">CRI</text>
+        <text x="161" y="114" text-anchor="middle" style="fill:var(--muted);font:8.5px sans-serif">gRPC/unix sock</text>
+        <text x="591" y="150" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">runc exits;</text>
+        <text x="546" y="163" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">shim stays as the container's parent</text>
+
+        <!-- docker path -->
+        <rect x="12" y="216" width="116" height="60" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="70" y="242" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">docker CLI</text>
+        <text x="70" y="258" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">developer</text>
+        <rect x="196" y="216" width="176" height="60" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="284" y="242" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">dockerd</text>
+        <text x="284" y="258" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">build · CLI API · networking</text>
+        <g style="stroke:var(--muted);stroke-width:1.8">
+          <line x1="128" y1="246" x2="194" y2="246" marker-end="url(#c2)"/>
+          <line x1="284" y1="216" x2="284" y2="134" marker-end="url(#c2)"/>
+        </g>
+        <text x="300" y="180" style="fill:var(--muted);font:9.5px sans-serif">dockerd delegates to the same containerd</text>
+
+        <!-- OCI note -->
+        <rect x="12" y="300" width="696" height="86" rx="9" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="26" y="322" style="fill:var(--ink);font:11px sans-serif"><tspan style="fill:var(--accent2);font-weight:700">OCI image-spec:</tspan> manifest → config → content-addressed layers (the pantry packaging).</text>
+        <text x="26" y="342" style="fill:var(--ink);font:11px sans-serif"><tspan style="fill:var(--applied);font-weight:700">OCI runtime-spec:</tspan> a bundle = config.json + rootfs; runc reads it to build one container (the recipe card).</text>
+        <text x="26" y="362" style="fill:var(--ink);font:11px sans-serif"><tspan style="fill:var(--accent);font-weight:700">OCI distribution-spec:</tspan> the registry pull/push API.</text>
+        <text x="26" y="380" style="fill:var(--ink);font:11px sans-serif"><tspan style="fill:var(--deep);font-weight:700">dockershim removed in Kubernetes 1.24:</tspan> kubelet talks CRI to containerd/CRI-O directly — no Docker needed on nodes.</text>
+      </svg>
+      <figcaption>The kubelet uses the CRI to reach containerd; containerd hands a bundle to a shim-managed <code>runc</code>, which creates the container and exits. The Docker CLI drives <code>dockerd</code>, which delegates the actual container work to the same <code>containerd</code>.</figcaption>
+    </figure>
+
+    <p>Read the layers by what they own. <code>dockerd</code> owns the developer experience — <code>docker build</code>, the CLI API, Compose integration, Docker networking — and nothing on a Kubernetes node needs any of it. <code>containerd</code> owns node-level container management: pulling and storing images, unpacking layers via its snapshotter (overlayfs, from <a href="ch24-container-filesystems-overlayfs-and-image-layers.html">Chapter 24</a>), and driving the lifecycle of every container. <code>runc</code> owns the actual creation of one container from a bundle. And the shim sits between containerd and each container so containerd can restart or be upgraded without killing running containers.</p>
+
+    <h2 id="internals"><span class="beat">Internal working</span>From "run this image" to a live process</h2>
+    <ol class="steps">
+      <li><b>The request arrives over the CRI.</b> The kubelet decides a pod needs a container and makes a gRPC call — over a Unix socket like <code>/run/containerd/containerd.sock</code> — to containerd's CRI service. The CRI has two halves: a <code>RuntimeService</code> (pods and containers: create, start, stop, exec) and an <code>ImageService</code> (pull, list, remove images). This is a stable contract, so the kubelet doesn't care whether the other side is containerd or CRI-O.</li>
+      <li><b>containerd ensures the image is present.</b> If not already cached, it pulls the image per the OCI distribution spec: fetch the manifest, then the config and the layer blobs by digest, verifying each. The snapshotter unpacks the layers into the overlay directories that will become the container's <code>lowerdir</code> stack.</li>
+      <li><b>containerd prepares an OCI bundle.</b> It assembles a <b>bundle</b>: the root filesystem (the overlay mount) plus a <code>config.json</code> that is the OCI runtime spec for this container — which namespaces to create, which cgroup limits to apply, the mounts, the process to run, the user, the capabilities, the seccomp profile. This JSON is the precise recipe card.</li>
+      <li><b>containerd starts a shim, which invokes <code>runc</code>.</b> containerd launches a <code>containerd-shim-runc-v2</code> process for the container, and the shim calls <code>runc create</code>/<code>runc start</code> against the bundle. Crucially, the shim is <em>reparented to init (PID 1)</em>, not left as a child of containerd — so if containerd restarts, the shim and the container keep running and simply reconnect.</li>
+      <li><b><code>runc</code> creates the container and exits.</b> <code>runc</code> does the low-level work you did by hand in Chapters 22–23: it <code>clone</code>s into new namespaces, sets up the cgroup limits, pivots to the new root filesystem, applies seccomp and capabilities, and <code>exec</code>s your process — which becomes PID 1 inside the container. Then <code>runc</code> exits. It's a short-lived launcher, not a supervisor. The <b>shim</b> is what remains as the container's parent, holding its stdio, reporting its exit status back to containerd, and keeping the container alive independent of containerd's lifetime.</li>
+      <li><b>The process runs; the shim watches.</b> Your workload is now a normal process on the host, isolated by namespaces and metered by cgroups. When it exits, the shim notices, reports the exit code up to containerd, and containerd tells the kubelet — which decides whether to restart it per the pod's policy.</li>
+    </ol>
+
+    <div class="box keypoint"><div class="h">Why a separate shim exists</div>
+      <p>Without a shim, every container would be a child of the containerd daemon, and restarting or upgrading containerd would orphan or kill every container on the node. The shim breaks that coupling: it's reparented to init and owns the container's stdio and exit reporting, so containerd becomes a stateless manager you can restart at will. This is the single design choice that makes "upgrade the runtime without downtime" possible, and it's why you see a <code>containerd-shim-runc-v2</code> process per container — not per node.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: you restart the containerd service on a node. Do the running containers die?</summary>
+      <div class="body">
+        <p>No — and the shim is why. Each container is held by its own <code>containerd-shim-runc-v2</code> process, which is parented to init, not to containerd. When containerd stops, the shims (and therefore the containers) keep running; when containerd comes back, it reconnects to the existing shims and picks up managing them again. The exit codes and stdio that happened during the gap are buffered by the shim and reported once containerd returns. This is exactly what makes a runtime upgrade a non-event for workloads — contrast it with the old world, where the container process was tied to the daemon's lifetime. It's also why <code>runc</code> exiting immediately is fine: <code>runc</code> only <em>creates</em> the container; the shim, not <code>runc</code>, is the lasting parent.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces and the tools that drive them</h2>
+    <ul>
+      <li><b>The OCI specifications</b> — three of them. The <b>image spec</b> defines the on-disk/registry format: a manifest referencing a config (with the ordered layer <code>diff_ids</code> and build history) and content-addressed layer blobs. The <b>runtime spec</b> defines a bundle — a rootfs plus <code>config.json</code> — and what it means to run it. The <b>distribution spec</b> defines the registry pull/push API. Together they're why any compliant tool interoperates.</li>
+      <li><b><code>runc</code></b> — the reference implementation of the runtime spec, built on <code>libcontainer</code>. Alternatives that read the same bundle: <b><code>crun</code></b> (a faster C implementation), <b>gVisor's <code>runsc</code></b> (a userspace kernel for stronger isolation), and <b>Kata Containers</b> (each container in a lightweight VM). Swapping the runtime doesn't touch containerd or the kubelet — that's the whole point of the spec.</li>
+      <li><b><code>ctr</code></b> — containerd's own low-level debug CLI. It exposes containerd concepts directly, including containerd <b>namespaces</b> (unrelated to kernel namespaces): Kubernetes containers live in the <code>k8s.io</code> namespace, Docker's in <code>moby</code>. Powerful, unpolished, no stability guarantees.</li>
+      <li><b><code>nerdctl</code></b> — a Docker-compatible CLI for containerd. Same commands as <code>docker</code> (<code>nerdctl run</code>, <code>nerdctl build</code>) but talking to containerd directly, useful when there's no Docker daemon.</li>
+      <li><b><code>crictl</code></b> — the CRI debugging CLI. It speaks the CRI to <em>any</em> compliant runtime, so it's the runtime-agnostic tool for inspecting pods and containers <em>from a node's point of view</em> — <code>crictl ps</code>, <code>crictl images</code>, <code>crictl logs</code>, <code>crictl inspect</code>. This is what you reach for when <code>kubectl</code> can't help because the problem is below the API server.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one pod start on a node</h2>
+    <p>The scheduler binds a pod to a node; the kubelet sees it. The kubelet calls the CRI <code>RunPodSandbox</code> to create the pod's shared infrastructure (its network namespace and the "pause" container that holds it), then for each container it calls the <code>ImageService</code> to ensure the image is pulled and the <code>RuntimeService</code> to create and start the container. containerd fields those gRPC calls, unpacks image layers through its snapshotter into an overlay, writes the OCI <code>config.json</code> with the pod's namespaces and the container's cgroup limits, and starts a shim that runs <code>runc</code> against the bundle. <code>runc</code> builds the namespaces and cgroups, execs the app, and exits; the shim stays as parent. The app runs. When you later type <code>kubectl logs</code>, that request travels API server → kubelet → CRI → containerd → the shim, which has been capturing the container's stdout the whole time. Every hop is a named component doing its one job, and when logs are missing or a container is stuck in <code>CreateContainerError</code>, you now know exactly which hop to interrogate — which the labs do with <code>crictl</code>.</p>
+
+    <details class="recall"><summary>Think first: you built an image with <code>docker build</code> on your laptop. Can a node that runs only containerd — no Docker at all — pull and run it?</summary>
+      <div class="body">
+        <p>Yes, with no conversion. <code>docker build</code> produces an OCI-format image — a manifest, a config, and content-addressed layers — pushed to a registry over the OCI distribution API. containerd (or CRI-O, or any compliant runtime) pulls and runs that exact artefact, because the image format is a shared standard independent of whatever built it. This is precisely why removing dockershim didn't break anyone's images, and why "build with Docker, run with containerd" is the normal, correct state of the world rather than a contradiction. The build tool and the runtime are decoupled by the spec.</p>
+      </div>
+    </details>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>Labs 1–2 use Docker on your Mac. Labs 3–5 use a one-node Kubernetes cluster from <a href="https://kind.sigs.k8s.io/">kind</a>, whose node is a container running <code>containerd</code> — the authentic place to use <code>ctr</code> and <code>crictl</code>. Create it once:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>brew install kind kubectl        <span class="c"># if not already installed</span>
+kind create cluster --name lab
+docker exec -it lab-control-plane bash   <span class="c"># a shell ON the node; containerd lives here</span></code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — see the layers as processes</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Start a container with Docker and look at the process ancestry. The stack isn't a metaphor — it's real processes with a specific parent-child shape.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker run -d --name web nginx
+<span class="c"># A helper that can see the whole host process tree:</span>
+docker run --rm --privileged --pid=host ubuntu:24.04 sh -c \
+  'apt-get -qq update &gt;/dev/null; apt-get -qq install -y procps &gt;/dev/null
+   ps -eo pid,ppid,comm --forest | grep -E "containerd|shim|nginx|dockerd" | grep -v grep'</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>  PID  PPID COMMAND
+  841     1 dockerd
+  902     1 containerd
+ 1503     1 containerd-shim   <span class="c"># parented to PID 1, NOT to containerd</span>
+ 1526  1503  \_ nginx         <span class="c"># the container process, child of the shim</span>
+ 1560  1526      \_ nginx</code></div>
+        <p>Two things to notice. <code>nginx</code>'s parent is the <b>shim</b> (<code>containerd-shim-runc-v2</code>), and the shim's parent is <b>PID 1</b>, not <code>containerd</code> — that reparenting is what lets containerd restart without touching <code>nginx</code>. And there's no <code>runc</code> in the tree: it already did its job (create the namespaces, exec nginx) and exited. <code>dockerd</code> and <code>containerd</code> sit as separate top-level daemons. This one <code>ps</code> makes the whole architecture concrete.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — crack open an OCI image</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>An image is a manifest pointing at a config and layers, all content-addressed. Export one and read its structure.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker pull alpine:3.20
+docker save alpine:3.20 -o alpine.tar
+mkdir img &amp;&amp; tar -xf alpine.tar -C img
+find img -maxdepth 2 -name '*.json' -o -name 'index.json' | head   <span class="c"># manifest/config/index</span>
+<span class="c"># Read the config: architecture, the layer diff_ids, and the build history:</span>
+cfg=$(find img -path '*blobs*' -type f | while read f; do grep -l '"rootfs"' "$f" 2&gt;/dev/null; done | head -1)
+cat "$cfg" | python3 -m json.tool | grep -A6 '"rootfs"'</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>"rootfs": {
+    "type": "layers",
+    "diff_ids": [
+        "sha256:d4fc045c9e3a848011de66f34b81f052d4f2c15a17bb196d637e526349601820"
+    ]
+}</code></div>
+        <p>The config's <code>rootfs.diff_ids</code> is the ordered list of layer digests — the exact stack overlayfs will assemble at run time. The manifest ties this config to the layer blobs (each a <code>sha256:</code> file under <code>blobs/</code>), and the whole thing is content-addressed, so identical layers are shared and pulled once. This is the OCI <b>image spec</b> in the flesh: manifest → config → layers, all by digest. It's what a registry serves and what containerd unpacks.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Understand — talk to containerd directly with ctr and crictl</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>On the kind node (<code>docker exec -it lab-control-plane bash</code>), the Kubernetes containers are managed by containerd. Deploy something, then view it from two levels: the CRI (<code>crictl</code>) and containerd's own API (<code>ctr</code>).</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># From your Mac: create a workload</span>
+kubectl create deployment web --image=nginx
+<span class="c"># On the node (docker exec ... bash), see it through the CRI:</span>
+crictl ps                                   <span class="c"># running containers, CRI view</span>
+crictl images                               <span class="c"># images known to the runtime</span>
+<span class="c"># Now containerd's native view — note the k8s.io containerd namespace:</span>
+ctr namespaces ls
+ctr -n k8s.io containers ls | head</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>CONTAINER      IMAGE                 STATE     NAME   POD
+9f2a1c...      docker.io/library/    Running   web    web-...
+NAME
+k8s.io
+CONTAINER            IMAGE                              RUNTIME
+9f2a1c...            docker.io/library/nginx:latest     io.containerd.runc.v2</code></div>
+        <p><code>crictl</code> shows the CRI's abstraction — pods and containers, exactly what the kubelet sees. <code>ctr -n k8s.io</code> shows the same containers as containerd objects, in the <code>k8s.io</code> containerd namespace (a containerd concept, unrelated to the kernel namespaces of <a href="ch22-linux-namespaces.html">Chapter 22</a>). Same container, two altitudes: <code>crictl</code> is the debugging tool you'll actually use, because it speaks the standard CRI and works the same on any node regardless of whether the runtime is containerd or CRI-O.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — debug a broken pod with crictl</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>A pod is stuck and <code>kubectl logs</code> gives you nothing useful. On the node, <code>crictl</code> sees what the runtime sees. Break a pod on purpose, then investigate from the node before revealing.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># From your Mac: a pod that references an image that doesn't exist</span>
+kubectl run bad --image=nginx:doesnotexist-9x9x
+kubectl get pod bad          <span class="c"># stuck: ImagePullBackOff</span>
+<span class="c"># On the node — what does the runtime actually report?</span>
+crictl pods --name bad
+crictl images | grep doesnotexist || echo "image not present on node"</code></pre></div>
+        <p>The pod won't start. The API says <code>ImagePullBackOff</code>, but why exactly, and how would you confirm it's genuinely the image and not, say, the runtime or the network? Investigate from the node, then reveal.</p>
+        <details class="recall"><summary>Reveal the approach</summary>
+          <div class="body">
+            <p>Go down the stack until something tells you the truth. <code>kubectl describe pod bad</code> shows the events, and on the node <code>crictl</code> confirms the runtime's own view — the sandbox exists but the container image never pulled:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>crictl pods --name bad              <span class="c"># the pod sandbox is up (pause container)</span>
+crictl ps -a | grep bad || true     <span class="c"># no app container was ever created</span>
+<span class="c"># Ask containerd to pull it directly — the raw error, no Kubernetes in the way:</span>
+crictl pull nginx:doesnotexist-9x9x</code></pre></div>
+            <div class="out"><span class="ol">Output</span>FATA[0002] pulling image: failed to resolve reference
+"docker.io/library/nginx:doesnotexist-9x9x": not found</code></div>
+            <p>That's the ground truth: the runtime tried and the tag doesn't exist in the registry. Now you know it's an image problem, not a runtime crash, not a CRI-socket problem, not a network partition — because you asked the layer that actually does the pull and got its unfiltered error. This is the core value of <code>crictl</code> on a node: when <code>kubectl</code> is too high-level (or the kubelet itself is unhealthy), you drop to the CRI and get the runtime's own answer. The same move diagnoses a wedged container (<code>crictl inspect</code>), missing logs (<code>crictl logs</code>), or a runtime that's down entirely (<code>crictl info</code> failing points at containerd, not your workload). This is the node-level troubleshooting you'll formalise in <a href="ch40-kubernetes-troubleshooting-methodology.html">Chapter 40</a>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — the dockershim removal</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>A team upgrades a cluster to Kubernetes 1.24+ and their nodes — configured years ago to use "Docker" as the runtime — stop being able to run pods. First, confirm what your kind node actually uses, then reason about what happened to them.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># From your Mac: which runtime is each node on?</span>
+kubectl get nodes -o wide      <span class="c"># see the CONTAINER-RUNTIME column</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME                STATUS   ... CONTAINER-RUNTIME
+lab-control-plane   Ready    ... containerd://1.7.x</code></div>
+        <p>Your node reports <code>containerd://…</code>, not Docker. The senior question: what was "dockershim," why was removing it in 1.24 mostly a non-event yet broke some clusters, and what should the affected team check and do? Reason it through before revealing.</p>
+        <details class="recall"><summary>Reveal the reasoning</summary>
+          <div class="body">
+            <p><b>What dockershim was:</b> the kubelet couldn't speak Docker Engine's API through the CRI, so it shipped a built-in adapter — dockershim — that translated CRI calls into Docker Engine calls. It was extra code the Kubernetes project had to maintain for one specific runtime, while every other runtime already spoke the CRI natively. It was deprecated in 1.20 and <b>removed in Kubernetes 1.24</b> (released May 2022).</p>
+            <p><b>Why removal was mostly a non-event:</b> Docker Engine already uses containerd under the hood, and most clusters — and all managed offerings — were already configured with containerd or CRI-O as the CRI runtime directly. For them, nothing changed: the kubelet was never using dockershim. It also does <em>not</em> affect images: OCI images built by <code>docker build</code> run unchanged, because the image format is a shared standard.</p>
+            <p><b>Who broke and what to do:</b> clusters where nodes were explicitly configured to use Docker Engine <em>as the kubelet's runtime</em> (via dockershim) lost their runtime on upgrade. The fix is one of: point the kubelet at containerd directly (which was already installed as Docker's own dependency) — the common path — or install <b>cri-dockerd</b>, the external CRI adapter for Docker Engine maintained by Mirantis, if they truly must keep Docker Engine. The check is exactly the command above: <code>kubectl get nodes -o wide</code> and the node's kubelet <code>--container-runtime-endpoint</code>. The lasting lesson is the one this whole chapter teaches: "Docker" was always several layers, Kubernetes only ever needed the bottom ones, and standardising on the CRI and containerd made the Docker-branded layers optional on a node. Building images with Docker and running them with containerd is not a contradiction — it's the OCI model working as designed.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · kubectl logs is empty but the app is clearly running</div>
+      <p><b>Symptom:</b> <code>kubectl logs</code> returns nothing, yet the container is serving traffic. <b>First cut:</b> on the node, <code>crictl ps</code> to find the container ID, then <code>crictl logs &lt;id&gt;</code>. <b>Usual cause:</b> the app writes logs to a file inside the container instead of stdout/stderr — the shim only captures the standard streams, so file logs never reach the CRI or <code>kubectl</code>. <b>Fix:</b> log to stdout/stderr (twelve-factor style) or run a sidecar that tails the file. Knowing the shim is what captures stdio tells you immediately why file logs are invisible.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · node NotReady, kubelet can't reach the runtime</div>
+      <p><b>Symptom:</b> a node goes <code>NotReady</code>; the kubelet log says it can't connect to the container runtime. <b>First cut:</b> on the node, <code>crictl info</code> or <code>crictl ps</code> — if these hang or fail, the problem is containerd, not any workload. <b>Confirm:</b> <code>systemctl status containerd</code> and the CRI socket path the kubelet is configured with. <b>Usual cause:</b> containerd crashed, is out of resources, or the socket path/endpoint is misconfigured. <b>Fix:</b> restart containerd (the shims keep the containers alive across the restart) and correct the endpoint. This is where "the daemon and the runtime are different things with different lifetimes" pays off.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · "works in Docker, fails in the cluster"</div>
+      <p><b>Symptom:</b> an image runs under <code>docker run</code> but misbehaves as a pod. <b>First cut:</b> remember the runtimes differ only in a few places — the image is identical (OCI), so suspect what containerd/CRI configures differently: the cgroup driver (systemd vs cgroupfs mismatch causes odd resource behaviour), a stricter default seccomp/AppArmor profile, or a different logging path. <b>Usual cause:</b> a cgroup-driver mismatch between the kubelet and containerd, or the container relying on Docker-specific defaults. <b>Fix:</b> align the cgroup driver on both, and don't assume Docker's conveniences (its default network, its DNS behaviour) exist under the CRI.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Know your node's runtime, and don't install what you don't need.</b> Production Kubernetes nodes run containerd (or CRI-O) and have no reason to run Docker Engine or the Docker CLI — fewer components mean less to patch and less attack surface. Keep the CRI socket path consistent between the kubelet and the runtime, and align the cgroup driver (use <code>systemd</code> on systemd hosts for both) or you'll get subtle resource-accounting bugs. When you build images, you can still use Docker or BuildKit locally; the resulting OCI image runs on any compliant runtime, which is the point of the standard.</p>
+    <p><b>Security.</b> The runtime layer is where a lot of container hardening actually takes effect: the OCI <code>config.json</code> is where seccomp profiles, dropped capabilities, read-only root filesystems, and user mappings are set, and containerd/the kubelet populate it from your pod's <code>securityContext</code>. For workloads that need stronger isolation than shared-kernel namespaces provide, the pluggable-runtime design lets you run specific pods under gVisor or Kata via a <code>RuntimeClass</code> without changing anything else — the payoff of the OCI split. Verify and pin images by digest and use signature verification so the artefact the runtime pulls is the one you built (<a href="ch27-container-security-and-process-to-container-to.html">Chapter 27</a>).</p>
+    <p><b>Performance and operations.</b> containerd is designed to be restarted and upgraded without downtime because the shims keep containers alive — so runtime upgrades are routine, not scary. Image pull time dominates cold-start latency, so a good base-image and caching strategy (shared layers, a pull-through cache or registry mirror) matters more than the runtime's own overhead, which is small. For very high container density or fast-scaling workloads, some teams choose <code>crun</code> for lower per-container startup cost; measure before switching, since the difference is usually marginal for long-lived services.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>The OCI split is a case study in designing for replaceability through standards, and it's worth internalising as a pattern, not just a fact about containers. By defining narrow, stable interfaces — the image format, the runtime bundle, the registry protocol, and the CRI — the ecosystem made every layer independently swappable: build with any tool, store in any registry, manage with containerd or CRI-O, and execute with runc, crun, gVisor, or Kata, all without the layers above caring. That's why Kubernetes could remove Docker without breaking a single image, and why you can drop a sandboxed runtime under one sensitive workload via <code>RuntimeClass</code> while everything else stays on runc. When you design platforms, this is the lever: a well-placed standard interface turns a monolith you're stuck with into components you can evolve. The CRI in particular is the seam that lets the control plane (<a href="ch28-why-kubernetes-the-declarative-reconciled-model.html">Chapter 28</a>) and the node runtime (<a href="ch30-the-node-kubelet-kube-proxy-runtime-cri.html">Chapter 30</a>) evolve on separate schedules — a decoupling you'll rely on every time you upgrade one without the other.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first, then open it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's the difference between containerd and runc?</summary>
+        <div class="a"><p><code>containerd</code> is a daemon that manages the whole node's containers over time: it pulls and stores images, unpacks layers, and drives container lifecycle. <code>runc</code> is a low-level tool that creates <em>one</em> container from an OCI bundle — it sets up namespaces and cgroups, execs the process, and exits. So containerd is the long-lived manager and runc is the short-lived launcher. containerd calls runc (via a shim) to actually create each container.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through what happens from a CRI call to a running container.</summary>
+        <div class="a"><p>The kubelet makes a gRPC call over the CRI — a Unix socket — to containerd's CRI service, which has a RuntimeService for pods/containers and an ImageService for images. containerd ensures the image is pulled per the OCI distribution spec and unpacks its layers through the snapshotter into an overlay. It then assembles an OCI bundle: the root filesystem plus a <code>config.json</code> describing the namespaces, cgroup limits, mounts, user, capabilities, and seccomp for this container. containerd starts a <code>containerd-shim-runc-v2</code> process — reparented to init so it outlives containerd — and the shim invokes <code>runc</code>, which creates the namespaces and cgroups, pivots root, applies security settings, execs the workload as PID 1 inside the container, and exits. The shim stays as the container's parent, owning its stdio and reporting its exit status back to containerd and up to the kubelet. The key ideas: the CRI is a stable seam, runc only creates and then exits, and the shim is what keeps the container independent of containerd's lifetime.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>What are the OCI specifications and why do they matter?</summary>
+        <div class="a"><p>There are three. The image spec defines how an image is packaged — a manifest referencing a config (with the ordered layer digests and history) and content-addressed layer blobs — so any tool can build or read one. The runtime spec defines a bundle, which is a root filesystem plus a <code>config.json</code> describing exactly how to run a container (namespaces, cgroups, mounts, process, security), so any compliant runtime can execute it. The distribution spec defines the registry pull/push API. They matter because they turn the stack into swappable layers: you can build with Docker or BuildKit, store in any registry, manage with containerd or CRI-O, and execute with runc, crun, gVisor, or Kata, and everything interoperates. It's why Kubernetes removing Docker didn't break any images, and why you can run a sandboxed runtime under one workload without changing the rest. Standards are what made the monolith into components.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A node is NotReady and pods won't schedule to it. <code>kubectl logs</code> and <code>kubectl exec</code> fail. How do you triage on the node?</summary>
+        <div class="a"><p>I'd drop below Kubernetes to the runtime. On the node I'd run <code>crictl info</code> and <code>crictl ps</code> — if those hang or error, the container runtime itself is unhealthy, which explains the NotReady, and the workloads are a red herring. I'd check <code>systemctl status containerd</code> and the kubelet's configured CRI socket endpoint, and look at containerd and kubelet logs. If containerd crashed, restarting it is safe because the per-container shims keep the running containers alive and containerd reconnects to them. If <code>crictl</code> works fine but <code>kubectl</code> doesn't, the problem is higher up — the kubelet's connection to the API server, or certificates. The method is to walk the stack downward until a layer gives you an unfiltered error, and <code>crictl</code> is the tool that talks to the CRI directly regardless of which runtime is underneath.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>Kubernetes "removed Docker" in 1.24 — what actually changed?</summary>
+        <div class="a"><p>They removed dockershim, the kubelet's built-in adapter that translated CRI calls to Docker Engine's API. Docker Engine doesn't speak the CRI, so it needed that shim; every other runtime speaks CRI natively, and maintaining special-case code for one runtime wasn't worth it. For almost everyone it was a non-event, because clusters and managed platforms were already using containerd or CRI-O directly — and Docker Engine itself runs on containerd anyway. It did not affect images at all: OCI images built with <code>docker build</code> run unchanged, because the image format is a shared standard. The only people affected were those who'd explicitly configured nodes to use Docker Engine as the kubelet's runtime; they either repointed the kubelet at the containerd that was already installed, or added cri-dockerd, the external Docker CRI adapter. The headline "Kubernetes is dropping Docker" scared people, but the substance was just removing a redundant translation layer.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>"Docker" is a stack. The <code>docker</code> CLI drives <code>dockerd</code>, which owns build, the CLI API, and Docker networking, and delegates the actual container work to <code>containerd</code>. <code>containerd</code> is the node's container manager: it pulls and stores OCI images, unpacks layers via its snapshotter, and drives lifecycle. For each container it prepares an OCI bundle (rootfs + <code>config.json</code>) and starts a shim (<code>containerd-shim-runc-v2</code>, reparented to init) that invokes <code>runc</code>. <code>runc</code> is the OCI runtime that creates one container — namespaces, cgroups, pivot root, seccomp, exec — and then exits; the shim stays as the container's parent so containerd can restart without killing workloads. Kubernetes' kubelet skips Docker and calls <code>containerd</code> over the <b>CRI</b> (gRPC: RuntimeService + ImageService) on a Unix socket. The three OCI specs — image, runtime, distribution — make every layer swappable, which is why <b>dockershim was removed in 1.24</b> without breaking images. Debug from the node with <code>crictl</code> (CRI, runtime-agnostic) and <code>ctr</code> (containerd-native, <code>k8s.io</code> namespace).</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>The stack: <code>docker</code> CLI → <code>dockerd</code> → <code>containerd</code> → shim → <code>runc</code> → container.</li>
+      <li><code>containerd</code> is the long-lived node manager (images, snapshots, lifecycle); <code>runc</code> is the short-lived launcher of one container.</li>
+      <li><code>runc</code> creates namespaces + cgroups, pivots root, applies seccomp/caps, execs the process, then exits.</li>
+      <li>The shim (<code>containerd-shim-runc-v2</code>) is reparented to init and stays as the container's parent, so containerd can restart without killing containers.</li>
+      <li>The kubelet talks to the runtime over the CRI — gRPC on a Unix socket, with a RuntimeService and an ImageService.</li>
+      <li>Three OCI specs: image (manifest→config→layers), runtime (bundle = rootfs + <code>config.json</code>), distribution (registry API).</li>
+      <li><code>runc</code> is the reference OCI runtime; <code>crun</code>, gVisor's <code>runsc</code>, and Kata are drop-in alternatives selectable via <code>RuntimeClass</code>.</li>
+      <li>dockershim was removed in Kubernetes 1.24; kubelet uses containerd/CRI-O directly, and cri-dockerd is the external adapter if you must keep Docker Engine.</li>
+      <li>Images are unaffected by the runtime — an OCI image built by Docker runs on any compliant runtime.</li>
+      <li>Debug on a node with <code>crictl</code> (CRI, works on any runtime) and <code>ctr -n k8s.io</code> (containerd-native); drop to them when <code>kubectl</code> can't see the problem.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch22-linux-namespaces.html"><b>Ch 22</b> Namespaces</a>
+      <a href="ch23-cgroups-v2-cpu-memory-io-limits.html"><b>Ch 23</b> cgroups v2</a>
+      <a href="ch24-container-filesystems-overlayfs-and-image-layers.html"><b>Ch 24</b> Overlayfs &amp; layers</a>
+      <a href="ch27-container-security-and-process-to-container-to.html"><b>Ch 27</b> Container security</a>
+      <a href="ch30-the-node-kubelet-kube-proxy-runtime-cri.html"><b>Ch 30</b> The node &amp; CRI</a>
+      <a href="ch40-kubernetes-troubleshooting-methodology.html"><b>Ch 40</b> K8s troubleshooting</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Open Container Initiative — <a href="https://opencontainers.org/">opencontainers.org</a>, and the <a href="https://github.com/opencontainers/runtime-spec">Runtime Spec</a> and <a href="https://github.com/opencontainers/image-spec">Image Spec</a>: the bundle, the manifest/config/layers, and the standards behind the stack.</li>
+      <li>containerd — <a href="https://containerd.io/">containerd.io</a> and its <a href="https://github.com/containerd/containerd/blob/main/docs/getting-started.md">documentation</a>: the daemon, snapshotters, the CRI plugin, and <code>ctr</code>.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/architecture/cri/">Container Runtime Interface (CRI)</a>: how the kubelet talks to runtimes.</li>
+      <li>Kubernetes blog — <a href="https://kubernetes.io/blog/2022/02/17/dockershim-faq/">Dockershim Removal FAQ</a> and <a href="https://kubernetes.io/blog/2020/12/02/dont-panic-kubernetes-and-docker/">Don't Panic: Kubernetes and Docker</a>: what the 1.24 change did and didn't do.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/tasks/debug/debug-cluster/crictl/">Debugging Kubernetes nodes with crictl</a> and <a href="https://docs.docker.com/engine/">Docker Engine docs</a>: the tools and the daemon.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch25-container-networking.html"><span class="dir">← Prev</span><div class="ti">Ch 25 — Container networking</div></a>
+      <a class="nx" href="ch27-container-security-and-process-to-container-to.html"><span class="dir">Next →</span><div class="ti">Ch 27 — Container security &amp; Process → Container → Pod → VM</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 26 of 121 · Part III · Containers &amp; Container Internals. Run <code>crictl ps</code> on a real node once; it demystifies the whole stack.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">The layers</a>
+    <a href="#internals">CRI call → process</a>
+    <a href="#components">Pieces &amp; tools</a>
+    <a href="#flow">Following a pod start</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

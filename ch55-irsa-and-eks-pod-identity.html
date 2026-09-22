@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 55 — IRSA and EKS Pod Identity</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part VI · AWS &amp; EKS &nbsp;·&nbsp; Chapter 55</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part VI · AWS &amp; EKS for SREs · Chapter 55</div>
+      <h1>IRSA and EKS Pod Identity</h1>
+      <p class="tagline">A pod has no access key sitting on disk for anyone to steal, and yet it calls S3 as if it does. The trick is that Kubernetes hands STS a signed note instead of a credential, and STS already knew how to deal with signed notes — it's the exact door Chapter 54 walked through, just with a different kind of ID at the window.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~42 min read · eksctl / kubectl / AWS CLI</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain the problem IRSA solves that "just give every node one big IAM role" doesn't, and why a pod needed a new mechanism at all.</li>
+          <li>Trace a projected service account token from the kubelet's disk write all the way to a completed <code>sts:AssumeRoleWithWebIdentity</code> call, in order.</li>
+          <li>Tell IRSA and EKS Pod Identity apart — what changed, what stayed the same, and which one to reach for on a new cluster.</li>
+          <li>Annotate a ServiceAccount, exec into a pod, and reach S3 with no static credential anywhere on the box.</li>
+          <li>Debug "pod can't access S3" by checking the trust policy, the ServiceAccount annotation, and the token's claims, in that order.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>A pod isn't an EC2 instance, and IMDS doesn't know that</h2>
+    <p><a href="ch54-iam-and-sts.html">Chapter 54</a> ended with an EC2 instance pulling its attached role's credentials off the Instance Metadata Service — clean, no static secret, works great for one process per machine. Now put forty pods from six different teams on that same instance. IMDS still only knows about <em>the node</em>. Every pod that curls <code>169.254.169.254</code> gets back the exact same node-level role, whether it's the billing service that needs to write to a database or a static file server that needs nothing at all. Your options with that constraint are both bad: give the node role the union of everything any pod on it might ever need — enormous, standing over-privilege — or run one tiny single-tenant node group per workload, which defeats half the point of bin-packing pods onto shared nodes in the first place.</p>
+    <p>What you actually want is an IAM role <em>per pod</em>, or more precisely per workload. But a pod has no hardware identity the way an EC2 instance does — it's a Linux process, not a machine IMDS was ever designed to recognize individually. So AWS needed a different question to ask at the door. Instead of "prove you're this EC2 instance," the question becomes "prove you're this specific Kubernetes ServiceAccount" — and Kubernetes already has a built-in way to prove exactly that: a signed token. <b>IAM Roles for Service Accounts (IRSA)</b>, and its newer sibling <b>EKS Pod Identity</b>, are both just AWS teaching IAM's trust machinery to accept that Kubernetes-signed proof in place of an existing AWS credential.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>Nothing about the <em>authorization</em> half of this chapter is new. Once a pod has temporary credentials, they're checked against a permission policy exactly the way Chapter 54 described — same STS, same temporary-credential shape, same evaluation rules. The only genuinely new idea here is on the <em>authentication</em> half: what a pod presents as proof of who it is, and who AWS trusts to have signed that proof.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: the same badge desk, a new kind of ID</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Remember the temp-badge desk from <a href="ch54-iam-and-sts.html">Chapter 54</a> — you showed a permanent company badge, the desk checked its rulebook, you walked away with a temporary badge. IRSA teaches that same desk one new trick: it now also keeps a list of <b>outside notaries it has agreed in advance to trust</b>, and it will accept a properly signed note from one of them in place of your company badge. The notary it registers is Kubernetes itself — specifically, one particular cluster's own signing key.</p>
+      <p>Every pod that needs AWS access carries exactly one such note: a signed, short-lived <b>token</b>, naming precisely one requester ("this note is for <code>system:serviceaccount:payments:billing-writer</code>, nobody else") and automatically replaced with a fresh one before the old one goes stale. The pod hands that note to the badge desk instead of a company badge. The desk checks two things: is this note genuinely signed by the notary it registered (Kubernetes' signature verifies), and does the note's stated purpose match what this specific temporary badge requires ("only issue this badge to notes naming exactly <code>billing-writer</code>")? Pass both, and out comes a temporary badge — identical in every way to the one Alice got in Chapter 54, just requested with a very different kind of ID.</p>
+      <p><b>EKS Pod Identity</b> is the same idea with the paperwork simplified: instead of you personally registering the outside notary and hand-writing the note-matching rule into the badge's own rulebook, a dedicated clerk (an agent running on every floor of the building) handles the whole notary relationship for you and just hands the badge straight to the pod.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In IRSA / Pod Identity</th></tr>
+      <tr><td>The outside notary the badge desk agreed to trust in advance</td><td>The IAM OIDC identity provider, pointed at the cluster's own OIDC issuer URL</td></tr>
+      <tr><td>The signed note, naming one requester, replaced automatically before it goes stale</td><td>The projected ServiceAccount token (a JWT) mounted into the pod, refreshed by the kubelet</td></tr>
+      <tr><td>The specific temporary badge the note is allowed to request</td><td>The IAM role whose trust policy conditions match this token's claims</td></tr>
+      <tr><td>Handing the note to the desk</td><td><code>sts:AssumeRoleWithWebIdentity</code></td></tr>
+      <tr><td>The desk checking the note is genuinely from the registered notary and says what it claims</td><td>STS verifying the JWT's signature and checking its <code>sub</code>/<code>aud</code> claims against the role's trust policy</td></tr>
+      <tr><td>A dedicated clerk who now handles the whole exchange for you</td><td>The EKS Pod Identity Agent, running as a DaemonSet on every node</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>OIDC federation, a projected token, and one scoped role</h2>
+    <p>Every EKS cluster has its own <b>OIDC issuer URL</b> — a real, discoverable OpenID Connect endpoint that publishes its own signing keys, exactly like any other identity provider. IRSA's setup has exactly one manual, one-time step per cluster: register that issuer as an <b>IAM OIDC identity provider</b>, so IAM is willing to trust JSON Web Tokens signed by this specific cluster at all. From there, an IAM role's trust policy can name that provider as a <code>Federated</code> principal and add a condition pinning the token's <code>sub</code> claim to one exact string — <code>system:serviceaccount:&lt;namespace&gt;:&lt;service-account-name&gt;</code> — and its <code>aud</code> claim to <code>sts.amazonaws.com</code>. That condition is the entire scoping mechanism: it's not "any pod in this cluster," it's one specific ServiceAccount, full stop.</p>
+    <p>On the Kubernetes side, you annotate that ServiceAccount with the role's ARN. A mutating admission webhook that ships with EKS watches for pods using an annotated ServiceAccount and, at pod creation, injects a projected volume containing a freshly requested token plus two environment variables — <code>AWS_ROLE_ARN</code> and <code>AWS_WEB_IDENTITY_TOKEN_FILE</code>. Any AWS SDK that sees both of those variables already knows, with zero application code changes, to read the token file and call <code>AssumeRoleWithWebIdentity</code> with it. That auto-detection is deliberate — it's the same mechanism the SDK already used for other web-identity flows, just pointed at a new token source.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 840 420" role="img" aria-label="A pod's app container reads a projected service account token and calls STS AssumeRoleWithWebIdentity; STS verifies the token against the cluster's OIDC provider and the role's trust policy, then returns temporary credentials the pod uses against a target AWS API">
+        <defs>
+          <marker id="p1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+          <marker id="p2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+        </defs>
+        <rect x="16" y="30" width="230" height="290" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="32" y="52" style="fill:var(--muted);font:700 10.5px sans-serif;letter-spacing:.04em">POD</text>
+        <rect x="32" y="62" width="198" height="58" rx="7" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.4"/>
+        <text x="131" y="84" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">app container</text>
+        <text x="131" y="100" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">AWS SDK · no static creds anywhere</text>
+        <line x1="131" y1="120" x2="131" y2="138" style="stroke:var(--line);stroke-width:1.5"/>
+        <text x="150" y="132" style="fill:var(--muted);font:9px sans-serif">reads token file</text>
+        <rect x="32" y="142" width="198" height="106" rx="7" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.4;stroke-dasharray:5 4"/>
+        <text x="131" y="162" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">Projected SA token (JWT)</text>
+        <text x="131" y="178" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">mounted, auto-refreshed by kubelet</text>
+        <text x="131" y="196" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">sub: system:serviceaccount:</text>
+        <text x="131" y="210" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">payments:billing-writer</text>
+        <text x="131" y="228" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">aud: sts.amazonaws.com</text>
+        <text x="131" y="266" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">env: AWS_ROLE_ARN,</text>
+        <text x="131" y="280" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">AWS_WEB_IDENTITY_TOKEN_FILE</text>
+        <text x="131" y="298" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">— injected by the pod-identity webhook</text>
+
+        <line x1="246" y1="90" x2="288" y2="90" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#p1)"/>
+        <text x="267" y="72" text-anchor="middle" style="fill:var(--accent2);font:600 8.5px sans-serif">AssumeRoleWithWebIdentity</text>
+        <text x="267" y="83" text-anchor="middle" style="fill:var(--accent2);font:600 8.5px sans-serif">(RoleArn, WebIdentityToken)</text>
+
+        <rect x="292" y="20" width="230" height="290" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="308" y="42" style="fill:var(--accent);font:700 11.5px sans-serif;letter-spacing:.04em">AWS STS</text>
+        <rect x="308" y="52" width="198" height="92" rx="7" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.4"/>
+        <text x="407" y="72" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">Verifies the JWT</text>
+        <text x="407" y="88" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">signature checked against the</text>
+        <text x="407" y="102" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">cluster's OIDC provider public keys</text>
+        <text x="407" y="118" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">(registered as a one-time setup step)</text>
+        <line x1="407" y1="144" x2="407" y2="162" style="stroke:var(--line);stroke-width:1.5"/>
+        <rect x="308" y="166" width="198" height="102" rx="7" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.4"/>
+        <text x="407" y="186" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">Checks the role's TRUST POLICY</text>
+        <text x="407" y="202" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">Federated principal = OIDC provider ARN</text>
+        <text x="407" y="216" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">Condition: sub == this exact</text>
+        <text x="407" y="230" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">service account · aud == sts.amazonaws.com</text>
+        <text x="407" y="248" text-anchor="middle" style="fill:var(--accent2);font:600 9px sans-serif">match → mint temp credentials</text>
+
+        <line x1="522" y1="90" x2="564" y2="90" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#p1)"/>
+        <text x="543" y="72" text-anchor="middle" style="fill:var(--accent2);font:600 8.5px sans-serif">temp credentials</text>
+        <text x="543" y="106" text-anchor="middle" style="fill:var(--muted);font:8px sans-serif">(same shape as Ch 54 —</text>
+        <text x="543" y="117" text-anchor="middle" style="fill:var(--muted);font:8px sans-serif">nothing new past this point)</text>
+
+        <rect x="568" y="40" width="220" height="80" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="678" y="64" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">Target AWS API</text>
+        <text x="678" y="82" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">e.g. S3 GetObject / PutObject</text>
+        <text x="678" y="98" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">signed with the temp credentials</text>
+        <line x1="678" y1="120" x2="678" y2="160" style="stroke:var(--accent);stroke-width:2" marker-end="url(#p2)"/>
+
+        <rect x="568" y="164" width="220" height="110" rx="8" style="fill:var(--panel);stroke:var(--deep);stroke-width:1.4"/>
+        <text x="678" y="186" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">Checks the ROLE'S</text>
+        <text x="678" y="202" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">PERMISSION POLICY</text>
+        <text x="678" y="220" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">exactly as in Chapter 54 —</text>
+        <text x="678" y="234" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">the pod's identity never enters here</text>
+        <text x="678" y="252" text-anchor="middle" style="fill:var(--accent2);font:600 9px sans-serif">allow → object returned</text>
+        <text x="678" y="266" text-anchor="middle" style="fill:var(--deep);font:600 9px sans-serif">deny → AccessDenied</text>
+      </svg>
+      <figcaption>Only the first hop is new: a Kubernetes-signed token stands in for an existing IAM credential. Everything from "STS mints temporary credentials" onward is the identical machinery from Chapter 54.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>The webhook injects that projected token and those two environment variables <em>at pod creation</em>, through admission. A pod that was already running when you annotated its ServiceAccount does not retroactively get either one — it has to be recreated. "I annotated the ServiceAccount and it still doesn't work" is very often just an old pod that was never touched by the webhook at all.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>From one-time cluster setup to one completed AssumeRoleWithWebIdentity</h2>
+    <p>Walk the full chain in the order it actually happens, because every lab in this chapter is a variation on one step in this list going wrong.</p>
+    <ol class="steps">
+      <li><b>Register the cluster's OIDC issuer with IAM, once per cluster.</b> <code>eksctl utils associate-iam-oidc-provider</code> (or the console equivalent) creates an IAM OIDC identity provider whose URL matches the cluster's own issuer and whose audience is <code>sts.amazonaws.com</code>. Skip this and no role anywhere can trust tokens from this cluster, no matter how correctly everything else is configured.</li>
+      <li><b>Create a role whose trust policy names that provider,</b> with a <code>Federated</code> principal and a condition pinning <code>&lt;oidc-provider&gt;:sub</code> to one exact <code>system:serviceaccount:namespace:name</code> string and <code>&lt;oidc-provider&gt;:aud</code> to <code>sts.amazonaws.com</code>. This is the scoping mechanism — get the namespace or name even slightly wrong here and the role trusts nothing real.</li>
+      <li><b>Annotate the matching ServiceAccount</b> with <code>eks.amazonaws.com/role-arn: &lt;the role's ARN&gt;</code>. This is a plain Kubernetes object annotation — it does nothing by itself until a pod using this ServiceAccount is actually created.</li>
+      <li><b>A pod using that ServiceAccount is scheduled.</b> EKS's mutating admission webhook intercepts the pod spec before it's persisted and injects a projected volume (sourced from the Kubernetes <code>TokenRequest</code> API, requesting audience <code>sts.amazonaws.com</code>), a fixed mount path for it, and the two environment variables the SDK looks for.</li>
+      <li><b>The kubelet requests the actual token</b> from the API server at pod startup, and keeps refreshing it automatically well before it expires — the running container never has to think about rotation.</li>
+      <li><b>The AWS SDK inside the container detects <code>AWS_WEB_IDENTITY_TOKEN_FILE</code> and <code>AWS_ROLE_ARN</code></b> and, the first time any AWS call is made, reads the token file and calls <code>sts:AssumeRoleWithWebIdentity</code> with the role ARN and the token as <code>WebIdentityToken</code>.</li>
+      <li><b>STS verifies the JWT's signature</b> against the OIDC provider's published public keys, confirms it hasn't expired, and evaluates the target role's trust policy — does the <code>Federated</code> principal match, and do the token's <code>sub</code> and <code>aud</code> claims satisfy the policy's conditions?</li>
+      <li><b>If everything matches, STS mints temporary credentials</b> — the identical access key / secret key / session token shape from Chapter 54 — and the SDK caches and uses them exactly like any other assumed-role session, refreshing them again via the same flow once they near expiry.</li>
+    </ol>
+    <p><b>EKS Pod Identity</b> collapses several of these steps. There's no IAM OIDC provider for you to create, and no manual ServiceAccount annotation with a role ARN — instead you create a <b>Pod Identity association</b> (<code>aws eks create-pod-identity-association</code>) that directly links a cluster, a namespace, and a ServiceAccount name to a role ARN as a first-class EKS object. A dedicated <b>EKS Pod Identity Agent</b>, running as a DaemonSet on every node, handles the credential exchange locally, and the role's trust policy uses a dedicated <code>pods.eks.amazonaws.com</code> service principal instead of a Federated OIDC-provider principal with hand-written <code>sub</code>/<code>aud</code> conditions. The pod still gets a projected token; there's simply less of the OIDC federation plumbing for you to wire up and get wrong by hand.</p>
+
+    <details class="recall"><summary>Think first: you annotate a ServiceAccount correctly, but a pod that's been running for three days using it still fails to authenticate as the role. Why?</summary>
+      <div class="body">
+        <p>The webhook only acts at <b>pod admission</b> — the moment a pod is created, it inspects the ServiceAccount it's using and injects the token volume and environment variables then, and only then. A pod that was already running before you added the annotation was never touched by the webhook; it has neither the projected token nor the two environment variables, so its SDK calls fall through to whatever the next credential source in the chain happens to be (very possibly the node's own role, silently, which is its own problem). The fix is simply to delete and recreate the pod — a rolling restart of its Deployment does this for you — so the webhook gets a fresh chance to mutate it at creation time.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, and what each one owns</h2>
+    <ul>
+      <li><b>IAM OIDC identity provider.</b> Owns the one-time trust relationship between IAM and one specific cluster's token signer. Required for IRSA; not needed for EKS Pod Identity.</li>
+      <li><b>Role trust policy (IRSA form).</b> Owns the scoping: a <code>Federated</code> principal plus <code>sub</code>/<code>aud</code> conditions that pin the role to exactly one namespace:ServiceAccount pair.</li>
+      <li><b>ServiceAccount annotation.</b> Owns the Kubernetes-side pointer from a ServiceAccount to a role ARN, for IRSA. Does nothing retroactively — it only affects pods created after it's set.</li>
+      <li><b>Pod Identity association.</b> Owns the same cluster/namespace/ServiceAccount-to-role link for EKS Pod Identity, as a queryable EKS API object instead of an annotation plus a hand-written trust policy.</li>
+      <li><b>The mutating admission webhook (IRSA) / Pod Identity Agent (Pod Identity).</b> Owns injecting the projected token and, for IRSA, the two environment variables, at pod creation time.</li>
+      <li><b>Projected ServiceAccount token.</b> Owns proof of identity: a short-lived, audience-scoped JWT naming exactly one ServiceAccount, automatically refreshed by the kubelet for the life of the pod.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>One <code>aws s3 ls</code>, from inside the pod to the bucket</h2>
+    <p>A pod in namespace <code>payments</code> uses ServiceAccount <code>billing-writer</code>, annotated with a role that trusts exactly <code>system:serviceaccount:payments:billing-writer</code>. Someone execs in and runs <code>aws s3 ls s3://invoices/</code>. The CLI's SDK layer sees <code>AWS_WEB_IDENTITY_TOKEN_FILE</code> and <code>AWS_ROLE_ARN</code> already set in the environment, reads the projected token from disk, and calls <code>sts:AssumeRoleWithWebIdentity</code>. STS fetches the cluster's public keys, verifies the token's signature, and checks its <code>sub</code> claim — <code>system:serviceaccount:payments:billing-writer</code> — against the role's trust policy condition. They match, so STS returns temporary credentials. The CLI signs the S3 <code>ListObjectsV2</code> request with them; S3 checks the role's permission policy, finds an allow for <code>s3:ListBucket</code> on <code>invoices</code>, and returns the listing. Nothing in that entire chain — not the token, not the temporary credentials — was ever written to a secret, a config file, or anything that outlives the pod.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>This chapter's core mechanism only means something against a real EKS cluster's own OIDC issuer — a <code>kind</code> cluster's issuer isn't something IAM will ever trust, so unlike earlier chapters, LocalStack and local clusters can't meaningfully stand in for the cluster-to-IAM trust relationship itself. Where a lab genuinely needs real AWS, it says so; where the IAM side alone can be rehearsed for $0, it's noted.</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>CLUSTER=my-cluster
+OIDC_ID=$(aws eks describe-cluster --name $CLUSTER \
+  --query "cluster.identity.oidc.issuer" --output text | cut -d '/' -f 5)
+echo $OIDC_ID
+
+<span class="c"># No-cost local alt for the IAM half only: LocalStack Community can accept</span>
+<span class="c"># create-open-id-connect-provider and create-role calls so you can validate</span>
+<span class="c"># the JSON you're about to run against a real cluster, for $0.</span></code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — associate an OIDC provider and scope a role to one ServiceAccount</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Do the one-time cluster setup, then create a role that trusts exactly one namespace:ServiceAccount pair — not the whole cluster.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># One-time per cluster.</span>
+eksctl utils associate-iam-oidc-provider --cluster $CLUSTER --approve
+
+OIDC_PROVIDER="oidc.eks.us-east-1.amazonaws.com/id/$OIDC_ID"
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+cat &gt; trust.json &lt;&lt;EOF
+{ "Version": "2012-10-17", "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Federated": "arn:aws:iam::$ACCOUNT_ID:oidc-provider/$OIDC_PROVIDER" },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": { "StringEquals": {
+      "$OIDC_PROVIDER:sub": "system:serviceaccount:payments:billing-writer",
+      "$OIDC_PROVIDER:aud": "sts.amazonaws.com"
+} } }] }
+EOF
+aws iam create-role --role-name billing-writer-role --assume-role-policy-document file://trust.json
+aws iam put-role-policy --role-name billing-writer-role --policy-name s3-invoices \
+  --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::invoices/*"}]}'
+
+kubectl annotate serviceaccount billing-writer -n payments \
+  eks.amazonaws.com/role-arn=arn:aws:iam::$ACCOUNT_ID:role/billing-writer-role</code></pre></div>
+        <div class="out"><span class="ol">Output (from get-role)</span>{ "Role": { "Arn": "arn:aws:iam::111122223333:role/billing-writer-role" } }
+serviceaccount/billing-writer annotated</code></div>
+        <p>Look closely at the trust policy's <code>Condition</code> block: it names one exact namespace and one exact ServiceAccount name, not a wildcard. That single string is the entire boundary between "this role belongs to the billing writer" and "this role belongs to anything in the cluster."</p>
+        <p class="small"><b>No-cost local alt:</b> the trust-policy JSON and <code>put-role-policy</code> calls run identically against LocalStack for $0; only <code>associate-iam-oidc-provider</code> and the eventual pod-side test need a real cluster.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — exec in and read exactly what the SDK reads</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Roll a pod using that ServiceAccount, then look at precisely what the webhook injected — the environment variables and the token's actual claims.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>POD=$(kubectl get pod -n payments -l app=billing-writer -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n payments $POD -- env | grep AWS
+
+<span class="c"># Decode the token's payload (the middle third of the JWT) without verifying it:</span>
+kubectl exec -n payments $POD -- sh -c \
+  'cat $AWS_WEB_IDENTITY_TOKEN_FILE | cut -d. -f2 | base64 -d 2>/dev/null'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>AWS_ROLE_ARN=arn:aws:iam::111122223333:role/billing-writer-role
+AWS_WEB_IDENTITY_TOKEN_FILE=/var/run/secrets/eks.amazonaws.com/serviceaccount/token
+{"aud":["sts.amazonaws.com"],"exp":1758480000,
+ "sub":"system:serviceaccount:payments:billing-writer", ...}</code></div>
+        <p>The <code>sub</code> claim in that decoded token is character-for-character the same string you wrote into the trust policy's condition in Lab 1 — that's not a coincidence, it's the entire mechanism. Now prove the whole chain actually works:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl exec -n payments $POD -- aws sts get-caller-identity
+kubectl exec -n payments $POD -- aws s3 ls s3://invoices/</code></pre></div>
+        <div class="out"><span class="ol">Output</span>{ "Arn": "arn:aws:sts::111122223333:assumed-role/billing-writer-role/botocore-session-..." }
+2026-09-10 09:14:02       8421 q3-acme.csv</code></div>
+        <p class="small"><b>No-cost local alt:</b> none meaningful — this lab is inherently about a real cluster's live token and a real STS call, which is the whole point of it.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — the pod that can't authenticate at all</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Someone copies the ServiceAccount and role from Lab 1 into a new namespace, <code>payments-staging</code>, expecting it to just work. It doesn't. Investigate before revealing.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl exec -n payments-staging $POD -- aws s3 ls s3://invoices/</code></pre></div>
+        <div class="out"><span class="ol">Output</span>An error occurred (AccessDenied) when calling the AssumeRoleWithWebIdentity operation:
+Not authorized to perform sts:AssumeRoleWithWebIdentity</code></div>
+        <p>Note where this fails: it's an <code>AssumeRoleWithWebIdentity</code> error, not an S3 error — the call never even got as far as S3. Decode the token in this pod and compare its <code>sub</code> claim against what's actually in the role's trust policy before opening the answer.</p>
+        <details class="recall"><summary>Reveal the cause</summary>
+          <div class="body">
+            <p><b>The token's <code>sub</code> claim is <code>system:serviceaccount:payments-staging:billing-writer</code>, but the role's trust policy condition still says <code>system:serviceaccount:payments:billing-writer</code>.</b> The ServiceAccount got copied into a new namespace, and the annotation came with it — but nobody updated the IAM role's trust policy to match the new namespace, so the condition is now checking against a string the token will never produce. STS correctly refuses: this pod really isn't the principal the role trusts, by exactly one namespace's worth of difference.</p>
+            <p>The fix is either updating the trust policy's condition to the new namespace, or — better, if both environments genuinely need this access — adding a second condition value (or a second statement) so the role trusts both <code>payments:billing-writer</code> and <code>payments-staging:billing-writer</code> explicitly. What it should never become is a wildcard <code>sub</code> condition "to make the error go away" — that's the scoping mechanism gone entirely.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — no error at all, just silence and the wrong identity</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>A different pod, different day. No <code>AssumeRoleWithWebIdentity</code> error this time — <code>aws sts get-caller-identity</code> just quietly returns an identity nobody expected. Investigate before revealing.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl exec -n payments $POD2 -- env | grep AWS
+<span class="c"># (nothing printed at all)</span>
+
+kubectl exec -n payments $POD2 -- aws sts get-caller-identity</code></pre></div>
+        <div class="out"><span class="ol">Output</span>{ "Arn": "arn:aws:sts::111122223333:assumed-role/eksctl-nodegroup-role/i-0abc123..." }</code></div>
+        <p>There's no <code>AWS_ROLE_ARN</code>, no <code>AWS_WEB_IDENTITY_TOKEN_FILE</code> — the webhook injected nothing into this pod at all — and yet the SDK still returned an identity. Whose, and why didn't it just fail?</p>
+        <details class="recall"><summary>Reveal the cause</summary>
+          <div class="body">
+            <p><b>This is the node's own instance-profile role, reached through IMDS, exactly as in Chapter 54</b> — and it's answering because the SDK's credential-provider chain doesn't stop and error out when the IRSA-specific environment variables are missing; it just keeps falling through to the next source, and IMDS is the fallback of last resort. Checking the ServiceAccount's annotation turns up a typo: <code>eks.amazonaws.com/role-arn </code> with a trailing space in the annotation key, which Kubernetes treats as a completely different, unrecognized annotation — so the webhook never matched this ServiceAccount at all, and silently injected nothing.</p>
+            <p>This is worse than an outright failure, and worth sitting with: a broken annotation doesn't make the pod fail loudly, it makes the pod <em>quietly inherit whatever the node's role can do</em>. If that node role is broad — which it often is, because it also needs to support the CNI, kubelet, and image pulls — this pod may have far more access than anyone intended, and nothing about its behavior looks broken until someone notices the identity in a CloudTrail log. Fix the annotation key, recreate the pod, and confirm the environment variables actually appear this time before considering it resolved.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — can a pod just skip IRSA and ask the node directly?</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>Lab 4 hinted at something worth testing on purpose. If a pod's own credentials are misconfigured, it falls back to the node's role — but could a pod reach the node's IMDS credentials even when its <em>own</em> IRSA setup is perfectly correct, just by asking directly? Try it, then design the fix.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># From inside the correctly-configured billing-writer pod:</span>
+kubectl exec -n payments $POD -- curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" -o /tmp/t
+kubectl exec -n payments $POD -- sh -c \
+  'curl -s -H "X-aws-ec2-metadata-token: $(cat /tmp/t)" http://169.254.169.254/latest/meta-data/iam/security-credentials/'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>eksctl-nodegroup-role</code></div>
+        <p>It answered. A pod with a perfectly correct, narrowly-scoped IRSA role can still reach out and pull the <em>node's</em> role credentials directly, because by default nothing stops pod network traffic from reaching the node's link-local metadata address at all — Security Groups don't filter this traffic either, as <a href="ch51-vpc-security-security-groups-vs-nacls.html">Chapter 51</a> noted. Design the fix before opening it.</p>
+        <details class="recall"><summary>Reveal the fix</summary>
+          <div class="body">
+            <p><b>The durable fix is architectural, not a firewall rule: never let the node's role be worth stealing.</b> Keep node instance-profile roles down to exactly what kubelet, the CNI, and image pulls genuinely require — nothing application-shaped should ever live there — and give every workload its own IRSA role or Pod Identity association for anything it actually needs to do. If the node role can't read customer data, a pod reaching it via IMDS is a non-event.</p>
+            <p><b>As defense in depth on top of that,</b> some clusters additionally block pod-to-IMDS traffic at the network layer — either an explicit rule dropping pod-sourced traffic to <code>169.254.169.254</code>, or tuning the instance's metadata hop limit, though how effective a given hop-limit setting is depends on exactly which VPC CNI networking mode the cluster runs, so treat it as a secondary control to verify for your specific setup, not a substitute for keeping the node role minimal in the first place. The senior-level takeaway is the ordering: fix the blast radius first (minimal node role, IRSA/Pod Identity everywhere), then add network-layer hardening if you still want the extra layer — never the other way around.</p>
+          </div>
+        </details>
+        <p class="small"><b>No-cost local alt:</b> the vulnerability itself needs a real node and real IMDS to demonstrate; the fix — auditing what a node role actually grants and trimming it — is a policy-review exercise you can do against any account's IAM console for $0.</p>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · AssumeRoleWithWebIdentity rejected outright</div>
+      <p><b>Symptom:</b> the SDK fails before ever reaching the target AWS service, with an explicit <code>AssumeRoleWithWebIdentity</code> denial. <b>First cut:</b> decode the pod's token and diff its <code>sub</code>/<code>aud</code> claims against the role's trust policy condition, character for character. <b>Usual cause:</b> a namespace or ServiceAccount name that drifted out of sync between the Kubernetes annotation and the IAM trust policy — commonly after copying manifests into a new namespace.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · no error, but the wrong identity entirely</div>
+      <p><b>Symptom:</b> calls succeed, but <code>get-caller-identity</code> shows the node's instance-profile role instead of the expected assumed role, and no error was ever raised. <b>First cut:</b> check whether <code>AWS_ROLE_ARN</code> and <code>AWS_WEB_IDENTITY_TOKEN_FILE</code> are actually present in the pod's environment at all. <b>Usual cause:</b> a typo'd or missing ServiceAccount annotation that the webhook silently never matched, so the SDK fell all the way through to IMDS.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · it worked, then stopped, after an unrelated deploy</div>
+      <p><b>Symptom:</b> a workload that authenticated fine for weeks suddenly can't, right after a routine rollout. <b>First cut:</b> did the rollout change the ServiceAccount the pod uses, or was the annotation added <em>after</em> pods were already running rather than before? <b>Usual cause:</b> the webhook only injects at admission time — an annotation added to an already-running Deployment's ServiceAccount does nothing until the pods are actually recreated.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Scope every role to one workload, not a shared ServiceAccount for convenience.</b> The entire security value of IRSA comes from the trust policy's <code>sub</code> condition naming exactly one ServiceAccount. Reusing one ServiceAccount — and therefore one role — across several unrelated workloads quietly rebuilds the node-level over-privilege problem this chapter exists to solve, just one layer up.</p>
+    <p><b>Keep node roles minimal, always, regardless of IRSA.</b> Because pod network traffic can reach a node's IMDS unless something specifically blocks it, a node role is only as safe as "boring" — kubelet, CNI, and image-pull permissions, nothing that looks like an application permission. This isn't optional hardening; it's the actual backstop behind every correctly-configured IRSA role on that node.</p>
+    <p><b>Prefer EKS Pod Identity for new clusters, but know IRSA cold regardless.</b> Pod Identity removes the OIDC-provider bookkeeping and the hand-written trust-policy conditions, which removes a whole category of the mistakes in this chapter's labs. That said, IRSA is what the overwhelming majority of production EKS fleets run today, and CloudTrail entries, trust policies, and incident write-ups you'll encounter for years will assume you can read IRSA's mechanics fluently.</p>
+    <p><b>Common mistakes:</b> annotating a ServiceAccount and expecting already-running pods to pick it up without a restart; wildcarding a trust policy's <code>sub</code> condition to make an error disappear instead of fixing the actual mismatch; sharing one ServiceAccount across workloads with different permission needs; and assuming a locked-down Security Group protects a node's IMDS endpoint, when Security Groups explicitly don't filter that traffic at all.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>IRSA and Pod Identity are the reason "zero static secrets in the platform" is achievable at all on EKS, and that property is worth stating out loud in any system-design answer involving Kubernetes on AWS: every workload gets exactly the AWS permissions it needs, provably scoped, with nothing to rotate by hand and nothing sitting on disk for an attacker to find. It's the direct payoff of everything built up to here — <a href="ch54-iam-and-sts.html">Chapter 54</a>'s trust-policy and AssumeRole mechanics, <a href="ch35-config-and-identity-configmap-secret-serviceaccount-namespace.html">Chapter 35</a>'s ServiceAccount as a first-class Kubernetes identity, and <a href="ch58-vpc-cni-the-deep-one.html">Chapter 58</a>'s fact that a pod is a fully-addressable citizen of the VPC, which is exactly why its traffic can reach IMDS in Lab 5 and exactly why that has to be designed around rather than assumed away. It also mirrors Kubernetes' own RBAC story (<a href="ch39-security-rbac-admission-policy-securitycontext.html">Chapter 39</a>): both systems answer "what is this workload allowed to do," just against two different APIs, and a mature EKS platform has to get both stories right, not just one.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What problem does IRSA solve, in one sentence?</summary>
+        <div class="a"><p>It gives an individual Kubernetes pod its own scoped IAM role instead of forcing every pod on a node to share that node's one instance-profile role — replacing "prove you're this EC2 instance" (what IMDS answers) with "prove you're this exact ServiceAccount," which a Kubernetes-signed token can do and a node-level mechanism never could.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through what happens from a pod calling an AWS API to getting a response, under IRSA.</summary>
+        <div class="a"><p>The ServiceAccount the pod uses is annotated with a role ARN, and at pod creation a mutating webhook injects a projected token — a short-lived JWT naming that exact ServiceAccount as its <code>sub</code> claim and <code>sts.amazonaws.com</code> as its <code>aud</code> — plus two environment variables the AWS SDK recognizes automatically. When the app makes its first AWS call, the SDK reads that token file and calls <code>sts:AssumeRoleWithWebIdentity</code> with the role ARN and the token. STS verifies the token's signature against the cluster's OIDC provider, which had to be registered with IAM as a one-time setup step, then checks the role's trust policy: a Federated principal naming that OIDC provider, with a condition pinning the token's <code>sub</code> and <code>aud</code> to expected values. If that matches, STS returns ordinary temporary credentials — identical in shape to any other assumed-role session — and every subsequent call is authorized against that role's permission policy. The one idea I'd anchor the whole answer on: only the first hop, proving identity with a signed token instead of an existing credential, is new; everything after "STS mints temporary credentials" is unchanged from a plain AssumeRole.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>How does EKS Pod Identity actually differ from IRSA, mechanically?</summary>
+        <div class="a"><p>IRSA relies on general-purpose OIDC federation: you register the cluster's OIDC issuer as an IAM identity provider yourself, and every role's trust policy has to spell out a Federated principal plus hand-written <code>sub</code>/<code>aud</code> string conditions that have to exactly match a token's claims — powerful, but entirely dependent on you getting several independent strings correct across two different systems. Pod Identity replaces that hand-wiring with a first-class EKS object, the Pod Identity association, that directly declares "this namespace and ServiceAccount maps to this role" without you touching an OIDC provider ARN or writing a condition block at all; the trust policy instead just trusts the dedicated <code>pods.eks.amazonaws.com</code> service principal. Operationally, a Pod Identity Agent DaemonSet on every node handles the credential exchange, rather than the pod's own SDK independently performing a public AssumeRoleWithWebIdentity call with a JWT it read off disk. The pod still gets a projected token under the hood, but there's meaningfully less surface area for a typo to silently break trust — which is precisely why most of this chapter's labs are IRSA-shaped: that's where the interesting failure modes concentrate.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A pod's AWS calls are succeeding, but with permissions nobody granted it. What's your first hypothesis?</summary>
+        <div class="a"><p>My first hypothesis is that IRSA never actually engaged for this pod, and it's quietly running on the node's own instance-profile role via IMDS instead — which explains both "it works" and "with permissions nobody granted," since the node role was scoped for kubelet and CNI needs, not for this workload. I'd check the pod's environment for <code>AWS_ROLE_ARN</code> and <code>AWS_WEB_IDENTITY_TOKEN_FILE</code> first; their absence confirms the webhook never touched this pod, usually because of a ServiceAccount annotation typo, a missing recreation after the annotation was added, or the pod using a different ServiceAccount than intended. I'd also directly confirm by calling <code>get-caller-identity</code> and checking whether the ARN says <code>assumed-role/&lt;expected-role&gt;</code> or <code>assumed-role/&lt;node-group-role&gt;</code> — that single string answers the question immediately. This is exactly why keeping node roles minimal matters regardless of how well IRSA is configured elsewhere: a misconfigured pod fails safe only if there's nothing dangerous to fail into.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>Why can't a pod's Security Group protect it from a node-role IMDS leak?</summary>
+        <div class="a"><p>Because Security Groups don't filter traffic to the EC2 instance metadata endpoint at all — it's one of a documented handful of exceptions, alongside DNS, DHCP, and a few others, that always bypass Security Group rules by design, covered back in <a href="ch51-vpc-security-security-groups-vs-nacls.html">Chapter 51</a>. A pod can be sitting behind the tightest Security Group imaginable and still reach <code>169.254.169.254</code> freely, because that traffic was never subject to Security Group evaluation in the first place. That's exactly why the durable fix in Lab 5 has to be architectural — keep the node role harmless to steal — rather than relying on any firewall-layer control to block the path, since the most obvious firewall layer was never in a position to block it at all.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>A pod has no hardware identity, so IMDS can only ever answer at the node level — every pod on a node sharing one role is the problem IRSA and EKS Pod Identity both solve, by teaching AWS's trust machinery to accept a Kubernetes-signed token as proof of identity instead of an existing credential. IRSA needs a cluster's OIDC issuer registered with IAM once, a role trust policy with a Federated principal and <code>sub</code>/<code>aud</code> conditions pinned to one exact namespace:ServiceAccount, and a ServiceAccount annotation that a mutating webhook uses to inject a projected token plus two environment variables into pods <em>at creation time only</em>. The SDK auto-detects those variables and calls <code>sts:AssumeRoleWithWebIdentity</code>; everything from there — temporary credentials, permission-policy evaluation — is identical to a plain AssumeRole. EKS Pod Identity replaces the OIDC federation and hand-written conditions with a first-class association object and an on-node agent, with less to misconfigure. Debugging means decoding the token's actual claims and diffing them against the trust policy, checking whether the webhook's environment variables are present at all, and never forgetting that a pod can reach a node's IMDS directly regardless of how correct its own IRSA setup is — which is why the node's own role has to stay minimal no matter what.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>IMDS answers per node, not per pod — one shared node role for many pods is exactly the over-privilege problem IRSA solves.</li>
+      <li>IRSA swaps "prove you're this EC2 instance" for "prove you're this ServiceAccount," using a Kubernetes-signed token as the proof.</li>
+      <li>Registering the cluster's OIDC issuer with IAM is a one-time, per-cluster step; skip it and no role can ever trust this cluster's tokens.</li>
+      <li>A role's trust policy scopes IRSA to one exact namespace:ServiceAccount via <code>sub</code>/<code>aud</code> conditions — never widen this to make an error disappear.</li>
+      <li>The mutating webhook injects the token and environment variables only at pod <em>creation</em>; an annotation added later needs the pod recreated to take effect.</li>
+      <li>Once STS mints temporary credentials, everything is identical to a plain AssumeRole from Chapter 54 — nothing new past that point.</li>
+      <li>EKS Pod Identity replaces OIDC federation and hand-written trust conditions with a first-class association and an on-node agent — fewer moving parts.</li>
+      <li>Missing IRSA environment variables don't cause a loud failure — the SDK silently falls through to the node's role via IMDS instead.</li>
+      <li>Security Groups don't filter traffic to the instance metadata endpoint, so a pod can reach a node's IMDS regardless of its own network policy.</li>
+      <li>The durable defense is architectural: keep node instance-profile roles minimal, and give every workload its own IRSA or Pod Identity role for everything it actually needs.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch54-iam-and-sts.html"><b>Ch 54</b> IAM and STS</a>
+      <a href="ch35-config-and-identity-configmap-secret-serviceaccount-namespace.html"><b>Ch 35</b> ServiceAccounts</a>
+      <a href="ch39-security-rbac-admission-policy-securitycontext.html"><b>Ch 39</b> Kubernetes RBAC</a>
+      <a href="ch51-vpc-security-security-groups-vs-nacls.html"><b>Ch 51</b> Security Groups vs NACLs</a>
+      <a href="ch57-eks-architecture.html"><b>Ch 57</b> EKS architecture</a>
+      <a href="ch58-vpc-cni-the-deep-one.html"><b>Ch 58</b> VPC CNI &amp; pod IPs</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Amazon EKS User Guide — <a href="https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html">IAM roles for service accounts</a>: the full IRSA mechanism and when to use it.</li>
+      <li>Amazon EKS User Guide — <a href="https://docs.aws.amazon.com/eks/latest/userguide/enable-iam-roles-for-service-accounts.html">Create an IAM OIDC provider for your cluster</a>: the exact one-time setup commands this chapter's Lab 1 uses.</li>
+      <li>Amazon EKS User Guide — <a href="https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html">EKS Pod Identity</a>: the newer association-based mechanism and how it differs from IRSA.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_create_oidc.html">Create an OpenID Connect (OIDC) identity provider in IAM</a>: what IAM checks when it verifies a token's issuer and signature.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers.html">Identity providers and federation into AWS</a>: how web-identity federation fits alongside SAML and other IdP patterns.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRoleWithWebIdentity.html">AssumeRoleWithWebIdentity</a>: the API this entire chapter's authentication half is built on.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/security/service-accounts/">Service accounts</a>: the Kubernetes-side identity primitive and token projection this chapter assumes.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch54-iam-and-sts.html"><span class="dir">← Prev</span><div class="ti">Ch 54 — IAM and STS</div></a>
+      <a class="nx" href="ch56-compute-and-data-services-for-sres.html"><span class="dir">Next →</span><div class="ti">Ch 56 — Compute and data services for SREs</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 55 of 121 · Part VI · AWS &amp; EKS for SREs. Every pod in your cluster can now carry its own scoped identity with nothing sitting on disk. Next: the rest of the AWS compute and data surface an SRE actually touches day to day.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">OIDC, tokens, one role</a>
+    <a href="#internals">Setup to AssumeRoleWithWebIdentity</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">One call, end to end</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 33 — Workloads I: Pod, ReplicaSet, Deployment</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part IV · Kubernetes &nbsp;·&nbsp; Chapter 33</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part IV · Kubernetes — Architecture &amp; Internals · Chapter 33</div>
+      <h1>Workloads I: Pod, ReplicaSet, Deployment</h1>
+      <p class="tagline">A Pod is the thing that actually runs your container — and it's mortal, disposable, and never restarted in place. Stack a ReplicaSet on it for "keep N alive," a Deployment on that for "roll me to a new version without downtime," and you have the object you'll deploy 99% of the time. This chapter is how that stack behaves when it works, and how it fails.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~40 min read · kind</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain a Pod's lifecycle — phases, container states, restartPolicy, and why CrashLoopBackOff is a symptom, not a cause.</li>
+          <li>Say precisely what liveness, readiness, and startup probes each do, and which one to reach for.</li>
+          <li>Trace a rolling update from Deployment to ReplicaSet to Pods, and control it with <code>maxSurge</code> and <code>maxUnavailable</code>.</li>
+          <li>Roll a Deployment forward and back, and read why a rollout stalled.</li>
+          <li>Diagnose the two probe incidents that dominate on-call: a bad rollout that won't progress, and a probe misconfig that restarts healthy pods.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem: containers die, and you can't babysit them</h2>
+    <p>You know what a container is (<a href="ch21-what-a-container-really-is.html">Chapter 21</a>) and you know Kubernetes reconciles desired state (<a href="ch31-the-reconciliation-loop-controllers-informers.html">Chapter 31</a>). Now put a real service on it. A bare container has three problems the moment it meets production. It dies — the process crashes, the node reboots, the kernel OOM-kills it — and nothing brings it back. You want more than one copy for capacity and redundancy, and keeping "exactly five running" by hand across a fleet is a full-time job nobody should have. And you need to ship new versions many times a day <em>without</em> dropping traffic, which means replacing running copies a few at a time while the rest keep serving.</p>
+    <p>Kubernetes solves these in three layers, each owning one job. A <b>Pod</b> is one or more containers that share a network namespace and a lifecycle — the smallest thing you can schedule. A <b>ReplicaSet</b> keeps a set number of identical Pods alive, replacing any that vanish. A <b>Deployment</b> manages ReplicaSets to give you versioned, controlled rollouts and one-command rollbacks. You almost never create a Pod or a ReplicaSet directly; you write a Deployment, and it drives the other two for you.</p>
+    <p>The one idea that trips everyone up first: <b>Pods are never repaired, only replaced.</b> Kubernetes doesn't fix a sick Pod in place — it deletes it and schedules a fresh one, often on a different node, with a new IP. Everything else in this chapter follows from treating Pods as cattle, not pets.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>A Pod is mortal and immutable in its identity: it gets scheduled to a node once and stays there until it's deleted. "Restarting a Pod" almost always means <em>replacing</em> it with a new Pod (new name, new IP). The controllers above it — ReplicaSet and Deployment — exist so that replacement is automatic, counted, and version-aware.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a shift manager and a staffing agency</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Picture a shop floor that must always have five workers on it. You don't hire and fire directly. You tell a <b>staffing agency</b> — "keep five workers here at all times" — and the agency watches the floor: someone goes home sick, the agency sends a replacement without you asking. That agency is a <b>ReplicaSet</b>. The workers are <b>Pods</b>: interchangeable, and when one leaves, a <em>different</em> person shows up, not the same one healed.</p>
+      <p>Above the agency sits a <b>shift manager</b> — the <b>Deployment</b>. When you want to switch the whole crew to a new trained team, the manager doesn't send everyone home at once. It brings on a couple of new-team workers, waits until they're <em>ready to serve customers</em>, then lets a couple of old-team workers go, and repeats until the floor is entirely the new team. That's a <b>rolling update</b>, and "a couple at a time" is exactly <code>maxSurge</code> (how many extra you'll allow) and <code>maxUnavailable</code> (how many you'll let drop below target).</p>
+      <p>Three health checks run constantly. A supervisor taps each worker on the shoulder to confirm they're conscious — if not, walk them out and the agency sends a replacement (that's <b>liveness</b>). Before routing a customer to a worker, the host checks they're actually ready — logged in, till open — and only then sends work their way (that's <b>readiness</b>). And a brand-new worker gets a grace period to finish setup before either check counts against them (that's the <b>startup</b> probe). Confuse these three and you either restart healthy workers or route customers to workers who aren't ready.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In Kubernetes</th></tr>
+      <tr><td>An interchangeable worker on the floor</td><td>A <b>Pod</b> — mortal, replaced not repaired</td></tr>
+      <tr><td>The staffing agency keeping five present</td><td>A <b>ReplicaSet</b> — maintains the replica count</td></tr>
+      <tr><td>The shift manager swapping crews safely</td><td>A <b>Deployment</b> — versioned rolling updates &amp; rollback</td></tr>
+      <tr><td>Bringing on a few, then letting a few go</td><td><code>maxSurge</code> / <code>maxUnavailable</code></td></tr>
+      <tr><td>Tap on the shoulder: are you conscious?</td><td><b>Liveness probe</b> — fail → restart the container</td></tr>
+      <tr><td>Are you ready to take a customer?</td><td><b>Readiness probe</b> — fail → pull from Service endpoints</td></tr>
+      <tr><td>Grace period for a new worker to set up</td><td><b>Startup probe</b> — gates the other two until boot completes</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>Deployment → ReplicaSet → Pods, during a rollout</h2>
+    <p>Here's the ownership stack and what it looks like mid-rollout. A Deployment doesn't own Pods directly — it owns ReplicaSets, one per version, and each ReplicaSet owns the Pods for its version. During an update you have <em>two</em> ReplicaSets alive at once: the old one scaling down, the new one scaling up.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 400" role="img" aria-label="A Deployment owns two ReplicaSets during a rollout: the old ReplicaSet scaling down from three to one pod, and the new ReplicaSet scaling up from zero to two pods, governed by maxSurge and maxUnavailable">
+        <defs>
+          <marker id="d1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="d2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" style="fill:var(--deep)"/></marker>
+          <marker id="d3" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+        </defs>
+        <!-- deployment -->
+        <rect x="270" y="26" width="180" height="56" rx="10" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="360" y="49" text-anchor="middle" style="fill:var(--accent);font:700 13px sans-serif">Deployment web</text>
+        <text x="360" y="67" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">desired: 3 · rolling update</text>
+
+        <!-- old RS -->
+        <rect x="60" y="140" width="240" height="60" rx="10" style="fill:var(--panel);stroke:var(--deep);stroke-width:1.5"/>
+        <text x="180" y="164" text-anchor="middle" style="fill:var(--deep);font:700 12px sans-serif">ReplicaSet web-v1 (old)</text>
+        <text x="180" y="182" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">scaling 3 → 1</text>
+        <line x1="320" y1="82" x2="200" y2="138" style="stroke:var(--accent);stroke-width:1.5" marker-end="url(#d1)"/>
+
+        <!-- new RS -->
+        <rect x="420" y="140" width="240" height="60" rx="10" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="540" y="164" text-anchor="middle" style="fill:var(--accent2);font:700 12px sans-serif">ReplicaSet web-v2 (new)</text>
+        <text x="540" y="182" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">scaling 0 → 2</text>
+        <line x1="400" y1="82" x2="520" y2="138" style="stroke:var(--accent);stroke-width:1.5" marker-end="url(#d1)"/>
+
+        <!-- old pods -->
+        <rect x="70" y="250" width="80" height="54" rx="8" style="fill:var(--chip);stroke:var(--deep)"/>
+        <text x="110" y="273" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">pod v1</text>
+        <text x="110" y="291" text-anchor="middle" style="fill:var(--deep);font:10px sans-serif">Terminating</text>
+        <rect x="170" y="250" width="80" height="54" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="210" y="273" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">pod v1</text>
+        <text x="210" y="291" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">Running</text>
+        <line x1="150" y1="200" x2="120" y2="248" style="stroke:var(--deep);stroke-width:1.5" marker-end="url(#d2)"/>
+        <line x1="200" y1="200" x2="210" y2="248" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#d2)"/>
+
+        <!-- new pods -->
+        <rect x="450" y="250" width="80" height="54" rx="8" style="fill:var(--chip);stroke:var(--accent2)"/>
+        <text x="490" y="273" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">pod v2</text>
+        <text x="490" y="291" text-anchor="middle" style="fill:var(--accent2);font:10px sans-serif">Ready</text>
+        <rect x="550" y="250" width="80" height="54" rx="8" style="fill:var(--chip);stroke:var(--applied)"/>
+        <text x="590" y="273" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">pod v2</text>
+        <text x="590" y="291" text-anchor="middle" style="fill:var(--applied);font:9.5px sans-serif">NotReady</text>
+        <line x1="520" y1="200" x2="490" y2="248" style="stroke:var(--accent2);stroke-width:1.5" marker-end="url(#d3)"/>
+        <line x1="560" y1="200" x2="590" y2="248" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#d2)"/>
+
+        <!-- readiness gate note -->
+        <rect x="230" y="332" width="260" height="44" rx="9" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.2;stroke-dasharray:5 4"/>
+        <text x="360" y="352" text-anchor="middle" style="fill:var(--accent2);font:700 10.5px sans-serif">readiness gates progress</text>
+        <text x="360" y="368" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">a new pod counts as available only once Ready</text>
+      </svg>
+      <figcaption>A Deployment owns one ReplicaSet per version. A rollout scales the new RS up and the old RS down a few Pods at a time — and a new Pod only counts toward the target once its readiness probe passes, which is what makes "wait until ready" work.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>The two ReplicaSets are why <code>kubectl rollout undo</code> is instant and safe: the old ReplicaSet is still there at zero replicas (Deployments keep a history), so rolling back is just "scale the old one up, the new one down" — the same rolling mechanism in reverse. It's also why a botched image tag doesn't take you down if readiness is set correctly: the new Pods never become Ready, so the rollout stalls with the old Pods still serving. Readiness is the safety interlock of the whole system.</p>
+    </div>
+
+    <h2 id="lifecycle"><span class="beat">Internal working</span>Pod lifecycle, probes, and the rollout</h2>
+
+    <h4>1 · Phases and container states</h4>
+    <p>A Pod has a coarse <code>phase</code> and, underneath it, per-container <code>state</code>. Keep them separate — the phase is a summary; the container state is where the truth lives. The phases:</p>
+    <ul>
+      <li><b>Pending</b> — accepted by the API server but not yet running: waiting to be scheduled, or pulling images.</li>
+      <li><b>Running</b> — bound to a node with at least one container started.</li>
+      <li><b>Succeeded</b> / <b>Failed</b> — all containers terminated (0 exit / non-zero). Terminal for that Pod.</li>
+      <li><b>Unknown</b> — the node stopped reporting (usually the node is gone).</li>
+    </ul>
+    <p>Each container is <code>Waiting</code>, <code>Running</code>, or <code>Terminated</code>, with a reason. The reason you'll see most is <code>CrashLoopBackOff</code> — a <em>Waiting</em> reason that means "this container keeps exiting, so the kubelet is backing off before restarting it again," with an exponential delay up to five minutes. <b>CrashLoopBackOff is not the failure; it's the kubelet's response to a container that won't stay up.</b> The real cause is in the container's logs and its exit code — a missing config file, a failed dependency at startup, a panic. Chasing the backoff instead of the exit code is the rookie move.</p>
+
+    <h4>2 · restartPolicy and init containers</h4>
+    <p>A Pod's <code>restartPolicy</code> (<code>Always</code> for Deployments, <code>OnFailure</code>/<code>Never</code> for Jobs) governs whether the kubelet restarts a container <em>in the same Pod</em>. Note that restart here means "run the container process again inside the existing Pod" — the Pod object itself is never resurrected; that's the controller's job.</p>
+    <p><b>Init containers</b> run to completion, in order, before any app container starts — use them for one-shot setup: wait for a dependency, run a migration, fetch a secret to a shared volume. If an init container fails, the Pod restarts it (per policy) and no app container runs until it succeeds. <b>Native sidecar containers</b> are the modern fix for the long-standing "sidecar problem": an init container with <code>restartPolicy: Always</code>, which starts before the app containers, keeps running alongside them, and shuts down after them. That ordering is exactly what a mesh proxy or log shipper needs. Native sidecars are on by default since Kubernetes 1.29 — before them, people hacked ordering with lifecycle hooks and it was fragile. Use the native form.</p>
+
+    <h4>3 · The three probes, precisely</h4>
+    <p>The kubelet runs three independent health checks against each container. They look similar and do completely different things:</p>
+    <ol class="steps">
+      <li><b>Liveness probe.</b> "Is this container wedged?" On failure, the kubelet <em>kills and restarts the container</em>. Use it only for deadlock/hang detection — a process that's alive but stuck. Make it depend on nothing external.</li>
+      <li><b>Readiness probe.</b> "Should this container receive traffic right now?" On failure, the Pod's IP is <em>removed from the Service's endpoints</em> (<a href="ch43-services-and-the-datapath-pod-to-service.html">Chapter 43</a>) — no restart, no kill. Use it to shed traffic during startup, warmup, or a temporary dependency blip.</li>
+      <li><b>Startup probe.</b> "Has this container finished booting?" While it's failing, the liveness and readiness probes are <em>held off</em>. Use it for slow-starting apps (a JVM warming up, a large cache load) so a long boot isn't mistaken for a hang and restarted.</li>
+    </ol>
+    <p>The single most important distinction: <b>liveness restarts, readiness routes.</b> A failing readiness probe pulls a Pod out of rotation but leaves it running so it can recover; a failing liveness probe destroys and rebuilds the container. Mixing them up is the source of the two worst probe incidents, which you'll cause in the labs.</p>
+
+    <h4>4 · The rollout, mechanically</h4>
+    <p>When you change a Deployment's Pod template (a new image, an env var), the Deployment controller does this:</p>
+    <ol class="steps">
+      <li>It computes a hash of the new Pod template and looks for a ReplicaSet with that hash. None exists, so it <b>creates a new ReplicaSet</b> at 0 replicas.</li>
+      <li>It scales the new RS up and the old RS down in steps, respecting <code>maxSurge</code> (how many Pods above desired are allowed) and <code>maxUnavailable</code> (how many below desired). With the defaults (25% each) and 4 replicas, it can run up to 5 and drop to 3 during the move.</li>
+      <li>A new Pod counts as <b>available</b> only after its readiness probe passes and <code>minReadySeconds</code> elapses. Until then the controller won't scale the old RS down further — this is the interlock that makes "wait until ready" real.</li>
+      <li>When the new RS is at full replicas and the old is at 0, the rollout is complete. The old RS is kept (at 0) up to <code>revisionHistoryLimit</code>, which is what makes rollback instant.</li>
+      <li>If new Pods never become available, the rollout stalls and — after <code>progressDeadlineSeconds</code> (default 600) — the Deployment reports <code>ProgressDeadlineExceeded</code>. One detail matters more than the rest: <b>a stalled rollout leaves the old Pods serving</b>; it does not take you down, provided readiness is honest.</li>
+    </ol>
+
+    <details class="recall"><summary>Think first: your app takes 90 seconds to warm up. You set a liveness probe with a 30-second initial delay and no startup probe. What happens on every deploy?</summary>
+      <div class="body">
+        <p>An endless restart loop. The liveness probe starts checking at 30 seconds, the app isn't up yet, so it fails, and the kubelet <em>kills and restarts the container</em> — right in the middle of its 90-second warmup. It never survives long enough to finish booting, so it never passes liveness, so it's killed again: CrashLoopBackOff caused entirely by the probe, not the app. The fix is a <b>startup probe</b> that allows up to, say, 120 seconds (a generous <code>failureThreshold × periodSeconds</code>); while it's still failing, liveness is suppressed, so the app gets its full warmup. Only once startup passes does liveness begin. This is the textbook reason startup probes exist, and forgetting one is a top cause of "the app works fine when I run it, but crashloops in the cluster."</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, named</h2>
+    <ul>
+      <li><b>Pod</b> — one or more containers sharing a network namespace, IP, and lifecycle; the smallest schedulable unit. Mortal and replaced, never repaired.</li>
+      <li><b>Init containers</b> — run to completion in order before app containers; one-shot setup.</li>
+      <li><b>Native sidecar containers</b> — init containers with <code>restartPolicy: Always</code>; start first, run alongside, stop last (default-on since 1.29).</li>
+      <li><b>Liveness / readiness / startup probes</b> — the kubelet's three checks: restart, route, and gate-during-boot respectively.</li>
+      <li><b>ReplicaSet</b> — keeps a fixed number of identical Pods alive by label selector; replaces any that disappear. One per Deployment version.</li>
+      <li><b>Deployment</b> — <code>apps/v1</code>; owns ReplicaSets, drives rolling updates and rollbacks, keeps revision history.</li>
+      <li><b><code>maxSurge</code> / <code>maxUnavailable</code></b> — the two knobs bounding how far above and below the target replica count a rollout may go.</li>
+      <li><b><code>minReadySeconds</code> / <code>progressDeadlineSeconds</code> / <code>revisionHistoryLimit</code></b> — how long a Pod must be Ready to count, how long before a stalled rollout is flagged, and how many old ReplicaSets to keep for rollback.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one rolling update</h2>
+    <p>You run <code>kubectl set image deployment/web app=web:v2</code> on a healthy 4-replica Deployment:</p>
+    <ol class="steps">
+      <li>The API server admits the change to the Deployment's Pod template (<a href="ch32-api-machinery-apply-path-admission-crds-and.html">Chapter 32</a>) and stores it.</li>
+      <li>The Deployment controller sees the template hash changed, creates ReplicaSet <code>web-v2</code> at 0, and begins the move.</li>
+      <li>It scales <code>web-v2</code> to 1 (surge). The scheduler places the new Pod; the kubelet pulls <code>web:v2</code> and starts it. The startup/readiness probes gate it.</li>
+      <li>Once that Pod is Ready and <code>minReadySeconds</code> passes, the controller scales the old <code>web-v1</code> from 4 to 3. Endpoints for the Service now include the new Pod and exclude the terminating one (<a href="ch43-services-and-the-datapath-pod-to-service.html">Chapter 43</a>).</li>
+      <li>Repeat — up one new, down one old — until <code>web-v2</code> is at 4 and <code>web-v1</code> is at 0. Throughout, at least <code>desired − maxUnavailable</code> Pods are serving, so traffic never drops.</li>
+      <li>The rollout is complete. <code>web-v1</code> stays at 0 in history. <code>kubectl rollout undo</code> would scale it back up and <code>web-v2</code> down — instant rollback.</li>
+    </ol>
+    <p>If <code>web:v2</code> is a bad image and its Pods never pass readiness, step 4 never advances: the old Pods keep serving, and after <code>progressDeadlineSeconds</code> the Deployment reports the stall. That is the system protecting you — a broken deploy that fails <em>safe</em> instead of failing <em>closed</em>.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>kind create cluster --name wl1
+kubectl create deployment web --image=nginx:1.27-alpine --replicas=4</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — see the Deployment → ReplicaSet → Pod stack</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Make the ownership chain visible. One Deployment created one ReplicaSet, which created four Pods:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl get deploy,rs,pods -l app=web
+kubectl get pod -l app=web -o jsonpath='{.items[0].metadata.ownerReferences[0].kind}/{.items[0].metadata.ownerReferences[0].name}{"\n"}'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME                  READY   UP-TO-DATE   AVAILABLE
+deployment.apps/web   4/4     4            4
+NAME                             DESIRED   CURRENT   READY
+replicaset.apps/web-6f8c...      4         4         4
+NAME               READY   STATUS    RESTARTS   AGE
+pod/web-6f8c-2k9   1/1     Running   0          20s
+...
+ReplicaSet/web-6f8c</code></pre></div>
+        <p>The Pod's <code>ownerReference</code> points at the ReplicaSet, and the ReplicaSet's points at the Deployment — the same ownership links that drive garbage collection from <a href="ch31-the-reconciliation-loop-controllers-informers.html">Chapter 31</a>. Now prove Pods are replaced, not repaired: delete one and watch a <em>new</em> name appear.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl delete pod $(kubectl get pod -l app=web -o name | head -1)
+kubectl get pods -l app=web</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME               READY   STATUS              RESTARTS   AGE
+web-6f8c-2k9       1/1     Running             0          90s
+web-6f8c-x7p       0/1     ContainerCreating   0          2s        <span class="c"># brand-new pod, not the old one healed</span></code></pre></div>
+        <p>The ReplicaSet noticed it was one short and created a replacement with a new name and, once running, a new IP. This is why you never depend on a Pod's identity — you go through a Service.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — watch a rolling update, see two ReplicaSets</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Change the image and watch the Deployment move traffic version to version. In one terminal, watch pods; in another, roll:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># terminal A</span>
+kubectl get pods -l app=web --watch
+<span class="c"># terminal B</span>
+kubectl set image deployment/web nginx=nginx:1.27
+kubectl rollout status deployment/web</code></pre></div>
+        <div class="out"><span class="ol">Output (rollout status)</span>Waiting for deployment "web" rollout to finish: 2 out of 4 new replicas have been updated...
+Waiting for deployment "web" rollout to finish: 3 of 4 updated replicas are available...
+deployment "web" successfully rolled out</code></div>
+        <p>Now see the two ReplicaSets — the old one drained to 0, the new one at 4:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl get rs -l app=web
+kubectl rollout history deployment/web</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME              DESIRED   CURRENT   READY
+web-6f8c...       0         0         0        <span class="c"># old version, kept for rollback</span>
+web-59ab...       4         4         4        <span class="c"># new version</span>
+REVISION  CHANGE-CAUSE
+1         &lt;none&gt;
+2         &lt;none&gt;</code></pre></div>
+        <p>Two revisions, two ReplicaSets. The old RS sitting at 0 is your undo button. Look at the rollout knobs the Deployment used:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl get deploy web -o jsonpath='{.spec.strategy.rollingUpdate}{"\n"}'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>{"maxSurge":"25%","maxUnavailable":"25%"}</code></div>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — a readiness probe that stops all traffic</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Add a readiness probe pointed at a path that doesn't exist, and watch the Pods stay Running but leave the Service. This is the difference between "restart" and "route" made concrete.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl expose deployment web --port=80
+kubectl patch deployment web --type=json -p='[{"op":"add","path":"/spec/template/spec/containers/0/readinessProbe","value":{"httpGet":{"path":"/nope","port":80},"periodSeconds":3}}]'
+kubectl rollout status deployment/web --timeout=40s
+kubectl get pods -l app=web
+kubectl get endpoints web</code></pre></div>
+        <div class="out"><span class="ol">Output</span>error: deployment "web" exceeded its progress deadline
+NAME               READY   STATUS    RESTARTS   AGE
+web-77d5-abc       0/1     Running   0          35s        <span class="c"># Running, but 0/1 READY</span>
+NAME   ENDPOINTS
+web    &lt;none&gt;                                                <span class="c"># no Pods behind the Service</span></code></pre></div>
+        <p>Look closely: the Pods are <code>Running</code> with <code>0</code> restarts — the readiness probe did not kill them. But <code>READY</code> is <code>0/1</code>, so every Pod was pulled from the Service's endpoints, and the endpoint list is empty. Any client hitting the Service now gets nothing. If this had been a <em>liveness</em> probe instead, you'd see the restart count climbing and CrashLoopBackOff. Fix it and confirm traffic returns:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl patch deployment web --type=json -p='[{"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/httpGet/path","value":"/"}]'
+kubectl rollout status deployment/web
+kubectl get endpoints web</code></pre></div>
+        <div class="out"><span class="ol">Output</span>deployment "web" successfully rolled out
+NAME   ENDPOINTS
+web    10.244.0.7:80,10.244.0.8:80,10.244.0.9:80,10.244.0.10:80</code></pre></div>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — a rollout that won't progress</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Ship a broken image and investigate as if you didn't know it was broken. Notice that the old Pods keep serving throughout.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl set image deployment/web nginx=nginx:v-does-not-exist
+kubectl rollout status deployment/web --timeout=30s
+kubectl get pods -l app=web</code></pre></div>
+        <div class="out"><span class="ol">Output</span>Waiting for deployment "web" rollout to finish: 1 out of 4 new replicas have been updated...
+error: deployment "web" exceeded its progress deadline
+NAME               READY   STATUS             RESTARTS   AGE
+web-59ab-...       1/1     Running            0          8m      <span class="c"># old version, still serving</span>
+web-6cd7-...       0/1     ImagePullBackOff   0          40s     <span class="c"># new version, stuck</span></code></pre></div>
+        <p>The rollout stalled but the service didn't go down — three old Pods are still Running. Now find <em>why</em> the new Pod is stuck before you reach for undo.</p>
+        <details class="recall"><summary>Reveal the diagnosis and the fix</summary>
+          <div class="body">
+            <p>The status <code>ImagePullBackOff</code> is the tell, but confirm the reason from the Pod's events rather than guessing:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl describe pod -l app=web | sed -n '/Events/,$p' | head</code></pre></div>
+            <div class="out"><span class="ol">Output</span>  Warning  Failed  ...  Failed to pull image "nginx:v-does-not-exist": ... not found
+  Warning  Failed  ...  Error: ErrImagePull
+  Normal   BackOff ...  Back-off pulling image "nginx:v-does-not-exist"</code></pre></div>
+            <p>The image tag doesn't exist, so the new Pod can never start, so the rollout can never advance past the surge Pod — which is exactly why the old Pods were never scaled down and you stayed up. This is the safety interlock working. The fix is one command, and it's instant because the old ReplicaSet is still in history:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl rollout undo deployment/web
+kubectl rollout status deployment/web</code></pre></div>
+            <div class="out"><span class="ol">Output</span>deployment.apps/web rolled back
+deployment "web" successfully rolled out</code></pre></div>
+            <p>Undo scaled the last-good ReplicaSet back to 4 and the broken one to 0 — the rolling mechanism in reverse. The general lesson: when a rollout stalls, read the new Pod's events for the real reason (bad image, failing probe, insufficient resources, CrashLoop), and lean on the fact that a well-configured Deployment keeps the old version serving while it's stuck.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — design probes that don't cause outages</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>Your service calls a database on every request. A colleague proposes a liveness probe that returns 500 if the database is unreachable — "so Kubernetes restarts us and we reconnect." A whole fleet runs this. The database has a 30-second blip. What happens, and how should the probes actually be designed? Reason first.</p>
+        <details class="recall"><summary>Reveal the approach</summary>
+          <div class="body">
+            <p>The proposal causes a self-inflicted outage that outlasts the blip. When the database is briefly unreachable, <em>every</em> Pod's liveness probe fails at once, so the kubelet kills and restarts <em>every</em> Pod across the fleet simultaneously. Now, just as the database recovers, the entire service is cold-restarting — dropping in-flight requests, re-establishing connections in a thundering herd, and possibly failing liveness again during the slow reconnect. A 30-second dependency blip becomes minutes of full downtime. The rule this violates: <b>a liveness probe must never depend on a downstream dependency.</b> Liveness answers "is <em>this process</em> wedged," full stop — a trivial "am I looping / can I serve my own health endpoint" check with nothing external in it.</p>
+            <p>The correct design uses all three probes for their real jobs. <b>Liveness</b>: a cheap local check (process responds, event loop not deadlocked), generous thresholds, no dependencies — so it only ever fires on a genuine hang. <b>Readiness</b>: <em>this</em> is where a dependency check belongs — if the database is unreachable, fail readiness, which pulls the Pod from the Service and sheds traffic <em>without</em> restarting it, so it recovers the instant the dependency does. If all Pods fail readiness during the blip, the Service has no endpoints and requests fail fast, but nothing is destroyed, and recovery is automatic and immediate. <b>Startup</b>: for the warmup window, so a slow boot never trips liveness. The mental model to state in an interview: liveness restarts, readiness routes — put dependencies behind readiness, never behind liveness. Clean up: <code>kind delete cluster --name wl1</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · CrashLoopBackOff after a deploy</div>
+      <p><b>Symptom:</b> new Pods cycle through <code>Running</code> → <code>Error</code>/<code>CrashLoopBackOff</code>, restart count climbing. <b>First cut:</b> read the logs of the crashing container — <code>kubectl logs &lt;pod&gt; --previous</code> for the last crash — and its exit code and events. <b>Usual causes:</b> a missing config/secret or env var, a failed dependency at startup, a bad command, or a liveness/startup probe killing the app mid-warmup (Pod-caused vs probe-caused — check whether restarts correlate with probe failures in events). <b>Fix:</b> the app or its config; CrashLoopBackOff is the symptom, the exit code and logs are the cause.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · a rollout stalls at ProgressDeadlineExceeded</div>
+      <p><b>Symptom:</b> <code>kubectl rollout status</code> hangs, then reports the progress deadline exceeded; new Pods are Pending, ImagePullBackOff, or Running-but-not-Ready. <b>First cut:</b> <code>kubectl describe</code> the stuck new Pod and read its events. <b>Usual causes:</b> bad image tag, a readiness probe that never passes, insufficient resources to schedule the surge Pod, or a crash on start. <b>Reassurance:</b> a correctly configured Deployment keeps the old Pods serving during the stall — so triage calmly, then <code>rollout undo</code> or fix forward.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · traffic drops but Pods look Running</div>
+      <p><b>Symptom:</b> clients get connection failures, yet <code>kubectl get pods</code> shows everything Running with no restarts. <b>Tell:</b> the <code>READY</code> column is <code>0/1</code> and the Service's endpoints are empty. <b>Cause:</b> a readiness probe failing fleet-wide — often a bad probe path/port, or a shared dependency the readiness check depends on going down. <b>Fix:</b> check the readiness probe config and the dependency; remember readiness pulls Pods from the Service without restarting them, so recovery is immediate once the check passes.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Probe design matters more than anything else here, and it's the easiest thing to get wrong.</b> Liveness must be a trivial, dependency-free "am I wedged" check with generous thresholds — its only job is to recover a genuinely hung process, and a jumpy liveness probe restarts healthy Pods and amplifies incidents. Readiness is where dependency and warmup logic belongs, because failing it sheds traffic without destroying anything. Startup probes protect slow-booting apps from liveness. If you take one rule from this chapter: never put a downstream dependency behind a liveness probe.</p>
+    <p><b>Set the rollout knobs deliberately.</b> For a zero-downtime service, <code>maxUnavailable: 0</code> guarantees you never drop below the target during a roll (at the cost of needing surge capacity); <code>maxSurge</code> controls how fast and how much extra capacity you'll spin up. Use <code>minReadySeconds</code> so a Pod must be stably Ready before it counts — this catches Pods that pass readiness then immediately fall over. Keep a sane <code>revisionHistoryLimit</code> (10 is the default) so rollback works but you don't hoard hundreds of dead ReplicaSets. Always set resource <code>requests</code> so the scheduler can place your Pods (<a href="ch36-scheduling-deep.html">Chapter 36</a>) — a Deployment with no requests schedules unpredictably and is first to be evicted under pressure.</p>
+    <p><b>Pair Deployments with a PodDisruptionBudget and honest graceful shutdown.</b> A PDB (<a href="ch36-scheduling-deep.html">Chapter 36</a>) keeps a minimum number of Pods available during voluntary disruptions like node drains, so a cluster upgrade doesn't take all your replicas at once. And make sure your app handles <code>SIGTERM</code> and drains in-flight requests within <code>terminationGracePeriodSeconds</code> — Kubernetes removes a terminating Pod from endpoints and sends SIGTERM, but if your app ignores it and gets SIGKILLed, you drop connections on every rollout. A <code>preStop</code> hook with a short sleep is the common trick to let endpoint removal propagate before the process exits.</p>
+    <p><b>Common mistakes:</b> liveness probes with dependencies (fleet-wide restart storms), no startup probe on a slow app (probe-induced CrashLoop), <code>maxUnavailable</code> too high for a latency-sensitive service, no resource requests, treating CrashLoopBackOff as the problem instead of reading the exit code, and no graceful-shutdown handling so every deploy drops in-flight requests.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>The Deployment is the atom of stateless scaling and progressive delivery. Because Pods are disposable and replaced, you scale a service by changing one number — the base of horizontal scaling (<a href="ch95-scaling-patterns.html">Chapter 95</a>) and of the HPA that changes it for you (<a href="ch37-autoscaling-and-governance-hpa-vpa-cluster-autoscaler.html">Chapter 37</a>). Because the two-ReplicaSet rollout gives you controlled, reversible version transitions, it's the substrate every advanced deployment strategy builds on: canary, blue-green, and automated progressive delivery with flagged rollbacks (<a href="ch73-ci-cd-and-progressive-delivery.html">Chapter 73</a>) are all "manage which ReplicaSet gets traffic, and how fast." Readiness probes are the contract that makes load balancers and Services safe — they're how a mesh or an Ingress knows a backend is actually serving, so they connect straight to the reliability patterns of timeouts and health-based routing (<a href="ch88-reliability-engineering.html">Chapter 88</a>). And the discipline that Pods are cattle, not pets, is precisely what lets you design for node failure as a routine event rather than an emergency: a node dying is just some Pods getting replaced elsewhere, which is only survivable if nothing depended on those specific Pods. When this layer is set up well, deploys are boring and node failures are invisible; when it's set up badly, every release is a gamble and every dependency blip is an outage.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's the difference between a liveness and a readiness probe?</summary>
+        <div class="a"><p>A liveness probe answers "is this container wedged" — if it fails, the kubelet kills and restarts the container. A readiness probe answers "should this container get traffic right now" — if it fails, the Pod is removed from the Service's endpoints but keeps running, so no restart. Liveness restarts, readiness routes. That's why dependency checks belong behind readiness, never liveness: readiness sheds traffic and recovers on its own, while a liveness probe with a dependency triggers fleet-wide restarts when that dependency blips.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through what happens when you change a Deployment's image.</summary>
+        <div class="a"><p>The API server stores the new Pod template. The Deployment controller hashes it, sees no ReplicaSet matches, and creates a new ReplicaSet at zero replicas. Then it performs a rolling update: it scales the new ReplicaSet up and the old one down a few Pods at a time, bounded by <code>maxSurge</code> (how many above desired) and <code>maxUnavailable</code> (how many below). A new Pod only counts as available after its readiness probe passes and <code>minReadySeconds</code> elapses, and the controller won't scale the old ReplicaSet down further until enough new Pods are available — so if the new version can't become ready, the rollout stalls with the old Pods still serving, and after <code>progressDeadlineSeconds</code> it reports ProgressDeadlineExceeded. When the new ReplicaSet reaches full replicas and the old is at zero, the rollout is done; the old ReplicaSet stays at zero in history, which is what makes <code>rollout undo</code> instant. The important property is that readiness gates progress, so a broken deploy fails safe rather than dropping traffic.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Why are Pods replaced instead of repaired, and what follows from that?</summary>
+        <div class="a"><p>A Pod is bound to a node at schedule time and its identity — name, UID, IP — is fixed for its life; there's no mechanism to "move" or "heal" a Pod, only to delete it and create a new one. That's a deliberate design choice that makes the system simpler and harder to break: the controller's job is just "is the count/version right," and the answer to any Pod-level problem is the same primitive — delete and recreate. Several things follow. You can never depend on a specific Pod's IP or name, so you address workloads through Services and DNS (Chapters 43, 45), which gives you a stable front to an unstable set of backends. Node failure becomes routine rather than catastrophic — a dead node just means its Pods get recreated elsewhere. Local Pod state is ephemeral, so anything that must survive a Pod needs a PersistentVolume or an external store (Chapter 38) — and that's exactly why stateful workloads need StatefulSets (Chapter 34), which add stable identity and storage on top of this cattle model. And rollouts work by creating new Pods and deleting old ones, never mutating existing ones, which is why they're reversible and why image changes are safe. The whole ecosystem of Services, health-based routing, and horizontal scaling assumes Pods are fungible and disposable.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A deploy went out and now clients get errors, but every Pod shows Running with zero restarts. What's happening?</summary>
+        <div class="a"><p>Running with zero restarts rules out crashes and liveness kills, so I'd look at readiness immediately. I'd check the <code>READY</code> column — I expect <code>0/1</code> — and then the Service's endpoints, which I expect to be empty. That pattern means the readiness probe is failing fleet-wide, so every Pod was pulled from the Service while staying alive. From there it's two possibilities: the deploy changed the readiness probe itself (wrong path, wrong port, too-tight threshold), or the probe depends on something that's now down. I'd read the Pod's events and the probe config, and if it's a bad probe I'd fix or roll back; if it's a real dependency, readiness is doing its job by shedding traffic and will recover on its own once the dependency returns. The key reasoning is that Running-but-not-Ready with empty endpoints is a readiness story, not a crash story — and readiness removes Pods from rotation without restarting them, which is both the cause of the outage and the reason recovery is automatic.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>What are native sidecar containers and what problem did they fix?</summary>
+        <div class="a"><p>A native sidecar is an init container declared with <code>restartPolicy: Always</code>. That small change gives it sidecar lifecycle: it starts <em>before</em> the main app containers, keeps running alongside them, and shuts down <em>after</em> them — with the kubelet restarting it if it dies. It's been on by default since Kubernetes 1.29. The problem it fixed is real and old: a service mesh proxy or a log shipper needs to be up before the app so the app has network/logging from its first request, and needs to stay up until the app finishes draining. With ordinary sidecar containers (just extra containers in the Pod) there was no ordering guarantee — the app could start before the proxy was ready, or the proxy could exit first and drop the app's final requests, and Jobs would never complete because the sidecar kept running. People worked around it with startup hacks and lifecycle sleeps, which were fragile. Native sidecars give the ordering and shutdown semantics as a first-class feature, so you should use the init-container-with-<code>restartPolicy: Always</code> form rather than the old workarounds.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>A Pod is the smallest schedulable unit — one or more containers sharing a network namespace and lifecycle — and it's mortal: replaced, never repaired. Its <code>phase</code> (Pending/Running/Succeeded/Failed) summarises per-container states, and CrashLoopBackOff is the kubelet backing off a container that won't stay up, not the root cause — read the exit code and logs. Init containers run to completion first; native sidecars (init containers with <code>restartPolicy: Always</code>, default-on since 1.29) start before and stop after the app. The three probes do different jobs: liveness restarts a wedged container, readiness pulls a Pod from Service endpoints without restarting it, startup gates the other two during boot — and dependencies belong behind readiness, never liveness. A ReplicaSet keeps N identical Pods alive; a Deployment owns one ReplicaSet per version and rolls between them a few Pods at a time, bounded by <code>maxSurge</code> and <code>maxUnavailable</code>, with readiness gating progress so a broken deploy stalls safely while the old Pods keep serving. The old ReplicaSet stays at zero in history, so <code>rollout undo</code> is instant.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>A Pod is mortal and immutable in identity — Kubernetes replaces Pods, it never repairs them, so never depend on a Pod's name or IP.</li>
+      <li>Pod <code>phase</code> is a summary; the per-container <code>state</code> and exit code are where the truth is.</li>
+      <li>CrashLoopBackOff is the kubelet's backoff on a container that keeps exiting — a symptom; the cause is in the logs and exit code.</li>
+      <li>Liveness restarts a wedged container; readiness removes a Pod from Service endpoints without restarting it; startup gates both during boot.</li>
+      <li>Never put a downstream dependency behind a liveness probe — it turns a dependency blip into a fleet-wide restart storm.</li>
+      <li>A ReplicaSet keeps a fixed number of identical Pods alive by label selector, replacing any that disappear.</li>
+      <li>A Deployment owns one ReplicaSet per version and performs rolling updates between them; the old RS stays at 0 for instant rollback.</li>
+      <li><code>maxSurge</code> and <code>maxUnavailable</code> bound how far above and below the target a rollout may go; <code>maxUnavailable: 0</code> for strict zero-downtime.</li>
+      <li>Readiness gates rollout progress, so a broken image or failing probe stalls the roll while the old Pods keep serving — it fails safe.</li>
+      <li>Native sidecar containers = init containers with <code>restartPolicy: Always</code> (default-on since 1.29): start first, run alongside, stop last.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch31-the-reconciliation-loop-controllers-informers.html"><b>Ch 31</b> The reconcile loop</a>
+      <a href="ch32-api-machinery-apply-path-admission-crds-and.html"><b>Ch 32</b> API machinery</a>
+      <a href="ch34-workloads-ii-statefulset-daemonset-job-cronjob.html"><b>Ch 34</b> Workloads II</a>
+      <a href="ch36-scheduling-deep.html"><b>Ch 36</b> Scheduling, PDBs</a>
+      <a href="ch43-services-and-the-datapath-pod-to-service.html"><b>Ch 43</b> Services &amp; endpoints</a>
+      <a href="ch73-ci-cd-and-progressive-delivery.html"><b>Ch 73</b> Progressive delivery</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/">Pod Lifecycle</a>: phases, container states, restartPolicy, and the backoff behaviour.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/workloads/controllers/deployment/">Deployments</a> and <a href="https://kubernetes.io/docs/concepts/workloads/controllers/replicaset/">ReplicaSet</a>: rolling update, <code>maxSurge</code>/<code>maxUnavailable</code>, rollback, history.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/">Configure Liveness, Readiness and Startup Probes</a>: the three probes and their thresholds.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/">Sidecar Containers</a>: native sidecars (init containers with <code>restartPolicy: Always</code>).</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/workloads/pods/init-containers/">Init Containers</a>: ordered, run-to-completion setup.</li>
+      <li>Kubernetes blog — <a href="https://kubernetes.io/blog/2023/08/25/native-sidecar-containers/">Native sidecar containers</a>: the problem they solve and how they behave.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch32-api-machinery-apply-path-admission-crds-and.html"><span class="dir">← Prev</span><div class="ti">Ch 32 — API machinery: apply path, admission, CRDs and operators</div></a>
+      <a class="nx" href="ch34-workloads-ii-statefulset-daemonset-job-cronjob.html"><span class="dir">Next →</span><div class="ti">Ch 34 — Workloads II: StatefulSet, DaemonSet, Job, CronJob</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 33 of 121 · Part IV · Kubernetes — Architecture &amp; Internals. You own the stateless workload now. Next: the workloads that need identity, one-per-node placement, or run-to-completion — StatefulSet, DaemonSet, Job, CronJob.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Deployment → RS → Pods</a>
+    <a href="#lifecycle">Lifecycle &amp; probes</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">Following a rollout</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

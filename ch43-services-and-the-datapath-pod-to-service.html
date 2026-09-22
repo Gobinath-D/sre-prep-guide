@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 43 — Services and the datapath: Pod → Service</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part V · K8s networking &nbsp;·&nbsp; Chapter 43</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part V · Kubernetes Networking at Packet Level · Chapter 43</div>
+      <h1>Services and the datapath: Pod → Service</h1>
+      <p class="tagline">A Service has an IP that nothing listens on, no process bound to it, no interface holding it — yet <code>curl</code> to that address reaches a healthy pod every time. The trick is a set of kernel rules that rewrite the destination as the packet leaves. Learn the exact rewrite and Services stop being magic and start being greppable.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~50 min read · kind + kubectl + iptables/ipvsadm lab</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain what a ClusterIP really is — a virtual IP that exists only as kernel rules, not on any interface.</li>
+          <li>Read the exact iptables chains a Service creates and point at the line that DNATs the ClusterIP to a pod IP.</li>
+          <li>Say how EndpointSlices connect a Service's label selector to the set of pod IPs kube-proxy programs.</li>
+          <li>Contrast kube-proxy's iptables, IPVS, and nftables modes and know which one to reach for at scale.</li>
+          <li>Diagnose the two Service classics: a Service with no endpoints, and load that piles onto one pod.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem Services solve</h2>
+    <p>From <a href="ch42-pod-networking-internals-pod-to-pod.html">Chapter 42</a> you can send a packet from any pod to any other pod by IP. That sounds like enough — until you try to build anything real on top of it. Pod IPs are ephemeral. A pod dies and its replacement comes up with a new address. A Deployment scales from three replicas to ten and back to two; the set of live IPs changes every few seconds during a rollout. If your frontend hard-codes a backend pod's IP, the first reschedule breaks it, and no amount of retry logic fixes an address that no longer exists.</p>
+    <p>You need a <b>stable name and address for a changing set of pods</b>, plus load-balancing across whichever of them are healthy right now. That's the Service. You give it a label selector — "all pods with <code>app=api</code>" — and Kubernetes gives you back one steady virtual IP, the <b>ClusterIP</b>, that transparently spreads connections across the current healthy members. Your frontend talks to the ClusterIP (or its DNS name, <a href="ch45-coredns-and-service-discovery.html">Chapter 45</a>) and never learns that pods came and went underneath it.</p>
+    <p>Here's the part that surprises people: there is no load balancer <em>process</em> in the path. The ClusterIP isn't assigned to any pod, any node interface, or any proxy you can point at. When a pod connects to it, the packet's destination is rewritten — in the kernel, on the way out of the client's node — from the ClusterIP to one specific pod IP. The "load balancer" is a table of netfilter or IPVS rules that every node's <b>kube-proxy</b> keeps in sync with the cluster's current endpoints. Understand that rewrite and you understand Services completely.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>A ClusterIP is a <em>virtual</em> IP: no NIC has it, no socket is bound to it, nothing answers ARP for it. It's a match key in a kernel rule. A packet to <code>10.96.12.34:80</code> is DNATed to a real pod IP like <code>10.244.1.6:8080</code> before it leaves the source node; the pod network from Chapter 42 then carries it. Services are DNAT plus a list of endpoints, kept fresh — nothing more.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a hotline that rings whoever's on shift</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Think of a support hotline with one published number. Callers dial that number forever; it never changes. Behind it, agents clock in and out all day — the roster of who's available is never the same twice. Nobody publishes an agent's desk number, because that agent might be on lunch, off shift, or replaced.</p>
+      <p>When a call comes in, the <b>phone switch</b> looks at the current roster of on-shift agents and connects the caller to one of them — and, importantly, it keeps that one call glued to that one agent for its whole duration; it doesn't re-roll the dice mid-conversation. The published number is the <b>ClusterIP</b>. The roster is the <b>EndpointSlice</b>: the live list of ready agents, updated the instant someone clocks in or out. The switch making the connect decision is <b>kube-proxy's rules in the kernel</b>. And "glue this call to this agent" is <b>connection tracking</b> — conntrack — which remembers the chosen pod so every packet of the connection goes to the same place.</p>
+      <p>Two failure modes fall straight out of the picture. If the roster is empty — nobody clocked in, or the shift-scheduler was looking at the wrong list — the hotline rings out; that's a <b>Service with no endpoints</b>. And if one agent takes a caller who then stays on the line for hours while everyone else gets quick calls, the load looks lopsided even though the switch dealt fairly per-call; that's <b>long-lived-connection imbalance</b>.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In the Service datapath</th></tr>
+      <tr><td>The one published hotline number</td><td>The <b>ClusterIP</b> (e.g. <code>10.96.12.34</code>) — a virtual IP</td></tr>
+      <tr><td>The live roster of on-shift agents</td><td>The <b>EndpointSlice</b> — ready pod IPs matching the selector</td></tr>
+      <tr><td>The phone switch making the connect</td><td><b>kube-proxy</b> rules in the kernel (iptables / IPVS / nftables)</td></tr>
+      <tr><td>Connecting to one specific agent</td><td>The <b>DNAT</b>: ClusterIP → one pod IP:port</td></tr>
+      <tr><td>Gluing the call to that agent</td><td><b>conntrack</b> — pins the connection to the chosen endpoint</td></tr>
+      <tr><td>Nobody on shift → rings out</td><td>Service with <b>no endpoints</b> (selector/label mismatch)</td></tr>
+      <tr><td>One caller monopolises one agent</td><td>Long-lived connections (keepalive, gRPC) → <b>imbalance</b></td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>The Pod → Service → Pod datapath</h2>
+    <p>Follow a request from a client pod to a ClusterIP. The client's stack sends a packet to <code>10.96.12.34:80</code>. Because that address is in the Service CIDR and not on-link, it heads for the node's networking, and on the way out it hits the <code>nat</code> table (the <code>OUTPUT</code> chain, for locally-originated traffic — <code>PREROUTING</code> for traffic arriving from elsewhere). kube-proxy has planted rules there. In iptables mode the packet walks a short chain of jumps: a top-level <code>KUBE-SERVICES</code> chain matches the destination IP and port and jumps to a per-Service <code>KUBE-SVC-&lt;hash&gt;</code> chain, which uses a random probability to pick one per-endpoint <code>KUBE-SEP-&lt;hash&gt;</code> chain, which does the actual <b>DNAT</b> to a pod IP. conntrack records the choice so the rest of the connection follows it. Then the rewritten packet — now addressed to a real pod — rides the pod network from Chapter 42 to its destination, same node or across the cluster.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 460" role="img" aria-label="A client pod sends to a ClusterIP; on the source node the nat table matches KUBE-SERVICES, jumps to the per-service chain, randomly selects one endpoint chain, DNATs the ClusterIP to a pod IP, records it in conntrack, and the pod network delivers it to the chosen endpoint pod">
+        <defs>
+          <marker id="d-ar" markerWidth="10" markerHeight="10" refX="7.5" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" style="fill:var(--accent)"/></marker>
+          <marker id="d-ar2" markerWidth="10" markerHeight="10" refX="7.5" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" style="fill:var(--accent2)"/></marker>
+        </defs>
+        <text x="360" y="20" text-anchor="middle" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">POD → CLUSTERIP → DNAT → ENDPOINT POD</text>
+
+        <!-- client -->
+        <rect x="14" y="40" width="128" height="74" rx="9" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="78" y="64" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">client pod</text>
+        <text x="78" y="82" text-anchor="middle" style="fill:var(--accent);font:9.5px ui-monospace,monospace">10.244.1.2</text>
+        <text x="78" y="100" text-anchor="middle" style="fill:var(--muted);font:9.5px ui-monospace,monospace">→ 10.96.12.34:80</text>
+
+        <!-- nat table box -->
+        <rect x="164" y="34" width="392" height="230" rx="11" style="fill:none;stroke:var(--line);stroke-width:1.5"/>
+        <text x="176" y="52" style="fill:var(--muted);font:700 10.5px sans-serif;letter-spacing:.04em">SOURCE NODE · nat table (OUTPUT / PREROUTING) · kube-proxy rules</text>
+
+        <rect x="180" y="64" width="150" height="50" rx="7" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="255" y="84" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">KUBE-SERVICES</text>
+        <text x="255" y="101" text-anchor="middle" style="fill:var(--muted);font:9px ui-monospace,monospace">-d 10.96.12.34 --dport 80</text>
+
+        <rect x="360" y="64" width="176" height="50" rx="7" style="fill:var(--panel);stroke:var(--violet);stroke-width:1.5"/>
+        <text x="448" y="84" text-anchor="middle" style="fill:var(--violet);font:600 11px sans-serif">KUBE-SVC-XXXX</text>
+        <text x="448" y="101" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">statistic random → pick 1 of 3</text>
+
+        <!-- SEP chains -->
+        <rect x="360" y="132" width="176" height="34" rx="6" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="448" y="153" text-anchor="middle" style="fill:var(--accent2);font:9.5px sans-serif">KUBE-SEP-A · DNAT → 10.244.1.6:8080</text>
+        <rect x="360" y="170" width="176" height="34" rx="6" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="448" y="191" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">KUBE-SEP-B · DNAT → 10.244.2.4:8080</text>
+        <rect x="360" y="208" width="176" height="34" rx="6" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="448" y="229" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">KUBE-SEP-C · DNAT → 10.244.0.9:8080</text>
+
+        <!-- conntrack -->
+        <rect x="180" y="132" width="150" height="110" rx="7" style="fill:var(--panel);stroke:var(--applied);stroke-width:1.5"/>
+        <text x="255" y="154" text-anchor="middle" style="fill:var(--applied);font:600 11px sans-serif">conntrack</text>
+        <text x="255" y="176" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">records chosen</text>
+        <text x="255" y="190" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">endpoint →</text>
+        <text x="255" y="210" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">whole connection</text>
+        <text x="255" y="224" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">pinned to SEP-A</text>
+
+        <!-- arrows inside nat -->
+        <g style="stroke:var(--accent);stroke-width:2">
+          <line x1="330" y1="89" x2="358" y2="89" marker-end="url(#d-ar)"/>
+          <line x1="448" y1="114" x2="448" y2="130" marker-end="url(#d-ar)"/>
+        </g>
+        <line x1="360" y1="149" x2="332" y2="149" style="stroke:var(--applied);stroke-width:1.5;stroke-dasharray:4 3" marker-end="url(#d-ar)"/>
+
+        <!-- from client to nat -->
+        <line x1="142" y1="77" x2="178" y2="88" style="stroke:var(--accent);stroke-width:2" marker-end="url(#d-ar)"/>
+
+        <!-- endpoint pod -->
+        <rect x="580" y="132" width="126" height="74" rx="9" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="643" y="156" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">endpoint pod</text>
+        <text x="643" y="174" text-anchor="middle" style="fill:var(--accent2);font:9.5px ui-monospace,monospace">10.244.1.6:8080</text>
+        <text x="643" y="192" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">via pod network (Ch 42)</text>
+        <line x1="536" y1="149" x2="578" y2="160" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#d-ar2)"/>
+
+        <!-- packet transform note -->
+        <rect x="14" y="284" width="692" height="70" rx="9" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="28" y="306" style="fill:var(--ink);font:11px ui-monospace,monospace">before DNAT:  src 10.244.1.2  →  dst 10.96.12.34:80      (the virtual ClusterIP)</text>
+        <text x="28" y="326" style="fill:var(--ink);font:11px ui-monospace,monospace">after  DNAT:  src 10.244.1.2  →  dst 10.244.1.6:8080     (a real pod, chosen by KUBE-SVC)</text>
+        <text x="28" y="346" style="fill:var(--muted);font:10.5px sans-serif">Reply comes back from the pod; conntrack un-DNATs it so the client sees a reply from 10.96.12.34:80.</text>
+
+        <!-- return -->
+        <rect x="14" y="372" width="692" height="72" rx="9" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="28" y="394" style="fill:var(--ink);font:11px sans-serif"><tspan style="fill:var(--violet);font-weight:700">IPVS mode</tspan> does the same job differently: all ClusterIPs are bound to a dummy <tspan style="font-family:ui-monospace,monospace">kube-ipvs0</tspan> device, and each</text>
+        <text x="28" y="410" style="fill:var(--ink);font:11px sans-serif">Service is an IPVS virtual server whose real servers are the pod IPs — an in-kernel hash table, O(1) lookup, not a rule walk.</text>
+        <text x="28" y="430" style="fill:var(--ink);font:11px sans-serif"><tspan style="fill:var(--accent);font-weight:700">Either way</tspan> the packet's destination is rewritten from ClusterIP to a pod IP before it leaves the source node.</text>
+      </svg>
+      <figcaption>The ClusterIP is matched in the nat table, one endpoint is selected (randomly in iptables mode), the destination is DNATed to that pod's IP, and conntrack pins the connection so every later packet follows the same choice.</figcaption>
+    </figure>
+
+    <details class="recall"><summary>Think first: if nothing is bound to the ClusterIP, why doesn't a packet to it just get "connection refused"?</summary>
+      <div class="body">
+        <p>Because the packet never travels to the ClusterIP as a destination. The DNAT rewrites the destination to a real pod IP <em>before routing</em>, so by the time the kernel decides where to send it, the address is a live pod that <em>is</em> listening. The ClusterIP is only ever a match key on the way out, not a place packets actually go. That's also why you can't <code>ping</code> a ClusterIP meaningfully or see it in <code>ip addr</code> on most setups — there's nothing there to answer; the address only has meaning inside the DNAT rule. The exception that proves it: if the Service has no endpoints, there's no pod to DNAT to, so kube-proxy installs a REJECT rule instead — and <em>then</em> you get an immediate "connection refused."</p>
+      </div>
+    </details>
+
+    <h2 id="internals"><span class="beat">Internal working</span>From selector to kernel rule, step by step</h2>
+    <ol class="steps">
+      <li><b>You create a Service with a selector.</b> <code>selector: {app: api}</code> and <code>port: 80</code> → <code>targetPort: 8080</code>. The API server allocates a ClusterIP from the Service CIDR (kind uses <code>10.96.0.0/16</code>) and stores the object. Nothing is programmed yet.</li>
+      <li><b>The EndpointSlice controller matches pods to the Service.</b> It watches pods with <code>app=api</code> that are <em>Ready</em> and writes their IPs and ports into one or more <b>EndpointSlice</b> objects (<code>discovery.k8s.io/v1</code>, up to 100 endpoints per slice by default). This is the modern replacement for the single monolithic Endpoints object, and it's what scales to services with thousands of pods. Not-Ready pods are excluded — that's how readiness probes gate traffic.</li>
+      <li><b>kube-proxy on every node watches Services and EndpointSlices.</b> It runs as a DaemonSet. When either changes, it recomputes the node's datapath rules so they reflect the current ClusterIP → {ready pod IPs} mapping. Every node ends up with the same rules, so the DNAT can happen on whichever node the client pod runs on.</li>
+      <li><b>In iptables mode it writes a chain hierarchy.</b> <code>KUBE-SERVICES</code> (entered from <code>nat</code> <code>PREROUTING</code> and <code>OUTPUT</code>) matches <code>-d &lt;ClusterIP&gt; --dport &lt;port&gt;</code> and jumps to <code>KUBE-SVC-&lt;hash&gt;</code>. That per-Service chain has one rule per endpoint using the <code>statistic</code> module in random mode: the first endpoint with probability <code>1/N</code>, the next <code>1/(N-1)</code>, and so on, which comes out to roughly even. Each selected rule jumps to a <code>KUBE-SEP-&lt;hash&gt;</code> chain that does <code>DNAT --to-destination &lt;podIP&gt;:&lt;targetPort&gt;</code> (and a <code>KUBE-MARK-MASQ</code> for cases that need source-NAT, like hairpin traffic).</li>
+      <li><b>conntrack pins the connection.</b> The DNAT is recorded in the connection-tracking table, so only the first packet walks the selection; every subsequent packet of that connection is translated to the same endpoint automatically. Load balancing is therefore <em>per connection</em>, not per packet and not per request.</li>
+      <li><b>Return traffic is un-NATed.</b> The endpoint pod replies to the client's real IP. On the way back, conntrack reverses the DNAT so the source address becomes the ClusterIP again — the client sees a reply from the address it dialled and never learns which pod answered.</li>
+    </ol>
+    <div class="box keypoint"><div class="h">Three datapath modes, one behaviour</div>
+      <p><b>iptables</b> (long the default) walks a chain of rules — simple and reliable, but the rule count grows linearly with services × endpoints, so updates and matching get slow on very large clusters. <b>IPVS</b> binds all ClusterIPs to a dummy <code>kube-ipvs0</code> interface and uses the kernel's in-kernel load balancer: virtual servers keyed by hash, O(1) lookup, real load-balancing algorithms (round-robin, least-connection, and more). <b>nftables</b> is the newer default-track mode (stable from Kubernetes 1.33) that replaces iptables with nftables for far better scaling while keeping the same conceptual DNAT. All three end at the same place: destination rewritten from ClusterIP to a pod IP. You choose based on scale and kernel support, not on behaviour.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: you scale a Deployment from 3 to 0 replicas. What happens to a client that connects to its Service?</summary>
+      <div class="body">
+        <p>At 0 ready replicas the EndpointSlice is empty, so kube-proxy has nothing to DNAT to. In iptables mode the per-Service chain falls through to a <code>REJECT</code> (a <code>KUBE-MARK-DROP</code>/reject rule kube-proxy installs specifically for the no-endpoints case), so the client gets an immediate <b>connection refused</b> rather than a hang. That fast rejection is a feature — it fails loudly instead of timing out — but it's also exactly what a selector/label typo produces even when pods <em>are</em> running: the pods exist, but none match the selector, so the slice is empty and every call is refused. The lesson: "connection refused to a Service that clearly has running pods" almost always means the endpoints are empty, and the first thing to check is <code>kubectl get endpointslices</code>, not the pods.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces and what each owns</h2>
+    <ul>
+      <li><b>The Service object</b> — owns the stable identity: the ClusterIP, the port mapping (<code>port</code> → <code>targetPort</code>), and the selector. Types build on it: <code>ClusterIP</code> (in-cluster only), <code>NodePort</code> and <code>LoadBalancer</code> (external, <a href="ch44-nodeport-loadbalancer-internet-to-pod.html">Chapter 44</a>), and <code>ExternalName</code> (a CNAME, no proxying). A <code>headless</code> Service (<code>clusterIP: None</code>) skips the virtual IP entirely and just publishes pod IPs in DNS.</li>
+      <li><b>The EndpointSlice controller</b> — owns the roster: it watches pods and writes ready pod IPs/ports into EndpointSlices. It decides which pods count (Ready, matching selector) and shards large sets into multiple slices.</li>
+      <li><b>EndpointSlices</b> (<code>discovery.k8s.io/v1</code>) — the data structure the datapath reads. Each entry carries an address, a <code>ready</code>/<code>serving</code>/<code>terminating</code> condition, and topology hints. This is what kube-proxy turns into rules.</li>
+      <li><b>kube-proxy</b> — owns the datapath on each node. It translates Services + EndpointSlices into iptables/IPVS/nftables rules and conntrack behaviour. It does <em>not</em> do pod-to-pod networking (that's the CNI) — it only programs Service virtual IPs, as <a href="ch30-the-node-kubelet-kube-proxy-runtime-cri.html">Chapter 30</a> stressed.</li>
+      <li><b>netfilter / IPVS + conntrack</b> — the kernel machinery that actually matches, rewrites, and remembers. The DNAT and the connection pinning live here; kube-proxy is just the thing that writes the rules.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one connection to a Service</h2>
+    <p>A pod at <code>10.244.1.2</code> runs <code>curl http://api:80</code>. DNS resolves <code>api</code> to the ClusterIP <code>10.96.12.34</code> (Chapter 45). The TCP SYN leaves with destination <code>10.96.12.34:80</code>. On its way out of the node it enters the <code>nat</code> <code>OUTPUT</code> chain, jumps <code>KUBE-SERVICES → KUBE-SVC-&lt;hash&gt;</code>, and the statistic rule rolls the dice and picks <code>KUBE-SEP-A</code>, which DNATs the destination to <code>10.244.1.6:8080</code>. conntrack records "this 4-tuple → endpoint A." Now the packet is addressed to a real pod and the pod network of Chapter 42 delivers it — locally if that pod is on this node, or cross-node otherwise. The pod's app accepts the SYN on <code>8080</code>, replies to <code>10.244.1.2</code>; conntrack reverses the translation so the source reads <code>10.96.12.34:80</code>, and the client's kernel matches it to the connection it opened. Every subsequent packet of that connection skips the selection and follows the conntrack entry straight to endpoint A. When the connection closes, the entry ages out. A brand-new connection from the same client rolls the dice again and may land on B or C. That per-connection stickiness is the seed of both correct behaviour and the imbalance you'll meet in the labs.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>Reuse the kind cluster from Chapter 42 (or create one). We'll read the real kernel rules a Service produces by exec-ing into a kind node, which is just a Docker container with <code>iptables</code> and <code>conntrack</code> inside.</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>kind create cluster --name netlab --config - &lt;&lt;'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+EOF</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — a Service, its ClusterIP, and its EndpointSlice</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Deploy three replicas that report their own name, expose them with a ClusterIP Service, and confirm the roster.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl create deployment api --image=hashicorp/http-echo \
+  -- /http-echo -listen=:8080 -text="hello from a pod"
+kubectl scale deployment api --replicas=3
+kubectl expose deployment api --port=80 --target-port=8080
+kubectl wait --for=condition=available deployment/api --timeout=90s
+
+kubectl get svc api                     <span class="c"># note the CLUSTER-IP, e.g. 10.96.x.x</span>
+kubectl get endpointslices -l kubernetes.io/service-name=api -o wide</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME   TYPE        CLUSTER-IP     PORT(S)   AGE
+api    ClusterIP   10.96.12.34    80/TCP    5s
+
+NAME         ADDRESSTYPE   PORTS   ENDPOINTS                          AGE
+api-abc12    IPv4          8080    10.244.0.9,10.244.1.6,10.244.2.4   5s</code></div>
+        <p>Three pod IPs, all Ready, sitting in one EndpointSlice — that's the roster kube-proxy will turn into rules. Now dial the ClusterIP from a client pod and confirm it reaches a real backend:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl run c --image=nicolaka/netshoot --command -- sleep infinity
+kubectl wait --for=condition=Ready pod/c --timeout=90s
+kubectl exec c -- sh -c 'for i in 1 2 3 4; do curl -s http://api:80; done'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>hello from a pod
+hello from a pod
+hello from a pod
+hello from a pod</code></div>
+        <p>Each <code>curl</code> is a new connection, so each may land on a different backend — the DNAT chose per connection. Nothing listens on <code>10.96.12.34</code>; the kernel rewrote it. Next lab, we read the rewrite.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — read the exact iptables chains kube-proxy wrote</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Exec into the worker node and follow the chain from ClusterIP to DNAT. Start at the top-level Service chain and grep for your ClusterIP.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>SVC_IP=$(kubectl get svc api -o jsonpath='{.spec.clusterIP}')
+docker exec netlab-worker iptables -t nat -S KUBE-SERVICES | grep "$SVC_IP"</code></pre></div>
+        <div class="out"><span class="ol">Output</span>-A KUBE-SERVICES -d 10.96.12.34/32 -p tcp -m tcp --dport 80 -j KUBE-SVC-ABCDEF...</code></div>
+        <p>That's the match: destination = ClusterIP, port 80, jump to the per-Service chain. Follow it, and then one endpoint chain:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>SVC_CHAIN=$(docker exec netlab-worker iptables -t nat -S KUBE-SERVICES | grep "$SVC_IP" | grep -o 'KUBE-SVC-[A-Z0-9]*')
+docker exec netlab-worker iptables -t nat -S "$SVC_CHAIN"</code></pre></div>
+        <div class="out"><span class="ol">Output</span>-A KUBE-SVC-ABCDEF -m statistic --mode random --probability 0.33333 -j KUBE-SEP-AA...
+-A KUBE-SVC-ABCDEF -m statistic --mode random --probability 0.50000 -j KUBE-SEP-BB...
+-A KUBE-SVC-ABCDEF -j KUBE-SEP-CC...</code></div>
+        <p>Read the probabilities as a cascade: the first endpoint is taken with p=1/3; if not, the second with p=1/2 of the remainder; otherwise the third — evenly 1/3 each. Now the endpoint chain, which does the actual work:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>SEP=$(docker exec netlab-worker iptables -t nat -S "$SVC_CHAIN" | grep -o 'KUBE-SEP-[A-Z0-9]*' | head -1)
+docker exec netlab-worker iptables -t nat -S "$SEP"</code></pre></div>
+        <div class="out"><span class="ol">Output</span>-A KUBE-SEP-AA -s 10.244.0.9/32 -j KUBE-MARK-MASQ
+-A KUBE-SEP-AA -p tcp -m tcp -j DNAT --to-destination 10.244.0.9:8080</code></div>
+        <p>There it is — the one line that is the entire "load balancer": <code>DNAT --to-destination 10.244.0.9:8080</code>. The <code>KUBE-MARK-MASQ</code> handles the hairpin case (a pod reaching its own Service). Confirm conntrack pins a connection by holding one open and reading the table:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl exec c -- sh -c 'curl -s -m5 http://api:80 &amp; sleep 1; :' &amp;
+docker exec netlab-worker conntrack -L -p tcp 2>/dev/null | grep 8080 | head -2</code></pre></div>
+        <div class="out"><span class="ol">Output</span>tcp 6 ... src=10.244.1.2 dst=10.96.12.34 sport=... dport=80 [DNAT] src=10.244.0.9 dst=10.244.1.2 ... dport=8080</code></div>
+        <p>conntrack shows the original tuple (to the ClusterIP) and the translated reply tuple (from the pod) — proof the connection is glued to one endpoint.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — a Service with no endpoints</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>This is the most common "why can't I reach my Service" ticket. Create the exact mismatch that produces it: a Service whose selector doesn't match any pod's labels. The pods are healthy and running the whole time.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl create service clusterip api-typo --tcp=80:8080
+kubectl set selector service api-typo 'app=api-oops'    <span class="c"># no pod has this label</span>
+kubectl run probe --image=nicolaka/netshoot --command -- sleep infinity
+kubectl wait --for=condition=Ready pod/probe --timeout=90s
+kubectl exec probe -- curl -s -m5 -o /dev/null -w '%{http_code}\n' http://api-typo:80 || echo "FAILED"</code></pre></div>
+        <div class="out"><span class="ol">Output</span>000
+FAILED        <span class="c"># or an immediate "Connection refused" — not a timeout</span></code></div>
+        <p>The Service exists, has a ClusterIP, resolves in DNS — and every call fails. The pods are all <code>Running</code>. Before revealing, ask yourself the one question that cracks this class of bug and run the one command that answers it.</p>
+        <details class="recall"><summary>Reveal the cause</summary>
+          <div class="body">
+            <p>The Service has <b>no endpoints</b> because its selector matches nothing. The single command that proves it:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl get endpointslices -l kubernetes.io/service-name=api-typo
+kubectl describe svc api-typo | grep -i endpoints</code></pre></div>
+            <div class="out"><span class="ol">Output</span>No resources found          <span class="c"># the slice is empty</span>
+Endpoints:  &lt;none&gt;</code></div>
+            <p>Empty endpoints, so kube-proxy has nothing to DNAT to and installs a reject rule — hence the immediate refusal rather than a hang. In the real world the causes are: a selector/label typo (here), pods that never became Ready (a failing readiness probe keeps them out of the slice), a <code>targetPort</code> that doesn't match the container's actual port, or a Service in a different namespace than the pods. The fix here is to align the selector: <code>kubectl set selector service api-typo 'app=api'</code>, after which the slice populates and calls succeed within a second. The durable reflex: <b>"Service unreachable, pods healthy" → check <code>get endpointslices</code> first.</b> Endpoints are the join between your Service and your pods, and an empty join is silent unless you look.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — scale endpoints and watch the rules rewrite</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>The datapath is live: kube-proxy rewrites it every time the roster changes. Watch the probabilities shift as you scale, so that when a rollout changes traffic distribution you know exactly what moved.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>SVC_CHAIN=$(docker exec netlab-worker iptables -t nat -S KUBE-SERVICES | grep "$(kubectl get svc api -o jsonpath='{.spec.clusterIP}')" | grep -o 'KUBE-SVC-[A-Z0-9]*')
+echo "== 3 replicas =="; docker exec netlab-worker iptables -t nat -S "$SVC_CHAIN" | grep -c KUBE-SEP
+kubectl scale deployment api --replicas=5
+kubectl wait --for=condition=available deployment/api --timeout=90s
+sleep 2
+echo "== 5 replicas =="; docker exec netlab-worker iptables -t nat -S "$SVC_CHAIN"</code></pre></div>
+        <div class="out"><span class="ol">Output</span>== 3 replicas ==
+3
+== 5 replicas ==
+-A KUBE-SVC-ABCDEF -m statistic --mode random --probability 0.20000 -j KUBE-SEP-...
+-A KUBE-SVC-ABCDEF -m statistic --mode random --probability 0.25000 -j KUBE-SEP-...
+-A KUBE-SVC-ABCDEF -m statistic --mode random --probability 0.33333 -j KUBE-SEP-...
+-A KUBE-SVC-ABCDEF -m statistic --mode random --probability 0.50000 -j KUBE-SEP-...
+-A KUBE-SVC-ABCDEF -j KUBE-SEP-...</code></div>
+        <p>Five endpoints, five rules, probabilities recomputed to 1/5, 1/4, 1/3, 1/2, 1 — still even. Now watch the darker side: <em>per-connection</em> balancing goes lopsided under long-lived connections. Open one keepalive connection and hammer requests down it, then see they all hit one pod:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Reuse a single TCP connection for many requests (HTTP keepalive):</span>
+kubectl exec c -- sh -c 'curl -s http://api:80 --keepalive-time 60 \
+  $(for i in $(seq 1 10); do echo -n " http://api:80"; done) | sort | uniq -c'</code></pre></div>
+        <p>All ten responses come from the same backend, even though five are available. Why does a "load-balanced" Service send everything to one pod here? Reason it out, then reveal.</p>
+        <details class="recall"><summary>Reveal how to read it</summary>
+          <div class="body">
+            <p>Because kube-proxy load-balances <b>per connection, not per request</b>. The selection happens once, on the first packet, and conntrack pins the whole connection to that endpoint. HTTP keepalive, HTTP/2, and gRPC all multiplex many requests over one long-lived connection — so they all ride the single endpoint that connection was pinned to. Scale up all you like; existing connections don't rebalance, and a handful of long-lived clients can pile onto a few pods while others sit idle. This is the number-one cause of "we added replicas but the hot pod is still hot."</p>
+            <p>The fixes live above L4, because L4 can only balance connections: put an L7 proxy in the path that balances per request (an Ingress or a service mesh, Chapters 46 and 66), have clients periodically recycle connections or use a client-side balancer that opens one connection per endpoint, or use a headless Service so clients see all pod IPs and spread themselves. Knowing kube-proxy is per-connection tells you immediately that "add pods" won't fix a long-lived-connection hotspot.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — iptables vs IPVS at scale</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>iptables mode is fine until it isn't. Reason about where it falls over, then see IPVS mode's completely different structure with your own eyes. First, the senior question, no commands: a cluster grows to 5,000 Services and 50,000 endpoints and every kube-proxy update starts taking seconds, briefly stalling Service changes cluster-wide. What is the mechanism, and what do you switch to?</p>
+        <details class="recall"><summary>Reveal the reasoning and see IPVS</summary>
+          <div class="body">
+            <p><b>The mechanism:</b> iptables mode expresses the datapath as a linear list of rules. Every Service adds chains and every endpoint adds a rule, so the rule set grows with services × endpoints. Matching a packet can mean walking a long chain, and — worse for operations — kube-proxy historically rewrote large swaths of the table on each change, so update time grew with cluster size. Past a few thousand Services you feel it as slow Service propagation and CPU spent in kube-proxy. <b>The switch:</b> <b>IPVS mode</b> (or the newer <b>nftables</b> mode). IPVS uses in-kernel hash tables — O(1) lookup regardless of Service count — and updates incrementally, so it scales to tens of thousands of Services. It also offers real algorithms (round-robin, least-connection) instead of iptables' random.</p>
+            <p>Switch kube-proxy to IPVS and look at the structure. Edit the config, restart the DaemonSet, then inspect with <code>ipvsadm</code> from a privileged node-network pod:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl -n kube-system get configmap kube-proxy -o yaml \
+  | sed 's/mode: ""/mode: "ipvs"/' | kubectl apply -f -
+kubectl -n kube-system rollout restart daemonset kube-proxy
+kubectl -n kube-system rollout status daemonset kube-proxy
+
+<span class="c"># A node-network, privileged pod so ipvsadm sees the node's IPVS table:</span>
+kubectl run ipvs --image=nicolaka/netshoot --overrides='{"spec":{"hostNetwork":true,"nodeName":"netlab-worker","containers":[{"name":"ipvs","image":"nicolaka/netshoot","command":["sleep","infinity"],"securityContext":{"privileged":true}}]}}'
+kubectl wait --for=condition=Ready pod/ipvs --timeout=90s
+kubectl exec ipvs -- ipvsadm -Ln | grep -A6 "$(kubectl get svc api -o jsonpath='{.spec.clusterIP}')"
+kubectl exec ipvs -- ip addr show kube-ipvs0 | head</code></pre></div>
+            <div class="out"><span class="ol">Output</span>TCP  10.96.12.34:80 rr
+  -> 10.244.0.9:8080   Masq  1  0  0
+  -> 10.244.1.6:8080   Masq  1  0  0
+  -> 10.244.2.4:8080   Masq  1  0  0
+...
+kube-ipvs0: &lt;BROADCAST,NOARP&gt; ... inet 10.96.12.34/32 scope global kube-ipvs0</code></div>
+            <p>Now the ClusterIP is a real (dummy) address bound to <code>kube-ipvs0</code>, and the Service is an IPVS virtual server (<code>rr</code> = round-robin) with the pod IPs as real servers — a table, not a rule walk. Same DNAT behaviour, radically better scaling. In production the decision is: iptables for small/simple clusters, IPVS or nftables once Service and endpoint counts get large. Clean up: <code>kind delete cluster --name netlab</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · Service with no endpoints</div>
+      <p><b>Symptom:</b> connections to a Service are refused or time out, yet the backing pods are <code>Running</code>. <b>First cut:</b> <code>kubectl get endpointslices -l kubernetes.io/service-name=&lt;svc&gt;</code> — is it empty? <b>Confirm:</b> compare the Service <code>selector</code> to the pods' labels, and check whether the pods are actually <em>Ready</em> (a failing readiness probe silently removes them from the slice). <b>Usual causes:</b> a selector/label typo, pods never passing readiness, a <code>targetPort</code> that doesn't match the container port, or Service and pods in different namespaces. The empty endpoint set is the root; the pods are a red herring.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · one backend is hot, adding replicas doesn't help</div>
+      <p><b>Symptom:</b> traffic concentrates on a few pods while others idle; scaling out barely moves the hotspot. <b>First cut:</b> are clients using long-lived connections — HTTP keepalive, HTTP/2, gRPC, a database pool? <b>Confirm:</b> kube-proxy balances per connection, so a few long connections pin to a few pods. <b>Fix:</b> balance at L7 (Ingress/mesh, per request), recycle client connections, use a client-side balancer with one connection per endpoint, or a headless Service. "Add pods" is the wrong lever for a per-connection hotspot.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · intermittent resets during a rollout / conntrack exhaustion</div>
+      <p><b>Symptom:</b> brief connection errors when pods come and go, or under very high connection churn, resets and drops with <code>nf_conntrack: table full</code> in the kernel log. <b>First cut:</b> for rollouts, check that terminating pods are draining (readiness gate + <code>preStop</code>); for churn, check <code>conntrack -S</code> and <code>nf_conntrack_max</code>. <b>Usual causes:</b> connections landing on a pod that's shutting down before it left the endpoints (fixed by graceful termination and terminating-endpoint handling), or the node's conntrack table filling under a flood of short-lived NATed connections — the same finite-table limit you met on Docker in <a href="ch25-container-networking.html">Chapter 25</a>.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Choosing a mode.</b> Default iptables (or nftables on recent clusters) is right for the vast majority of clusters — simple, well-understood, reliable. Move to IPVS or nftables when you have thousands of Services or tens of thousands of endpoints and feel kube-proxy update latency or match cost; both scale far better. Don't switch pre-emptively for a small cluster — you'd trade familiar tooling for a mode you now have to operate.</p>
+    <p><b>Session affinity and stickiness.</b> If a workload needs a client pinned to one pod, set <code>service.spec.sessionAffinity: ClientIP</code> (with <code>sessionAffinityConfig.clientIP.timeoutSeconds</code>, default 10800). It's L4 stickiness keyed on source IP, which is coarse — many clients behind one NAT share a pod, and it doesn't survive the client's IP changing. For anything richer (cookie-based affinity) you need L7 (Ingress/mesh). And remember the flip side: the <em>accidental</em> stickiness of per-connection balancing is what causes the hotspot above.</p>
+    <p><b>Security and correctness.</b> ClusterIPs are reachable from any pod that can route to the Service CIDR, so a Service is not an access control boundary — use NetworkPolicy (<a href="ch47-networkpolicy-deep.html">Chapter 47</a>) for that. Prefer named target ports so a container port change doesn't silently orphan the Service. And treat readiness probes as traffic gates: they're the mechanism that adds and removes pods from the datapath, so a too-lax probe sends traffic to a pod that can't serve, and a too-strict one starves a healthy Service. <b>Common mistakes:</b> hard-coding pod IPs instead of using the Service; assuming the ClusterIP is pingable; expecting per-request balancing from an L4 Service; and forgetting that a rollout needs graceful termination so connections drain off terminating pods.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>The Service is the seam between "a changing set of processes" and "a stable thing other systems depend on" — the same abstraction a load balancer gives you in any architecture, but built from kernel rules instead of a box in the path. That design choice has consequences you carry up the stack. Because balancing is L4 and per-connection, every design that needs even distribution of <em>requests</em> (not connections) reaches for an L7 layer: an Ingress (<a href="ch46-ingress-and-the-gateway-api.html">Chapter 46</a>), a service mesh (<a href="ch66-service-mesh-foundations.html">Chapter 66</a>), or a client-side balancer. Because endpoints are gated on readiness, your health-check design directly shapes traffic. And because the whole thing is DNAT over the flat pod network, external entry points (NodePort, LoadBalancer, <a href="ch44-nodeport-loadbalancer-internet-to-pod.html">Chapter 44</a>) are just this same machinery extended to the node's edge, and the AWS load-balancer integrations of <a href="ch60-end-to-end-synthesis-internet-to-alb.html">Chapter 60</a> either target these NodePorts or bypass them to hit pod IPs directly. Get the Service model right and the external and mesh layers are refinements, not new mysteries.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first, then open it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What is a ClusterIP, really?</summary>
+        <div class="a"><p>A virtual IP for a Service that exists only as kernel rules — no interface holds it, no process is bound to it. When a pod connects to the ClusterIP, kube-proxy's rules DNAT the destination to one of the Service's ready pod IPs before the packet leaves the source node, and conntrack pins the connection to that pod. The set of pod IPs comes from the Service's EndpointSlices, which the EndpointSlice controller keeps in sync with the ready pods matching the selector. So a Service is really "a stable virtual IP plus DNAT to a live endpoint list."</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through what happens from creating a Service to a packet reaching a pod.</summary>
+        <div class="a"><p>Creating the Service allocates a ClusterIP from the Service CIDR and stores the selector and port mapping. The EndpointSlice controller finds ready pods matching the selector and writes their IPs and ports into EndpointSlices. kube-proxy on every node watches Services and EndpointSlices and programs the datapath — in iptables mode, a <code>KUBE-SERVICES</code> rule matching the ClusterIP and port that jumps to a per-Service chain, which uses the statistic module to randomly pick one per-endpoint chain, which DNATs to that pod's IP and target port. When a client pod connects to the ClusterIP, the SYN hits that chain on the way out of its node, gets DNATed to a chosen pod, and conntrack records the choice; the pod network delivers the now-real-IP packet, the pod replies, and conntrack un-NATs the reply so the client sees it coming from the ClusterIP. Every later packet of the connection follows the conntrack entry to the same pod. IPVS and nftables modes do the same DNAT with a hash table instead of a rule walk.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Why does adding replicas sometimes fail to relieve a hot pod?</summary>
+        <div class="a"><p>Because kube-proxy balances per connection, not per request. The endpoint is chosen once, on the first packet, and conntrack pins the whole connection to it. Long-lived connections — HTTP keepalive, HTTP/2, gRPC, database pools — carry many requests over one connection, so all of them ride the single endpoint that connection landed on. New replicas only receive <em>new</em> connections; they don't rebalance existing ones, and if a few clients hold a few long connections, those few pods stay hot no matter how many you add. The fix has to be above L4: an L7 proxy that balances per request (Ingress or mesh), clients that periodically recycle connections, a client-side balancer opening one connection per endpoint, or a headless Service so clients spread themselves across pod IPs. Recognising "per-connection" immediately rules out "just scale out" as the fix.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A Service is refusing connections but its pods are all Running. What do you check?</summary>
+        <div class="a"><p>Endpoints first, always: <code>kubectl get endpointslices -l kubernetes.io/service-name=&lt;svc&gt;</code>. If it's empty, the Service has no backends, so kube-proxy installs a reject rule and every call is refused even though pods run. Then I find why the join is empty: does the Service selector actually match the pod labels; are the pods truly <em>Ready</em>, since a failing readiness probe removes them from the slice; does <code>targetPort</code> match the container's real port; and are the Service and pods in the same namespace? Nine times out of ten it's a selector/label mismatch or a readiness failure. Only if endpoints are present and correct do I move on to the datapath — kube-proxy health, the iptables/IPVS rules, conntrack — and to the pod itself.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>When would you switch kube-proxy from iptables to IPVS?</summary>
+        <div class="a"><p>When scale hurts. iptables mode is a linear rule set that grows with services × endpoints, so on large clusters — thousands of Services, tens of thousands of endpoints — you see rising kube-proxy CPU and slow Service propagation because updates touch large parts of the table and matching walks long chains. IPVS uses in-kernel hash tables with O(1) lookup and incremental updates, so it scales far past that, and it adds real algorithms like least-connection. The newer nftables mode gives similar scaling as the modern default. For a small or medium cluster I'd stay on iptables/nftables defaults — switching to IPVS means operating a different datapath and toolset, which isn't worth it until you actually feel the scaling limit.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>A Service gives a changing set of pods one stable ClusterIP and load-balances across the ready ones. The ClusterIP is virtual — no interface, no process; it's a match key in a kernel rule. The EndpointSlice controller turns the Service's selector into a live list of ready pod IPs (EndpointSlices, <code>discovery.k8s.io/v1</code>), and kube-proxy on every node turns that into datapath rules. In iptables mode: <code>KUBE-SERVICES</code> matches the ClusterIP and jumps to <code>KUBE-SVC-&lt;hash&gt;</code>, which randomly picks a <code>KUBE-SEP-&lt;hash&gt;</code> that DNATs to a pod IP; conntrack pins the connection so balancing is per connection. IPVS binds ClusterIPs to <code>kube-ipvs0</code> and uses in-kernel hash tables for O(1) lookup at scale; nftables is the modern default alternative. Empty endpoints (selector/label typo, unready pods, wrong port, wrong namespace) give an immediate connection refused — check <code>get endpointslices</code> first. Long-lived connections pin to one pod, so adding replicas won't fix a per-connection hotspot; move balancing to L7.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>A ClusterIP is virtual — nothing is bound to it; it's a DNAT match key in the kernel, not a place packets go.</li>
+      <li>EndpointSlices (<code>discovery.k8s.io/v1</code>) are the live list of ready pod IPs the Service's selector matches.</li>
+      <li>kube-proxy watches Services + EndpointSlices and programs each node's datapath; it does not do pod-to-pod networking.</li>
+      <li>iptables mode: <code>KUBE-SERVICES → KUBE-SVC-&lt;hash&gt;</code> (statistic random) <code>→ KUBE-SEP-&lt;hash&gt;</code> (<code>DNAT</code> to pod IP).</li>
+      <li>conntrack pins each connection to the chosen endpoint, so balancing is per connection, not per request.</li>
+      <li>IPVS binds ClusterIPs to <code>kube-ipvs0</code> and uses in-kernel hash tables (O(1)); nftables is the modern default at scale.</li>
+      <li>Empty endpoints → kube-proxy installs a REJECT → immediate "connection refused," even with pods Running.</li>
+      <li>"Service unreachable, pods healthy" → check <code>kubectl get endpointslices</code> before anything else.</li>
+      <li>Long-lived connections (keepalive/HTTP2/gRPC) pin to one pod; adding replicas won't rebalance them — balance at L7.</li>
+      <li>Session affinity (<code>sessionAffinity: ClientIP</code>) is coarse L4 stickiness by source IP; readiness gates which pods get traffic.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch30-the-node-kubelet-kube-proxy-runtime-cri.html"><b>Ch 30</b> kube-proxy on the node</a>
+      <a href="ch42-pod-networking-internals-pod-to-pod.html"><b>Ch 42</b> Pod-to-Pod</a>
+      <a href="ch44-nodeport-loadbalancer-internet-to-pod.html"><b>Ch 44</b> NodePort &amp; LoadBalancer</a>
+      <a href="ch45-coredns-and-service-discovery.html"><b>Ch 45</b> CoreDNS</a>
+      <a href="ch47-networkpolicy-deep.html"><b>Ch 47</b> NetworkPolicy</a>
+      <a href="ch66-service-mesh-foundations.html"><b>Ch 66</b> Service mesh</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/services-networking/service/">Service</a>: types, selectors, ports, session affinity, and headless Services.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/reference/networking/virtual-ips/">Virtual IPs and Service Proxies</a>: how kube-proxy's iptables, IPVS, and nftables modes implement the ClusterIP.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/">EndpointSlices</a>: the roster the datapath reads, and why slices replaced the monolithic Endpoints object.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/tasks/debug/debug-application/debug-service/">Debug Services</a>: the official checklist for a Service that won't route, starting with endpoints.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/services-networking/">Services, Load Balancing, and Networking</a>: where the Service sits relative to pods, DNS, and Ingress.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch42-pod-networking-internals-pod-to-pod.html"><span class="dir">← Prev</span><div class="ti">Ch 42 — Pod networking internals: Pod → Pod</div></a>
+      <a class="nx" href="ch44-nodeport-loadbalancer-internet-to-pod.html"><span class="dir">Next →</span><div class="ti">Ch 44 — NodePort, LoadBalancer: Internet → Pod</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 43 of 121 · Part V · Kubernetes Networking at Packet Level. Grep the DNAT rule once and you'll never fear a Service again.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">The datapath</a>
+    <a href="#internals">Selector to kernel rule</a>
+    <a href="#components">The components</a>
+    <a href="#flow">Following a connection</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

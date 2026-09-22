@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 48 — Pod to Internet and the Full Synthesis</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part V · K8s networking &nbsp;·&nbsp; Chapter 48</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part V · Kubernetes Networking at Packet Level · Chapter 48</div>
+      <h1>Pod to Internet, and the full synthesis</h1>
+      <p class="tagline">Every chapter in this Part answered "how does traffic get in." This one answers the direction nobody asks about until it breaks: how does a pod's own outbound call ever get a reply back. Then we run one request through all of it — in, across, and out — on the same cluster.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~50 min read · kind + conntrack/tcpdump lab</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain why a pod's outbound packet needs its source address rewritten before it ever reaches the internet.</li>
+          <li>Read a conntrack entry and identify the exact SNAT translation for a pod's egress connection.</li>
+          <li>Say what decides which destinations get masqueraded and which don't, and what breaks when that list is wrong.</li>
+          <li>Trace one request through every mechanism this Part covered — entry, DNS, Service, policy, and exit — on one cluster.</li>
+          <li>Diagnose a connection that hangs specifically because its reply has nowhere to come back to.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The direction nobody designs for on purpose</h2>
+    <p>Every chapter in this Part so far has been about traffic arriving somewhere: pod to pod (<a href="ch42-pod-networking-internals-pod-to-pod.html">Chapter 42</a>), pod to Service (<a href="ch43-services-and-the-datapath-pod-to-service.html">Chapter 43</a>), internet to pod (<a href="ch44-nodeport-loadbalancer-internet-to-pod.html">Chapter 44</a>). But plenty of real traffic starts <em>inside</em> a pod and heads out — a payment call to a card processor, a webhook to a SaaS vendor, a package pull from a registry, a metrics push to a monitoring backend nobody runs inside the cluster. That pod's IP is a private address from the cluster's own pod CIDR. It means nothing to any router on the public internet, and even where the CNI hands out real, routable VPC addresses (<a href="ch58-vpc-cni-the-deep-one.html">Chapter 58</a>), those addresses still generally aren't meant to receive unsolicited replies from arbitrary internet hosts — they're addressed for the VPC, not for the open internet's own routing tables.</p>
+    <p>So the same translation problem Chapter 44 solved for inbound traffic exists again, mirrored, for outbound traffic. Before a pod's packet leaves the node, something has to rewrite its source address to something the internet actually knows how to route a reply back to — the node's own address. That rewrite is <b>IP masquerading</b>, and it's the exact same mechanism your home Wi-Fi router uses for every device on your network, running one layer down, on every Kubernetes node.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>This isn't a separate subsystem you opt into — it's on by default in essentially every CNI, because without it, pod egress to the real internet simply wouldn't work at all. The only question that ever matters operationally is <em>which destinations</em> get this treatment and which don't, because getting that list wrong is what actually causes incidents.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: your home Wi-Fi router, one layer down</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Every device on your home network — your laptop, your phone, the smart thermostat — has a private address like <code>192.168.1.42</code> that means nothing outside your house. When your laptop opens a connection to a website, your <b>router</b> rewrites the source address on its way out to the router's own public IP, and quietly remembers the swap in its own translation table. The website replies to the router's public IP; the router looks up its table, sees that reply belongs to your laptop's earlier request, and un-rewrites it back to <code>192.168.1.42</code> before handing it to your laptop. Your laptop never notices any of this happened.</p>
+      <p>A Kubernetes node runs the exact same trick for its pods. Pod IPs are the house's private addresses; the node is the router; the node's own IP is the public one the internet actually knows how to reach. The <b>translation table</b> your router keeps is <b>conntrack</b> — the identical connection-tracking table that's already been pinning Service connections and NodePort relays throughout this whole Part. And just like a home router needs to know "don't NAT traffic headed to another device on my own network" — you don't want your laptop's request to your printer rewritten as if it were leaving the house — a Kubernetes node needs a list of destinations that should <em>skip</em> the rewrite: other pods, other nodes, the cluster's own address ranges. Get that list wrong — mark something as "internal" that's actually external, or vice versa — and you get exactly the kind of odd, one-directional failure a misconfigured home router would produce.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In Kubernetes egress</th></tr>
+      <tr><td>A device's private address (<code>192.168.1.42</code>)</td><td>A pod's IP, from the cluster's pod CIDR</td></tr>
+      <tr><td>The home router</td><td>The pod's node</td></tr>
+      <tr><td>The router's public IP</td><td>The node's own routable IP</td></tr>
+      <tr><td>Rewriting the source address on the way out</td><td><b>IP masquerading / SNAT</b></td></tr>
+      <tr><td>The router's translation table</td><td><b>conntrack</b></td></tr>
+      <tr><td>"Don't NAT traffic to my own devices"</td><td>The <b>non-masquerade CIDR list</b> (pod/cluster ranges)</td></tr>
+      <tr><td>A misconfigured rule that NATs the wrong traffic</td><td>An egress NAT misconfiguration — the Break lab</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>Pod → node → masquerade → internet</h2>
+    <p>Follow a pod's outbound packet to a destination outside the cluster entirely. It leaves the pod exactly as any packet does — out <code>eth0</code>, across the veth, into the node's root namespace. The node's routing table has no local-pod route and no cluster-route for this destination, so it falls to the node's own default route, out its real network interface. Just before that, the <code>nat</code> table's <code>POSTROUTING</code> chain matches it against the masquerade rule and rewrites the source.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 320" role="img" aria-label="A pod's packet crosses into the node, gets its source rewritten from the pod IP to the node IP by a masquerade rule, is tracked in conntrack, and leaves toward the internet; the reply is un-translated on the way back">
+        <defs>
+          <marker id="e-ar" markerWidth="10" markerHeight="10" refX="7.5" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" style="fill:var(--accent)"/></marker>
+          <marker id="e-ar2" markerWidth="10" markerHeight="10" refX="7.5" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" style="fill:var(--accent2)"/></marker>
+        </defs>
+        <text x="360" y="18" text-anchor="middle" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">POD → NODE → MASQUERADE → INTERNET</text>
+
+        <rect x="14" y="40" width="120" height="70" rx="9" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="74" y="64" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">pod</text>
+        <text x="74" y="82" text-anchor="middle" style="fill:var(--accent);font:9.5px ui-monospace,monospace">src 10.244.1.6</text>
+        <text x="74" y="98" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">dst 203.0.113.9:443</text>
+        <line x1="134" y1="75" x2="160" y2="75" style="stroke:var(--accent);stroke-width:2" marker-end="url(#e-ar)"/>
+
+        <rect x="162" y="30" width="220" height="150" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="272" y="50" text-anchor="middle" style="fill:var(--ink);font:700 11px sans-serif;letter-spacing:.03em">NODE — nat table, POSTROUTING</text>
+        <rect x="178" y="60" width="188" height="46" rx="7" style="fill:var(--panel);stroke:var(--deep);stroke-width:1.5"/>
+        <text x="272" y="80" text-anchor="middle" style="fill:var(--deep);font:700 11px sans-serif">MASQUERADE</text>
+        <text x="272" y="96" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">! -d &lt;cluster ranges&gt; -j MASQUERADE</text>
+        <rect x="178" y="116" width="188" height="52" rx="7" style="fill:var(--panel);stroke:var(--applied);stroke-width:1.5"/>
+        <text x="272" y="136" text-anchor="middle" style="fill:var(--applied);font:700 11px sans-serif">conntrack</text>
+        <text x="272" y="152" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">records 10.244.1.6 ↔ node-IP</text>
+        <line x1="382" y1="90" x2="408" y2="90" style="stroke:var(--accent);stroke-width:2" marker-end="url(#e-ar)"/>
+
+        <rect x="410" y="55" width="150" height="70" rx="9" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="485" y="79" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">on the wire now</text>
+        <text x="485" y="97" text-anchor="middle" style="fill:var(--accent2);font:9.5px ui-monospace,monospace">src = node IP</text>
+        <text x="485" y="113" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">dst unchanged</text>
+        <line x1="560" y1="90" x2="586" y2="90" style="stroke:var(--accent);stroke-width:2" marker-end="url(#e-ar)"/>
+
+        <rect x="588" y="50" width="118" height="80" rx="9" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="647" y="82" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">internet</text>
+        <text x="647" y="100" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">203.0.113.9</text>
+
+        <line x1="588" y1="115" x2="410" y2="150" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#e-ar2)"/>
+        <text x="500" y="150" text-anchor="middle" style="fill:var(--accent2);font:9.5px sans-serif">reply → node IP</text>
+
+        <rect x="30" y="204" width="660" height="96" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="46" y="226" style="fill:var(--ink);font:11px sans-serif">Inside the pod, <code>ip a</code> and every log line still show <b>10.244.1.6</b> — the pod never learns anything changed.</text>
+        <text x="46" y="246" style="fill:var(--ink);font:11px sans-serif">On the node's outbound interface, the exact same connection shows source = the <b>node's own IP</b> — a different address,</text>
+        <text x="46" y="266" style="fill:var(--ink);font:11px sans-serif">depending purely on which side of the node you capture from. conntrack un-translates the reply automatically on the way back,</text>
+        <text x="46" y="286" style="fill:var(--ink);font:11px sans-serif">so the pod receives it addressed exactly as if it had never been rewritten at all.</text>
+      </svg>
+      <figcaption>The masquerade rule matches "destination is not one of our own cluster ranges" and rewrites the source to the node's IP. conntrack remembers the swap so the reply finds its way back — the identical mechanism as Chapter 43's Service DNAT, running in the opposite direction.</figcaption>
+    </figure>
+
+    <details class="recall"><summary>Think first: from inside the pod, does anything in <code>ip route</code>, <code>ip addr</code>, or an application's own logs ever show the node's IP instead of the pod's?</summary>
+      <div class="body">
+        <p>No — and that's exactly the point of NAT. The rewrite happens on the node, after the packet has already left the pod's network namespace; nothing inside the pod's own namespace is touched. A pod's logs, its socket's local address, and its own view of the world all still say <code>10.244.1.6</code> forever. The only place you can ever see the node's IP is by looking at the packet from <em>outside</em> the node — a capture on the node's physical interface, or the receiving end's own access logs, which is exactly the asymmetry that makes this mechanism easy to forget about until an external party tells you "all your traffic looks like it's coming from three IPs" and you have to explain node-level egress NAT.</p>
+      </div>
+    </details>
+
+    <h2 id="internals"><span class="beat">Internal working</span>Deciding what gets masqueraded, step by step</h2>
+    <ol class="steps">
+      <li><b>A pod sends a packet whose destination isn't another pod.</b> The node's own routing has no on-link or cluster route for it, so it's headed out the node's real uplink — same as any ordinary server's outbound traffic.</li>
+      <li><b>Before it leaves, the <code>nat</code> table's <code>POSTROUTING</code> chain evaluates it against a masquerade rule.</b> The rule's shape is always some version of "if the destination is <em>not</em> one of our own known-internal ranges, rewrite the source to this node's address." Exactly who installs that rule differs by CNI: kindnet and most simple CNIs install a plain iptables MASQUERADE rule; Calico's Felix agent controls it per-pool via a <code>natOutgoing</code> setting; the AWS VPC CNI applies it by default for internet-bound pod traffic and exposes <code>AWS_VPC_K8S_CNI_EXTERNALSNAT</code> to disable it when you're routing egress yourself (Chapter 58). On some distributions — notably GKE — this list is managed centrally by the <b>ip-masq-agent</b>, which reads a ConfigMap of CIDRs to <em>exclude</em> from masquerading and reprograms the rule accordingly.</li>
+      <li><b>The list of "don't masquerade this" ranges is the entire configuration surface here.</b> It has to include the pod CIDR (so pod-to-pod traffic, already handled by Chapter 42's rules, is never touched by this rule too) and usually the Service CIDR and any other private ranges your cluster legitimately considers internal — VPC peering ranges, on-prem CIDRs reached over a VPN. Anything not on that list gets masqueraded, which is the correct behaviour for anything genuinely external.</li>
+      <li><b>The rewrite itself is ordinary SNAT</b> — the source IP (and, if needed, the source port, to keep multiple pods' connections from colliding on the node's one address) is changed to the node's own address. <code>conntrack</code> records the mapping the instant the first packet of the connection is translated.</li>
+      <li><b>Every later packet of that connection, in both directions, follows the conntrack entry automatically.</b> Outbound packets get the same rewrite; the reply, arriving addressed to the node, gets un-rewritten back to the pod's real address before delivery — the pod never has to know its own address was ever anything but what it's always been.</li>
+      <li><b>If a destination is wrongly excluded from masquerading</b> — included on the "internal" list by mistake, or matched by an overly broad rule someone added above the real masquerade rule — the packet leaves with the raw pod IP as its source. A destination outside the cluster has no route back to a private pod-CIDR address, so the reply is undeliverable; from the pod's side, the connection simply hangs until it times out. This is the single most common shape of egress-NAT incident, and it's the Break lab below.</li>
+    </ol>
+    <div class="box keypoint"><div class="h">Same mechanism, opposite direction, one difference</div>
+      <p>Chapter 43's Service DNAT rewrites a packet's <em>destination</em> so it can find a specific pod; this chapter's masquerade rewrites a packet's <em>source</em> so a reply can find its way back to the node that sent it. Both live in the same <code>nat</code> table, both lean on conntrack to remember the swap, and both are invisible to whichever side didn't get rewritten. If you're comfortable with one, you already understand the other.</p>
+    </div>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces and what each owns</h2>
+    <ul>
+      <li><b>The masquerade/MASQUERADE rule.</b> Lives in the node's <code>nat</code> table, <code>POSTROUTING</code> chain. Owns the actual source rewrite for anything matching "destination not in our internal ranges."</li>
+      <li><b>The non-masquerade CIDR list.</b> Whatever mechanism your CNI uses to define "internal" — a hardcoded pod/Service CIDR check, Calico's <code>natOutgoing</code> per IP pool, or a centrally managed <b>ip-masq-agent</b> ConfigMap. Owns the single decision that determines correctness here.</li>
+      <li><b>conntrack.</b> The same connection-tracking table used everywhere else in this Part. Owns remembering the translation so replies get un-rewritten automatically.</li>
+      <li><b>Egress <code>NetworkPolicy</code></b> (<a href="ch47-networkpolicy-deep.html">Chapter 47</a>). A separate, earlier concern — it decides <em>whether</em> a pod may send a packet toward a given destination at all, before masquerading ever gets a chance to run. A pod blocked by egress policy never reaches this rule; a pod allowed through still needs a correct masquerade decision to get a reply back.</li>
+      <li><b>An egress gateway / NAT gateway pattern.</b> For workloads that need a small, stable, allow-listable set of outbound IPs — a third-party API that only trusts two fixed addresses — funnelling all egress through a dedicated chokepoint with a fixed address, rather than relying on each node's own IP, which changes as nodes scale and get replaced. This is exactly the problem AWS's NAT Gateway (<a href="ch50-vpc-foundations-cidr-subnets-route-tables-igw.html">Chapter 50</a>) solves at the VPC level.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one pod's real external call</h2>
+    <p>A pod at <code>10.244.1.6</code> calls a payment provider's API at <code>203.0.113.9:443</code>. The TCP SYN leaves the pod's <code>eth0</code>, crosses into the node's root namespace, and the node's routing finds no cluster route for <code>203.0.113.9</code> — it's genuinely external, so the packet heads for the node's default route. On the way out, <code>POSTROUTING</code>'s masquerade rule matches (the destination isn't in any internal range) and rewrites the source to the node's own IP, recording the translation in conntrack. The packet crosses the real network exactly like any ordinary server's traffic; the payment provider sees a connection from the node's IP and has no idea a pod, let alone which one, originated it. It replies to the node's IP; the node's conntrack entry recognises the reply, un-translates the destination back to <code>10.244.1.6</code>, and delivers it into the pod's namespace. The TLS handshake completes, the API call succeeds, and at no point did the pod's own view of its address change. If a second pod on the same node makes a similar call at the same moment, conntrack keeps both connections distinct by source port, exactly the way your home router juggles multiple devices' connections through one public IP.</p>
+
+    <p>Zoom out from that one call and every mechanism this Part built is a single connected loop, not seven separate topics. This is the one diagram that stitches all of it together — worth holding as one picture before the labs walk it with real commands.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 700 660" role="img" aria-label="A synthesis diagram: an internet client enters through a load balancer and NodePort into pod A, which resolves a name through CoreDNS, calls pod B through a Service DNAT gated by NetworkPolicy over the pod-to-pod fabric, and pod B calls an external API through egress masquerading">
+        <defs>
+          <marker id="s-ar" markerWidth="10" markerHeight="10" refX="7.5" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" style="fill:var(--accent)"/></marker>
+          <marker id="s-ar2" markerWidth="10" markerHeight="10" refX="7.5" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" style="fill:var(--accent2)"/></marker>
+        </defs>
+        <text x="350" y="20" text-anchor="middle" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">ONE REQUEST, ALL OF PART V, ONE LOOP</text>
+
+        <!-- Stage 1: internet -->
+        <rect x="20" y="36" width="150" height="56" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="95" y="60" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">internet client</text>
+        <text x="95" y="78" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">dials a NodePort</text>
+        <line x1="170" y1="64" x2="230" y2="64" style="stroke:var(--accent);stroke-width:2" marker-end="url(#s-ar)"/>
+        <text x="200" y="56" text-anchor="middle" style="fill:var(--accent);font:700 10px sans-serif">1 · Ch44</text>
+        <rect x="232" y="36" width="150" height="56" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="307" y="58" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">LB → node NodePort</text>
+        <text x="307" y="76" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">kube-proxy DNAT</text>
+        <line x1="382" y1="64" x2="440" y2="64" style="stroke:var(--accent);stroke-width:2" marker-end="url(#s-ar)"/>
+        <rect x="442" y="36" width="150" height="56" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="517" y="58" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">pod A</text>
+        <text x="517" y="76" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">the entry pod</text>
+
+        <line x1="517" y1="92" x2="517" y2="128" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#s-ar2)"/>
+        <text x="580" y="114" style="fill:var(--accent2);font:700 10px sans-serif">2 · Ch45</text>
+
+        <!-- Stage 2: DNS -->
+        <rect x="380" y="130" width="270" height="60" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="515" y="152" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">pod A queries CoreDNS for "pod-b-svc"</text>
+        <text x="515" y="170" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">one query → back with a ClusterIP</text>
+
+        <line x1="517" y1="190" x2="517" y2="226" style="stroke:var(--accent);stroke-width:2" marker-end="url(#s-ar)"/>
+        <text x="437" y="212" style="fill:var(--accent);font:700 10px sans-serif">3 · Ch43</text>
+
+        <!-- Stage 3: Service + policy -->
+        <rect x="380" y="228" width="270" height="70" rx="8" style="fill:var(--panel);stroke:var(--deep);stroke-width:1.5"/>
+        <text x="515" y="250" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">Service DNAT to a pod B endpoint</text>
+        <text x="515" y="268" text-anchor="middle" style="fill:var(--deep);font:700 10.5px sans-serif">✓ NetworkPolicy allow (Ch 47)</text>
+        <text x="515" y="284" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">carried over the pod-to-pod fabric (Ch 42)</text>
+
+        <line x1="515" y1="298" x2="515" y2="334" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#s-ar2)"/>
+
+        <rect x="442" y="336" width="150" height="56" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="517" y="358" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">pod B</text>
+        <text x="517" y="376" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">does the real work</text>
+
+        <line x1="517" y1="392" x2="517" y2="428" style="stroke:var(--deep);stroke-width:2" marker-end="url(#s-ar)"/>
+        <text x="580" y="414" style="fill:var(--deep);font:700 10px sans-serif">5 · Ch48</text>
+
+        <!-- Stage 4: egress -->
+        <rect x="380" y="430" width="270" height="60" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="515" y="452" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">pod B calls a third-party API</text>
+        <text x="515" y="470" text-anchor="middle" style="fill:var(--deep);font:700 10.5px sans-serif">egress masquerade → node IP (this chapter)</text>
+
+        <line x1="515" y1="490" x2="515" y2="526" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#s-ar2)"/>
+
+        <rect x="442" y="528" width="150" height="56" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="517" y="550" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">external API</text>
+        <text x="517" y="568" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">sees the node's IP, not pod B's</text>
+
+        <rect x="20" y="130" width="330" height="454" rx="12" style="fill:none;stroke:var(--line);stroke-width:1.2;stroke-dasharray:6 4"/>
+        <text x="36" y="608" style="fill:var(--muted);font:10.5px sans-serif">Everything inside this dashed box happens entirely inside the cluster — an external</text>
+        <text x="36" y="626" style="fill:var(--muted);font:10.5px sans-serif">observer only ever sees stage 1 go in and stage 5 come back out, transformed twice.</text>
+      </svg>
+      <figcaption>Six chapters, one loop: entry (Ch 44) → naming (Ch 45) → the Service datapath, gated by policy, over the pod fabric (Ch 43 / 47 / 42) → egress (Ch 48). Nothing here is a separate system — each stage hands the packet to the next with its own, independent translation or decision.</figcaption>
+    </figure>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>Reuse the kind cluster from earlier chapters in this Part, or create one fresh. To keep these labs self-contained and reproducible without depending on the real internet being reachable during a training session, stand in a plain container on the same Docker network as an "external" endpoint — the lesson transfers directly to a real destination.</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>kind create cluster --name netlab --config - &lt;&lt;'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+EOF
+
+<span class="c"># A stand-in "external" endpoint, on the same docker network, but NOT part of the cluster:</span>
+docker run -d --name ext-api --network kind nginx:1.27-alpine
+EXT_IP=$(docker inspect -f '{{.NetworkSettings.Networks.kind.IPAddress}}' ext-api)
+echo "stand-in external endpoint: $EXT_IP"</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — prove the SNAT with two simultaneous views</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Call the stand-in external endpoint from a pod, and look at the exact same connection from both sides at once.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl run c --image=nicolaka/netshoot --command -- sleep infinity
+kubectl wait --for=condition=Ready pod/c --timeout=60s
+POD_IP=$(kubectl get pod c -o jsonpath='{.status.podIP}')
+echo "pod's own IP: $POD_IP"
+
+kubectl exec c -- curl -s -o /dev/null -w '%{http_code}\n' "http://$EXT_IP"
+docker logs ext-api --tail 2</code></pre></div>
+        <div class="out"><span class="ol">Output</span>200
+172.18.0.3 - - [.....] "GET / HTTP/1.1" 200 ...</code></div>
+        <p>The "external" server's own access log shows <code>172.18.0.3</code> — the kind worker node's address — not the pod's <code>10.244.x.x</code> address you printed a moment ago. The pod called out successfully, and the receiving end never learned the pod's real address at all.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — read the translation straight out of conntrack</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Rather than inferring the SNAT from a log line, read the kernel's own record of it while a connection is open.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl exec c -- sh -c "curl -s -m5 http://$EXT_IP &gt; /dev/null &amp; sleep 1; :" &amp;
+docker exec netlab-worker conntrack -L -p tcp 2&gt;/dev/null | grep "$EXT_IP"</code></pre></div>
+        <div class="out"><span class="ol">Output</span>tcp 6 ... src=10.244.1.6 dst=172.18.0.5 sport=41822 dport=80 \
+    src=172.18.0.5 dst=172.18.0.3 sport=80 dport=41822 [ASSURED]</code></div>
+        <p>Read the two halves as before-and-after. The first line is the <em>original</em> direction: the real pod IP as source, heading to the stand-in endpoint. The second is the <em>reply</em> direction the kernel expects back: destined for <code>172.18.0.3</code> — the node's own IP, not the pod's — which is the tell that conntrack has this connection mapped to a translated address. This is the exact same conntrack table you already read for Service DNAT in Chapter 43 and for the NodePort masquerade in Chapter 44 — one table, three different jobs.</p>
+      </div>
+    </div>
+
+    <details class="recall"><summary>Think first: two different pods on the same node both open connections to the same external destination and port at the same moment. How does the node's egress NAT keep their replies from getting mixed up?</summary>
+      <div class="body">
+        <p>By source port, the same field TCP already uses to distinguish connections. Both pods' packets get their source IP rewritten to the same node address, but each connection keeps (or is assigned) a distinct source port, so conntrack's lookup key — protocol, source and destination address, source and destination port — stays unique per connection even though the source address is now shared. It's the identical trick your home router uses when your laptop and your phone both have connections open to the same website at once. The only way this breaks is genuine port exhaustion on the node — thousands of simultaneous outbound connections through one node IP can run out of available ephemeral ports, a real, separate capacity concern from the ports-and-sockets material in <a href="ch14-ports-sockets-ephemeral-ports-connection-lifecycle.html">Chapter 14</a>.</p>
+      </div>
+    </details>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — accidentally exempt a real destination from masquerading</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Reproduce the exact class of misconfiguration the analogy warned about: a destination that should be masqueraded gets excluded by mistake. Insert a rule that skips the masquerade specifically for the stand-in endpoint, the way an overly broad "internal ranges" entry would in production.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Confirm it works first:</span>
+kubectl exec c -- curl -s -m3 -o /dev/null -w '%{http_code}\n' "http://$EXT_IP"
+
+<span class="c"># Now insert a RETURN rule ABOVE the real masquerade rule, for this one destination —</span>
+<span class="c"># exactly what an over-broad "treat this as internal" entry would do:</span>
+docker exec netlab-worker iptables -t nat -I POSTROUTING 1 -d "$EXT_IP" -j RETURN
+
+kubectl exec c -- curl -s -m5 -o /dev/null -w '%{http_code}\n' "http://$EXT_IP" || echo "HANGS / FAILS"</code></pre></div>
+        <div class="out"><span class="ol">Output</span>200
+HANGS / FAILS</code></div>
+        <p>The exact same request that worked a moment ago now times out — nothing about the pod, the Service, or the destination server changed. Before revealing: the SYN clearly leaves the pod. Where does the connection actually die, and why does it look like a hang rather than an immediate refusal?</p>
+        <details class="recall"><summary>Reveal the mechanism</summary>
+          <div class="body">
+            <p>The SYN leaves the pod with its real address, <code>10.244.1.6</code>, as the source — the <code>RETURN</code> rule skips the masquerade before the packet ever reaches it, exactly as intended by whoever (mistakenly) wrote it. The stand-in endpoint receives that SYN just fine — routing between docker containers on the same network doesn't care what the source address is — and tries to send its SYN-ACK back to <code>10.244.1.6</code>. But that address is the cluster's internal pod CIDR, and nothing outside the cluster network has any route to it. The reply has nowhere to go; it's silently undeliverable, not rejected, so the pod's TCP stack just keeps waiting for a SYN-ACK that's never coming, until its own connection timeout gives up. That's why this failure mode reads as a hang rather than a clean "connection refused" — the request half of the conversation worked perfectly, and only the reply is impossible. Undo it: <code>docker exec netlab-worker iptables -t nat -D POSTROUTING -d "$EXT_IP" -j RETURN</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — tell an egress NAT gap apart from every other kind of failure</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Given only the symptom — some external destinations time out, others from the same pod work fine, nothing in the app changed — build the diagnostic that isolates the cause without needing to already know about the broken rule from Lab 3.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Re-break it so there's something real to diagnose:</span>
+docker exec netlab-worker iptables -t nat -I POSTROUTING 1 -d "$EXT_IP" -j RETURN
+
+<span class="c"># A known-good destination for contrast — anything NOT exempted:</span>
+docker exec netlab-worker conntrack -L -p tcp 2&gt;/dev/null | grep -v "$EXT_IP" | head -3
+<span class="c"># The broken one, captured while a request is in flight:</span>
+kubectl exec c -- sh -c "curl -s -m3 http://$EXT_IP &gt; /dev/null &amp; sleep 1; :" &amp;
+docker exec netlab-worker conntrack -L -p tcp 2&gt;/dev/null | grep "$EXT_IP"</code></pre></div>
+        <div class="out"><span class="ol">Output</span>tcp 6 ... src=10.244.1.6 dst=172.18.0.9 ... src=172.18.0.9 dst=172.18.0.3 ...   <span class="c"># a working one: reply expected at the NODE's IP</span>
+tcp 6 ... src=10.244.1.6 dst=172.18.0.5 ... src=172.18.0.5 dst=10.244.1.6 ...   <span class="c"># the broken one: reply expected at the POD's own IP</span></code></div>
+        <p>That second line is the whole diagnosis without ever needing to inspect a single iptables rule: a healthy egress connection's conntrack entry expects its reply addressed to the <em>node's</em> IP; this one expects it addressed to the <em>pod's own</em> IP, which means no translation happened at all. Any egress connection whose reply-side conntrack entry still shows the raw pod address, for a destination that clearly isn't another pod, is a masquerade-exemption bug — full stop, before you've read a single rule. Clean up: remove the <code>RETURN</code> rule as in Lab 3.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — trace one request through the whole of Part V</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>One request, every mechanism this Part covered, on one cluster. Build a small setup with a front-end pod that calls a back-end pod by Service name, and a back-end that calls the stand-in external API — then gather independent evidence for every leg without taking any single hop on faith.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl create deployment front --image=nicolaka/netshoot --command -- sleep infinity
+kubectl create deployment back --image=hashicorp/http-echo -- /http-echo -listen=:8080 -text=back-ok
+kubectl expose deployment back --port=8080
+kubectl expose deployment front --port=31300 --type=NodePort --target-port=8080 --name front-entry 2&gt;/dev/null || true
+kubectl wait --for=condition=available deployment/front deployment/back --timeout=60s
+FRONT_POD=$(kubectl get pod -l app=front -o jsonpath='{.items[0].metadata.name}')</code></pre></div>
+        <details class="recall"><summary>Reveal the full trace, leg by leg</summary>
+          <div class="body">
+            <p><b>Leg 1 — internet/NodePort in (Ch 44).</b> You already proved in Chapter 44 that any node's IP on the allocated NodePort reaches this cluster regardless of which node runs the target pod; that mechanism is what would have delivered an external client to <code>front</code> here — an Ingress (Ch 46) would sit on top of this same entry point, not replace it.</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl exec "$FRONT_POD" -- dig +short back.default.svc.cluster.local     <span class="c"># Leg 2 — DNS (Ch 45)</span></code></pre></div>
+            <p><b>Leg 2 — name resolution (Ch 45).</b> <code>back</code> resolves in one query via the first search suffix, returning the Service's ClusterIP — proof the naming layer is doing exactly what Chapter 45 described, with no cascade because this is a short in-cluster name.</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>BACK_IP=$(kubectl get svc back -o jsonpath='{.spec.clusterIP}')
+kubectl exec "$FRONT_POD" -- curl -s "http://$BACK_IP:8080"                  <span class="c"># Leg 3 — Service DNAT (Ch 43)</span>
+docker exec netlab-worker conntrack -L -p tcp 2&gt;/dev/null | grep 8080 | head -1</code></pre></div>
+            <p><b>Leg 3 — the Service datapath (Ch 43).</b> The ClusterIP call succeeds, and conntrack shows the DNAT to a real backend pod IP — the same rewrite you read directly off the wire in Chapter 43's own labs. <b>Leg 4 — policy (Ch 47).</b> On a cluster running an enforcing CNI with a default-deny baseline, this exact call is the one you'd need an explicit allow rule for; its success or 10-second hang here is precisely the signal Chapter 47 taught you to read as "allowed" or "silently dropped." <b>Leg 5 — egress out (this chapter).</b> Have <code>back</code> call the stand-in external endpoint and confirm the same SNAT from Labs 1–2 of this chapter applies to it too — a completely different pod, the identical mechanism.</p>
+            <p>Six chapters, one request, no step taken on faith — every leg has its own independent piece of evidence: a DNS answer, a conntrack entry, a policy's observed effect, and a rewritten source address. That's the whole of Part V, and it's also the exact discipline a real incident review demands: don't guess which layer broke, produce the evidence for each one until you find where it stops matching what it should.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · egress to specific destinations hangs, others are fine</div>
+      <p><b>Symptom:</b> a pod's outbound calls to most destinations work; a subset time out with no application-level error. <b>First cut:</b> compare a working and a failing destination's conntrack entries during an active attempt — does the reply-side entry expect the node's IP or the pod's own IP? <b>Confirm:</b> a raw pod IP in the reply-side entry means the masquerade rule never fired for that destination. <b>Cause is usually:</b> an over-broad "internal range" entry in the CNI's or ip-masq-agent's non-masquerade CIDR list that accidentally captures a real external destination, often introduced while adding a legitimate private range (a VPN peer, a VPC peering CIDR) with too loose a mask.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · a third party sees traffic from a handful of unexplained IPs</div>
+      <p><b>Symptom:</b> a partner or vendor reports API calls from IP addresses your team doesn't recognise as application servers, and asks you to allow-list them or explain the traffic. <b>First cut:</b> do those IPs match your cluster's node addresses? <b>Confirm:</b> yes — every pod's egress is masqueraded to whichever node it happened to run on, so the visible source is node IPs, not anything tied to a specific service or team. <b>Cause is usually:</b> nothing broken at all — it's this chapter's mechanism working as designed, surprising someone who expected a stable, application-specific source address. <b>Fix, if a stable address is genuinely required:</b> route that egress through a fixed-IP chokepoint (a NAT gateway or egress gateway) instead of relying on node IPs, which change as nodes scale and get replaced.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · egress failures cluster right after a node group replacement</div>
+      <p><b>Symptom:</b> a third-party integration that was allow-listing specific source IPs starts failing right after routine node infrastructure changes — an upgrade, an Auto Scaling event, a node group replacement. <b>First cut:</b> did the set of node IPs actually change? <b>Confirm:</b> the partner's allow-list still has the old node IPs; the new nodes have different ones. <b>Cause is usually:</b> the same "unexplained IPs" issue above, discovered the hard way — someone allow-listed raw node addresses instead of a stable egress point, and nodes are, by design, not stable identities over the cluster's lifetime.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Never allow-list a node's IP on purpose.</b> Nodes come and go — scaling events, upgrades, AZ rebalancing — and every one of them changes your egress source address under the default masquerade-to-node-IP behaviour. Any integration that needs a stable, few, allow-listable source address needs a dedicated egress chokepoint with a fixed address, not a promise about which nodes will exist next month.</p>
+    <p><b>Keep the non-masquerade CIDR list as an explicit, reviewed piece of configuration.</b> It's small, it's rarely touched, and that's exactly why a careless edit to it goes unnoticed until traffic to some specific destination starts hanging. Treat additions to it — a new VPN range, a new peered VPC — with the same scrutiny you'd give a firewall rule, because that's functionally what it is.</p>
+    <p><b>Egress NetworkPolicy and egress NAT are two independent layers, not one.</b> A policy denial and a masquerade-exemption bug can produce a symptom that looks identical from the pod's side — a stalled or refused outbound connection — but they're fixed in completely different places, and conntrack is what tells them apart: a policy-blocked packet never gets far enough to create a conntrack entry pointed the wrong way; a masquerade-exemption bug does, with the reply-side address as the tell. <b>Common mistakes:</b> assuming every outbound hang is a firewall/policy problem and never checking conntrack; allow-listing node IPs for a third-party integration; treating the non-masquerade CIDR list as a "set once, forget forever" config; and being surprised that pod IPs never appear in a downstream party's own logs.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>Egress that needs a small, stable, allow-listable identity is a recurring real-world requirement — payment processors, banking partners, and many enterprise SaaS integrations only trust a short, fixed list of source addresses — and the fix is always the same shape: stop relying on whatever's initiating the connection to also be the stable identity, and route through a dedicated chokepoint that owns a fixed address instead. On AWS that's a NAT Gateway with an Elastic IP, sitting in front of however many nodes and pods actually originate the traffic (<a href="ch50-vpc-foundations-cidr-subnets-route-tables-igw.html">Chapter 50</a>); in a service mesh it's an egress gateway that every outbound call is forced through. This whole chapter is also the quiet other half of the "flat network" promise Part V opened with: a flat, NAT-free pod network internally (Chapter 42) can coexist with a heavily NATed boundary at the cluster's edge, because those are different problems solved at different layers — internal addressing needs no translation precisely so that egress translation, at the one place it's actually needed, stays simple and centralised.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>Why does pod egress to the internet need NAT at all?</summary>
+        <div class="a"><p>Because a pod's IP comes from the cluster's private pod CIDR, which no router on the public internet knows how to send a reply back to. Before the packet leaves the node, a masquerade rule rewrites its source address to the node's own routable IP, and conntrack remembers the swap so the reply gets un-translated back to the pod automatically. It's the same mechanism a home Wi-Fi router uses for every device on your network, just running on the Kubernetes node instead.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through exactly what happens to a pod's packet on its way to an external destination.</summary>
+        <div class="a"><p>The packet leaves the pod's network namespace across its veth into the node's root namespace, same as any packet. The node's routing table has no local-pod or cluster route for this destination, so it heads out the node's real interface — and just before it does, the <code>nat</code> table's <code>POSTROUTING</code> chain evaluates a masquerade rule that matches "destination is not one of our known-internal ranges." If it matches, the source address is rewritten from the pod's IP to the node's own IP, and conntrack records the translation. The packet crosses the real network looking like ordinary traffic from the node. The destination replies to the node's IP; conntrack recognises the reply as belonging to that tracked connection, un-translates the destination back to the pod's real address, and delivers it — the pod's own view of its address never changes. Which CNI installs and manages that masquerade rule varies — a plain iptables rule, Calico's per-pool <code>natOutgoing</code> setting, or the AWS VPC CNI's default SNAT-to-primary-IP behaviour — but the mechanism is identical everywhere.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>What exactly breaks if a real external destination is accidentally excluded from masquerading, and why does it look like a hang rather than an error?</summary>
+        <div class="a"><p>The masquerade rule is matched against a list of ranges considered "internal" — anything on that list skips the rewrite. If a genuinely external destination ends up on that list by mistake, typically from an overly broad CIDR added for a legitimate private range like a VPN peer or a peered VPC, the pod's outbound packet leaves with its real, private pod-CIDR address as the source. Ordinary routing between the pod's node and that destination usually still delivers the packet fine, because intermediate routing doesn't inspect or care about the source address — the problem is entirely on the reply. The destination tries to send its response back to a private pod-CIDR address that nothing outside the cluster has any route to, so the reply is silently undeliverable. From the pod's side, the SYN went out fine and nothing about the local stack failed, so it just sits waiting for a SYN-ACK that can never arrive, until its own connection timeout eventually gives up — which is why it presents as a hang, not an immediate refusal. The diagnostic tell is a conntrack entry whose reply-side tuple expects the raw pod IP as the destination rather than the node's IP; any egress connection showing that, for a destination that clearly isn't another pod, is this bug.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A partner integration that allow-lists your traffic by source IP suddenly starts failing after a routine node upgrade. What happened and how do you prevent a repeat?</summary>
+        <div class="a"><p>Almost certainly, the partner allow-listed the actual node IPs your pods' egress traffic was being masqueraded to, and the node upgrade replaced those nodes with new ones carrying different addresses — since egress NAT ties the visible source address to whichever node happened to run the pod, and nodes are not a stable identity across infrastructure changes. I'd confirm by comparing the partner's allow-list against your current node IPs and checking whether they diverged right around the upgrade. The immediate fix is updating the allow-list, but the actual prevention is architectural: route that specific egress traffic through a dedicated chokepoint with a genuinely fixed address — a NAT gateway with an Elastic IP, or an egress gateway if you're running a mesh — so future node churn never touches the address the partner trusts, and stop giving out node-level addresses as if they were a stable identity.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>How is egress NAT different from egress NetworkPolicy, and can both affect the same connection?</summary>
+        <div class="a"><p>They're independent layers solving different questions, and yes, both can affect the same connection at different points in its life. Egress NetworkPolicy decides whether a pod is allowed to send a packet toward a given destination at all — it's enforced by the CNI's dataplane and, if it denies, the packet never gets anywhere near the masquerade rule. Egress NAT/masquerading decides, for packets that are allowed through, what source address they leave with and whether a reply can find its way back — it's a routing and NAT concern, unrelated to authorization. A pod can be fully permitted by policy and still have its connection fail because of a masquerade misconfiguration, and a pod can be correctly configured for NAT and still have every connection silently dropped by policy. Telling them apart is straightforward once you know where to look: a policy denial typically shows no conntrack entry at all for the blocked attempt, while a masquerade bug shows a conntrack entry whose reply-side address is wrong.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>A pod's IP is private to the cluster, so outbound traffic to a real external destination needs its source address rewritten to the node's own IP before it leaves — IP masquerading, the identical mechanism a home router uses for every device on your network. The node's <code>nat</code> table <code>POSTROUTING</code> chain does the rewrite for anything not matching a configured list of "internal" ranges (the pod CIDR, the Service CIDR, and any other private ranges the cluster considers its own), and conntrack — the same table used for Service DNAT and NodePort relays — remembers the translation so replies come back correctly. Get the internal-ranges list wrong and a genuinely external destination's replies become undeliverable, which presents as a hang, not an error, because the outbound packet leaves fine and only the reply has nowhere to go. Egress NetworkPolicy and egress NAT are separate concerns that can each independently break the same connection; conntrack tells them apart. Across this whole Part: pod-to-pod needs no translation at all (Ch 42), pod-to-Service DNATs the destination (Ch 43), internet-to-pod DNATs at the node edge and sometimes masquerades the source (Ch 44), names resolve through CoreDNS before any of it starts (Ch 45), L7 rules can sit on top of the entry point (Ch 46), NetworkPolicy gates what's allowed before any of it runs (Ch 47), and pod-to-internet masquerades the source on the way out (Ch 48) — one connected set of mechanisms, not seven separate ones.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>Pod IPs are private to the cluster; outbound traffic to the internet needs its source rewritten to the node's IP.</li>
+      <li>The rewrite is IP masquerading (SNAT), applied in the node's <code>nat</code> table <code>POSTROUTING</code> chain — the same table Service DNAT uses.</li>
+      <li>conntrack remembers the translation so replies are un-rewritten back to the pod automatically.</li>
+      <li>The masquerade rule fires for anything <em>not</em> in a configured "internal ranges" list — pod CIDR, Service CIDR, peered/VPN ranges.</li>
+      <li>Different CNIs manage that list differently: plain iptables, Calico's <code>natOutgoing</code>, ip-masq-agent, or the VPC CNI's own SNAT default.</li>
+      <li>A destination wrongly marked "internal" skips the rewrite; its reply has no route back to the raw pod IP and the connection hangs.</li>
+      <li>The diagnostic tell: a working egress connection's conntrack reply-tuple targets the node's IP; a broken one targets the pod's own IP.</li>
+      <li>Never allow-list node IPs for a stable integration — nodes churn; use a dedicated NAT/egress gateway with a fixed address instead.</li>
+      <li>Egress NetworkPolicy (allowed at all?) and egress NAT (can the reply get back?) are independent layers that fail differently.</li>
+      <li>Pod↔pod, pod→Service, internet→pod, DNS, policy, and pod→internet are one connected set of mechanisms, not separate subjects.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch42-pod-networking-internals-pod-to-pod.html"><b>Ch 42</b> Pod-to-Pod</a>
+      <a href="ch43-services-and-the-datapath-pod-to-service.html"><b>Ch 43</b> Services &amp; the datapath</a>
+      <a href="ch44-nodeport-loadbalancer-internet-to-pod.html"><b>Ch 44</b> NodePort &amp; LoadBalancer</a>
+      <a href="ch47-networkpolicy-deep.html"><b>Ch 47</b> NetworkPolicy</a>
+      <a href="ch50-vpc-foundations-cidr-subnets-route-tables-igw.html"><b>Ch 50</b> VPC &amp; NAT Gateway</a>
+      <a href="ch58-vpc-cni-the-deep-one.html"><b>Ch 58</b> VPC CNI</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/tasks/administer-cluster/ip-masq-agent/">Set up an IP Masquerade Agent</a>: the non-masquerade CIDR list model this chapter builds on.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/cluster-administration/networking/">Cluster Networking</a>: how the pod network model and its edges fit together.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/services-networking/network-policies/">Network Policies</a>: egress rules as the authorization layer this chapter's NAT sits behind.</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man8/iptables-extensions.8.html">iptables-extensions(8)</a>: the MASQUERADE, SNAT, and DNAT target definitions.</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man8/conntrack.8.html">conntrack(8)</a>: the tool used throughout this chapter's labs to read live translations.</li>
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc1918">RFC 1918: Address Allocation for Private Internets</a>: why pod-CIDR-style addresses need translation before they mean anything on the public internet.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch47-networkpolicy-deep.html"><span class="dir">← Prev</span><div class="ti">Ch 47 — NetworkPolicy deep</div></a>
+      <a class="nx" href="ch49-the-aws-mental-model-regions-azs-failure.html"><span class="dir">Next →</span><div class="ti">Ch 49 — The AWS mental model: regions, AZs, failure domains</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 48 of 121 · Part V · Kubernetes Networking at Packet Level. Every packet in this Part now has a place you can find it — in, across, or out. Part VI moves up a level: the cloud underneath the cluster itself.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Pod → node → internet</a>
+    <a href="#internals">Deciding what's masqueraded</a>
+    <a href="#components">The components</a>
+    <a href="#flow">Following one call</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

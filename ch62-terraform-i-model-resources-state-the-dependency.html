@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 62 — Terraform I: Resources, State &amp; the Dependency Graph</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part VII · Platform Engineering &nbsp;·&nbsp; Chapter 62</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part VII · Platform Engineering — Packaging, IaC, GitOps, Mesh, Access · Chapter 62</div>
+      <h1>Terraform I — model, resources, state, the dependency graph</h1>
+      <p class="tagline">You've packaged the app with Helm. Nobody has packaged the infrastructure underneath it. If that VPC, that database, that load balancer still gets created by someone clicking through a console or running a one-off script, you don't actually know what's running — you know what you think you clicked last time.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~42 min read · Terraform CLI + Docker provider (local)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain what a provider, resource, data source, and the state file each are and how they fit together.</li>
+          <li>Read a <code>terraform plan</code> diff and predict what <code>apply</code> will actually do before you run it.</li>
+          <li>Read a <code>terraform graph</code> and say which resources Terraform can build in parallel and which it can't.</li>
+          <li>Point at the exact line in state that tells Terraform a resource already exists.</li>
+          <li>Diagnose a plan that wants to destroy and recreate something you didn't expect to change.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>Clicking buttons doesn't scale, and scripts don't know when they're done</h2>
+    <p>Say you need a VPC, a couple of subnets, a database, and a load balancer. You could click through the AWS console. That works once. It does not survive a second environment, a teammate who wasn't in the room, or you six months from now trying to remember which of the four almost-identical security groups is actually load-bearing.</p>
+    <p>So you write a script instead — a pile of AWS CLI calls in order. That's better: it's at least reviewable text. But it has a different problem. The script only knows how to <em>create</em>. Run it twice and it either fails on "already exists" or, worse, creates a second database next to the first one. It has no concept of "what already exists and what still needs to change." It's a sequence of commands, not a description of an end state — and if a step halfway through fails, you're left in some unknown, unnamed condition between "before" and "after" with no record of which resources actually got made.</p>
+    <p>Infrastructure-as-code tools exist to fix exactly that gap. You write down <b>what you want to exist</b> — not the steps to get there — and the tool figures out the steps, keeps a record of what it already built, and only changes the parts of the real world that no longer match what you wrote. Terraform is the one you'll meet in almost every SRE job. It's declarative, it works across dozens of providers with one workflow, and its core trick — a dependency graph plus a persisted state file — is the same trick every tool in this space uses in some form, so understanding it here pays off even the day you touch a different one.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>Terraform's job is convergence, not execution. You describe a target. It compares that target against what it last recorded as real, computes the smallest set of changes to close the gap, and only then touches anything. Everything else in this chapter is really just "how does it compute that gap, safely, and in what order."</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a blueprint and a general contractor</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>You're the architect. You draw a blueprint — a description of the finished building, not a step-by-step build order. You hand it to a <b>general contractor</b>. The contractor doesn't start swinging hammers randomly; they work out that the foundation has to exist before the walls, and the walls before the roof, and they hire the right <b>subcontractors</b> for plumbing and electrical because those trades speak a different language than "general construction."</p>
+      <p>Critically, the contractor keeps a <b>punch list</b> — a ledger of exactly what's been built so far and its details: this outlet, this exact model, installed on this date, at this address. When you come back next year with a change, the contractor checks the punch list first. They don't rebuild the whole house from scratch and they don't guess whether the deck already exists — the punch list tells them. Lose that punch list, and the contractor is back to guessing, which is exactly as dangerous as it sounds.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In Terraform</th></tr>
+      <tr><td>The blueprint</td><td>Your <code>.tf</code> configuration files (HCL)</td></tr>
+      <tr><td>You, the architect</td><td>You, the person who wrote the config</td></tr>
+      <tr><td>The general contractor</td><td>Terraform Core (the CLI/engine)</td></tr>
+      <tr><td>A subcontractor for one trade</td><td>A provider (AWS, Docker, Kubernetes, …)</td></tr>
+      <tr><td>Working out foundation-before-walls</td><td>The dependency graph</td></tr>
+      <tr><td>The punch list, with exact serial numbers</td><td>The state file</td></tr>
+      <tr><td>"Show me what would change before you touch anything"</td><td><code>terraform plan</code></td></tr>
+      <tr><td>"Go make it real"</td><td><code>terraform apply</code></td></tr>
+      <tr><td>"Tear it back down"</td><td><code>terraform destroy</code></td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>Providers, resources, data sources, and state</h2>
+    <p>A Terraform configuration is plain text (HCL) describing a handful of block types, and almost everything else builds on these:</p>
+    <ul>
+      <li><b>Provider.</b> A plugin that knows how to talk to one system's API — AWS, Docker, Kubernetes, GitHub, whatever. You declare which ones you need and pin their versions in a <code>required_providers</code> block; <code>terraform init</code> downloads the matching plugin binaries and records the exact versions it resolved in a <b>dependency lock file</b>, <code>.terraform.lock.hcl</code>, so a second <code>init</code> next month — on your laptop or in CI — doesn't silently pick up a newer provider release.</li>
+      <li><b>Resource.</b> One thing you want Terraform to own the full lifecycle of — create it, update it in place when it can, destroy it when you remove the block. A resource's <b>address</b> is <code>type.name</code>, e.g. <code>docker_container.web</code>, and that address is exactly what ties a block in your config to an entry in state.</li>
+      <li><b>Data source.</b> A read-only lookup — "what's the latest AMI matching this filter," "what's this existing VPC's ID." Terraform doesn't manage a data source's lifecycle; it just reads a value at plan/apply time so you can use it elsewhere.</li>
+      <li><b>Variables, locals, outputs.</b> Variables are inputs you can override per environment. Locals are computed, named values you're tired of repeating. Outputs are values a config exposes on purpose — for a human running <code>terraform output</code>, or for another module to consume.</li>
+    </ul>
+    <p>The <b>state file</b> is the punch list made concrete. By default it's a local JSON file, <code>terraform.tfstate</code> — Terraform's own docs are blunt about why it exists at all: it maps real-world objects back to the resource blocks in your config, tracks metadata, and lets Terraform avoid re-querying the entire world on every run. Never hand-edit it; use the <code>terraform state</code> subcommands if you need to inspect or fix it, because the CLI insulates you from the underlying format changing between Terraform versions.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 430" role="img" aria-label="A dependency graph: a provider configuration node feeds three resource nodes, two of which are real dependencies of the third, with a root node pointing at all three">
+        <defs>
+          <marker id="tf1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="tf2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--muted)"/></marker>
+        </defs>
+        <text x="360" y="18" text-anchor="middle" style="fill:var(--muted);font:700 11px sans-serif;letter-spacing:.05em">TERRAFORM GRAPH · ONE PROVIDER, THREE RESOURCES, TWO REAL DEPENDENCIES</text>
+
+        <rect x="290" y="34" width="140" height="44" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="360" y="61" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">provider[docker]</text>
+
+        <line x1="330" y1="78" x2="150" y2="128" style="stroke:var(--muted);stroke-width:1.4;stroke-dasharray:5 4" marker-end="url(#tf2)"/>
+        <line x1="360" y1="78" x2="380" y2="128" style="stroke:var(--muted);stroke-width:1.4;stroke-dasharray:5 4" marker-end="url(#tf2)"/>
+        <line x1="390" y1="78" x2="600" y2="128" style="stroke:var(--muted);stroke-width:1.4;stroke-dasharray:5 4" marker-end="url(#tf2)"/>
+        <text x="360" y="108" text-anchor="middle" style="fill:var(--muted);font:600 10px sans-serif">configures (edge to every resource)</text>
+
+        <rect x="40" y="130" width="220" height="60" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="150" y="156" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">docker_image.nginx</text>
+        <text x="150" y="174" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">resource node</text>
+
+        <rect x="270" y="130" width="220" height="60" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="380" y="156" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">docker_network.app</text>
+        <text x="380" y="174" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">resource node</text>
+
+        <rect x="500" y="130" width="220" height="60" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.6"/>
+        <text x="610" y="156" text-anchor="middle" style="fill:var(--ink);font:700 13px sans-serif">docker_container.web</text>
+        <text x="610" y="174" text-anchor="middle" style="fill:var(--accent);font:11px sans-serif">depends on both neighbours</text>
+
+        <line x1="220" y1="190" x2="560" y2="132" style="stroke:var(--accent);stroke-width:1.8" marker-end="url(#tf1)"/>
+        <text x="330" y="216" style="fill:var(--accent);font:600 11px sans-serif">image_id referenced →</text>
+
+        <line x1="420" y1="190" x2="560" y2="132" style="stroke:var(--accent);stroke-width:1.8" marker-end="url(#tf1)"/>
+        <text x="440" y="238" style="fill:var(--accent);font:600 11px sans-serif">network_id referenced →</text>
+
+        <rect x="290" y="340" width="140" height="42" rx="8" style="fill:var(--chip);stroke:var(--line);stroke-dasharray:2 2"/>
+        <text x="360" y="366" text-anchor="middle" style="fill:var(--muted);font:600 12px sans-serif">(root)</text>
+        <line x1="330" y1="340" x2="160" y2="192" style="stroke:var(--muted);stroke-width:1.2;stroke-dasharray:4 4" marker-end="url(#tf2)"/>
+        <line x1="390" y1="340" x2="390" y2="192" style="stroke:var(--muted);stroke-width:1.2;stroke-dasharray:4 4" marker-end="url(#tf2)"/>
+        <line x1="420" y1="340" x2="610" y2="192" style="stroke:var(--muted);stroke-width:1.2;stroke-dasharray:4 4" marker-end="url(#tf2)"/>
+        <text x="360" y="404" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">root points at every resource so there's one entry point — Terraform ignores it when deciding execution order</text>
+      </svg>
+      <figcaption>Two solid edges are real dependencies, discovered because one resource's config references another's attribute. The dashed edges (provider, root) exist for bookkeeping. Image and network have no edge between each other, so Terraform can build them in parallel; the container has to wait for both.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>A clean <code>terraform plan</code> is a change-review artifact, not just a convenience. Paste it into a pull request and a reviewer can see exactly what will be created, changed, or destroyed before anyone runs <code>apply</code> against production. That's the same review discipline you already expect from application code — Terraform is what makes infrastructure changes reviewable the same way.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>How the graph gets built, and how Terraform walks it</h2>
+    <p>This is the part most engineers use for years without ever seeing. Here's what Terraform actually does, in order, every time you run <code>plan</code> or <code>apply</code>:</p>
+    <ol class="steps">
+      <li><b>Add a resource node for every resource block.</b> If a resource uses <code>count</code> greater than 1, each index gets its own node, plus a <b>resource meta-node</b> that groups them for convenience — it doesn't do anything on its own.</li>
+      <li><b>Attach state and diff metadata.</b> If a resource already exists in state, or has a pending diff from a plan, that data rides along on its node.</li>
+      <li><b>Map resources to provisioners</b>, if any are declared — done after every resource node exists, so resources sharing a provisioner type can share the implementation.</li>
+      <li><b>Add explicit <code>depends_on</code> edges.</b> This is the escape hatch for a dependency Terraform can't see any other way — usually because it's a side effect, not a referenced attribute.</li>
+      <li><b>Add orphaned resources.</b> Anything present in state but no longer in config gets a node too, so it can be scheduled for destruction. Orphans never carry configuration, because state doesn't store any.</li>
+      <li><b>Map every resource to its provider configuration node.</b> This creates the edge "this resource depends on its provider being configured" — which is why a provider block with a typo breaks everything that provider touches, all at once.</li>
+      <li><b>Parse interpolations to find implicit dependencies.</b> Any time one resource's config references another resource's attribute (like <code>docker_container.web</code> reading <code>docker_image.nginx.image_id</code>), that reference becomes a graph edge automatically. This is how most dependencies get discovered — you rarely write <code>depends_on</code> by hand.</li>
+      <li><b>Create a single root node</b> pointing at every resource, purely so the graph has one entry point. It's ignored when Terraform decides execution order.</li>
+      <li><b>Split replace operations.</b> If a diff says a resource must be destroyed and recreated, its single node splits into a destroy node and a create node, because destroy order and create order aren't always the same thing (this is exactly what <code>create_before_destroy</code>, covered in the next chapter, controls).</li>
+      <li><b>Validate.</b> No cycles allowed, and exactly one root. If your config has a circular reference, this is the step that catches it and Terraform refuses to proceed.</li>
+    </ol>
+    <p>Walking the finished graph is a standard depth-first traversal, done <b>in parallel</b>: a node runs as soon as every node it depends on has finished, not in one single-file line. By default up to 10 nodes run concurrently — controlled by <code>-parallelism</code> on <code>plan</code>, <code>apply</code>, and <code>destroy</code> — and HashiCorp is explicit that this isn't meant for routine tuning; some providers (AWS included) handle their own API rate limiting with backoff inside the provider itself, so Terraform's parallelism knob isn't the tool for that problem.</p>
+    <p><code>terraform plan</code> walks this same graph to compute a diff per node — refreshing real infrastructure state first, comparing it against config, and ordering the comparisons so a value computed upstream is available when a downstream resource needs to reference it. <code>terraform apply</code> walks it again for real, making the actual API calls. <code>terraform destroy</code> walks it in the reverse dependency order, so the container gets torn down before the network it depends on, never the other way round.</p>
+
+    <details class="recall"><summary>Think first: two resources have no reference between them anywhere in your config. Does Terraform create them one after another, or at the same time?</summary>
+      <div class="body">
+        <p>At the same time, up to the parallelism limit. Terraform only serializes work where the graph has an actual edge — a reference, a <code>depends_on</code>, or a shared provider-configuration dependency. No edge means no ordering constraint, so both nodes become eligible to run as soon as their own (separate) prerequisites are satisfied. This is exactly why unrelated resources in a large plan often apply in a burst rather than a strict top-to-bottom list — and why adding an unnecessary <code>depends_on</code> "just to be safe" quietly costs you real wall-clock time on every apply.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, named</h2>
+    <ul>
+      <li><b>HCL configuration files (<code>.tf</code>).</b> Owns: the desired end state, as data — not a script.</li>
+      <li><b>Terraform Core.</b> Owns: parsing config, building and walking the graph, computing diffs, talking to providers over a plugin protocol.</li>
+      <li><b>Providers.</b> Own: translating resource blocks into real API calls for one specific system.</li>
+      <li><b>The state file.</b> Owns: the one-to-one mapping between your config's resource addresses and real-world object IDs, plus metadata.</li>
+      <li><b>The dependency lock file (<code>.terraform.lock.hcl</code>).</b> Owns: exactly which provider versions were resolved, so <code>init</code> is reproducible across machines.</li>
+      <li><b>The Terraform Registry.</b> Owns: where providers and modules are published, versioned, and discovered.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one real <code>init &amp; plan &amp; apply</code></h2>
+    <p>You write a small config: a <code>docker_image</code>, a <code>docker_network</code>, and a <code>docker_container</code> that references both. <code>terraform init</code> reads <code>required_providers</code>, downloads the Docker provider plugin, and writes the lock file. <code>terraform plan</code> builds the graph from the steps above, refreshes any existing state against the real Docker daemon, walks the graph to compute what's missing, and prints a diff — <code>+</code> for create, <code>~</code> for update in place, <code>-/+</code> for destroy-then-recreate. <code>terraform apply</code> asks for confirmation, then walks the same graph for real: the image and network nodes have no edge between them, so they can both proceed as soon as the provider is configured; the container node waits for both, because its config reads their attributes. Once everything succeeds, Terraform writes a new state file recording each object's real ID — and that ID is what makes the <em>next</em> plan a comparison instead of a guess.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>All five labs run against the Docker provider on your own machine — no cloud account needed. You just need Docker and the Terraform CLI installed.</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>mkdir tf-lab62 &amp;&amp; cd tf-lab62
+terraform version   <span class="c"># confirm the CLI is installed; any recent 1.x works</span></code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — a real container, managed as code</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Create <code>main.tf</code>:</p>
+        <div class="codewrap"><span class="lang">hcl</span><pre><code>terraform {
+  required_providers {
+    docker = { source = "kreuzwerker/docker" }
+  }
+}
+provider "docker" {}
+
+resource "docker_image" "nginx" {
+  name = "nginx:1.27-alpine"
+}
+resource "docker_network" "app" {
+  name = "tf-lab62-net"
+}
+resource "docker_container" "web" {
+  name    = "tf-lab62-web"
+  image   = docker_image.nginx.image_id
+  ports   { internal = 80  external = 8080 }
+  networks_advanced { name = docker_network.app.name }
+}</code></pre></div>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>terraform init
+terraform plan
+terraform apply -auto-approve
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>Plan: 3 to add, 0 to change, 0 to destroy.
+...
+Apply complete! Resources: 3 added, 0 changed, 0 destroyed.
+200</code></div>
+        <p>Three resources, zero edges you wrote by hand between image/network and the container — those two references (<code>image_id</code>, <code>docker_network.app.name</code>) were enough for Terraform to work out the order on its own.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — read the punch list yourself</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>State isn't a black box. Look straight at it.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>terraform state list
+terraform state show docker_container.web | head -8</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>docker_container.web
+docker_image.nginx
+docker_network.app
+
+# docker_container.web:
+resource "docker_container" "web" {
+    id       = "3f1a9c…"
+    image    = "sha256:8e9c…"
+    name     = "tf-lab62-web"</code></div>
+        <p>That <code>id</code> is the real Docker container ID, not something Terraform invented — it's the exact value the punch list carries forward so next time it doesn't have to guess whether this container exists. Compare with the raw JSON directly:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>terraform show -json | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d['values']['root_module']['resources']), 'resources in state')"</code></pre></div>
+        <div class="out"><span class="ol">Output</span>3 resources in state</code></div>
+      </div>
+    </div>
+
+    <details class="recall"><summary>Think first: someone tells you Terraform could just re-query the real infrastructure every time instead of keeping a state file. What would that lose?</summary>
+      <div class="body">
+        <p>Two things, mainly. First, plenty of real objects don't expose a clean, unique key that maps back to "this resource address in my config" — Terraform's own docs are explicit that the primary purpose of state is recording that mapping, because the provider's API often can't hand it back to you cheaply on demand. Second, performance: refreshing thousands of resources by querying live on every single command would make Terraform unusably slow at any real scale. State is a cache with a very specific, deliberate job — not an accident of implementation.</p>
+      </div>
+    </details>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — a change you didn't expect to be destructive</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Not every config change updates in place. Some attributes can only be changed by destroying and recreating the object. Change the container's name:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>sed -i.bak 's/tf-lab62-web/tf-lab62-web-v2/' main.tf
+terraform plan</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>  # docker_container.web must be replaced
+-/+ resource "docker_container" "web" {
+      ~ name = "tf-lab62-web" -&gt; "tf-lab62-web-v2" # forces replacement
+      ...
+    }
+Plan: 1 to add, 0 to change, 1 to destroy.</code></div>
+        <p>Read the symbols like a sentence: <code>-/+</code> means destroy-then-create, not update. The comment <code>forces replacement</code> is Terraform telling you exactly which attribute triggered it — the Docker provider can't rename a running container via its API, so the only path is a new one. This is normal and often fine; it's dangerous only when you didn't expect it.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — find out why, before you apply</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Imagine you inherited this repo and someone else made that name change weeks ago. The plan above lands on your screen during a routine apply. Before you scroll up: which single word in the plan output tells you the cause, and where do you look to confirm it's really unavoidable rather than a mistake?</p>
+        <details class="recall"><summary>Reveal the approach</summary>
+          <div class="body">
+            <p>The word is <code>forces replacement</code>, printed right next to the specific changed line — Terraform always tells you which attribute triggered a replace, so you never have to guess by diffing the whole resource by eye. To confirm whether it's avoidable, check the provider's own documentation for that resource and that attribute specifically: some "ForceNew" attributes are a genuine API limitation (like this one), and some are a modeling choice a newer provider version relaxed. If it's a real limitation, your only options are to accept the replacement, or use <code>create_before_destroy</code> so the new one exists before the old one disappears — covered properly in the next chapter, because it interacts with every dependent resource too.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — read the raw graph, and meet drift early</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>Undo the rename (<code>mv main.tf.bak main.tf</code>) and look at the graph Terraform actually built for this config:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>terraform graph</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>digraph {
+  "docker_container.web" -&gt; "docker_image.nginx"
+  "docker_container.web" -&gt; "docker_network.app"
+  "docker_image.nginx" -&gt; "provider[\"docker\"]"
+  "docker_network.app" -&gt; "provider[\"docker\"]"
+}</code></div>
+        <p>That's Graphviz DOT syntax — each line is one edge, read as "the left node depends on the right node." Even without rendering it, you can answer the graph-reading question cold now: which two lines describe resources with no dependency edge between each other at all, meaning Terraform is free to build them at the same time? (<code>docker_image.nginx</code> and <code>docker_network.app</code> — neither line mentions the other.) If graphviz is installed, <code>terraform graph | dot -Tsvg &gt; graph.svg</code> renders it visually; the reasoning doesn't need the picture.</p>
+        <p>Now, one more thing, without touching any <code>.tf</code> file — reach outside Terraform entirely and change something it manages:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker rename tf-lab62-web tf-lab62-web-renamed-by-hand
+terraform plan</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>  # docker_container.web has changed outside of Terraform
+~ resource "docker_container" "web" {
+      ~ name = "tf-lab62-web-renamed-by-hand" -&gt; "tf-lab62-web"
+    }</code></div>
+        <p>Terraform noticed immediately, on the very next plan, because <code>plan</code> refreshes real state before comparing. This is <b>drift</b> — reality moved without going through code — and right now your only tool for it is "notice it by accident on the next plan." Chapter 63 is entirely about state at scale, and drift is the first thing it takes seriously.</p>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · "apply wants to destroy half my infrastructure"</div>
+      <p><b>Symptom:</b> a routine <code>apply</code> proposes replacing far more than you touched. <b>First cut:</b> read the plan for <code>forces replacement</code> comments — count how many distinct resources actually changed versus how many are just downstream of one that did. <b>Confirm:</b> a resource that many others reference (a shared VPC, a shared security group) changed in a way that forces its own replacement, and everything referencing it gets rescheduled to depend on the new one. <b>Usual cause:</b> a seemingly small attribute change on a heavily-shared resource, or a provider upgrade that changed a default value you never set explicitly.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · "plan is clean locally, CI shows something different"</div>
+      <p><b>Symptom:</b> your laptop's <code>plan</code> shows no changes; the same commit in CI shows a diff. <b>First cut:</b> compare provider versions — did CI resolve a newer version because <code>.terraform.lock.hcl</code> wasn't committed, or was skipped? <b>Usual cause:</b> an uncommitted lock file, or someone applied manually from a machine whose local state is now stale relative to the shared one.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · manual change, silent drift</div>
+      <p><b>Symptom:</b> a resource's real-world settings don't match what's in code, and nobody remembers changing the code. <b>First cut:</b> <code>terraform plan</code> — the diff shows exactly which attribute drifted. <b>Usual cause:</b> someone made an emergency fix directly against the cloud console or CLI during an incident, and the fix was never ported back into the Terraform config. Chapter 63 covers detecting this deliberately instead of by accident, and deciding whether to keep the manual fix or revert it.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Security.</b> The state file routinely contains plaintext values for anything a resource's attributes expose — including secrets a resource generated, like a database's initial password. Marking a variable or output <code>sensitive = true</code> only redacts it from CLI and UI output; it does <b>not</b> encrypt it inside state. Treat the state file itself as a secret: encrypt the backend storing it, and restrict read access as tightly as you would restrict access to the secrets it might contain.</p>
+    <p><b>Performance.</b> Parallelism defaults to 10 concurrent graph nodes for a reason — it's a reasonable default, not a dial to casually crank up. If a provider's API is rate-limiting you, that's the provider's job to back off gracefully, not something you fix by lowering Terraform's parallelism across the board.</p>
+    <p><b>Common mistakes</b> at this stage: hand-editing the state file directly instead of using <code>terraform state</code> subcommands; treating a stale local plan as still valid after time has passed and the real world could have changed; and reaching for <code>-target</code> as a normal part of the workflow — it's an emergency escape hatch that breaks the very completeness guarantee the dependency graph exists to give you, and it should feel unusual every time you type it.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>The state file is functionally a cache with a job: remember what's real so the next comparison is cheap and accurate instead of a live query against everything. That's the same shape as a Kubernetes controller's watch cache, or any reconciler that tracks "what I last observed" separately from "what I want" — you'll meet the same pattern by name in <a href="ch28-why-kubernetes-the-declarative-reconciled-model.html">Chapter 28</a> and <a href="ch31-the-reconciliation-loop-controllers-informers.html">Chapter 31</a>. And a config that declaratively describes desired infrastructure state, reviewed as a diff before it's applied, is exactly the kind of artifact a pull-based delivery system can operate on automatically instead of a human running <code>apply</code> from a laptop — which is precisely where <a href="ch64-gitops-principles.html">Chapter 64</a> picks up.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What problem does Terraform actually solve?</summary>
+        <div class="a"><p>It lets you describe infrastructure as a desired end state instead of a sequence of imperative steps, and it converges real infrastructure to match that state safely — creating what's missing, updating what can change in place, destroying what's no longer declared — using a persisted state file to know what already exists and a dependency graph to work out safe ordering. The alternative, hand-written scripts or console clicks, has no concept of "already done" and no reviewable diff before a change lands.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through what happens between running <code>terraform plan</code> and it printing a diff.</summary>
+        <div class="a"><p>Terraform parses the configuration and builds a dependency graph: one node per resource (or per index under <code>count</code>), a node per provider configuration, edges from explicit <code>depends_on</code>, edges discovered automatically whenever one resource's config references another resource's attribute, and a single root node pointing at everything so there's one entry point. Any resources present in state but no longer in config get added as orphan nodes destined for destruction. Before comparing anything, Terraform refreshes: it queries the real infrastructure for every resource already in state to catch drift. Then it walks the graph — in parallel wherever nodes have no dependency edge between them, serialized wherever they do — computing a diff at each node between refreshed real state and desired config. The output uses <code>+</code>/<code>~</code>/<code>-</code>/<code>-/+</code> to mean create, update in place, destroy, and destroy-then-recreate respectively, and any destroy-then-recreate is called out with the specific attribute that forced it.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Why does Terraform need a state file at all — why not just query the real infrastructure every time?</summary>
+        <div class="a"><p>Two separate reasons, and I'd give both. First, mapping: state's primary documented purpose is binding a resource address in your config to a specific real-world object's identity, and plenty of provider APIs have no clean way to hand that mapping back to you on demand — without state, Terraform would have no reliable way to know "this config block corresponds to that exact object" versus a different one that happens to look similar. Second, performance and metadata: querying every attribute of every resource live on every single command doesn't scale, and state also carries metadata the provider's API doesn't expose at all. The trade-off is that state becomes a single point of failure and a sensitive artifact in its own right — which is exactly why remote backends with locking exist, covered in the next chapter.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A plan you didn't expect wants to destroy and recreate a resource lots of other things depend on. What do you do before running apply?</summary>
+        <div class="a"><p>First, I read the plan output for the specific attribute Terraform flagged with "forces replacement" — it always names the exact field, so I don't have to diff the whole resource by eye. Then I check whether that's a genuine provider limitation (some attributes truly can't be updated in place via the underlying API) or an accidental change, like a default value shifting after a provider upgrade nobody reviewed carefully. If it's a real limitation and the resource is something expensive or risky to recreate, I'd look at whether <code>create_before_destroy</code> is safe for it and for everything that depends on it, since that lifecycle rule propagates to dependencies automatically. If it's not actually necessary, I fix the config instead of applying the replacement. Either way, I would not apply a surprise destroy-and-recreate against anything with real dependents without understanding exactly why it's happening first.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>How does the dependency graph decide what can run in parallel?</summary>
+        <div class="a"><p>Purely from edges. Two resource nodes with no path between them — no explicit <code>depends_on</code>, no attribute reference, no shared forced ordering from a replace split — have no ordering constraint, so both become eligible to execute as soon as their own prerequisites (typically just their provider being configured) are satisfied, up to the parallelism limit, which defaults to 10 concurrent nodes and is adjustable with <code>-parallelism</code>. Anywhere an edge does exist, the downstream node simply waits until the upstream node finishes. That's also why an unnecessary manual <code>depends_on</code> has a real cost — it serializes work the graph would otherwise have run concurrently.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>Terraform describes infrastructure declaratively and converges real resources to match. A provider translates resource blocks into real API calls; a resource is one thing Terraform fully owns; a data source is a read-only lookup. State maps config addresses to real-world object identities and is the only reason Terraform doesn't have to guess what already exists. The dependency graph has resource nodes, provider-configuration nodes, and a root node, with edges built from explicit <code>depends_on</code> and — far more often — automatically discovered attribute references; it's walked depth-first, in parallel wherever there's no edge, serialized wherever there is. <code>plan</code> refreshes real state, then diffs against config, before anything is touched. A destroy-then-recreate is always labeled with the exact attribute that forced it. Never hand-edit state; treat it as a secret. Drift is what happens the moment reality changes without going through code — and it's the entire subject of the next chapter.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>Terraform converges real infrastructure to a declared desired state — it doesn't just execute a script of steps.</li>
+      <li>A provider is a plugin per target system; a resource is fully owned by Terraform; a data source is read-only.</li>
+      <li>State maps your config's resource addresses to real-world object identities — that mapping is its whole reason to exist.</li>
+      <li>The dependency lock file (<code>.terraform.lock.hcl</code>) pins provider versions so <code>init</code> is reproducible across machines.</li>
+      <li>Most graph edges are discovered automatically from attribute references, not written by hand as <code>depends_on</code>.</li>
+      <li>The graph is walked depth-first, in parallel wherever nodes have no edge between them — default parallelism is 10.</li>
+      <li><code>plan</code> refreshes real state before diffing against config — that's how drift gets noticed at all.</li>
+      <li>Plan symbols: <code>+</code> create, <code>~</code> update in place, <code>-</code> destroy, <code>-/+</code> destroy-then-recreate — always with the forcing attribute named.</li>
+      <li><code>sensitive = true</code> hides a value from CLI/UI output; it does not encrypt it inside the state file.</li>
+      <li><code>-target</code> is a break-glass tool, not a habit — it bypasses the completeness guarantee the graph exists to provide.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch61-helm.html"><b>Ch 61</b> Helm</a>
+      <a href="ch63-terraform-ii-modules-state-at-scale-drift.html"><b>Ch 63</b> Terraform II</a>
+      <a href="ch64-gitops-principles.html"><b>Ch 64</b> GitOps principles</a>
+      <a href="ch28-why-kubernetes-the-declarative-reconciled-model.html"><b>Ch 28</b> The declarative model</a>
+      <a href="ch54-iam-and-sts.html"><b>Ch 54</b> IAM &amp; STS</a>
+      <a href="ch73-ci-cd-and-progressive-delivery.html"><b>Ch 73</b> CI/CD &amp; progressive delivery</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>HashiCorp — <a href="https://developer.hashicorp.com/terraform/language">Terraform Configuration Language</a>: providers, resources, data sources, variables, outputs.</li>
+      <li>HashiCorp — <a href="https://developer.hashicorp.com/terraform/language/state">State</a> and <a href="https://developer.hashicorp.com/terraform/language/state/purpose">State: Purpose</a>: why state exists and what it stores.</li>
+      <li>HashiCorp — <a href="https://developer.hashicorp.com/terraform/internals/graph">Dependency Graph</a>: node types, how the graph is built, and how it's walked.</li>
+      <li>HashiCorp — <a href="https://developer.hashicorp.com/terraform/cli/commands/plan">terraform plan</a> and <a href="https://developer.hashicorp.com/terraform/cli/commands/apply">terraform apply</a> command references.</li>
+      <li>HashiCorp — <a href="https://developer.hashicorp.com/terraform/language/providers">Provider configuration</a> and the dependency lock file.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch61-helm.html"><span class="dir">← Prev</span><div class="ti">Ch 61 — Helm</div></a>
+      <a class="nx" href="ch63-terraform-ii-modules-state-at-scale-drift.html"><span class="dir">Next →</span><div class="ti">Ch 63 — Terraform II: modules, state at scale, drift</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 62 of 121 · Part VII · Platform Engineering — Packaging, IaC, GitOps, Mesh, Access. You can reason about one Terraform config end to end now. Next: what happens when there are forty of them, sharing one state file.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Providers, resources, state</a>
+    <a href="#internals">Building &amp; walking the graph</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">One init/plan/apply</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 56 — Compute and data services for SREs</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part VI · AWS &amp; EKS &nbsp;·&nbsp; Chapter 56</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part VI · AWS &amp; EKS for SREs · Chapter 56</div>
+      <h1>Compute and data services for SREs</h1>
+      <p class="tagline">The EKS chapters teach you the cluster. This chapter teaches you everything sitting around it that also pages you at 3am — the EC2 fleet under the nodes, the images they pull, the objects they fetch, the database and cache they depend on, and the queue that stops a spike from taking the whole system down.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~42 min read · AWS CLI, free-tier friendly</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain what an Auto Scaling group actually does when an instance fails a health check, and why it might disagree with your load balancer about "healthy."</li>
+          <li>Tell RDS Multi-AZ apart from a read replica, and say which one saves you from a primary failure and which one just adds read capacity.</li>
+          <li>Trace a message through SQS's visibility timeout and explain why "at least once" delivery means your consumer has to be idempotent.</li>
+          <li>Predict when S3 will throttle you with a 503 Slow Down, and design a key layout that avoids it.</li>
+          <li>Diagnose a stuck ASG, an ECR pull failure, and a cache outage that's about to take your database down with it.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>Not every page is a pod problem</h2>
+    <p>Everything from Part IV onward has been about Kubernetes: pods, controllers, Services, the CNI. That's most of what you'll operate day to day on EKS. But a real system has edges that sit outside the cluster entirely, and those edges page you just as often — sometimes more, because nobody drilled on them the way they drilled on <code>kubectl</code>.</p>
+    <p>The nodes themselves are EC2 instances, kept at the right count by an Auto Scaling group that has its own opinion about what "healthy" means. Every image a pod runs came from somewhere — usually ECR — and that pull can fail for reasons that have nothing to do with Kubernetes. Plenty of workloads read and write objects in S3 directly. Almost every stateful service ends up talking to a managed relational database (RDS) and, for the things too slow to look up every time, a managed cache (ElastiCache). And the moment your architecture needs to smooth out a burst or decouple two things that don't run on the same clock, you reach for a queue (SQS).</p>
+    <p>These six are the ones an SRE meets constantly, and each one fails in its own specific, well-documented way. This chapter is a tour of those failure shapes, so that when the pager says "orders are failing" you already know which of the six to suspect first, instead of starting at the pod and working outward.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>None of these six services are Kubernetes objects. They don't show up in <code>kubectl get</code>. That's exactly why teams under-invest in understanding them — until the incident where the pods are all <code>Running</code> and green, and the actual problem is a database that failed over, a queue that's backing up, or a cache that just died and handed its entire load to the database behind it.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: running a restaurant without a whiteboard</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Picture a busy restaurant kitchen. The <b>cooks</b> are your compute — they do the actual work. A <b>shift manager</b> watches the dinner rush and adjusts headcount: more cooks when it's busy, fewer when it's quiet, and if a cook clocks in but can't actually cook (fails a check), the manager pulls them and calls in a replacement without asking anyone's permission. That's an EC2 <b>Auto Scaling group</b>.</p>
+      <p>Before any cook touches a pan, they grab prepped, labeled ingredients from a <b>walk-in pantry</b> that only staff badges can open — that's <b>ECR</b>, your container images. Finished dishes and raw stock that don't fit on the line go into a <b>giant cold-storage warehouse</b> where anyone can drop off or retrieve a box by its ticket number, no size limit, no warehouse manager to ask — that's <b>S3</b>.</p>
+      <p>Every order gets written into a <b>reservations ledger</b> that must never lose a page — and there's a second copy of that ledger kept in perfect sync at all times in case the first one burns — that's <b>RDS with Multi-AZ</b>. For the stuff that would be too slow to look up in the ledger every single time — "what did table 12 order five minutes ago?" — the server keeps <b>sticky notes at the register</b>: fast, short-term, and safe to lose. That's <b>ElastiCache</b>. And when a waiter drops off an order chit, they don't wait for the cook to be free — they spike the chit on a board, and it stays there, visible and unclaimed, until a cook confirms the dish is actually made. If the cook wanders off mid-dish, the chit reappears on the board for someone else to grab. That's <b>SQS</b>, chit and all.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In AWS</th></tr>
+      <tr><td>The cooks doing the actual work</td><td>EC2 instances</td></tr>
+      <tr><td>The shift manager adjusting headcount, replacing a failed cook</td><td>Auto Scaling group + health checks</td></tr>
+      <tr><td>The badge-locked pantry of prepped ingredients</td><td>ECR (container image registry)</td></tr>
+      <tr><td>The cold-storage warehouse, any box by ticket number, no size limit</td><td>S3 (object storage)</td></tr>
+      <tr><td>The reservations ledger with a synced backup copy</td><td>RDS Multi-AZ (relational database)</td></tr>
+      <tr><td>Sticky notes at the register — fast, short-term, safe to lose</td><td>ElastiCache (in-memory cache)</td></tr>
+      <tr><td>An order chit spiked on the board until the dish is confirmed done</td><td>SQS + visibility timeout</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>The six services around one app in a VPC</h2>
+    <p>Three of these are regional AWS services your VPC reaches over the network, not things that live inside it: ECR, S3, and SQS. The other three — your compute, the database, the cache — sit inside your VPC's private subnets. Here's the whole picture around one ordinary app:</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 430" role="img" aria-label="An app fleet and an async worker fleet inside a VPC, reaching ECR, S3, and SQS outside the VPC, and RDS and ElastiCache inside it">
+        <defs>
+          <marker id="c1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="c2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+        </defs>
+        <text x="360" y="14" text-anchor="middle" style="fill:var(--muted);font:700 11.5px sans-serif;letter-spacing:.05em">OUTSIDE YOUR VPC — REGIONAL AWS SERVICES</text>
+        <rect x="20" y="26" width="190" height="58" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="115" y="50" text-anchor="middle" style="fill:var(--ink);font:700 13px sans-serif">ECR</text>
+        <text x="115" y="67" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">container image registry</text>
+        <rect x="265" y="26" width="190" height="58" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="360" y="50" text-anchor="middle" style="fill:var(--ink);font:700 13px sans-serif">S3</text>
+        <text x="360" y="67" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">object storage — buckets &amp; keys</text>
+        <rect x="510" y="26" width="190" height="58" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="605" y="50" text-anchor="middle" style="fill:var(--ink);font:700 13px sans-serif">SQS</text>
+        <text x="605" y="67" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">message queue</text>
+
+        <rect x="20" y="100" width="680" height="300" rx="14" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="36" y="122" style="fill:var(--accent2);font:700 12px sans-serif;letter-spacing:.04em">YOUR VPC — PRIVATE SUBNETS</text>
+
+        <rect x="44" y="136" width="280" height="112" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="184" y="158" text-anchor="middle" style="fill:var(--ink);font:700 13px sans-serif">App fleet</text>
+        <text x="184" y="175" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">EC2 in an Auto Scaling group</text>
+        <rect x="64" y="186" width="60" height="28" rx="5" style="fill:var(--panel);stroke:var(--accent)"/><text x="94" y="204" text-anchor="middle" style="fill:var(--ink);font:10px sans-serif">EC2</text>
+        <rect x="134" y="186" width="60" height="28" rx="5" style="fill:var(--panel);stroke:var(--accent)"/><text x="164" y="204" text-anchor="middle" style="fill:var(--ink);font:10px sans-serif">EC2</text>
+        <rect x="204" y="186" width="60" height="28" rx="5" style="fill:var(--panel);stroke:var(--deep);stroke-dasharray:4 3"/><text x="234" y="204" text-anchor="middle" style="fill:var(--deep);font:10px sans-serif">failed</text>
+        <text x="184" y="238" text-anchor="middle" style="fill:var(--deep);font:9.5px sans-serif">ASG replaces the failed one</text>
+
+        <rect x="396" y="136" width="280" height="112" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="536" y="158" text-anchor="middle" style="fill:var(--ink);font:700 13px sans-serif">Async workers</text>
+        <text x="536" y="175" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">a separate Auto Scaling group</text>
+        <rect x="466" y="186" width="70" height="28" rx="5" style="fill:var(--panel);stroke:var(--accent)"/><text x="501" y="204" text-anchor="middle" style="fill:var(--ink);font:10px sans-serif">EC2</text>
+        <rect x="546" y="186" width="70" height="28" rx="5" style="fill:var(--panel);stroke:var(--accent)"/><text x="581" y="204" text-anchor="middle" style="fill:var(--ink);font:10px sans-serif">EC2</text>
+        <text x="536" y="238" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">drains SQS, writes results</text>
+
+        <rect x="44" y="272" width="160" height="54" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="124" y="293" text-anchor="middle" style="fill:var(--ink);font:700 12px sans-serif">RDS</text>
+        <text x="124" y="309" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">primary — reads &amp; writes</text>
+        <rect x="54" y="330" width="140" height="32" rx="8" style="fill:var(--chip);stroke:var(--line);stroke-dasharray:5 4"/>
+        <text x="124" y="349" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">Multi-AZ standby (sync)</text>
+
+        <rect x="214" y="272" width="110" height="90" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.3"/>
+        <text x="269" y="294" text-anchor="middle" style="fill:var(--ink);font:700 11.5px sans-serif">ElastiCache</text>
+        <text x="269" y="309" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">Redis / Valkey</text>
+        <text x="269" y="328" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">cache-aside —</text>
+        <text x="269" y="341" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">checked first</text>
+
+        <line x1="115" y1="84" x2="150" y2="136" style="stroke:var(--accent);stroke-width:1.8" marker-end="url(#c1)"/>
+        <text x="60" y="105" style="fill:var(--accent);font:9.5px sans-serif">image pull</text>
+        <line x1="330" y1="84" x2="295" y2="136" style="stroke:var(--accent);stroke-width:1.8" marker-end="url(#c1)"/>
+        <line x1="392" y1="84" x2="425" y2="136" style="stroke:var(--accent);stroke-width:1.8" marker-end="url(#c1)"/>
+        <text x="360" y="105" text-anchor="middle" style="fill:var(--accent);font:9.5px sans-serif">GET/PUT objects</text>
+        <line x1="322" y1="188" x2="512" y2="86" style="stroke:var(--accent2);stroke-width:1.8" marker-end="url(#c2)"/>
+        <text x="420" y="130" style="fill:var(--accent2);font:9.5px sans-serif">enqueue (fire-and-forget)</text>
+        <line x1="605" y1="84" x2="605" y2="136" style="stroke:var(--accent2);stroke-width:1.8" marker-end="url(#c2)"/>
+        <text x="614" y="112" style="fill:var(--accent2);font:9.5px sans-serif">dequeue + process</text>
+        <line x1="110" y1="248" x2="110" y2="270" style="stroke:var(--accent);stroke-width:1.8" marker-end="url(#c1)"/>
+        <text x="6" y="264" style="fill:var(--accent);font:9px sans-serif">SQL</text>
+        <line x1="270" y1="248" x2="270" y2="270" style="stroke:var(--accent);stroke-width:1.8" marker-end="url(#c1)"/>
+        <text x="278" y="264" style="fill:var(--accent);font:9px sans-serif">cache r/w</text>
+      </svg>
+      <figcaption>ECR, S3, and SQS are regional services your VPC reaches over the network, not VPC residents. RDS and ElastiCache live inside your subnets. The app fleet serves requests synchronously (cache first, then the database); the async fleet drains the queue on its own clock.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>Look at which arrows are synchronous and which aren't. A request holding open a connection to a user is only ever touching ElastiCache and RDS — anything slow there is slow for a real human, right now. SQS exists specifically to take the rest off that critical path: enqueue and answer the user immediately, let a separate fleet do the actual work on its own schedule. Confusing which category a dependency falls into — treating a queue like a database, or a cache like a system of record — is where most of the incidents in this chapter start.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>How each one actually behaves</h2>
+
+    <h4>1 · EC2 + Auto Scaling groups</h4>
+    <p>An Auto Scaling group (ASG) holds a desired count of EC2 instances and keeps it there. It can check health two ways: <b>EC2 status checks</b> (is the instance and its underlying host even reachable) and <b>ELB health checks</b> (does the load balancer's target-group check pass). You can enable either or both. This matters because they can disagree — an instance can pass its EC2 status check (the box is up) while failing its ELB health check (the app inside it is wedged), and vice versa. If you only enable EC2 checks, the ASG will happily keep a instance that's up but serving nothing.</p>
+    <p><b>Lifecycle hooks</b> let you intervene mid-transition. On scale-out, a new instance can sit in <code>Pending:Wait</code> while a hook runs custom logic (register with a service mesh, warm a cache) before it ever reaches <code>InService</code>. On scale-in, an instance sits in <code>Terminating:Wait</code> — after being deregistered from any load balancer and letting connections drain — before it's actually terminated. Either wait defaults to one hour; you extend it with a heartbeat, and you can attach up to 50 hooks to one ASG. The <b>health check grace period</b> (how long a brand-new instance gets before its health even counts) starts once the instance reaches <code>InService</code>, not at launch — a slow-booting app needs that grace period sized correctly or the ASG will cycle it before it ever gets healthy.</p>
+
+    <h4>2 · ECR</h4>
+    <p>ECR is a private, regional container registry. Two scanning modes matter operationally: <b>Basic scanning</b> checks OS-level CVEs against a database, on push or on demand. <b>Enhanced scanning</b> integrates with Amazon Inspector, covers both OS and language-package (npm, pip, Maven…) vulnerabilities, and can run continuously — rescanning as new CVEs are published, not just at push time. Switching between the two modes drops your existing scan history, so pick one deliberately rather than toggling.</p>
+    <p>Authentication is the part that quietly bites people. <code>aws ecr get-login-password</code> returns a token valid for exactly <b>12 hours</b>, independent of how much you use it. A static <code>kubectl create secret docker-registry</code> built from that token will start failing pulls 12 hours later with an authentication error — which is why EKS's own AMIs ship an ECR credential provider that fetches a fresh token automatically via the node's IAM role, instead of relying on a static secret at all.</p>
+
+    <h4>3 · S3</h4>
+    <p>S3 is not one giant flat bucket with a single throughput ceiling — every request lands under a <b>prefix</b> (the part of the key up to the last <code>/</code>, roughly), and each prefix independently supports at least 3,500 PUT/COPY/POST/DELETE or 5,500 GET/HEAD requests per second, with no limit on how many prefixes a bucket can have. Scale beyond that on a given prefix and S3 scales <em>to meet you</em> — but gradually, not instantly. While it's catching up, you'll see <b>503 Slow Down</b> errors. They aren't a sign anything is broken; they're S3 telling you to back off for a moment while it repartitions.</p>
+    <p>The practical consequence: a sudden, concentrated burst against a single, brand-new prefix — the classic mistake is a key scheme like <code>uploads/2026-09-21/&lt;id&gt;.json</code>, where every object written today shares the exact same prefix — will throttle even though your account-wide traffic is nowhere near any real ceiling. The fix is a high-cardinality prefix component early in the key, so writes spread across many partitions from the first request instead of hammering one.</p>
+
+    <h4>4 · RDS — Multi-AZ vs read replicas</h4>
+    <p>These two get confused constantly, and they solve different problems. A <b>Multi-AZ DB instance</b> keeps a synchronous standby in a second Availability Zone purely for failover — it serves no read traffic. A <b>Multi-AZ DB cluster</b> (the newer option) keeps two standbys that <em>can</em> serve reads. A <b>read replica</b> is a separate, asynchronously-replicated copy you create explicitly to offload read traffic — it lags the primary by some amount, and it is not the DB engine's automatic failover target.</p>
+    <p>When the primary fails, RDS promotes the standby and — this is the mechanism that actually matters operationally — <b>flips the DNS record</b> for the instance's endpoint to point at the newly-promoted standby. Failover typically completes in <b>60–120 seconds</b>. Your application only benefits from that if it actually re-resolves DNS. A JVM that never restarted and never had its DNS cache TTL configured will happily keep dialing the address it resolved hours ago — which, post-failover, may not even be the writer anymore.</p>
+    <div class="box gotcha"><div class="h">Multi-AZ is not a scaling feature</div>
+      <p>Multi-AZ buys you availability, not throughput. If your database is CPU- or IO-bound under read load, adding Multi-AZ does nothing for it — you need a read replica (async, eventually consistent) or a Multi-AZ DB cluster (sync standbys that can also read). Reach for the wrong one and you'll pay for HA while your read latency problem is still sitting there unsolved.</p>
+    </div>
+
+    <h4>5 · ElastiCache</h4>
+    <p>ElastiCache (Redis/Valkey) with Multi-AZ enabled monitors the primary continuously. If it fails, ElastiCache promotes the replica with the <em>least replication lag</em> and propagates the new primary's DNS to the existing primary endpoint — your application's connection string doesn't change. Promotion typically completes in a few seconds, dramatically faster than recreating a node from scratch, because replication is asynchronous: some very recent writes can be lost in the failover, which is exactly why a cache is the wrong place to keep anything you can't afford to lose.</p>
+    <p>The <b>cache-aside</b> pattern — check the cache, fall back to the database on a miss, write the result back to the cache — is simple until the cache itself goes away. If your code treats a cache error as fatal instead of as "go straight to the database," a cache outage becomes a database outage, instantly, at 100% of your read volume.</p>
+
+    <h4>6 · SQS</h4>
+    <p>SQS delivers <b>at least once</b>, never zero times and never exactly once (Standard queues; FIFO queues add ordering and exactly-once processing within a message group, at lower throughput). A message you receive becomes invisible to other consumers for the queue's <b>visibility timeout</b> — default 30 seconds, configurable from 0 seconds up to 12 hours. If your consumer doesn't call <code>DeleteMessage</code> before that timeout expires, the message becomes visible again and someone else — maybe you, maybe another worker — will receive it a second time.</p>
+    <p>That single mechanic drives two rules you can't skip: your consumer must be <b>idempotent</b> (processing the same message twice must be safe), and your visibility timeout must be sized comfortably above your worst-case processing time, or extended mid-flight with <code>ChangeMessageVisibility</code> — otherwise a slow-but-successful worker will lose its own message to a second consumer while it's still working.</p>
+
+    <details class="recall"><summary>Think first: a payment gets charged twice for the same order. The consumer code looks correct — it charges, then deletes the message. What's the likely cause?</summary>
+      <div class="body">
+        <p>The visibility timeout is shorter than the time it actually takes to charge the payment and delete the message. Consumer A receives the message, starts charging, and is still working when the timeout expires — the message reappears, consumer B (or A again) receives it and charges a second time before the first delete ever lands. The code isn't wrong; the timing budget is. Fix it by raising the visibility timeout to comfortably exceed the slowest realistic processing time, or by having the worker call <code>ChangeMessageVisibility</code> partway through long jobs — and, regardless, make the charge operation itself idempotent (an idempotency key) so a genuine duplicate delivery can never double-charge no matter what the timeout is set to.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, named</h2>
+    <ul>
+      <li><b>Launch template + Auto Scaling group.</b> The launch template owns the AMI/instance type/user data; the ASG owns desired count, health checks, and lifecycle hooks. Owns: how many instances exist and whether a given one is allowed to keep running.</li>
+      <li><b>ECR repository + image + manifest.</b> A repository holds tagged images; a scan (Basic or Enhanced) attaches findings to a specific digest. Owns: what code actually gets pulled, and whether it's known to be vulnerable.</li>
+      <li><b>S3 bucket, key, prefix.</b> The bucket is the namespace; the prefix is the partitioning unit that determines request-rate scaling. Owns: object durability and per-prefix throughput.</li>
+      <li><b>RDS instance/cluster + parameter group.</b> The instance (or cluster) is the database; Multi-AZ adds a synchronous standby (or two); a read replica is a separate, async, explicitly-created resource. Owns: durable relational state and failover.</li>
+      <li><b>ElastiCache replication group.</b> A primary plus replicas, optionally sharded (cluster mode). Owns: fast, short-lived state, and automatic failover if Multi-AZ is on.</li>
+      <li><b>SQS queue + dead-letter queue.</b> The queue holds messages and enforces the visibility timeout; a DLQ (via <code>maxReceiveCount</code>) catches messages that fail processing repeatedly instead of retrying forever. Owns: at-least-once delivery and poison-message isolation.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one checkout end to end</h2>
+    <p>A user clicks "buy." The request lands on an EC2 instance in the <b>app fleet's ASG</b>, behind a load balancer that only sends traffic to instances passing their ELB health check. The handler checks <b>ElastiCache</b> for the user's cart — a hit, so no database round trip needed there. It writes the order to <b>RDS</b> as the durable record of truth. Order written, it immediately sends a message to <b>SQS</b> — <code>{"orderId": 1042}</code> — and returns a response to the user in milliseconds; everything past this point is no longer on their critical path.</p>
+    <p>Separately, the <b>async worker fleet</b> — its own ASG, scaled on queue depth rather than request rate — polls SQS, receives the message (now invisible to other workers for the visibility timeout), fetches an invoice template from <b>S3</b>, renders and emails the receipt, and calls <code>DeleteMessage</code> only once that's actually done. If the worker crashes mid-render, it never deletes the message, the visibility timeout expires, and another worker picks it up and finishes the job — the queue is what makes that recovery automatic instead of manual. Meanwhile, the containers running on both fleets were pulled from <b>ECR</b> at launch, and that pull is exactly the kind of thing that silently fails eight hours after a token was thought to be "already working."</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>These labs use the real AWS CLI — every service here has a generous free tier or a near-zero-cost path (SQS and ECR describe/auth calls are free; a <code>t3.micro</code> ASG is Free-Tier eligible). Where a step would cost real money, it's called out, with a read-only or LocalStack alternative noted.</p>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — stand up an ASG and read its health-check contract</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Create the smallest useful ASG, then read back the exact fields that decide what "healthy" means to it.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>aws ec2 create-launch-template --launch-template-name web-lt \
+  --launch-template-data '{"ImageId":"ami-0abcdef1234567890","InstanceType":"t3.micro"}'
+
+aws autoscaling create-auto-scaling-group --auto-scaling-group-name web-fleet \
+  --launch-template LaunchTemplateName=web-lt,Version='$Latest' \
+  --min-size 2 --max-size 4 --desired-capacity 2 \
+  --availability-zones us-east-1a us-east-1b \
+  --health-check-type ELB --health-check-grace-period 120
+
+aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names web-fleet \
+  --query 'AutoScalingGroups[0].{min:MinSize,max:MaxSize,desired:DesiredCapacity,healthCheck:HealthCheckType,grace:HealthCheckGracePeriod}'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>{
+    "min": 2,
+    "max": 4,
+    "desired": 2,
+    "healthCheck": "ELB",
+    "grace": 120
+}</code></div>
+        <p>Notice <code>healthCheck</code> is <code>ELB</code>, not <code>EC2</code> — this ASG trusts the load balancer's opinion of health, not just "is the box reachable." That single field is the difference between an ASG that replaces a wedged app and one that only replaces a dead box. <b>Local alt:</b> LocalStack's <code>autoscaling</code> service supports these same calls with zero cost and no real instances launched, if you want to skip even the Free-Tier spend.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — watch a message go invisible and come back</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>SQS's core mechanic, live. Send a message, receive it once, and prove nobody else can receive it until the timeout expires.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>aws sqs create-queue --queue-name orders --attributes VisibilityTimeout=30
+QURL=$(aws sqs get-queue-url --queue-name orders --output text)
+aws sqs send-message --queue-url $QURL --message-body '{"orderId":1042}'
+
+<span class="c"># Receive it — this starts the 30-second invisibility window:</span>
+aws sqs receive-message --queue-url $QURL --max-number-of-messages 1</code></pre></div>
+        <div class="out"><span class="ol">Output</span>{
+    "Messages": [ {
+        "MessageId": "c9c...",
+        "ReceiptHandle": "AQEB...",
+        "Body": "{\"orderId\":1042}"
+    } ]
+}</code></div>
+        <p>Immediately try to receive again — nothing comes back, because the message is invisible, not gone:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>aws sqs receive-message --queue-url $QURL</code></pre></div>
+        <div class="out"><span class="ol">Output</span>{}</code></div>
+        <p>Wait past 30 seconds without deleting it, and receive again — it's back:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>sleep 32 &amp;&amp; aws sqs receive-message --queue-url $QURL --max-number-of-messages 1</code></pre></div>
+        <div class="out"><span class="ol">Output</span>{
+    "Messages": [ { "MessageId": "c9c...", "Body": "{\"orderId\":1042}" } ]
+}</code></div>
+        <p>That's the entire "duplicate processing" incident, reproduced on purpose in under a minute. Clean up: <code>aws sqs delete-queue --queue-url $QURL</code>.</p>
+      </div>
+    </div>
+
+    <details class="recall"><summary>Think first: should you set the visibility timeout as high as possible "to be safe"?</summary>
+      <div class="body">
+        <p>No — that trades one failure mode for a worse one. Too short, and a slow-but-successful worker loses its message to a duplicate receive. Too long, and a worker that actually <em>crashed</em> leaves its message invisible and unprocessed for the entire timeout window before anyone else can pick it up — your queue backs up silently while everything looks "in flight." The right answer is a timeout sized to your realistic worst-case processing time, plus using <code>ChangeMessageVisibility</code> as a heartbeat for jobs whose duration varies a lot, rather than padding the static timeout to cover the worst case you can imagine.</p>
+      </div>
+    </details>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — let an ECR token expire under you</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Authenticate to ECR the manual way, and see exactly what fails eight-plus hours later when nobody's watching.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>aws ecr get-login-password --region us-east-1 \
+  | docker login --username AWS --password-stdin 111122223333.dkr.ecr.us-east-1.amazonaws.com
+docker pull 111122223333.dkr.ecr.us-east-1.amazonaws.com/web:1.4.2</code></pre></div>
+        <div class="out"><span class="ol">Output</span>Login Succeeded
+1.4.2: Pulling from web
+Status: Downloaded newer image</code></div>
+        <p>That token is valid for exactly <b>12 hours</b>, no matter how often you use it. Twelve hours later, with no new login, run the exact same pull:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker pull 111122223333.dkr.ecr.us-east-1.amazonaws.com/web:1.4.2</code></pre></div>
+        <p>Before revealing: if this were a static <code>imagePullSecret</code> baked into a Kubernetes manifest instead of your own <code>docker login</code>, what would the pod's error actually say, and what's the real fix?</p>
+        <details class="recall"><summary>Reveal the failure and the fix</summary>
+          <div class="body">
+            <div class="out"><span class="ol">Output</span>Error response from daemon: Head "https://111122223333.dkr.ecr.us-east-1.amazonaws.com/v2/web/manifests/1.4.2": unauthorized: authentication required</code></div>
+            <p>On a pod, this shows up as <code>ImagePullBackOff</code> with an <code>unauthorized</code> reason in the event — not a missing image, an <em>expired credential</em>. A static <code>imagePullSecret</code> created once from <code>get-login-password</code> is exactly this token, and it dies on the same 12-hour clock regardless of how the secret got there. EKS's node AMIs solve this properly with a built-in ECR credential provider that fetches a fresh token via the node's own IAM permissions on every pull — no stored secret to expire. If you're still using a manually-created <code>imagePullSecret</code>, that's the thing to remove.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — read an RDS failover after the fact</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>You don't need to force a real failover to learn to read one (though <code>aws rds reboot-db-instance --force-failover</code> on a Multi-AZ <code>db.t3.micro</code> does trigger a real one, for a few cents an hour of Multi-AZ pricing while it runs). Either way, the event log tells the whole story:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>aws rds describe-events --source-identifier orders-db --source-type db-instance \
+  --duration 1440 --query 'Events[].{time:Date,msg:Message}'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>[
+  { "time": "2026-09-21T03:14:02Z", "msg": "Multi-AZ instance failover started" },
+  { "time": "2026-09-21T03:15:09Z", "msg": "Multi-AZ instance failover completed" }
+]</code></div>
+        <p>Sixty-seven seconds, squarely inside the typical 60–120 second window. But the on-call ticket says the app kept throwing connection errors for another <b>ten minutes</b> after that second timestamp. The database was fine. What wasn't?</p>
+        <details class="recall"><summary>Reveal the diagnosis</summary>
+          <div class="body">
+            <p>RDS failover works by flipping the CNAME of the instance endpoint to the newly-promoted standby — it relies on clients re-resolving DNS. A JVM that never configured <code>networkaddress.cache.ttl</code> caches a DNS answer indefinitely by default on some configurations, so every connection attempt kept dialing the address it resolved hours earlier — the demoted, possibly unreachable old primary — long after the failover itself had cleanly finished. The fix has nothing to do with RDS: set the JVM's DNS cache TTL to 60 seconds or less (or trust a driver that does its own periodic re-resolution), and size connection pools to treat a connection error as "reconnect," not "the database is down."</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — will this S3 key scheme survive a launch?</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>A nightly ingestion job is about to write 800,000 objects into S3 in a 3-minute window, keyed as <code>uploads/2026-09-21/&lt;uuid&gt;.json</code>. Work out whether that's safe before opening the answer.</p>
+        <details class="recall"><summary>Reveal the math and the fix</summary>
+          <div class="body">
+            <p>800,000 objects over 180 seconds is about <b>4,444 PUTs/second</b> — over the baseline 3,500 PUT/second-per-prefix ceiling, and every single one of those 800,000 keys shares the exact same prefix (<code>uploads/2026-09-21/</code>), because the date is the same for the whole run. This job will see <b>503 Slow Down</b> errors from the first minute, because S3 scales a prefix's capacity gradually, not instantaneously — a sudden burst on a brand-new prefix arrives faster than S3 can repartition behind it.</p>
+            <p>The fix is a high-cardinality prefix component placed <em>early</em> in the key, not the date: something like <code>uploads/&lt;hash-of-uuid&gt;/2026-09-21/&lt;uuid&gt;.json</code>, where the hash prefix spreads writes across many partitions from request one. Retries with backoff on 503 responses are still worth having as a safety net — but the actual fix is the key layout, not the retry logic.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · connection errors for minutes after an RDS failover</div>
+      <p><b>Symptom:</b> the failover event log shows completion in under two minutes, but the application keeps failing well past that. <b>First cut:</b> check whether the app or its driver caches DNS resolutions beyond the record's TTL. <b>Confirm:</b> the failing connections are aimed at the old primary's IP, not its current one. <b>Usual cause:</b> a JVM (or any long-lived process) with an unbounded DNS cache. <b>Fix:</b> bound the DNS cache TTL and make connection-pool errors trigger a reconnect, not a fatal state.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · S3 503 Slow Down during a burst</div>
+      <p><b>Symptom:</b> a batch job or traffic spike gets a wave of 503s from S3, then recovers on its own minutes later. <b>First cut:</b> are the failing keys concentrated under one or a few prefixes? <b>Confirm:</b> request rate on that prefix exceeds roughly 3,500 PUT or 5,500 GET per second. <b>Usual cause:</b> a key scheme (often date- or sequence-prefixed) that funnels a burst onto one partition. <b>Fix:</b> add a high-cardinality prefix component early in the key; retry with backoff as a safety net, not the primary fix.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · a cache outage becomes a database outage</div>
+      <p><b>Symptom:</b> ElastiCache has a blip, and RDS CPU spikes to 100% seconds later. <b>First cut:</b> did every cache miss (or cache error) fall straight through to the database with no protection? <b>Confirm:</b> RDS connection count and query volume jumped in lockstep with the cache event. <b>Usual cause:</b> code that treats a cache error as fatal instead of "read from the source of truth," with no rate limiting on the fallback path. <b>Fix:</b> fail open to the database with a request-coalescing or rate-limiting layer in front of it, so a cold cache degrades latency instead of taking down the database.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · a message gets processed twice</div>
+      <p><b>Symptom:</b> the same order, charge, or email happens two or more times. <b>First cut:</b> is the consumer's processing time close to or longer than the queue's visibility timeout? <b>Confirm:</b> CloudWatch's <code>ApproximateReceiveCount</code> on the queue is greater than 1 for the affected messages. <b>Usual cause:</b> visibility timeout sized for the average case, not the slow case. <b>Fix:</b> raise the timeout or heartbeat it with <code>ChangeMessageVisibility</code> — and make the operation idempotent regardless, because at-least-once delivery means duplicates are always possible.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Security.</b> Give each service's access its own narrow IAM policy rather than a shared "app role" that can do everything — an ECR pull permission has no business also granting S3 write access. Keep RDS and ElastiCache off the public internet entirely; reach them only from inside the VPC. Prefer Enhanced ECR scanning and actually gate deploys on its findings rather than collecting reports nobody reads.</p>
+    <p><b>Performance.</b> Treat S3 key design as a capacity decision, not an afterthought — plan prefixes for the request rate you'll hit, not the one you have today. Use RDS read replicas for read scaling and Multi-AZ for availability; conflating the two is the single most common RDS design mistake. Turn on SQS long polling (<code>WaitTimeSeconds</code> up to 20s) so consumers aren't burning empty API calls, which also cuts cost.</p>
+    <p><b>Common mistakes:</b> an ASG with only EC2 health checks enabled, so a wedged-but-running app never gets replaced; a static ECR pull secret nobody remembers will expire in 12 hours; assuming Multi-AZ gives you more read capacity; a cache client with no circuit breaker between it and the database; and a queue consumer that isn't safe to run twice on the same message. Every one of these is invisible until the day it isn't.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>These six services are the concrete implementation of ideas you'll use in every system-design conversation. SQS is <b>queue-based load leveling</b> — decoupling a producer's burst from a consumer's steady pace, the same pattern behind <a href="ch84-async-and-flow-control.html">Chapter 84</a>'s async and flow-control material. ElastiCache's cache-aside pattern and Multi-AZ's "fail fast, promote, and keep going" are both instances of <b>graceful degradation</b> — the system gets worse before it gets down. And the fact that EC2/ASG holds no durable state at all — every byte that matters lives in RDS, ElastiCache, or S3 — is exactly what makes it safe to kill, replace, and horizontally scale compute without a second thought, the foundational idea behind <a href="ch94-building-blocks.html">Chapter 94</a>'s building blocks and <a href="ch95-scaling-patterns.html">Chapter 95</a>'s scaling patterns.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's the difference between RDS Multi-AZ and a read replica?</summary>
+        <div class="a"><p>Multi-AZ keeps a synchronous standby purely for failover — it serves no read traffic in the single-standby form, and failover promotes it automatically in roughly 60–120 seconds via a DNS flip. A read replica is a separate, asynchronously-replicated copy you create explicitly to offload read traffic; it lags the primary and isn't an automatic failover target. Multi-AZ buys availability, a read replica buys read capacity — they solve different problems and you often want both.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through what happens to a message in SQS from send to successful processing, including what happens if the consumer crashes halfway.</summary>
+        <div class="a"><p>A producer sends a message and it sits in the queue, visible. A consumer calls <code>ReceiveMessage</code>, which doesn't remove it — it starts a visibility timeout (default 30 seconds) during which the message is invisible to every other consumer, and hands back a receipt handle. The consumer processes the message and, if it succeeds, calls <code>DeleteMessage</code> with that handle, which is the only thing that actually removes it from the queue. If the consumer crashes or simply takes longer than the visibility timeout, no delete ever happens, the timeout expires, and the message becomes visible again — some other consumer (or the same one, retried) receives it and tries again. That's what "at least once" delivery means in practice: the queue guarantees the message isn't lost, but it can hand it out more than once, so the processing logic has to be idempotent and the timeout has to be sized realistically against how long processing actually takes, with <code>ChangeMessageVisibility</code> available as a heartbeat for jobs whose duration varies.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>AWS says S3 auto-scales. Why do you still see 503 Slow Down errors?</summary>
+        <div class="a"><p>S3's request-rate capacity scales per prefix, not per bucket, and that scaling is gradual — S3 repartitions a hot prefix's traffic across more internal partitions over time as sustained demand shows up, it doesn't provision infinite capacity for every prefix upfront. The baseline before any scaling is roughly 3,500 PUT/COPY/POST/DELETE or 5,500 GET/HEAD requests per second per prefix, and there's no cap on the number of prefixes a bucket can have. So a workload that spreads writes across many prefixes from the start can scale enormously with no throttling at all, while a workload that concentrates a sudden burst onto one prefix — commonly because the key scheme starts with something low-cardinality like a date — will get 503 Slow Down during that burst, because the burst arrives faster than S3's gradual scaling can react. The fix is designing the key layout for the request pattern up front: a high-cardinality component early in the key, not a retry loop papering over a partitioning problem.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>Orders are being processed twice. Where do you look first?</summary>
+        <div class="a"><p>I'd assume it's SQS's visibility timeout before I'd assume application logic is wrong, because "processed more than once" is the exact failure mode at-least-once delivery is designed to produce under the wrong timing. I'd check <code>ApproximateReceiveCount</code> on the affected messages — greater than one confirms a redelivery, not a bug elsewhere. Then I'd compare the queue's visibility timeout against the consumer's actual processing time, including anything slow inside that path like an external payment call. If processing time is close to or exceeds the timeout, that's the cause: a slow-but-successful worker loses the message to a second consumer before its own delete lands. I'd fix it two ways — raise the timeout or add a heartbeat via <code>ChangeMessageVisibility</code> for the immediate relief, and make the processing operation idempotent (an idempotency key on the charge, for instance) as the permanent fix, since duplicates are always possible with this delivery model regardless of timing.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>How does an Auto Scaling group decide an instance is unhealthy, and why might it disagree with your load balancer?</summary>
+        <div class="a"><p>An ASG can use EC2 status checks (is the instance and its host reachable), ELB health checks (does it pass the target group's health check), or both. If you've only enabled EC2 checks, the ASG will consider an instance perfectly healthy as long as the box itself responds — even if the application inside it is completely wedged and failing every request, which is exactly what the load balancer's health check would catch. That's the disagreement: the ASG says healthy, the load balancer says unhealthy and stops sending it traffic, and you end up with an instance that's "up" by the ASG's definition but useless in practice, silently eating capacity until someone enables ELB health checks or investigates manually.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>Six services cover most non-Kubernetes pages: EC2/ASG (compute and its replacement policy), ECR (images, with 12-hour auth tokens), S3 (objects, throttled per prefix, not per bucket, and scaling gradually), RDS (durable relational state, Multi-AZ for failover versus read replicas for read capacity, failover via a DNS flip in 60–120s), ElastiCache (fast, disposable state, Multi-AZ failover in seconds), and SQS (at-least-once delivery via a visibility timeout, which is why consumers must be idempotent). The recurring lesson is the same one everywhere: know which category a dependency falls into — durable versus disposable, synchronous versus async — because most incidents here are really a service being used as if it were a different kind of service.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>EC2 is the compute; an ASG is the policy that keeps the right number of healthy instances running and replaces ones that fail a check.</li>
+      <li>ASGs can use EC2 status checks, ELB health checks, or both — and "both" can disagree, which is a real incident shape.</li>
+      <li>Lifecycle hooks pause an instance in <code>Pending:Wait</code> or <code>Terminating:Wait</code> (1 hour default) so you can run custom logic during launch/termination.</li>
+      <li>ECR Basic scanning checks OS CVEs; Enhanced scanning (via Inspector) also covers language-package vulnerabilities and can run continuously.</li>
+      <li>S3 auto-scales per prefix (baseline ~3,500 PUT/5,500 GET per second) but scales gradually — a sudden burst on one prefix still gets 503 Slow Down.</li>
+      <li>RDS Multi-AZ (instance) gives you a synchronous standby for failover (60–120s, DNS flip) with no read capacity; a read replica adds read capacity but is asynchronous and isn't a default failover target.</li>
+      <li>ElastiCache Multi-AZ promotes the least-lagging replica on primary failure, usually within seconds, and updates the primary endpoint's DNS automatically.</li>
+      <li>SQS is at-least-once: a message becomes invisible for the visibility timeout after being received, and reappears if not deleted in time — so consumers must be idempotent.</li>
+      <li>Cache and queue failures should degrade, not cascade — a dead cache must not turn into 100% of read traffic hitting the database at once.</li>
+      <li>When the pager fires and it isn't a pod problem, it's usually one of these six: EC2/ASG, ECR, S3, RDS, ElastiCache, or SQS.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch57-eks-architecture.html"><b>Ch 57</b> EKS architecture</a>
+      <a href="ch84-async-and-flow-control.html"><b>Ch 84</b> Async &amp; flow control</a>
+      <a href="ch86-the-data-layer-mysql-and-postgresql.html"><b>Ch 86</b> The data layer</a>
+      <a href="ch87-redis-and-in-memory-data.html"><b>Ch 87</b> Redis &amp; in-memory data</a>
+      <a href="ch89-capacity-planning-and-performance.html"><b>Ch 89</b> Capacity planning</a>
+      <a href="ch95-scaling-patterns.html"><b>Ch 95</b> Scaling patterns</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/autoscaling/ec2/userguide/lifecycle-hooks-overview.html">How lifecycle hooks work in Auto Scaling groups</a>: the Pending/Terminating wait states and default timeouts.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/AmazonECR/latest/userguide/image-scanning.html">Scan images for software vulnerabilities in Amazon ECR</a>: Basic vs Enhanced scanning.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html">Best practices design patterns: optimizing Amazon S3 performance</a>: per-prefix request rates and 503 Slow Down.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZ.Failover.html">Failing over a Multi-AZ DB instance for Amazon RDS</a>: failover timing and the DNS mechanism.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/AutoFailover.html">Minimizing downtime in ElastiCache by using Multi-AZ</a>: automatic failover and replica promotion.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html">Amazon SQS visibility timeout</a>: the mechanic behind at-least-once delivery.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch55-irsa-and-eks-pod-identity.html"><span class="dir">← Prev</span><div class="ti">Ch 55 — IRSA and EKS Pod Identity</div></a>
+      <a class="nx" href="ch57-eks-architecture.html"><span class="dir">Next →</span><div class="ti">Ch 57 — EKS architecture</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 56 of 121 · Part VI · AWS &amp; EKS for SREs. Six services, six failure shapes — know them before the pager makes you learn them live.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Six services, one VPC</a>
+    <a href="#internals">How each one behaves</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">One checkout end to end</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

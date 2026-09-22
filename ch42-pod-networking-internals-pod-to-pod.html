@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 42 — Pod networking internals: Pod → Pod</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part V · K8s networking &nbsp;·&nbsp; Chapter 42</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part V · Kubernetes Networking at Packet Level · Chapter 42</div>
+      <h1>Pod networking internals: Pod → Pod</h1>
+      <p class="tagline">Two pods on different nodes talk to each other by IP as if they were on the same flat LAN — no NAT, no port mapping. That promise is the whole Kubernetes network model, and underneath it is a veth pair, a routing table, and sometimes a UDP tunnel doing quiet work. Learn where every packet goes and cross-node bugs stop being spooky.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~50 min read · kind + kubectl + tcpdump lab</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>State the four rules of the Kubernetes network model and why "no NAT pod-to-pod" is the one that matters.</li>
+          <li>Find a running pod's network namespace and the exact veth that carries its traffic to the node.</li>
+          <li>Draw the same-node datapath (veth → bridge/routes → veth) and the cross-node datapath (native routing vs VXLAN overlay).</li>
+          <li>Capture pod-to-pod traffic with <code>tcpdump</code> in both cases and read the pod IPs off the wire.</li>
+          <li>Diagnose the classic "cross-node traffic silently breaks for big packets" incident — an MTU/overlay mismatch — from first principles.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem the pod network solves</h2>
+    <p>You know from <a href="ch25-container-networking.html">Chapter 25</a> how a single Docker host wires containers up: a bridge, veth pairs, and NAT to hide private container IPs behind the host. That model works on one machine. It falls apart the moment you have fifty machines and want a container on node 3 to reach a container on node 41 by address, the way two processes on one host reach each other by <code>localhost</code>.</p>
+    <p>Docker's answer on a single host was "give containers private <code>172.17.x.x</code> addresses and NAT them." If Kubernetes did that per node, every node would hand out the same <code>172.17.0.2</code>, addresses would collide across the cluster, and a pod could never name another pod uniquely. You'd be back to publishing ports and chasing NAT tables for every pod-to-pod call — unworkable when a single service has a thousand replicas spread across a hundred nodes.</p>
+    <p>So Kubernetes made a deliberate architectural choice, and wrote it down as a contract every network plugin must satisfy. It's four rules, and I want you to memorise the shape of them because the rest of Part V is just their consequences:</p>
+    <ul>
+      <li>Every pod gets its own unique, cluster-wide IP address.</li>
+      <li>Any pod can reach any other pod's IP directly, <b>without NAT</b> — the destination pod sees the source pod's real IP.</li>
+      <li>Agents on a node (kubelet, system daemons) can reach all pods on that node.</li>
+      <li>A pod's view of its own IP is the same as everyone else's view of it. It isn't secretly translated.</li>
+    </ul>
+    <p>The second rule is the load-bearing one. "Any pod talks to any pod without NAT" is what lets you treat the cluster as one flat network and stop thinking about which machine anything runs on. The job of a <b>CNI plugin</b> (<a href="ch41-the-kubernetes-network-model-and-cni.html">Chapter 41</a>) is to make that true — to build a fabric where a packet from <code>10.244.0.5</code> to <code>10.244.3.9</code> arrives with both addresses intact, whether those pods share a node or sit two racks apart.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>A pod's <code>eth0</code> is still one end of a veth pair, exactly like a Docker container's — that part didn't change. What changed is the routing policy around it: pod IPs are real and cluster-routable, and pod-to-pod traffic is <em>not</em> source-NATed. Hold those two facts and the entire datapath is just "how does this pod's packet reach that pod's veth."</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: one phone system across many buildings</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Picture a company with buildings scattered across a city. In <a href="ch25-container-networking.html">Chapter 25</a> we had one building with an internal switchboard and extensions — but every building ran its own switchboard, so extension 202 existed in all of them and you had to dial the building's public number first, then the extension. Confusing and error-prone.</p>
+      <p>Kubernetes rips that out and installs <b>one company-wide phone system</b>. Every desk in every building gets a <b>globally unique direct-dial number</b> (the pod IP). You dial 5-0-9-1 and it rings that one specific desk, whether it's down the hall or across town. Nobody dials a building number first; nobody's call gets its caller-ID rewritten on the way. The caller sees the callee's number and the callee sees the caller's number — every time.</p>
+      <p>Making that work needs wiring between buildings. Two ways to do it: run <b>direct fibre</b> between buildings and program the routers so "numbers 5-0-xx live in the east building" (that's <b>native routing</b> — no rewrapping, just good directions), or lay the calls inside <b>company courier pouches</b> addressed building-to-building, unpacked at the far end (that's an <b>overlay/VXLAN tunnel</b> — the original call rides inside an outer envelope). Both deliver the same call intact; the pouch just adds envelope weight, which matters when the envelope plus the letter won't fit through the mail slot.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In the pod network</th></tr>
+      <tr><td>A desk's globally unique direct-dial number</td><td>The pod IP (e.g. <code>10.244.3.9</code>), unique cluster-wide</td></tr>
+      <tr><td>The wire from a desk to its floor's wiring closet</td><td>The <b>veth pair</b> — <code>eth0</code> in the pod, <code>vethXXXX</code> in the node's root namespace</td></tr>
+      <tr><td>The floor's wiring closet</td><td>The node's root netns: a bridge or a set of host routes</td></tr>
+      <tr><td>Caller-ID never rewritten</td><td>No SNAT/DNAT on pod-to-pod traffic — the model's core rule</td></tr>
+      <tr><td>Direct fibre + router directions between buildings</td><td><b>Native routing</b>: node routes / BGP / VPC routes carry pod CIDRs</td></tr>
+      <tr><td>Courier pouches addressed building-to-building</td><td><b>Overlay</b>: VXLAN/Geneve encapsulation, node IP to node IP</td></tr>
+      <tr><td>Envelope + letter too big for the mail slot</td><td>Overlay overhead vs path <b>MTU</b> — the classic silent break</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>Same-node and cross-node datapaths</h2>
+    <p>Start with the easy case: two pods on the same node. Each pod lives in its own network namespace with an <code>eth0</code> that's one end of a veth pair; the other end sits in the node's root namespace. Delivery between the two host-side veths happens one of two ways, and which one you get depends on the CNI:</p>
+    <ul>
+      <li><b>Bridge-style CNIs</b> attach every host-side veth to a Linux bridge (often called <code>cni0</code> or <code>kube-bridge</code>). Same-node pod-to-pod is then a plain layer-2 hop across that bridge — MAC to MAC, exactly like Docker's <code>docker0</code>.</li>
+      <li><b>Pure-L3 CNIs</b> (Calico, and kind's <code>kindnet</code> in its point-to-point mode) skip the bridge. The host side of each veth gets a <code>/32</code> route to that one pod, and the node's routing table forwards between them. No bridge, just routes and <code>proxy_arp</code>.</li>
+    </ul>
+    <p>Either way the pod IPs are untouched and there's no NAT. Here's the same-node path with both delivery styles drawn in:</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 320" role="img" aria-label="Same-node pod-to-pod: pod A eth0 through its veth into the node root namespace, across a bridge or host routes, into pod B veth and eth0, with pod IPs preserved and no NAT">
+        <defs>
+          <marker id="s-ar" markerWidth="10" markerHeight="10" refX="7.5" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" style="fill:var(--accent)"/></marker>
+        </defs>
+        <text x="360" y="20" text-anchor="middle" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">SAME-NODE · pod → pod (no NAT, pod IPs preserved)</text>
+
+        <!-- node outline -->
+        <rect x="14" y="34" width="692" height="228" rx="12" style="fill:none;stroke:var(--line);stroke-width:1.5"/>
+        <text x="26" y="52" style="fill:var(--muted);font:700 11px sans-serif;letter-spacing:.04em">NODE — root network namespace</text>
+
+        <!-- pod A netns -->
+        <rect x="30" y="66" width="150" height="86" rx="9" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="105" y="90" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">pod A netns</text>
+        <text x="105" y="110" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">eth0</text>
+        <text x="105" y="128" text-anchor="middle" style="fill:var(--accent);font:11px ui-monospace,monospace">10.244.0.5</text>
+        <text x="105" y="144" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">default route → veth</text>
+
+        <!-- pod B netns -->
+        <rect x="540" y="66" width="150" height="86" rx="9" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="615" y="90" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">pod B netns</text>
+        <text x="615" y="110" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">eth0</text>
+        <text x="615" y="128" text-anchor="middle" style="fill:var(--accent2);font:11px ui-monospace,monospace">10.244.0.6</text>
+        <text x="615" y="144" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">default route → veth</text>
+
+        <!-- veths -->
+        <rect x="200" y="80" width="96" height="58" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="248" y="104" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">vethA</text>
+        <text x="248" y="122" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">host side</text>
+        <rect x="424" y="80" width="96" height="58" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="472" y="104" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">vethB</text>
+        <text x="472" y="122" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">host side</text>
+
+        <!-- delivery box -->
+        <rect x="312" y="72" width="96" height="74" rx="8" style="fill:var(--panel);stroke:var(--violet);stroke-width:1.5"/>
+        <text x="360" y="96" text-anchor="middle" style="fill:var(--violet);font:600 11px sans-serif">bridge</text>
+        <text x="360" y="112" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">— or —</text>
+        <text x="360" y="128" text-anchor="middle" style="fill:var(--violet);font:600 11px sans-serif">host routes</text>
+
+        <!-- dashed netns boundaries -->
+        <line x1="190" y1="66" x2="190" y2="152" style="stroke:var(--deep);stroke-width:1.2;stroke-dasharray:5 4"/>
+        <line x1="530" y1="66" x2="530" y2="152" style="stroke:var(--deep);stroke-width:1.2;stroke-dasharray:5 4"/>
+        <text x="190" y="166" text-anchor="middle" style="fill:var(--deep);font:9.5px sans-serif">netns boundary</text>
+        <text x="530" y="166" text-anchor="middle" style="fill:var(--deep);font:9.5px sans-serif">netns boundary</text>
+
+        <!-- arrows -->
+        <g style="stroke:var(--accent);stroke-width:2">
+          <line x1="180" y1="109" x2="198" y2="109" marker-end="url(#s-ar)"/>
+          <line x1="296" y1="109" x2="310" y2="109" marker-end="url(#s-ar)"/>
+          <line x1="408" y1="109" x2="422" y2="109" marker-end="url(#s-ar)"/>
+          <line x1="520" y1="109" x2="538" y2="109" marker-end="url(#s-ar)"/>
+        </g>
+
+        <!-- note -->
+        <rect x="30" y="196" width="660" height="52" rx="9" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="46" y="218" style="fill:var(--ink);font:11px sans-serif"><tspan style="fill:var(--accent);font-weight:700">On the wire:</tspan> src 10.244.0.5 → dst 10.244.0.6, unchanged end to end. No SNAT, no DNAT, no port map.</text>
+        <text x="46" y="238" style="fill:var(--ink);font:11px sans-serif"><tspan style="fill:var(--violet);font-weight:700">Delivery:</tspan> bridge = one L2 hop; pure-L3 = the node routes between two /32s. Same result, different plumbing.</text>
+      </svg>
+      <figcaption>Same node: the packet crosses pod A's veth into the node's root namespace, gets handed to pod B's veth by a bridge or by host routes, and arrives with both pod IPs intact.</figcaption>
+    </figure>
+
+    <p>Now the interesting case: pod A on node 1 wants pod B on node 2. The packet leaves pod A exactly as before — out <code>eth0</code>, across the veth, into node 1's root namespace. Then it has to cross the physical (or virtual) network between nodes, and this is where CNIs diverge hard. Two families:</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 430" role="img" aria-label="Cross-node pod-to-pod shown two ways: native routing keeps pod IPs and routes node to node; VXLAN overlay wraps the pod packet in an outer node-to-node UDP packet and decapsulates at the far node">
+        <defs>
+          <marker id="c-ar" markerWidth="10" markerHeight="10" refX="7.5" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" style="fill:var(--accent)"/></marker>
+          <marker id="c-ar2" markerWidth="10" markerHeight="10" refX="7.5" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" style="fill:var(--applied)"/></marker>
+        </defs>
+        <text x="360" y="20" text-anchor="middle" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">CROSS-NODE · pod → pod · two CNI strategies</text>
+
+        <!-- LANE A: native routing -->
+        <text x="14" y="46" style="fill:var(--accent);font:700 10.5px sans-serif;letter-spacing:.04em">A · NATIVE ROUTING — no encapsulation, pod IPs stay on the wire</text>
+        <rect x="14" y="54" width="120" height="70" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="74" y="78" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">pod A (node1)</text>
+        <text x="74" y="96" text-anchor="middle" style="fill:var(--accent);font:10px ui-monospace,monospace">10.244.0.5</text>
+        <text x="74" y="112" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">→ eth0 · veth</text>
+        <rect x="152" y="54" width="150" height="70" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="227" y="78" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">node1 routing</text>
+        <text x="227" y="95" text-anchor="middle" style="fill:var(--muted);font:9.5px ui-monospace,monospace">10.244.1.0/24 via</text>
+        <text x="227" y="109" text-anchor="middle" style="fill:var(--muted);font:9.5px ui-monospace,monospace">node2-ip dev eth0</text>
+        <rect x="320" y="54" width="150" height="70" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="395" y="82" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">real network</text>
+        <text x="395" y="100" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">carries pod pkt as-is</text>
+        <rect x="488" y="54" width="150" height="70" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="563" y="82" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">node2 routing</text>
+        <text x="563" y="100" text-anchor="middle" style="fill:var(--muted);font:9.5px ui-monospace,monospace">10.244.1.6 dev vethB</text>
+        <rect x="656" y="54" width="52" height="70" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="682" y="86" text-anchor="middle" style="fill:var(--ink);font:600 10px sans-serif">pod B</text>
+        <text x="682" y="102" text-anchor="middle" style="fill:var(--accent2);font:8.5px ui-monospace,monospace">.1.6</text>
+        <g style="stroke:var(--accent);stroke-width:2">
+          <line x1="134" y1="89" x2="150" y2="89" marker-end="url(#c-ar)"/>
+          <line x1="302" y1="89" x2="318" y2="89" marker-end="url(#c-ar)"/>
+          <line x1="470" y1="89" x2="486" y2="89" marker-end="url(#c-ar)"/>
+          <line x1="638" y1="89" x2="654" y2="89" marker-end="url(#c-ar)"/>
+        </g>
+        <rect x="152" y="130" width="486" height="24" rx="6" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="160" y="146" style="fill:var(--ink);font:10.5px ui-monospace,monospace">packet: [ IP src 10.244.0.5 → dst 10.244.1.6 | TCP ... ]  — one IP header, nothing added</text>
+
+        <!-- divider -->
+        <line x1="14" y1="176" x2="706" y2="176" style="stroke:var(--line);stroke-width:1;stroke-dasharray:4 4"/>
+
+        <!-- LANE B: overlay -->
+        <text x="14" y="200" style="fill:var(--applied);font:700 10.5px sans-serif;letter-spacing:.04em">B · VXLAN OVERLAY — pod packet wrapped in an outer node-to-node packet</text>
+        <rect x="14" y="208" width="120" height="70" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="74" y="232" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">pod A (node1)</text>
+        <text x="74" y="250" text-anchor="middle" style="fill:var(--accent);font:10px ui-monospace,monospace">10.244.0.5</text>
+        <text x="74" y="266" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">→ eth0 · veth</text>
+        <rect x="152" y="208" width="150" height="70" rx="8" style="fill:var(--panel);stroke:var(--applied);stroke-width:1.5"/>
+        <text x="227" y="228" text-anchor="middle" style="fill:var(--applied);font:600 11px sans-serif">node1 ENCAP</text>
+        <text x="227" y="245" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">flannel.1 / vxlan dev</text>
+        <text x="227" y="261" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">wrap in UDP 4789/8472</text>
+        <rect x="320" y="208" width="150" height="70" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="395" y="236" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">real network</text>
+        <text x="395" y="254" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">sees node1-ip → node2-ip</text>
+        <rect x="488" y="208" width="150" height="70" rx="8" style="fill:var(--panel);stroke:var(--applied);stroke-width:1.5"/>
+        <text x="563" y="236" text-anchor="middle" style="fill:var(--applied);font:600 11px sans-serif">node2 DECAP</text>
+        <text x="563" y="254" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">unwrap → deliver to vethB</text>
+        <rect x="656" y="208" width="52" height="70" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="682" y="240" text-anchor="middle" style="fill:var(--ink);font:600 10px sans-serif">pod B</text>
+        <text x="682" y="256" text-anchor="middle" style="fill:var(--accent2);font:8.5px ui-monospace,monospace">.1.6</text>
+        <g style="stroke:var(--applied);stroke-width:2">
+          <line x1="134" y1="243" x2="150" y2="243" marker-end="url(#c-ar2)"/>
+          <line x1="302" y1="243" x2="318" y2="243" marker-end="url(#c-ar2)"/>
+          <line x1="470" y1="243" x2="486" y2="243" marker-end="url(#c-ar2)"/>
+          <line x1="638" y1="243" x2="654" y2="243" marker-end="url(#c-ar2)"/>
+        </g>
+        <rect x="152" y="284" width="486" height="40" rx="6" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="160" y="300" style="fill:var(--ink);font:10.5px ui-monospace,monospace">[ IP node1→node2 | UDP :4789 | VXLAN | IP 10.244.0.5→10.244.1.6 | TCP ]</text>
+        <text x="160" y="316" style="fill:var(--deep);font:10px sans-serif">outer headers add ~50 bytes → effective pod MTU shrinks (1450, not 1500)</text>
+
+        <!-- takeaway -->
+        <rect x="14" y="342" width="692" height="72" rx="9" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="28" y="364" style="fill:var(--ink);font:11px sans-serif"><tspan style="fill:var(--accent);font-weight:700">Native routing</tspan> is cheaper and easier to debug (real IPs on the wire), but needs the network to route pod CIDRs —</text>
+        <text x="28" y="380" style="fill:var(--ink);font:11px sans-serif">node routes on a shared L2 (kind), BGP (Calico), or cloud VPC routes / ENIs (AWS VPC CNI, <a href="ch58-vpc-cni-the-deep-one.html">Ch 58</a>).</text>
+        <text x="28" y="400" style="fill:var(--ink);font:11px sans-serif"><tspan style="fill:var(--applied);font-weight:700">Overlay</tspan> works on any network you can send UDP across, at the cost of encap overhead and the MTU math you must get right.</text>
+      </svg>
+      <figcaption>Cross-node: native routing sends the pod packet across the network unchanged; an overlay wraps it in an outer node-to-node UDP/VXLAN packet and unwraps it at the far node. Both preserve the inner pod IPs; the overlay pays a header tax that shows up as an MTU problem.</figcaption>
+    </figure>
+
+    <details class="recall"><summary>Think first: on the cross-node native-routing path, what does <code>tcpdump</code> on the node's physical interface show — pod IPs or node IPs?</summary>
+      <div class="body">
+        <p>Pod IPs. With native routing there's no encapsulation, so the packet on the wire between nodes still has source <code>10.244.0.5</code> and destination <code>10.244.1.6</code> — the node's interface is just routing them. That's exactly why native routing is easier to debug: what you capture is what the pods sent. On an overlay you'd instead see the outer node-to-node UDP packet, and you'd have to ask <code>tcpdump</code> to decode VXLAN (or capture on the tunnel device) to see the inner pod addresses. This single difference — "can I see pod IPs on the physical NIC?" — tells you in one command which family your CNI is in.</p>
+      </div>
+    </details>
+
+    <h2 id="internals"><span class="beat">Internal working</span>What the CNI does when a pod starts</h2>
+    <p>When the kubelet asks the container runtime to create a pod, the runtime creates the pod's <b>sandbox</b> (the <code>pause</code> container, which does nothing but hold the namespaces open) and then calls the CNI plugin with <code>ADD</code>. Here's what happens, step by step, and it will look familiar after Chapter 25:</p>
+    <ol class="steps">
+      <li><b>The runtime creates the pod's network namespace.</b> It's empty except for a loopback that starts down. Every container you list in the pod spec will join <em>this</em> namespace — that's why containers in one pod share <code>localhost</code> and one IP. The <code>pause</code> container owns the namespace so it survives individual containers restarting.</li>
+      <li><b>The kubelet invokes the CNI plugin.</b> It reads the CNI config from <code>/etc/cni/net.d/</code>, then runs the plugin binary from <code>/opt/cni/bin/</code> with the namespace path and the action <code>ADD</code> on stdin. This is the contract defined by the <a href="https://www.cni.dev/">CNI spec</a> — the kubelet doesn't know or care whether the plugin is Calico, Cilium, Flannel, or kindnet.</li>
+      <li><b>The plugin creates a veth pair.</b> Two linked virtual interfaces. One end is moved into the pod's namespace and renamed <code>eth0</code>; the other stays in the node's root namespace as <code>vethXXXX</code>. Whatever enters one end leaves the other.</li>
+      <li><b>The plugin does IPAM and assigns the pod IP.</b> It picks an address from the node's slice of the cluster pod CIDR — for kind, each node owns a <code>/24</code> out of <code>10.244.0.0/16</code>. It sets that on <code>eth0</code>, brings <code>lo</code> and <code>eth0</code> up, and installs a default route inside the pod pointing at the veth (often via a link-local gateway or the veth itself).</li>
+      <li><b>The plugin wires the root-namespace side.</b> Bridge-style: enslave <code>vethXXXX</code> to <code>cni0</code>. Pure-L3 (Calico, kindnet ptp): add a <code>/32</code> route on the host for the pod via its veth and enable <code>proxy_arp</code> on the veth. This is what decides same-node delivery.</li>
+      <li><b>The fabric learns the route to this pod's node.</b> For the pod to be reachable from <em>other</em> nodes, every node needs to know "pod CIDR X lives behind node Y." Native-routing CNIs install those routes (kindnet writes host routes for peer nodes; Calico distributes them over BGP; the VPC CNI programs VPC route tables and ENIs). Overlay CNIs instead maintain a map of pod-CIDR → node-IP and program the VXLAN device (<code>flannel.1</code>) so encapsulated packets go to the right node.</li>
+    </ol>
+    <div class="box keypoint"><div class="h">Containers in a pod share one network namespace</div>
+      <p>This is why a sidecar can reach the main container on <code>localhost:8080</code> with no service, no DNS, no cross-pod anything — they're literally in the same netns, sharing <code>lo</code>, the same <code>eth0</code>, and the same single pod IP. It's also why two containers in one pod cannot both bind the same port: one port space. The service mesh proxies of Part VII (<a href="ch67-envoy-and-istiod-internals.html">Chapter 67</a>) rely on exactly this — the Envoy sidecar intercepts the app's traffic because it shares the pod's network namespace.</p>
+    </div>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces and what each owns</h2>
+    <ul>
+      <li><b>The pod network namespace</b> — one per pod, holding <code>lo</code>, <code>eth0</code>, the pod's routing table, and its single IP. Held open by the <code>pause</code>/sandbox container so it outlives individual app containers.</li>
+      <li><b>The veth pair</b> — the virtual cable. <code>eth0</code> inside the pod, <code>vethXXXX</code> in the node root namespace. The kernel hands frames straight from one end to the other.</li>
+      <li><b>The node root namespace's delivery layer</b> — either a bridge (<code>cni0</code>) that switches at L2, or a set of per-pod <code>/32</code> routes that forward at L3. This is the same-node datapath.</li>
+      <li><b>The CNI plugin</b> — the binary in <code>/opt/cni/bin/</code> plus its config in <code>/etc/cni/net.d/</code>, invoked per pod. It owns IPAM, the veth, the host-side wiring, and (with its daemon) the cross-node routes or overlay. Calico, Cilium, Flannel, Weave, the AWS VPC CNI, and kindnet are all interchangeable implementations of the same contract.</li>
+      <li><b>The inter-node fabric</b> — the thing that makes a pod on node 2 reachable from node 1. Native: routes/BGP/VPC. Overlay: a VXLAN (or Geneve/WireGuard) tunnel device on each node and a mapping of pod CIDRs to node IPs.</li>
+      <li><b>The <code>pause</code> container</b> — one per pod, near-zero footprint, whose only job is to hold the namespaces so the pod's IP and netns are stable across container restarts.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one cross-node request end to end</h2>
+    <p>Pod A (<code>10.244.0.5</code> on node 1) opens a TCP connection to pod B (<code>10.244.1.6</code> on node 2), native-routing CNI. A's stack looks at its routing table: <code>10.244.1.6</code> isn't on-link, so it goes to A's default route — out <code>eth0</code>, across the veth into node 1's root namespace. Node 1's routing table has an entry the CNI installed: <code>10.244.1.0/24 via 172.18.0.4 dev eth0</code> (node 2's address). So node 1 forwards the packet — source and destination still the pod IPs — out its physical interface toward node 2. Node 2 receives a packet destined for <code>10.244.1.6</code>; its routing table says that address is on-link via <code>vethB</code>, so it delivers across the veth into pod B's namespace, where B's <code>eth0</code> accepts it. B replies to <code>10.244.0.5</code> and the mirror-image path carries it home. No address was rewritten anywhere; conntrack didn't touch it. That's the model's promise made concrete.</p>
+    <p>Swap in an overlay and only the middle changes: node 1's route for <code>10.244.1.0/24</code> points at the VXLAN device, which wraps the whole pod packet in an outer <code>node1→node2</code> UDP datagram, node 2's kernel decapsulates it, and the inner packet is delivered to <code>vethB</code> exactly as before. The pods never know. The <em>network</em> only ever saw node-to-node traffic.</p>
+
+    <details class="recall"><summary>Think first: a pod's <code>eth0</code> shows MTU 1500, but the CNI uses VXLAN over a 1500-MTU network. What breaks, and when?</summary>
+      <div class="body">
+        <p>Large packets break; small ones don't. VXLAN adds about 50 bytes of outer headers. If the pod emits a full 1500-byte packet, wrapping it makes a 1550-byte packet that won't fit the node network's 1500 MTU. The handshake (small packets) succeeds, DNS succeeds, tiny requests succeed — so the app "connects fine." Then a bulk response, a large POST, or a TLS certificate chain pushes a full-size segment, and it's silently dropped or needs fragmentation that the overlay may not allow (the DF bit + a blocked ICMP "packet too big" gives a blackhole). The fix is to set the pod MTU to the underlay MTU minus the encap overhead — 1450 for VXLAN on a 1500 underlay — so pods never emit a packet that can't be wrapped and forwarded. This is the single most common cross-node CNI incident, and we reproduce it in the labs.</p>
+      </div>
+    </details>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>You need Docker plus <a href="https://kind.sigs.k8s.io/">kind</a> and <code>kubectl</code>. kind runs each Kubernetes node as a Docker container, so "the node" is something you can <code>docker exec</code> into and run <code>ip</code>, <code>tcpdump</code>, and <code>crictl</code> inside. Build a two-node cluster with kind's default CNI (kindnet):</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Two nodes: one control-plane, one worker. Default CNI is kindnet.</span>
+kind create cluster --name netlab --config - &lt;&lt;'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+EOF
+
+kubectl get nodes -o wide            <span class="c"># note the two node names + their IPs</span>
+docker ps --format '{{.Names}}'      <span class="c"># netlab-control-plane, netlab-worker</span></code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — find a pod's veth and its network namespace</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Deploy two pods and force them onto different nodes so we can study both the same-node and cross-node paths. A tiny netshoot pod gives us <code>tcpdump</code>, <code>dig</code>, and <code>ip</code> inside the pod netns.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl run p1 --image=nicolaka/netshoot --overrides='{"spec":{"nodeName":"netlab-worker"}}' --command -- sleep infinity
+kubectl run p2 --image=nicolaka/netshoot --overrides='{"spec":{"nodeName":"netlab-control-plane"}}' --command -- sleep infinity
+kubectl wait --for=condition=Ready pod/p1 pod/p2 --timeout=90s
+kubectl get pods -o wide             <span class="c"># p1 and p2, their pod IPs, and their nodes</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME  READY  STATUS   IP           NODE
+p1    1/1    Running  10.244.1.2   netlab-worker
+p2    1/1    Running  10.244.0.5   netlab-control-plane</code></div>
+        <p>Each node owns a <code>/24</code> out of <code>10.244.0.0/16</code>. Now find the veth. Inside the pod, <code>eth0</code>'s <code>iflink</code> is the interface index of its host-side partner; match that index on the node:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>IDX=$(kubectl exec p1 -- cat /sys/class/net/eth0/iflink)
+echo "host-side veth ifindex = $IDX"
+docker exec netlab-worker ip -o link | grep -E "^$IDX:"</code></pre></div>
+        <div class="out"><span class="ol">Output</span>host-side veth ifindex = 8
+8: veth9c3a1f2b@if2: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; ... link-netns cni-xxxx</code></div>
+        <p>That <code>veth9c3a1f2b</code> is the node end of p1's cable; the <code>@if2</code> tells you the pod's <code>eth0</code> is index 2 inside its namespace. Now see the namespace itself from the node — every non-<code>hostNetwork</code> pod is a distinct net namespace:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker exec netlab-worker lsns -t net    <span class="c"># root netns + one per pod (the pause proc)</span></code></pre></div>
+        <p>You've now located, by hand, the two objects that carry every one of this pod's packets: the veth in the node's root namespace, and the isolated netns on the other side of it. That's the whole physical basis of pod networking.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — capture same-node pod-to-pod, then see the shared-netns trick</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Put two pods on the <em>same</em> node and watch a ping cross. First, how does kindnet actually deliver same-node traffic — bridge or routes? Ask the node:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl run s1 --image=nicolaka/netshoot --overrides='{"spec":{"nodeName":"netlab-worker"}}' --command -- sleep infinity
+kubectl run s2 --image=nicolaka/netshoot --overrides='{"spec":{"nodeName":"netlab-worker"}}' --command -- sleep infinity
+kubectl wait --for=condition=Ready pod/s1 pod/s2 --timeout=90s
+
+docker exec netlab-worker ip route            <span class="c"># per-pod /32 routes? or a cni0 bridge?</span>
+docker exec netlab-worker bridge link 2&gt;/dev/null | head  <span class="c"># empty on a pure-L3 CNI</span></code></pre></div>
+        <div class="out"><span class="ol">Output (kindnet — pure L3)</span>10.244.1.2 dev veth9c3a1f2b scope host
+10.244.1.3 dev vethb71e0a44 scope host
+default via 172.18.0.1 dev eth0</code></div>
+        <p>No <code>cni0</code>; kindnet installs a <code>/32</code> host route per local pod and forwards between them in the node's routing table. (A bridge-style CNI would show a <code>cni0</code> with the veths enslaved to it — same idea, different plumbing.) Now capture the ping <em>inside</em> s2 using an ephemeral debug container that shares s2's netns, and ping from s1:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>S2_IP=$(kubectl get pod s2 -o jsonpath='{.status.podIP}')
+<span class="c"># Terminal A — sniff inside s2's network namespace:</span>
+kubectl debug -it s2 --image=nicolaka/netshoot --target=s2 -- tcpdump -ni eth0 icmp
+<span class="c"># Terminal B — ping s2 from s1:</span>
+kubectl exec s1 -- ping -c3 "$S2_IP"</code></pre></div>
+        <div class="out"><span class="ol">Output (inside s2)</span>IP 10.244.1.4 &gt; 10.244.1.5: ICMP echo request, id 12, seq 1
+IP 10.244.1.5 &gt; 10.244.1.4: ICMP echo reply,   id 12, seq 1</code></div>
+        <p>Source and destination are the two pod IPs, untouched — no NAT on the same-node path, precisely as the model requires. For the shared-namespace point: exec into any pod and note that a sidecar would reach the app on <code>127.0.0.1</code> because they'd share this exact <code>lo</code> and <code>eth0</code>. One netns, one IP, one port space per pod.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — cross-node traffic that works small and dies big</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>This is the incident that eats afternoons. First confirm the cross-node path works normally, then introduce an MTU mismatch and watch it break in the most misleading way possible. p1 (worker) and p2 (control-plane) are on different nodes from Lab 1.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>P2_IP=$(kubectl get pod p2 -o jsonpath='{.status.podIP}')
+kubectl exec p1 -- ping -c2 "$P2_IP"                       <span class="c"># cross-node, works</span>
+kubectl exec p1 -- ping -c2 -M do -s 1400 "$P2_IP"         <span class="c"># 1400+28 payload, DF set — works</span>
+
+<span class="c"># Now shrink p1's eth0 MTU to simulate an overlay whose encap overhead wasn't accounted for,</span>
+<span class="c"># while the path still advertises 1500. Small packets fine; full-size ones will vanish.</span>
+kubectl exec p1 -- ip link set eth0 mtu 1400
+kubectl exec p1 -- ping -c2 -M do -s 1400 "$P2_IP"         <span class="c"># now what?</span></code></pre></div>
+        <p>Small pings still pass. A large TCP transfer, though, stalls after the handshake. Reproduce that shape with a big payload over TCP and watch it hang, then investigate <em>before</em> reading the reveal:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Serve 5 MB from p2 and pull it from p1 — the handshake completes, the body stalls:</span>
+kubectl exec p2 -- sh -c 'head -c 5000000 /dev/urandom &gt; /tmp/blob &amp;&amp; nohup python3 -m http.server 8080 --directory /tmp &gt;/dev/null 2&gt;&amp;1 &amp;'
+kubectl exec p1 -- curl -s -m 8 -o /dev/null -w '%{http_code} %{size_download}\n' "http://$P2_IP:8080/blob"</code></pre></div>
+        <div class="out"><span class="ol">Output</span>000 0        <span class="c"># timed out: connection opened, bytes never arrived</span></code></div>
+        <p>The connection establishes but the download hangs and times out. Ping works, small requests work, the app logs show a connection that "just stopped." What is actually happening? Work it out from what you know about packet sizes, then check.</p>
+        <details class="recall"><summary>Reveal the cause</summary>
+          <div class="body">
+            <p>It's an <b>MTU blackhole</b>. You set p1's <code>eth0</code> to 1400, but the TCP handshake negotiated a maximum segment size assuming a larger path, and — more to the point — p2 is still sending full-size segments toward p1. When p2's 1500-byte segments hit the constrained path with the "don't fragment" bit set, they're too big and get dropped; the ICMP "fragmentation needed" that should tell the sender to back off is often filtered or lost, so the sender just retransmits the same too-big packet forever. Small packets (pings, the handshake, HTTP headers) fit and pass, which is why everything <em>looks</em> healthy until the first full-size data segment.</p>
+            <p>Confirm it directly — the smaller payload that fits still works, the larger one with DF set fails:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl exec p1 -- ping -c2 -M do -s 1372 "$P2_IP"   <span class="c"># 1372+28 = 1400: passes</span>
+kubectl exec p1 -- ping -c2 -M do -s 1400 "$P2_IP"   <span class="c"># 1400+28 = 1428 &gt; 1400: fails</span></code></pre></div>
+            <p>In a real cluster you don't set the MTU by hand — the CNI does, and the bug is that it set the pod MTU to 1500 while the actual path is an overlay that only carries 1450 of payload (VXLAN eats ~50 bytes). Fix it at the CNI: set the pod/overlay MTU to underlay-minus-encap. Restore the lab with <code>kubectl exec p1 -- ip link set eth0 mtu 1500</code>. The reflex to build: <b>"works small, dies big, ping is fine" is MTU until proven otherwise.</b></p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — prove the cross-node mechanism from the wire</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Is your CNI routing natively or tunnelling? Don't guess — capture on the node's physical interface while pods talk across nodes, and read the addresses. This is the fastest way to classify any CNI.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Show the route node1 uses to reach node2's pod CIDR:</span>
+docker exec netlab-worker ip route | grep 10.244
+<span class="c"># Capture on the worker's physical interface while p1 pings p2 (other node):</span>
+P2_IP=$(kubectl get pod p2 -o jsonpath='{.status.podIP}')
+docker exec netlab-worker timeout 6 tcpdump -ni eth0 "icmp or udp port 4789 or udp port 8472" &amp;
+kubectl exec p1 -- ping -c3 "$P2_IP"</code></pre></div>
+        <p>Look at what crosses <code>eth0</code>. Are the addresses the pod IPs, or node IPs wrapping something? Decide which family you're in before revealing.</p>
+        <details class="recall"><summary>Reveal how to read it</summary>
+          <div class="body">
+            <div class="out"><span class="ol">Output (kindnet — native routing)</span># ip route
+10.244.0.0/24 via 172.18.0.3 dev eth0     <span class="c"># control-plane's pod CIDR via its node IP</span>
+default via 172.18.0.1 dev eth0
+# tcpdump on eth0
+IP 10.244.1.2 &gt; 10.244.0.5: ICMP echo request, id 20, seq 1
+IP 10.244.0.5 &gt; 10.244.1.2: ICMP echo reply,   id 20, seq 1</code></div>
+            <p>The pod IPs appear <em>directly</em> on the node's physical interface, and the route shows <code>10.244.0.0/24 via 172.18.0.3</code> — node 2's address. That's native routing: no encapsulation, the network itself carries pod packets because kindnet installed a route per peer node's CIDR. You saw no traffic on UDP 4789/8472 because there is no VXLAN here.</p>
+            <p>On an overlay CNI the same capture would show <code>IP 172.18.0.2.&lt;port&gt; &gt; 172.18.0.3.4789: VXLAN, ... IP 10.244.1.2 &gt; 10.244.0.5: ICMP</code> — node IPs on the outside, pod IPs nested within, and you'd add <code>-vv</code> or capture on the tunnel device (<code>flannel.1</code>) to see the inner packet. One capture, one question answered: is this cluster routing or tunnelling?</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — a cross-node blackhole with a green dashboard</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>Simulate the incident an on-call engineer actually gets paged for: pods on one node can't reach pods on another, but every pod is <code>Running</code>, every readiness probe is green (probes are local, kubelet-to-pod), and same-node traffic is fine. Break the fabric by deleting node 1's route to node 2's pod CIDR, then work it like a real incident.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Break it: drop the worker's route to the control-plane node's pod CIDR.</span>
+CP_CIDR=$(kubectl get node netlab-control-plane -o jsonpath='{.spec.podCIDR}')
+GW=$(docker exec netlab-worker ip route | awk -v c="$CP_CIDR" '$1==c{print $3}')
+docker exec netlab-worker ip route del "$CP_CIDR"
+<span class="c"># Symptom: cross-node dead, same-node alive, pods all Ready.</span>
+P2_IP=$(kubectl get pod p2 -o jsonpath='{.status.podIP}')   <span class="c"># p2 is on control-plane</span>
+kubectl exec p1 -- ping -c2 -W1 "$P2_IP" || echo "CROSS-NODE DOWN"
+kubectl get pods -o wide</code></pre></div>
+        <p>Now the senior question, no hand-holding: you have "some pods can't reach some other pods, intermittently by which node they're on, and nothing is CrashLooping." What is your ordered investigation, and what class of cause are you steering toward? Reason it out before revealing.</p>
+        <details class="recall"><summary>Reveal the approach and the fix</summary>
+          <div class="body">
+            <p><b>First, characterise the blast radius by topology, not by service.</b> The tell in this whole class of bug is that reachability correlates with <em>which nodes</em> the source and destination are on. Test a matrix: same-node pairs (work) vs cross-node pairs (fail). The moment you see "same-node fine, cross-node broken," you've eliminated the app, the Service layer, and DNS — this is the pod fabric between nodes.</p>
+            <p><b>Then inspect the fabric on the node, not the pod.</b> Check the routes and the CNI agent:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>docker exec netlab-worker ip route | grep 10.244        <span class="c"># is the peer CIDR route present?</span>
+kubectl -n kube-system get pods -l app=kindnet -o wide   <span class="c"># is the CNI daemon healthy on every node?</span>
+kubectl -n kube-system logs -l app=kindnet --tail=20</code></pre></div>
+            <p>The missing <code>10.244.0.0/24 via 172.18.0.3</code> route is the smoking gun: node 1 has no idea how to reach node 2's pods. In the wild this is a dead or crash-looping CNI agent on one node, a broken BGP session (Calico), a VXLAN device that didn't come up, a cloud route table or security group blocking node-to-node traffic, or an MTU blackhole like Lab 3 that only kills large packets. Restore the route and connectivity returns instantly:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>docker exec netlab-worker ip route add "$CP_CIDR" via "$GW"
+kubectl exec p1 -- ping -c2 "$P2_IP"                     <span class="c"># back</span></code></pre></div>
+            <p>The durable lesson: pod-to-pod reachability failures that track node topology are a fabric problem — routes, the CNI daemon, overlay devices, node firewalls, or MTU — and readiness probes will happily stay green throughout, because the kubelet probes each pod locally and never tests the cross-node path. When you're done: <code>kind delete cluster --name netlab</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · cross-node traffic works small, breaks big (MTU)</div>
+      <p><b>Symptom:</b> connections between pods on different nodes establish, then hang; small requests and health checks pass, large responses or uploads stall. Often "TLS handshake to service X times out" because the certificate chain is the first full-size packet. <b>First cut:</b> <code>ping -M do -s &lt;size&gt;</code> across nodes, bisecting the size to find the cliff. <b>Confirm:</b> compare the pod interface MTU with the underlay and the CNI's encap overhead (VXLAN ~50 bytes, WireGuard ~60, Geneve variable). <b>Usual cause:</b> pod MTU set to the underlay MTU without subtracting encap overhead, plus ICMP "packet too big" being filtered so Path MTU Discovery can't self-correct (<a href="https://www.rfc-editor.org/rfc/rfc1191">RFC 1191</a>).</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · one node is an island</div>
+      <p><b>Symptom:</b> pods on a specific node can't reach pods elsewhere (or can't be reached), while that node's own same-node traffic is fine and all pods show <code>Running</code>/<code>Ready</code>. <b>First cut:</b> build a reachability matrix by node; if failures cluster on one node, it's that node's fabric. <b>Confirm:</b> is the CNI agent pod healthy on that node, are its routes/BGP sessions/overlay devices present, does node-to-node traffic pass the underlay firewall? <b>Usual cause:</b> a crashed CNI daemon, a broken route/BGP peering, or a security group / firewall dropping node-to-node or VXLAN UDP.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · pod stuck ContainerCreating with a network error</div>
+      <p><b>Symptom:</b> a pod never gets an IP; events show <code>failed to set up sandbox ... plugin ... </code> or <code>failed to allocate IP</code>. <b>First cut:</b> <code>kubectl describe pod</code> and the kubelet/CNI logs on that node. <b>Usual cause:</b> the CNI binary or config missing from <code>/opt/cni/bin</code> or <code>/etc/cni/net.d</code>, the CNI daemon not yet running on a fresh node, or IPAM exhaustion — the node's pod CIDR (or, on the VPC CNI, the node's available IPs, <a href="ch58-vpc-cni-the-deep-one.html">Chapter 58</a>) is full. The pod networking never even got built; this isn't a datapath bug, it's a setup bug.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Choosing native vs overlay.</b> If your network can route pod CIDRs — a flat L2 (kind), BGP to the fabric (Calico), or a cloud that hands pods real VPC addresses (the AWS VPC CNI, <a href="ch58-vpc-cni-the-deep-one.html">Chapter 58</a>) — prefer native routing. It's faster, and every packet on the wire is a real pod IP, so <code>tcpdump</code> and flow logs mean something. Reach for an overlay when you can't change the underlay's routing but you can send UDP between nodes; you pay encap CPU and the MTU tax in exchange for running almost anywhere. Whatever you pick, set the MTU deliberately and check it after every CNI upgrade — silent MTU regressions are a recurring outage.</p>
+    <p><b>Security.</b> The flat, NAT-free model means every pod can reach every other pod by default — including across namespaces. That's convenient and dangerous: a compromised pod has L3 reach to your whole cluster. The control for that is <b>NetworkPolicy</b> (<a href="ch47-networkpolicy-deep.html">Chapter 47</a>), which most CNIs enforce with eBPF or iptables at the pod's veth. Also remember the shared-netns fact: anything in a pod can sniff and talk on that pod's <code>lo</code>, which is exactly how sidecar proxies intercept traffic — a feature for a mesh, a risk if you put untrusted containers in one pod.</p>
+    <p><b>Performance.</b> The veth hop is cheap; the expensive parts are encapsulation (per-packet CPU, worse with software checksums) and conntrack on the paths that do use NAT (Services and egress, next two chapters). Overlays also interact badly with NIC offloads unless the CNI enables VXLAN offload. For latency-sensitive or very high packet-rate workloads this is where eBPF-based datapaths (Cilium) and native routing earn their keep. <b>Common mistakes:</b> assuming pod IPs are stable (they change every reschedule — never hard-code them, use Services and DNS, Chapters 43 and 45); assuming pods can't reach each other across namespaces (they can, until a NetworkPolicy says otherwise); and blaming the app for a hang that is really an MTU blackhole two layers below it.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>The flat pod network is the substrate every higher layer assumes. Services (<a href="ch43-services-and-the-datapath-pod-to-service.html">Chapter 43</a>) are just kernel rules that DNAT a virtual IP to one of these pod IPs — they only work because any node can already reach any pod. Cluster DNS (<a href="ch45-coredns-and-service-discovery.html">Chapter 45</a>) resolves names to pod and service IPs on this same fabric. A service mesh (<a href="ch66-service-mesh-foundations.html">Chapter 66</a>) rides on it by sharing the pod netns. When you design for scale, the pod network is where you decide the shape of the whole platform: how many pods per node (IPAM and CIDR sizing), whether pod IPs are routable off-cluster (native/VPC) or hidden (overlay), and how you'll segment a flat network that trusts itself by default. Get the CIDR math and the MTU right at cluster-build time; both are painful to change once workloads depend on them. This is also the layer AWS reshapes most in <a href="ch58-vpc-cni-the-deep-one.html">Chapter 58</a>, where pods get first-class VPC IPs and the "fabric" becomes the VPC itself.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first, then open it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What are the rules of the Kubernetes network model?</summary>
+        <div class="a"><p>Every pod gets its own unique, cluster-wide IP; any pod can reach any other pod's IP directly without NAT; node agents can reach all pods on their node; and a pod sees its own IP the same way everyone else does. The one that drives everything is "pod-to-pod without NAT" — it lets you treat the cluster as one flat network and stop caring which node a pod runs on. The CNI plugin's job is to make that true, whether by routing pod CIDRs natively or by tunnelling them in an overlay.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Trace a packet from a pod on node 1 to a pod on node 2.</summary>
+        <div class="a"><p>The source pod's stack sees the destination isn't on-link and sends it to its default route: out <code>eth0</code>, which is one end of a veth pair, into the node's root namespace on the other end. Node 1's routing table has a CNI-installed entry for the destination pod's CIDR. With native routing that entry points at node 2's address, so node 1 forwards the packet — pod IPs untouched — out its physical NIC; node 2 receives it, its routing says the destination is on-link via that pod's veth, and delivers it into the pod's namespace. With an overlay, node 1's route points at a VXLAN device that wraps the pod packet in an outer node1-to-node2 UDP datagram; node 2 decapsulates and delivers the inner packet the same way. Either path preserves the source and destination pod IPs and does no NAT. Return traffic mirrors it. The only difference between the two families is whether the network sees pod IPs or node IPs on the wire.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Why do overlays cause MTU problems, and how do you size the MTU correctly?</summary>
+        <div class="a"><p>An overlay wraps each pod packet in outer headers — VXLAN adds roughly 50 bytes (outer IP + UDP + VXLAN), Geneve is variable, WireGuard about 60. If the pod MTU equals the underlay MTU, a full-size pod packet plus the outer headers exceeds what the underlay can carry, so the encapsulated packet is dropped or needs fragmentation. Because the "don't fragment" bit is usually set and the ICMP "packet too big" messages are often filtered, Path MTU Discovery can't correct it and you get a blackhole that only affects large packets — handshakes and small requests pass, bulk transfers and TLS chains hang. The fix is to set the pod (or tunnel-device) MTU to the underlay MTU minus the encapsulation overhead: 1450 for VXLAN over a 1500 underlay. On jumbo-frame underlays you get more headroom. The rule I keep: the pod must never be able to emit a packet that can't survive encapsulation and forwarding.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>Pods on node A can't reach pods on node B, but same-node traffic is fine and all pods are Ready. Where do you look?</summary>
+        <div class="a"><p>The topology correlation is the whole clue: reachability tracking "which nodes" means it's the inter-node fabric, not the app, Services, or DNS. I'd confirm with a quick same-node vs cross-node matrix, then move to the nodes: are the CNI agent pods healthy on both nodes, are the routes to each other's pod CIDRs present (or the BGP sessions up, or the VXLAN devices up), and does node-to-node traffic pass the underlay firewall — including the VXLAN UDP port if it's an overlay? I'd also check MTU, since an MTU blackhole presents as cross-node failures that spare small packets. Readiness stays green through all of this because the kubelet probes each pod locally and never exercises the cross-node path, so I never trust "all Ready" to mean "network is fine."</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>Why can two containers in the same pod talk over localhost, and what are the consequences?</summary>
+        <div class="a"><p>Because every container in a pod joins the same network namespace — held open by the <code>pause</code> container — so they share one <code>lo</code>, one <code>eth0</code>, and one pod IP. A sidecar reaches the main container on <code>127.0.0.1</code> with no Service or DNS involved. The consequences: containers in a pod can't both bind the same port (single port space), they can sniff each other's loopback traffic, and this is precisely the mechanism a service mesh uses — the Envoy sidecar shares the netns and intercepts the app's traffic. It's a feature for tightly coupled helpers and a risk if you'd colocate untrusted code, so the guidance is one concern per pod unless the containers genuinely must share a network identity.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>Kubernetes gives every pod a unique, cluster-routable IP and requires that any pod reach any other pod without NAT. A pod's <code>eth0</code> is one end of a veth pair whose other end is <code>vethXXXX</code> in the node's root namespace; containers in a pod share that one namespace and IP. Same-node delivery is either a layer-2 hop across a bridge (<code>cni0</code>) or L3 forwarding between per-pod <code>/32</code> routes — the CNI decides. Cross-node delivery is either native routing (pod IPs stay on the wire; the network routes pod CIDRs via node IPs, over host routes, BGP, or VPC routes) or an overlay (the pod packet is wrapped in an outer node-to-node VXLAN/UDP datagram and decapsulated at the far node). Overlays add ~50 bytes, so the pod MTU must be the underlay MTU minus that overhead or large packets blackhole while small ones pass. Capture on the node's physical NIC and the addresses tell you which family you're in. Pod-to-pod failures that track node topology are fabric problems — routes, CNI daemon, overlay, firewall, or MTU — and readiness probes stay green through all of them.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>The model: unique pod IPs, pod-to-pod with no NAT, node reaches its pods, and a pod's IP isn't secretly translated.</li>
+      <li>A pod's <code>eth0</code> is one end of a veth pair; the host end <code>vethXXXX</code> lives in the node's root namespace.</li>
+      <li>All containers in a pod share one network namespace and IP (held by <code>pause</code>): they talk over <code>localhost</code>.</li>
+      <li>Same-node delivery is a bridge (<code>cni0</code>, L2) or per-pod <code>/32</code> host routes (L3) — the CNI chooses; pod IPs stay intact either way.</li>
+      <li>Cross-node native routing keeps pod IPs on the wire; the network routes pod CIDRs via node IPs (host routes, BGP, VPC).</li>
+      <li>Cross-node overlay wraps the pod packet in an outer node-to-node VXLAN/UDP packet and decapsulates at the far node.</li>
+      <li>Overlays add ~50 bytes; set pod MTU = underlay MTU − encap overhead (1450 for VXLAN/1500) or large packets blackhole.</li>
+      <li>"Works small, dies big, ping is fine" = MTU until proven otherwise; bisect with <code>ping -M do -s</code>.</li>
+      <li><code>tcpdump</code> on the node's physical NIC: pod IPs = native routing; node IPs on UDP 4789/8472 = overlay.</li>
+      <li>Pod-to-pod failures that correlate with node topology are fabric bugs — routes, CNI daemon, overlay, firewall, MTU — not the app.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch18-the-linux-network-stack-internals.html"><b>Ch 18</b> The Linux network stack</a>
+      <a href="ch25-container-networking.html"><b>Ch 25</b> Container networking</a>
+      <a href="ch41-the-kubernetes-network-model-and-cni.html"><b>Ch 41</b> Network model &amp; CNI</a>
+      <a href="ch43-services-and-the-datapath-pod-to-service.html"><b>Ch 43</b> Services &amp; the datapath</a>
+      <a href="ch47-networkpolicy-deep.html"><b>Ch 47</b> NetworkPolicy</a>
+      <a href="ch58-vpc-cni-the-deep-one.html"><b>Ch 58</b> VPC CNI</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/cluster-administration/networking/">Cluster Networking</a>: the network model, its four requirements, and how CNIs implement them.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/services-networking/">Services, Load Balancing, and Networking</a>: the overview that ties pods, Services, and DNS together.</li>
+      <li>CNI — <a href="https://www.cni.dev/">the Container Network Interface specification</a>: the plugin contract (<code>ADD</code>/<code>DEL</code>), config format, and the reference plugins (bridge, ptp, host-local IPAM).</li>
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc7348">RFC 7348, VXLAN</a>: the encapsulation most overlay CNIs use, including the header layout that costs you MTU.</li>
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc1191">RFC 1191, Path MTU Discovery</a>: why a blocked ICMP "packet too big" turns an MTU mismatch into a silent blackhole.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch41-the-kubernetes-network-model-and-cni.html"><span class="dir">← Prev</span><div class="ti">Ch 41 — The Kubernetes network model and CNI</div></a>
+      <a class="nx" href="ch43-services-and-the-datapath-pod-to-service.html"><span class="dir">Next →</span><div class="ti">Ch 43 — Services and the datapath: Pod → Service</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 42 of 121 · Part V · Kubernetes Networking at Packet Level. Capture one cross-node packet and the CNI stops being a black box.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Same &amp; cross-node paths</a>
+    <a href="#internals">What the CNI does</a>
+    <a href="#components">The components</a>
+    <a href="#flow">Following a request</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

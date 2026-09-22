@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 27 — Container Security &amp; the Isolation Spectrum</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part III · Containers &nbsp;·&nbsp; Chapter 27</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part III · Containers &amp; Container Internals · Chapter 27</div>
+      <h1>Container security, and process → container → pod → VM</h1>
+      <p class="tagline">A container is a normal process wearing three restraints: namespaces decide what it can see, cgroups decide what it can use, and capabilities + seccomp decide what it can do. Loosen any one and the blast radius grows. This chapter is about where those dials sit and why.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~40 min read · Linux + Docker lab</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Place a process, a container, a pod, and a VM on the isolation spectrum — and say what each buys and costs.</li>
+          <li>Drop Linux capabilities to the minimum a workload needs, and name the two or three that actually let you own a host.</li>
+          <li>Write a seccomp profile that blocks a syscall, apply it, and recognise the <code>EPERM</code> it produces (the callback to Chapter 1).</li>
+          <li>Explain why a container escape is even possible — the shared-kernel attack surface — and name the doors people leave open.</li>
+          <li>Say what a pod really is at the namespace level, and why Kubernetes groups containers instead of running them alone.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem: isolation is a dial, not a wall</h2>
+    <p>You already know from <a href="ch21-what-a-container-really-is.html">Chapter 21</a> that a container is just a Linux process the kernel has been told to view through a narrower lens. Here's the uncomfortable consequence: <b>by default, that process is far less contained than people assume.</b> Start a plain <code>docker run</code> as root and, out of the box, the process inside runs as UID 0, can still make almost every system call, and is one misconfiguration away from touching the host.</p>
+    <p>That's the whole tension of this chapter. Containers are cheap because they share the host's single kernel — no second operating system to boot, so they start in tens of milliseconds and cost almost nothing (revisit <a href="ch01-kernel-and-system-calls.html">Chapter 1</a> if that isn't reflex yet). But "shares the kernel" also means the kernel is the <em>only</em> wall between a container and everything else on the box. If code in the container can reach a kernel bug, or you handed it a capability it didn't need, the wall has a door in it.</p>
+    <p>So the real question isn't "are containers secure?" — it's "how much of the kernel have I exposed to this workload, and what happens if it turns hostile?" Every feature in this chapter — capabilities, seccomp, user namespaces, read-only root filesystems — is a way to answer that with a smaller number. You are turning dials down until the workload can do its job and nothing more.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>A VM's isolation is a property you get for free from the hardware and the hypervisor. A container's isolation is a property <em>you configure</em>. An unconfigured container is a process that happens to have its own hostname and filesystem — not a security boundary. Treat it like one only after you've set the dials.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: rooms in a building vs a detached house</h2>
+    <p>Here's the picture to carry through the rest of the Kubernetes chapters.</p>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>A <b>VM</b> is a detached house. It has its own foundation, its own plumbing, its own electrical panel — its own <b>kernel</b>. If the wiring in one house catches fire, the house next door is fine, because they share nothing but the street.</p>
+      <p>A <b>container</b> is a room in a large shared building. Every room shares the same plumbing and electrical risers — the <b>host kernel</b>. What makes a room yours is a set of controls the building manager installed: a <b>lock on the door</b> (namespaces — you can't see into other rooms), a <b>metered fuse</b> (cgroups — you can't draw more power than your allowance), and a <b>tenancy agreement</b> listing exactly which shared facilities you may touch (capabilities and seccomp). Weaken the agreement — hand a tenant a master key — and they can walk into the riser room and affect everyone.</p>
+      <p>A <b>pod</b> is a small suite of adjoining rooms rented together: the containers inside share one phone line and one mailbox (a single <b>network namespace</b> and IP, plus IPC), so they reach each other on <code>localhost</code>, but each keeps its own closet (its own filesystem). That's why you co-locate a sidecar with an app — same phone line, separate luggage.</p>
+    </div>
+    <p>Every term maps onto something concrete:</p>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In Linux / Kubernetes</th></tr>
+      <tr><td>The shared plumbing &amp; risers</td><td>The single host kernel every container calls into</td></tr>
+      <tr><td>A detached house with its own plumbing</td><td>A virtual machine — its own guest kernel on a hypervisor</td></tr>
+      <tr><td>The lock on the room door</td><td>Namespaces (PID, mount, net, UTS, IPC, user, cgroup)</td></tr>
+      <tr><td>The metered fuse box</td><td>cgroups v2 — CPU, memory, IO, PID caps</td></tr>
+      <tr><td>The tenancy agreement (what you may touch)</td><td>Capabilities — root's powers split into ~40 pieces</td></tr>
+      <tr><td>The concierge checking each request at the desk</td><td>seccomp — a kernel filter on which syscalls are allowed</td></tr>
+      <tr><td>The master key you should never hand out</td><td><code>--privileged</code>, <code>CAP_SYS_ADMIN</code>, or a mounted Docker socket</td></tr>
+      <tr><td>A suite of adjoining rooms, one phone line</td><td>A pod — containers sharing a network + IPC namespace</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>The isolation spectrum</h2>
+    <p>Line the four options up from weakest isolation to strongest and the trade-off becomes obvious: the stronger the wall, the more it costs to build and the slower it is to put up.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 440" role="img" aria-label="The isolation spectrum from a bare process to a container, a pod, and a virtual machine, over a shared host kernel">
+        <text x="360" y="18" text-anchor="middle" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">THE ISOLATION SPECTRUM — weaker &nbsp;⟶&nbsp; stronger</text>
+        <!-- workload boxes -->
+        <rect x="16" y="34" width="150" height="74" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="91" y="62" text-anchor="middle" style="fill:var(--ink);font:600 14px sans-serif">Process</text>
+        <text x="91" y="82" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">just a PID +</text>
+        <text x="91" y="97" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">file permissions</text>
+
+        <rect x="178" y="34" width="150" height="74" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="253" y="62" text-anchor="middle" style="fill:var(--ink);font:600 14px sans-serif">Container</text>
+        <text x="253" y="82" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">process + ns +</text>
+        <text x="253" y="97" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">cgroup + seccomp</text>
+
+        <rect x="340" y="34" width="200" height="74" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="440" y="52" text-anchor="middle" style="fill:var(--ink);font:600 14px sans-serif">Pod</text>
+        <rect x="352" y="60" width="82" height="40" rx="6" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="393" y="84" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">ctr A</text>
+        <rect x="446" y="60" width="82" height="40" rx="6" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="487" y="84" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">ctr B</text>
+
+        <rect x="552" y="34" width="152" height="74" rx="8" style="fill:var(--panel);stroke:var(--violet);stroke-width:1.5"/>
+        <text x="628" y="62" text-anchor="middle" style="fill:var(--ink);font:600 14px sans-serif">Virtual machine</text>
+        <text x="628" y="82" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">own guest OS</text>
+        <text x="628" y="97" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">+ kernel</text>
+
+        <!-- isolation gate row -->
+        <rect x="178" y="122" width="362" height="30" rx="6" style="fill:var(--chip);stroke:var(--accent)"/>
+        <text x="359" y="141" text-anchor="middle" style="fill:var(--accent);font:600 11.5px sans-serif">namespaces · cgroups v2 · capabilities · seccomp · LSM</text>
+        <text x="91" y="141" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">(none by default)</text>
+
+        <!-- VM private stack -->
+        <rect x="552" y="122" width="152" height="34" rx="6" style="fill:var(--chip);stroke:var(--violet)"/>
+        <text x="628" y="144" text-anchor="middle" style="fill:var(--violet);font:600 11.5px sans-serif">guest kernel</text>
+        <rect x="552" y="164" width="152" height="30" rx="6" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="628" y="184" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">hypervisor (KVM)</text>
+
+        <!-- syscall boundary -->
+        <line x1="16" y1="238" x2="540" y2="238" style="stroke:var(--deep);stroke-width:1.5;stroke-dasharray:7 5"/>
+        <text x="278" y="232" text-anchor="middle" style="fill:var(--deep);font:700 11px sans-serif;letter-spacing:.03em">SYSTEM-CALL BOUNDARY · every container's syscalls funnel here (see Ch 1)</text>
+
+        <!-- shared host kernel -->
+        <rect x="16" y="300" width="688" height="56" rx="10" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="360" y="326" text-anchor="middle" style="fill:var(--accent);font:700 13px sans-serif">SHARED HOST KERNEL</text>
+        <text x="360" y="345" text-anchor="middle" style="fill:var(--muted);font:11.5px sans-serif">one kernel for the process, the container, and the pod — the VM has its own above</text>
+
+        <!-- hardware -->
+        <rect x="16" y="372" width="688" height="50" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="360" y="402" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">HARDWARE &nbsp;·&nbsp; CPU &nbsp;·&nbsp; RAM &nbsp;·&nbsp; disk &nbsp;·&nbsp; NIC</text>
+
+        <!-- connectors -->
+        <defs>
+          <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--muted)"/></marker>
+        </defs>
+        <line x1="91" y1="108" x2="91" y2="298" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#ar)"/>
+        <line x1="253" y1="152" x2="253" y2="298" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#ar)"/>
+        <line x1="440" y1="152" x2="440" y2="298" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#ar)"/>
+        <line x1="628" y1="194" x2="628" y2="298" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#ar)"/>
+      </svg>
+      <figcaption>Process, container, and pod all call into the one host kernel; only the VM inserts a second kernel and a hypervisor beneath its apps. That extra layer is exactly what you pay for in overhead and boot time.</figcaption>
+    </figure>
+
+    <p>Now the same four as a table an SRE actually reasons with. These numbers are order-of-magnitude, from a modern Linux host:</p>
+    <table class="t">
+      <tr><th></th><th>Isolation mechanism</th><th>Overhead</th><th>Boot / start</th><th>Blast radius if it's compromised</th></tr>
+      <tr><td><b>Bare process</b></td><td>File permissions + whatever the user can do; shares everything else</td><td>~0</td><td>&lt; 1 ms</td><td>Whatever that user can reach — often the whole box</td></tr>
+      <tr><td><b>Container</b></td><td>Namespaces + cgroups + dropped caps + seccomp, all on the host kernel</td><td>A few MB of RAM, near-zero CPU</td><td>10–100 ms</td><td>Bounded to the container <em>if</em> configured; a kernel bug or a bad capability reaches the host</td></tr>
+      <tr><td><b>Pod</b></td><td>Same as a container, but a group sharing net + IPC (and optionally PID)</td><td>One extra tiny "pause" container per pod</td><td>10–100 ms + image pulls</td><td>Same kernel surface; plus the containers in the pod trust each other on <code>localhost</code></td></tr>
+      <tr><td><b>Virtual machine</b></td><td>Its own guest kernel behind a hypervisor; hardware-enforced</td><td>Hundreds of MB, real CPU tax</td><td>Seconds to tens of seconds</td><td>Contained to the guest unless the attacker breaks the hypervisor — a much rarer, harder bug</td></tr>
+    </table>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>This table is the whole "why do we still use VMs?" argument in one place. When you run many workloads you trust (your own microservices), containers give you the density and speed and you accept the shared kernel. When you run code you <em>don't</em> trust — arbitrary customer builds, CI jobs from the internet, a multi-tenant PaaS — the shared kernel is too big a bet, and you reach for a stronger wall: a microVM (Firecracker, Kata Containers) or a syscall-intercepting sandbox (gVisor). Same container image, different runtime, different blast radius.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>How the kernel actually contains a process</h2>
+    <p>When <code>runc</code> starts a container from its OCI config (the handoff you traced in <a href="ch26-docker-containerd-runc-and-the-oci-model.html">Chapter 26</a>), it applies the restraints in a deliberate order, then <code>execve</code>s your program. Here's what it sets up, and what each part stops:</p>
+    <ol class="steps">
+      <li><b>Namespaces — change what the process can see.</b> New PID, mount, network, UTS, IPC, and (optionally) user and cgroup namespaces. Inside, your process is PID 1, sees only its own filesystem and network interfaces, and can't even <em>name</em> the host's other processes. This is isolation of <em>visibility</em>, covered in <a href="ch22-linux-namespaces.html">Chapter 22</a> — it is not, by itself, a security control against a determined attacker.</li>
+      <li><b>cgroups v2 — cap what the process can use.</b> CPU, memory, IO, and PID limits (<a href="ch23-cgroups-v2-cpu-memory-io-limits.html">Chapter 23</a>). Security-relevant because it stops one container from starving the host — a fork bomb hits the PID limit instead of taking down the node.</li>
+      <li><b>Drop capabilities — shrink what "root" means.</b> Since Linux 2.2, root's power is split into ~40 <b>capabilities</b>. A container's root keeps only a small default set (Docker/runc keep about 14, such as <code>CAP_CHOWN</code>, <code>CAP_NET_BIND_SERVICE</code>, <code>CAP_SETUID</code>) and drops the dangerous ones like <code>CAP_SYS_ADMIN</code> and <code>CAP_SYS_MODULE</code>. Kubernetes lets you drop the lot and add back only what you need.</li>
+      <li><b>Install a seccomp filter — restrict which syscalls are even reachable.</b> seccomp (secure computing) loads a small BPF program the kernel consults on every syscall. The default profile blocks around 40+ syscalls that a normal app never needs (e.g. <code>mount</code>, <code>kexec_load</code>, <code>reboot</code>, older keyring calls). A blocked call returns <code>EPERM</code> rather than doing the thing.</li>
+      <li><b>Set <code>no_new_privs</code> — freeze privilege forever.</b> The <code>PR_SET_NO_NEW_PRIVS</code> bit means <code>execve</code> can never grant more privilege — so a setuid binary inside the container can't suddenly become full root. In Kubernetes this is <code>allowPrivilegeEscalation: false</code>.</li>
+      <li><b>Apply an LSM label — a second opinion from SELinux or AppArmor.</b> The Linux Security Module hooks let SELinux (Red Hat) or AppArmor (Ubuntu) enforce mandatory rules on files and operations, independent of Unix permissions. Distro-default container profiles use these.</li>
+      <li><b><code>pivot_root</code> into the image, often read-only.</b> The process's root becomes the container's overlay filesystem (<a href="ch24-container-filesystems-overlayfs-and-image-layers.html">Chapter 24</a>). Mount it read-only and the running process can't modify its own binaries — so an attacker who lands code execution can't drop a persistent implant on disk.</li>
+      <li><b>Optionally, a user namespace — map container-root to a nobody on the host.</b> With a user namespace, UID 0 inside the container maps to an unprivileged high UID (say 100000) on the host. Now "root in the container" owns nothing on the host. This is the difference between rootful and rootless containers.</li>
+    </ol>
+    <p>Read that list as layers of defence, not alternatives. Namespaces hide the neighbours; capabilities and seccomp shrink the API the process can reach; <code>no_new_privs</code> and read-only rootfs stop escalation and persistence; a user namespace makes even a full breakout land on a powerless UID. Miss one layer and the others still hold — that's the point of stacking them.</p>
+
+    <details class="recall"><summary>Think first: a coworker says "we run everything as non-root, so capabilities don't matter." Are they right?</summary>
+      <div class="body">
+        <p>No — the two are different axes. <b>User/UID</b> is <em>who</em> you are; <b>capabilities</b> are <em>what powers</em> you hold. A process can run as a non-root UID and still be granted, say, <code>CAP_NET_RAW</code> or <code>CAP_SYS_ADMIN</code> via the container's capability set or a file capability — and that capability is what actually lets it sniff traffic or mount filesystems, not its UID. Conversely, root inside a container with <em>all capabilities dropped</em> is surprisingly powerless. Running as non-root is good hygiene, but you still drop capabilities explicitly. Belt and braces.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The security pieces, named</h2>
+    <p>You'll say these names constantly once you're on a platform team. Each owns one narrow thing:</p>
+    <ul>
+      <li><b>Capabilities</b> — the split-up powers of root. The ones that effectively <em>are</em> host root: <code>CAP_SYS_ADMIN</code> (mount, many privileged ops — the "new root"), <code>CAP_SYS_MODULE</code> (load a kernel module = arbitrary kernel code), <code>CAP_SYS_PTRACE</code>, <code>CAP_DAC_OVERRIDE</code> (ignore file permissions), and <code>CAP_NET_ADMIN</code>/<code>CAP_NET_RAW</code> for the network. If you grant one, know exactly why.</li>
+      <li><b>seccomp</b> — a per-process BPF syscall filter. Actions per rule: <code>SCMP_ACT_ALLOW</code>, <code>SCMP_ACT_ERRNO</code> (return an error, usually <code>EPERM</code>), <code>SCMP_ACT_LOG</code> (allow but log — great for profiling), and <code>SCMP_ACT_KILL</code>. Kubernetes exposes three profile types: <code>RuntimeDefault</code>, <code>Localhost</code> (your own file), and <code>Unconfined</code>.</li>
+      <li><b>User namespaces</b> — the UID/GID remapping that makes rootless containers possible. Container UID 0 → host UID 100000+. A breakout lands on an unprivileged host user.</li>
+      <li><b>LSMs (SELinux / AppArmor)</b> — mandatory access control layered on top of Unix permissions and capabilities. The distro default profile is usually enough; custom profiles are for hardened multi-tenant platforms.</li>
+      <li><b>The pause (infra) container</b> — a tiny, do-nothing container that owns a pod's network and IPC namespaces. App containers <em>join</em> its namespaces. It exists so the pod's IP survives an app container crashing and restarting. This is the mechanical reason a pod, not a container, is Kubernetes' smallest unit.</li>
+      <li><b>PodSecurity Admission</b> — the Kubernetes controller (built in since 1.25, replacing the removed PodSecurityPolicy) that enforces the <em>Privileged / Baseline / Restricted</em> standards per namespace by label. It's how a cluster says "no privileged pods here" and means it.</li>
+    </ul>
+
+    <div class="box gotcha"><div class="h">Legacy warning</div>
+      <p>If a tutorial tells you to write a <b>PodSecurityPolicy</b> (PSP), stop — PSP was deprecated in 1.21 and <b>removed in 1.25</b>. The current mechanism is <b>Pod Security Admission</b> (namespace labels selecting the Baseline or Restricted profile) for the built-in rules, plus a policy engine like Kyverno or the Validating Admission Policy API for anything custom. We build on this in <a href="ch39-security-rbac-admission-policy-securitycontext.html">Chapter 39</a>.</p>
+    </div>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one syscall from inside a locked-down container</h2>
+    <p>Put it together with a single call. Your app inside a hardened container calls <code>mount()</code> — maybe a library is trying to remount something. Watch every gate it hits:</p>
+    <ol class="steps">
+      <li>The process issues the <code>mount</code> syscall — the trap from <a href="ch01-kernel-and-system-calls.html">Chapter 1</a>, ring 3 → ring 0.</li>
+      <li><b>seccomp runs first.</b> The kernel consults the container's BPF filter before executing anything. If <code>mount</code> is set to <code>SCMP_ACT_ERRNO</code>, the kernel returns <code>-EPERM</code> immediately — the syscall never reaches the mount code at all.</li>
+      <li>If seccomp allows it, the kernel checks <b>capabilities</b>: <code>mount</code> needs <code>CAP_SYS_ADMIN</code>. A default container dropped it, so the mount code itself returns <code>-EPERM</code>.</li>
+      <li>libc turns the negative return into <code>-1</code> and sets <code>errno = EPERM</code>. Your app sees "Operation not permitted."</li>
+    </ol>
+    <p>Two independent layers each said no, and the failure looks identical from user space: <code>EPERM</code>. That's why, when you debug this, you have to check both — which syscall, and which layer blocked it. We do exactly that in the labs.</p>
+
+    <details class="recall"><summary>Think first: root inside a container with every capability dropped and seccomp on — how much can it really do?</summary>
+      <div class="body">
+        <p>Far less than the word "root" suggests. UID 0 with an empty capability set can't mount filesystems, can't load kernel modules, can't change most system settings, and can't override file permissions it wasn't granted — those powers <em>are</em> capabilities, and they're gone. seccomp has narrowed the reachable syscall table on top of that, and namespaces mean the process can't even see the host's other processes or interfaces. What's left dangerous is a kernel bug it can reach through an <em>allowed</em> syscall, or a capability someone added back "to make it work." So the honest answer: mostly harmless <em>as configured</em>, and exactly as dangerous as the widest capability or syscall you left open — which is why hardening is about shrinking that surface, not about the UID alone.</p>
+      </div>
+    </details>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>You're on a Mac, so use a throwaway Linux container as your lab bench, same as Chapter 1. Everything below runs on the host's Docker (Docker Desktop's Linux VM is fine). Start here:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># A disposable box with the tools we need for capability decoding.</span>
+docker run --rm -it ubuntu:24.04 bash
+apt-get update &amp;&amp; apt-get install -y libcap2-bin strace</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — see what your container is actually allowed to do</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Every process advertises its capabilities and seccomp mode in <code>/proc</code>. Look at PID 1 inside a default container:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>grep -E 'CapEff|Seccomp' /proc/1/status
+capsh --decode=$(grep CapEff /proc/1/status | awk '{print $2}')</code></pre></div>
+        <div class="out"><span class="ol">Output (default docker run)</span>CapEff:	00000000a80425fb
+Seccomp:	2
+0x00000000a80425fb=cap_chown,cap_dac_override,cap_fowner,cap_fsetid,cap_kill,
+cap_setgid,cap_setuid,cap_setpcap,cap_net_bind_service,cap_net_raw,
+cap_sys_chroot,cap_mknod,cap_audit_write,cap_setfcap</code></div>
+        <p>Read that. <code>Seccomp: 2</code> means mode 2 — a BPF filter is loaded (the Docker default profile). And <code>CapEff</code> decodes to the ~14 capabilities runc keeps by default. Notice what's <em>not</em> there: no <code>cap_sys_admin</code>, no <code>cap_sys_module</code>, no <code>cap_net_admin</code>. The runtime already dropped the truly dangerous ones for you. Now compare with a privileged container — run this from your Mac host, not inside the box:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker run --rm --privileged ubuntu:24.04 \
+  sh -c 'grep -E "CapEff|Seccomp" /proc/1/status'</code></pre></div>
+        <div class="out"><span class="ol">Output (--privileged)</span>CapEff:	000001ffffffffff
+Seccomp:	0</code></div>
+        <p><code>CapEff</code> is now all-ones — <em>every</em> capability — and <code>Seccomp: 0</code> means <b>no filter at all</b>. A privileged container is a process with full root powers and an unfiltered syscall table, sharing your kernel. It is root on the host with extra steps. This is the single most abused flag in container land.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — bind port 80 as non-root by keeping one capability</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Capabilities let you grant exactly one power instead of all of root. The classic case: binding a port below 1024 needs <code>CAP_NET_BIND_SERVICE</code> and nothing else. Prove it. First, drop <em>everything</em> and try:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker run --rm --user 1000 --cap-drop=ALL python:3.12-alpine \
+  python3 -c 'import socket; s=socket.socket(); s.bind(("0.0.0.0",80))'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>PermissionError: [Errno 13] Permission denied</code></div>
+        <p>That's <code>EACCES</code> — a non-root user with no capabilities can't touch a privileged port. Now add back the <em>one</em> capability that authorises it, still as a non-root user:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker run --rm --user 1000 --cap-drop=ALL \
+  --cap-add=NET_BIND_SERVICE python:3.12-alpine \
+  python3 -c 'import socket; s=socket.socket(); s.bind(("0.0.0.0",80)); print("bound :80 as UID 1000")'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>bound :80 as UID 1000</code></div>
+        <p>That's the model in one command: <b>drop ALL, add back the minimum.</b> In Kubernetes this is a three-line <code>securityContext</code>, and it's the difference between "our web pod runs as root because port 80" and "our web pod runs as UID 1000 with exactly one capability." The second one is a much smaller thing to hand an attacker.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — block a syscall with seccomp and watch EPERM</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>This is the direct callback to Chapter 1. Write a seccomp profile that allows everything <em>except</em> <code>mkdir</code>, then watch the kernel refuse it. Create the profile on your Mac host:</p>
+        <div class="codewrap"><span class="lang">json</span><pre><code><span class="c">// no-mkdir.json — default-allow, but errno on mkdir/mkdirat</span>
+{
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "syscalls": [
+    { "names": ["mkdir", "mkdirat"], "action": "SCMP_ACT_ERRNO", "errnoRet": 1 }
+  ]
+}</code></pre></div>
+        <p><code>errnoRet: 1</code> is <code>EPERM</code>. Apply it and try to make a directory:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker run --rm --security-opt seccomp=no-mkdir.json ubuntu:24.04 \
+  sh -c 'mkdir /tmp/x'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>mkdir: cannot create directory '/tmp/x': Operation not permitted</code></div>
+        <p>"Operation not permitted" is <code>EPERM</code> — errno 1 — exactly what the profile told the kernel to return. Confirm it's seccomp and not permissions by tracing the syscall (needs <code>--cap-add=SYS_PTRACE</code>):</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker run --rm --cap-add=SYS_PTRACE --security-opt seccomp=no-mkdir.json ubuntu:24.04 \
+  sh -c 'apt-get install -y strace &gt;/dev/null 2&gt;&amp;1; strace -f mkdir /tmp/x 2&gt;&amp;1 | grep mkdir'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>mkdirat(AT_FDCWD, "/tmp/x", 0777) = -1 EPERM (Operation not permitted)</code></div>
+        <p>The syscall returned before doing any work — the kernel consulted the filter and bounced it. This is precisely the incident pattern Chapter 1 promised: an unusual syscall failing with <code>EPERM</code> inside a container means a seccomp profile, not a file-permission problem.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — "works on the VM, EPERM in the container"</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Here's the real-world version. A team upgrades a base image; the app now crashes on start inside Kubernetes with <code>EPERM</code>, but runs fine on a plain VM. You're handed the pod. Reproduce the shape locally — a program that calls a syscall a strict profile forgot to allow:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># A profile that allows only a tiny set — realistic of an over-tight custom profile.</span>
+cat &gt; tight.json &lt;&lt;'EOF'
+{ "defaultAction": "SCMP_ACT_ERRNO", "architectures": ["SCMP_ARCH_X86_64"],
+  "syscalls": [ { "names":
+    ["read","write","exit","exit_group","brk","mmap","munmap","rt_sigreturn",
+     "execve","arch_prctl","access","openat","close","fstat","newfstatat"],
+    "action": "SCMP_ACT_ALLOW" } ] }
+EOF
+docker run --rm --security-opt seccomp=tight.json ubuntu:24.04 sh -c 'echo hi; getcwd 2>/dev/null; ls /'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>hi
+sh: 1: ls: Operation not permitted   <span class="c"># or the container dies before printing</span></code></div>
+        <p>Something fails with <code>EPERM</code>, but which syscall? Don't guess. The senior move is to make seccomp <em>tell you</em> instead of blocking. Think about how before you open the answer.</p>
+        <details class="recall"><summary>Reveal the approach</summary>
+          <div class="body">
+            <p>Flip the default action to <b>log, not error</b>, so every disallowed syscall is recorded but still runs — then read the kernel's audit log to see exactly what the app needs:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Temporarily: defaultAction SCMP_ACT_LOG instead of SCMP_ACT_ERRNO.</span>
+<span class="c"># On the host, disallowed calls now appear in the audit / kernel log:</span>
+journalctl -k | grep -i seccomp | tail
+<span class="c"># or watch the container's own strace, as in Lab 3.</span></code></pre></div>
+            <p>You'll see the culprit — commonly <code>statx</code>, <code>faccessat2</code>, <code>clone3</code>, or <code>getrandom</code>: newer syscalls that a modern glibc started using after a base-image bump, which an old hand-written profile never listed. The fix is almost never "disable seccomp." It's "add the missing syscall to the profile," or better, switch to the <b>RuntimeDefault</b> profile, which is maintained to track glibc. This exact class of bug — <code>clone3</code> under an old Docker seccomp profile — broke countless Alpine and Ubuntu 21.10+ images in the wild.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — try to break out, and see why you can't</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>The best way to trust a boundary is to push on it. First, confirm a locked-down container <em>can't</em> reach the host. Try to see host processes and to mount something:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker run --rm --cap-drop=ALL ubuntu:24.04 sh -c '
+  ps -e | wc -l;                 # how many processes can I even see?
+  mount -t proc proc /mnt 2>&1'   # can I mount?</code></pre></div>
+        <div class="out"><span class="ol">Output</span>2                                   <span class="c"># only my own process tree — PID namespace</span>
+mount: permission denied            <span class="c"># no CAP_SYS_ADMIN — EPERM</span></code></div>
+        <p>The PID namespace hides the host's hundreds of processes (you see 2), and mounting fails for lack of <code>CAP_SYS_ADMIN</code>. Both walls hold. Now the senior question: given a container that <em>does</em> escape, which misconfigurations opened the door — and how would you spot them in a running cluster before an attacker does?</p>
+        <details class="recall"><summary>Reveal the escape surface</summary>
+          <div class="body">
+            <p>Real container escapes almost always ride one of a short list of gifts, not a novel kernel 0-day:</p>
+            <ul>
+              <li><b><code>--privileged</code> / <code>privileged: true</code></b> — all caps, no seccomp, host devices. From here you can mount the host disk and <code>chroot</code> into it. Game over.</li>
+              <li><b>The Docker/containerd socket mounted in</b> (<code>/var/run/docker.sock</code> as a volume) — the container can now ask the daemon to start a <em>new</em> privileged container mounting the host root. A very common CI footgun.</li>
+              <li><b><code>hostPath</code> volumes, <code>hostPID</code>, <code>hostNetwork</code></b> — each punches a specific hole from pod to node.</li>
+              <li><b><code>CAP_SYS_ADMIN</code> or <code>CAP_SYS_MODULE</code></b> granted "to make it work" — the former is effectively root; the latter loads kernel code.</li>
+              <li><b>An unpatched kernel</b> — the shared kernel means a bug like Dirty Pipe (CVE-2022-0847) is exploitable from inside any container on that host.</li>
+            </ul>
+            <p>How you find them: enforce <b>Pod Security Admission (Restricted)</b> on namespaces so the API server rejects privileged/hostPath pods at admission time, and audit with <code>kubectl get pods -A -o jsonpath</code> for <code>securityContext.privileged</code> and <code>volumes.hostPath</code>. Patch nodes on a schedule. For genuinely untrusted workloads, don't rely on getting the dials perfect — run them under gVisor or in a Kata microVM so a breakout hits a sandbox, not your node.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · EPERM after a base-image or runtime bump</div>
+      <p><b>Symptom:</b> a workload that ran for a year starts crash-looping right after an image or containerd upgrade, logging "Operation not permitted" on startup. <b>First cut:</b> <code>kubectl logs</code> the crash, then reproduce with <code>strace</code> to find the failing syscall. <b>Confirm:</b> check the pod's <code>seccompProfile</code> and the node's runtime version. <b>Usual cause:</b> a newer libc uses a syscall (<code>clone3</code>, <code>faccessat2</code>, <code>statx</code>) that an old hand-rolled seccomp profile doesn't list. <b>Fix:</b> move to <code>RuntimeDefault</code> or add the syscall — never blanket-<code>Unconfined</code>.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · the read-only rootfs surprise</div>
+      <p><b>Symptom:</b> you set <code>readOnlyRootFilesystem: true</code> for hardening and the app dies writing to <code>/tmp</code>, <code>/var/run</code>, or a cache dir. <b>Cause:</b> plenty of apps write scratch data to the root filesystem. <b>Fix:</b> keep the rootfs read-only and mount an <code>emptyDir</code> at each writable path. This is a good change — it just needs the writable paths declared, which is itself documentation of what the app touches.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · "it works because it's privileged"</div>
+      <p><b>Symptom:</b> a chart or DaemonSet only works with <code>privileged: true</code>, so someone ships it that way. <b>Why it's an incident waiting to happen:</b> that pod is root on the node; a supply-chain compromise of that image compromises every node it lands on. <b>Fix:</b> find the <em>one</em> capability or mount it actually needs (often <code>CAP_NET_ADMIN</code> for a CNI agent, or a specific host path) and grant only that. "Privileged" is almost always laziness standing in for "I didn't find the specific permission."</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>The baseline every workload should meet.</b> Run as a non-root UID (<code>runAsNonRoot: true</code>, <code>runAsUser: 1000</code>); drop all capabilities and add back only the handful you proved you need; set <code>allowPrivilegeEscalation: false</code>; set <code>seccompProfile: { type: RuntimeDefault }</code> (as of recent Kubernetes the kubelet can even default this cluster-wide); mount the root filesystem read-only with <code>emptyDir</code>s for scratch. Those five lines of <code>securityContext</code> turn a "process with a hostname" into something that resembles a security boundary, and they cost nothing at runtime — seccomp filtering adds a few nanoseconds per syscall, which is lost in the noise for any real app.</p>
+    <p><b>Enforce it, don't hope for it.</b> Individual <code>securityContext</code> blocks are opt-in; developers forget them. Pod Security Admission set to <b>Restricted</b> on a namespace makes the API server reject any pod that isn't hardened, so the guarantee is structural rather than aspirational. Add Kyverno or Validating Admission Policy for rules PSA doesn't cover (registry allow-lists, required labels).</p>
+    <p><b>When namespaces aren't enough.</b> The shared kernel is a real bet. For multi-tenant platforms running untrusted code — CI runners taking pull requests from strangers, a customer-code PaaS, notebook-as-a-service — assume a container will be broken out of and put a second wall behind it: <b>gVisor</b> (a user-space kernel that intercepts the container's syscalls, so most never reach the host kernel) or a <b>microVM</b> (Kata / Firecracker — a real guest kernel that boots in ~125&nbsp;ms, close to container speed but with VM-grade isolation). You select these per workload with a Kubernetes <code>RuntimeClass</code>.</p>
+    <p><b>The user-namespace frontier.</b> Mapping container-root to an unprivileged host UID (<code>hostUsers: false</code> on the pod, a graduating feature) is the cleanest fix for the "root in the container" problem: even a full breakout lands on a UID that owns nothing. It's worth turning on where your kernel and runtime support it, especially for anything you don't fully trust.</p>
+    <p><b>Common mistakes</b> that put teams in the incident channel: reaching for <code>--privileged</code> instead of finding the one capability needed; mounting the Docker socket into a CI container; leaving <code>seccomp: Unconfined</code> because an old profile broke once; treating a bare container as equivalent to a VM for untrusted code; and never patching node kernels, which quietly re-arms every published container-escape CVE.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>This chapter is where "how isolated is it?" becomes a design input rather than an afterthought. When you architect a multi-tenant system, the first question is the trust boundary: are tenants separated by application logic (one process, tenant IDs in the query — cheap, one bug leaks everyone), by container (namespaces + seccomp — good for tenants you mostly trust), by pod/node (a node per tenant — coarse but simple), or by VM/microVM (hardware isolation — for untrusted or regulated workloads)? Each step up the isolation spectrum trades density and speed for a smaller blast radius, and that trade is the heart of the design. The same reasoning drives the "cell" and "shuffle-sharding" patterns you'll meet in <a href="ch95-scaling-patterns.html">Chapter 95</a> and reliability engineering in <a href="ch88-reliability-engineering.html">Chapter 88</a>: contain failure and compromise to the smallest unit you can afford. And it's the reason serverless platforms (AWS Lambda, Fargate) run each tenant's code in a Firecracker microVM rather than a shared-kernel container — at that trust boundary, the VM tax is the price of admission.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before you open it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's the fundamental security difference between a container and a VM?</summary>
+        <div class="a"><p>A VM ships its own guest kernel behind a hypervisor, so the isolation is hardware-enforced and an attacker has to break the hypervisor to escape. A container is a process sharing the host's single kernel; its isolation is a stack of kernel features — namespaces, cgroups, dropped capabilities, seccomp — that you configure. So a container is cheaper and faster (no second kernel to boot) but its wall is the host kernel itself: a kernel bug or an over-broad capability reaches the host. Trust the workload and use containers; don't trust it and add a VM-grade wall.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through hardening a pod's securityContext from scratch.</summary>
+        <div class="a"><p>I start from "deny everything, add back the minimum." Set <code>runAsNonRoot: true</code> and a specific <code>runAsUser</code> so the process isn't UID 0. Set <code>allowPrivilegeEscalation: false</code> so a setuid binary can't regain privilege — that's <code>no_new_privs</code> under the hood. Drop all capabilities with <code>capabilities.drop: ["ALL"]</code> and add back only what I've proven is needed, e.g. <code>NET_BIND_SERVICE</code> for a low port. Set <code>seccompProfile.type: RuntimeDefault</code> so the maintained syscall filter is on. Make the root filesystem read-only and mount <code>emptyDir</code>s at the paths the app writes to. Then I enforce it at the namespace with Pod Security Admission set to Restricted, so nothing un-hardened even schedules. The theme is that UID, capabilities, and syscalls are three separate axes and I tighten all three, rather than assuming non-root alone is safe.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>A syscall returns EPERM inside a container but works on a bare host. How do you find out why?</summary>
+        <div class="a"><p><code>EPERM</code> from inside a container has two likely sources and they look identical from user space, so I isolate which layer said no. First I <code>strace</code> the process to name the exact failing syscall — say <code>mount</code> or <code>clone3</code>. Then: is it a <b>capability</b> problem or a <b>seccomp</b> problem? I check <code>/proc/&lt;pid&gt;/status</code> — <code>CapEff</code> tells me the effective capabilities, and <code>Seccomp: 2</code> tells me a filter is loaded. If the syscall needs a capability the container dropped (mount needs <code>CAP_SYS_ADMIN</code>), that's the cause. If the capability is present but the call is still refused, it's the seccomp profile — I confirm by temporarily switching the profile's default action to <code>SCMP_ACT_LOG</code> and reading the audit log, which prints every disallowed call without blocking it. The classic case is a base-image bump where new glibc calls <code>clone3</code>, which an old profile never allowed; the fix is <code>RuntimeDefault</code> or adding the syscall, not disabling seccomp.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A vendor's Helm chart requires <code>privileged: true</code>. What do you do?</summary>
+        <div class="a"><p>I treat that as a red flag, not a requirement, because a privileged pod is root on every node it runs on. First I find out <em>why</em> it wants privilege — usually one specific need: a host path, <code>CAP_NET_ADMIN</code> for networking, or a device. I reproduce it with <code>strace</code>/logs and try to replace <code>privileged</code> with the narrow grant: a single added capability, a specific <code>hostPath</code>, or a device plugin. If it genuinely needs broad host access (some storage or CNI agents do), I scope the blast radius instead: pin it to dedicated nodes with taints, restrict its ServiceAccount RBAC to nothing extra, and keep those nodes patched. If it's untrusted, I push back on adopting it at all, or run it under a RuntimeClass that uses a microVM. What I don't do is ship <code>privileged</code> cluster-wide because the chart's default said so.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>Why is a pod the smallest unit in Kubernetes, and not a container?</summary>
+        <div class="a"><p>Because a pod is the natural grouping for containers that must share a fate and a network identity. Mechanically, a pod is a set of containers that share a network namespace and IPC — held open by a tiny "pause" container — so they see each other on <code>localhost</code> and share one IP, while keeping separate filesystems. That's exactly what you want for an app plus a sidecar (a proxy, a log shipper): same network endpoint, deployed and scheduled as one unit, but independent images and restarts. Scheduling and lifecycle operate on the pod because these containers only make sense together. It also means the security boundary you tune — capabilities, seccomp — largely applies per container within the pod, but the network trust boundary is the pod: everything in it trusts everything else on <code>localhost</code>.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>A container is a process on the shared host kernel, contained by dials you set: namespaces (what it sees), cgroups (what it uses), capabilities (which of root's powers it keeps), and seccomp (which syscalls it can even make). Turn those dials down — drop all caps and add back the minimum, run non-root, forbid privilege escalation, load <code>RuntimeDefault</code> seccomp, make the rootfs read-only — and enforce it with Pod Security Admission (never the removed PodSecurityPolicy). The isolation spectrum runs process → container → pod → VM: each step shrinks blast radius and adds overhead and boot time. A pod groups containers so they share a network namespace and IP via the pause container. When you can't trust the workload, don't perfect the dials — put a VM-grade wall behind it with gVisor or a microVM. And a mysterious <code>EPERM</code> inside a container is a capability or a seccomp filter talking — check <code>/proc/&lt;pid&gt;/status</code> to learn which.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>A container's isolation is configured, not inherent; an unconfigured container is not a security boundary.</li>
+      <li>Isolation spectrum: process &lt; container &lt; pod &lt; VM. Stronger wall = more overhead + slower boot + smaller blast radius.</li>
+      <li>Containers and pods share the one host kernel; a VM has its own kernel behind a hypervisor. That's the core difference.</li>
+      <li>Capabilities split root into ~40 powers. Drop ALL, add back the minimum. <code>CAP_SYS_ADMIN</code> ≈ root on the host.</li>
+      <li>seccomp filters syscalls; a blocked call returns <code>EPERM</code>. Prefer <code>RuntimeDefault</code> over hand-rolled profiles.</li>
+      <li><code>allowPrivilegeEscalation: false</code> sets <code>no_new_privs</code>; read-only rootfs + <code>emptyDir</code> stops on-disk persistence.</li>
+      <li>User namespaces map container-root to an unprivileged host UID, so a breakout lands powerless.</li>
+      <li><code>--privileged</code> = all caps + no seccomp + host devices. It is the most abused, most dangerous setting.</li>
+      <li>A pod shares one network + IPC namespace (held by the pause container), which is why it's the smallest unit.</li>
+      <li>Enforce hardening with Pod Security Admission (Restricted); for untrusted code use gVisor or a microVM via RuntimeClass.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch01-kernel-and-system-calls.html"><b>Ch 1</b> Syscalls &amp; EPERM</a>
+      <a href="ch05-users-groups-permissions-capabilities.html"><b>Ch 5</b> Capabilities</a>
+      <a href="ch22-linux-namespaces.html"><b>Ch 22</b> Namespaces</a>
+      <a href="ch23-cgroups-v2-cpu-memory-io-limits.html"><b>Ch 23</b> cgroups v2</a>
+      <a href="ch26-docker-containerd-runc-and-the-oci-model.html"><b>Ch 26</b> runc &amp; the OCI model</a>
+      <a href="ch39-security-rbac-admission-policy-securitycontext.html"><b>Ch 39</b> K8s security</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man7/capabilities.7.html">capabilities(7)</a>: the authoritative list of every capability and what it grants.</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man2/seccomp.2.html">seccomp(2)</a> and <a href="https://man7.org/linux/man-pages/man7/user_namespaces.7.html">user_namespaces(7)</a>: the syscall filter and UID remapping, first-hand.</li>
+      <li>Open Container Initiative — <a href="https://github.com/opencontainers/runtime-spec/blob/main/config-linux.md">runtime-spec, config-linux</a>: how capabilities, seccomp, and namespaces are expressed in the OCI config runc reads.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/tasks/configure-pod-container/security-context/">Configure a Security Context for a Pod or Container</a>: every field in this chapter, in YAML.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/security/pod-security-standards/">Pod Security Standards</a> and <a href="https://kubernetes.io/docs/concepts/security/pod-security-admission/">Pod Security Admission</a>: the Privileged/Baseline/Restricted profiles and their enforcement.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/reference/node/seccomp/">Seccomp and Kubernetes</a> and <a href="https://kubernetes.io/docs/concepts/workloads/pods/user-namespaces/">User Namespaces</a>: profile types and the rootless-pod feature.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch26-docker-containerd-runc-and-the-oci-model.html"><span class="dir">← Prev</span><div class="ti">Ch 26 — Docker, containerd, runc &amp; the OCI model</div></a>
+      <a class="nx" href="ch28-why-kubernetes-the-declarative-reconciled-model.html"><span class="dir">Next →</span><div class="ti">Ch 28 — Why Kubernetes: the declarative, reconciled model</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 27 of 121 · Part III · Containers &amp; Container Internals. This closes Part III — you now know what a container <em>is</em>, from the kernel up. Next we ask why we need something to orchestrate thousands of them.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Isolation spectrum</a>
+    <a href="#internals">How containment works</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">One syscall's journey</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

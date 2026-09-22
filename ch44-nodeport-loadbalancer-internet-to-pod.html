@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 44 — NodePort, LoadBalancer: Internet &#8594; Pod</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part V · K8s networking &nbsp;·&nbsp; Chapter 44</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part V · Kubernetes Networking at Packet Level · Chapter 44</div>
+      <h1>NodePort, LoadBalancer: Internet → Pod</h1>
+      <p class="tagline">A ClusterIP only exists inside the cluster. Something outside — a browser, a mobile app, another company's server — needs a door in the perimeter. That door is a plain node port opened on every machine you own, and everything else people call "a Kubernetes load balancer" is built by pointing something external at it.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~48 min read · kind + MetalLB lab</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain why a NodePort works when you dial <em>any</em> node's IP, even one running no matching pod at all.</li>
+          <li>Say exactly what a cloud's <code>LoadBalancer</code> Service adds on top of a NodePort, and who builds it.</li>
+          <li>Contrast <code>externalTrafficPolicy: Cluster</code> and <code>Local</code> — the extra hop, the SNAT, and the client IP each one costs or keeps.</li>
+          <li>Explain <code>healthCheckNodePort</code> and why it exists specifically for the <code>Local</code> policy.</li>
+          <li>Diagnose the two classics: every request logged as coming from one IP, and a <code>Local</code>-policy node that silently drops traffic.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem: nothing outside the cluster can dial a ClusterIP</h2>
+    <p><a href="ch43-services-and-the-datapath-pod-to-service.html">Chapter 43</a> gave every Service a stable virtual IP, but that IP only means anything to kube-proxy's rules — rules that exist on your cluster's nodes and nowhere else. A laptop on the internet has no route to <code>10.96.12.34</code>; it isn't advertised to the internet, it isn't in any public routing table, and even if a packet somehow arrived at a node addressed to it, that's not how the DNAT rule is written to match. The ClusterIP is an internal concept, full stop.</p>
+    <p>So you need something that <em>is</em> reachable from outside, sitting at the edge, whose whole job is "receive external traffic, then feed it into the machinery Chapter 43 already built." Kubernetes gives you two Service types for this, and they build on each other. <b>NodePort</b> is the primitive: it reserves the same port on <em>every node</em> in the cluster and wires it into the exact same DNAT chain a ClusterIP uses. <b>LoadBalancer</b> is NodePort plus one more actor: something — usually your cloud, sometimes a piece of software you run yourself — that provisions a real, externally reachable load balancer and points it at that NodePort on some or all of your nodes.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>There is no third mechanism. A <code>LoadBalancer</code> Service does not invent a new datapath — it's a NodePort with a piece of automation in front of it that gets an external IP and a health check pointed at your nodes. Understand the NodePort and you understand 90% of "how traffic gets into a Kubernetes cluster from the internet."</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: one dock door, at every warehouse</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Picture a company running several warehouses (nodes) in different parts of town. Corporate assigns <b>the exact same loading-dock door number — door 31240 — at every single warehouse</b>, whether or not that warehouse happens to be storing the product a truck is delivering. A truck can back up to <em>any</em> warehouse's door 31240 and be accepted. If that warehouse has the right stock room (a matching pod) on-site, a forklift takes the pallet straight there. If it doesn't, an internal company shuttle (the pod network) carries the pallet over to whichever warehouse across town actually does. That's a <b>NodePort</b>: the same port, opened everywhere, always accepted, sometimes handled on the spot and sometimes relayed.</p>
+      <p>Now corporate wants customers to stop guessing which warehouse to drive to. They hire a <b>dispatcher</b> who publishes one public shipping address, picks a warehouse for each incoming truck, and always sends it to that warehouse's door 31240. That dispatcher is the <b>cloud's load-balancer controller</b>, and the public address it hands out is your <b>LoadBalancer</b>'s external IP or DNS name.</p>
+      <p>Here's the part that has real consequences. If the dispatcher can send a truck to <em>any</em> warehouse and let the internal shuttle relay pallets between warehouses (<code>externalTrafficPolicy: Cluster</code>), the shuttle re-labels the pallet with "from Warehouse A" before handing it off — the receiving stock room never learns the truck's original licence plate. That's the SNAT. If instead the dispatcher only ever sends a truck to a warehouse that has the stock <em>right there</em> (<code>externalTrafficPolicy: Local</code>), no shuttle run is needed, the stock room sees the truck's real plate — but a warehouse with nothing in stock that gets sent a truck anyway just refuses the delivery outright, rather than relaying it. That refusal, and how the dispatcher learns to avoid it, is the second half of this chapter.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In Kubernetes</th></tr>
+      <tr><td>The same dock door number at every warehouse</td><td>A <b>NodePort</b> — one port (30000–32767 by default) opened on every node</td></tr>
+      <tr><td>The internal shuttle relaying a pallet to another warehouse</td><td>kube-proxy forwarding the packet to a pod on a <em>different</em> node</td></tr>
+      <tr><td>Re-labelling the pallet "from Warehouse A"</td><td><b>SNAT/masquerade</b> of the client's source IP to the node's IP</td></tr>
+      <tr><td>The dispatcher, one public shipping address</td><td>A <b>LoadBalancer</b> Service and its cloud-provisioned front door</td></tr>
+      <tr><td>Only send trucks to a warehouse with stock on hand</td><td><code>externalTrafficPolicy: Local</code> — route only to node-local pods</td></tr>
+      <tr><td>How the dispatcher learns which warehouses have stock</td><td><code>healthCheckNodePort</code> — reports "0 local endpoints" or more</td></tr>
+      <tr><td>A warehouse with no stock refuses the truck outright</td><td>A <code>Local</code>-policy node with no local pod <b>drops</b> the packet</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>Internet → LB → node → (SNAT?) → pod</h2>
+    <p>Both traffic policies share the first two hops and diverge at the third. A client on the internet resolves your service's DNS name to the load balancer's IP and connects to it. The load balancer forwards to <em>some</em> node on the NodePort. From there, the node's kube-proxy rules decide where the packet actually goes — and whether your pod ever sees the client's real address.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 470" role="img" aria-label="Internet client through a load balancer to a node's NodePort, then two lanes: Cluster policy hops to another node with SNAT applied, losing the client IP; Local policy stays on the receiving node with no SNAT, preserving the client IP, or drops if that node has no local pod">
+        <defs>
+          <marker id="n-ar" markerWidth="10" markerHeight="10" refX="7.5" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" style="fill:var(--accent)"/></marker>
+          <marker id="n-ar2" markerWidth="10" markerHeight="10" refX="7.5" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" style="fill:var(--accent2)"/></marker>
+          <marker id="n-arx" markerWidth="10" markerHeight="10" refX="7.5" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" style="fill:var(--deep)"/></marker>
+        </defs>
+        <text x="360" y="18" text-anchor="middle" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">INTERNET → LB → NODE:NODEPORT → (SNAT?) → POD</text>
+
+        <!-- shared front: client + LB -->
+        <rect x="14" y="34" width="112" height="64" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="70" y="58" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">client</text>
+        <text x="70" y="76" text-anchor="middle" style="fill:var(--muted);font:9.5px ui-monospace,monospace">203.0.113.9</text>
+        <rect x="150" y="34" width="128" height="64" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="214" y="58" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">load balancer</text>
+        <text x="214" y="76" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">picks a node, keeps client IP</text>
+        <line x1="126" y1="66" x2="148" y2="66" style="stroke:var(--accent);stroke-width:2" marker-end="url(#n-ar)"/>
+        <line x1="278" y1="66" x2="304" y2="66" style="stroke:var(--accent);stroke-width:2" marker-end="url(#n-ar)"/>
+        <text x="290" y="58" style="fill:var(--muted);font:9px sans-serif">:31240</text>
+
+        <!-- Lane A: Cluster policy -->
+        <text x="14" y="128" style="fill:var(--deep);font:700 10.5px sans-serif;letter-spacing:.04em">A · externalTrafficPolicy: CLUSTER (default) — any pod, cross-node hop, SNAT</text>
+        <rect x="14" y="136" width="168" height="76" rx="9" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="98" y="158" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">node A · received it</text>
+        <text x="98" y="176" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">KUBE-NODEPORTS →</text>
+        <text x="98" y="192" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">same KUBE-SVC chain</text>
+        <rect x="212" y="136" width="150" height="76" rx="9" style="fill:var(--panel);stroke:var(--deep);stroke-width:1.5"/>
+        <text x="287" y="158" text-anchor="middle" style="fill:var(--deep);font:700 11px sans-serif">MASQUERADE</text>
+        <text x="287" y="176" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">src → node A's IP</text>
+        <text x="287" y="192" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">(client IP is gone)</text>
+        <rect x="392" y="136" width="150" height="76" rx="9" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="467" y="164" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">cross-node hop</text>
+        <text x="467" y="182" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">pod network (Ch 42)</text>
+        <rect x="574" y="136" width="132" height="76" rx="9" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="640" y="164" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">pod · node B</text>
+        <text x="640" y="182" text-anchor="middle" style="fill:var(--accent2);font:9.5px sans-serif">sees src = node A</text>
+        <g style="stroke:var(--deep);stroke-width:2">
+          <line x1="182" y1="174" x2="210" y2="174" marker-end="url(#n-arx)"/>
+          <line x1="362" y1="174" x2="390" y2="174" marker-end="url(#n-arx)"/>
+          <line x1="542" y1="174" x2="572" y2="174" marker-end="url(#n-arx)"/>
+        </g>
+
+        <!-- divider -->
+        <line x1="14" y1="234" x2="706" y2="234" style="stroke:var(--line);stroke-width:1;stroke-dasharray:4 4"/>
+
+        <!-- Lane B: Local policy -->
+        <text x="14" y="258" style="fill:var(--accent2);font:700 10.5px sans-serif;letter-spacing:.04em">B · externalTrafficPolicy: LOCAL — this node's own pods only, no SNAT</text>
+        <rect x="14" y="266" width="168" height="76" rx="9" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="98" y="288" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">node A · received it</text>
+        <text x="98" y="306" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">has a local endpoint?</text>
+        <text x="98" y="322" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">healthCheckNodePort said yes</text>
+        <rect x="212" y="266" width="150" height="76" rx="9" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="287" y="292" text-anchor="middle" style="fill:var(--accent2);font:700 11px sans-serif">no rewrite</text>
+        <text x="287" y="310" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">src stays 203.0.113.9</text>
+        <rect x="392" y="266" width="150" height="76" rx="9" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="467" y="294" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">same-node veth</text>
+        <text x="467" y="312" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">no cross-node hop</text>
+        <rect x="574" y="266" width="132" height="76" rx="9" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="640" y="294" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">pod · node A</text>
+        <text x="640" y="312" text-anchor="middle" style="fill:var(--accent2);font:9.5px sans-serif">sees the real client IP</text>
+        <g style="stroke:var(--accent2);stroke-width:2">
+          <line x1="182" y1="304" x2="210" y2="304" marker-end="url(#n-ar2)"/>
+          <line x1="362" y1="304" x2="390" y2="304" marker-end="url(#n-ar2)"/>
+          <line x1="542" y1="304" x2="572" y2="304" marker-end="url(#n-ar2)"/>
+        </g>
+
+        <!-- bottom note -->
+        <rect x="14" y="360" width="692" height="96" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="30" y="382" style="fill:var(--ink);font:11px sans-serif"><tspan style="fill:var(--deep);font-weight:700">Cluster:</tspan> every node's NodePort can reach every ready pod cluster-wide, at the cost of an occasional extra hop and a rewritten source IP.</text>
+        <text x="30" y="402" style="fill:var(--ink);font:11px sans-serif"><tspan style="fill:var(--accent2);font-weight:700">Local:</tspan> a node only serves pods that live on it — no hop, real client IP — but a node with zero local pods for this</text>
+        <text x="30" y="420" style="fill:var(--ink);font:11px sans-serif">Service <b>drops</b> the packet rather than relaying it. A LoadBalancer's health check is what keeps traffic away from that node.</text>
+        <text x="30" y="440" style="fill:var(--muted);font:10.5px sans-serif">Either lane starts identically: LB → some node's NodePort. Everything past that point is ordinary kube-proxy DNAT (Ch 43).</text>
+      </svg>
+      <figcaption>Both policies enter the same way — the load balancer hits a node's NodePort. <code>Cluster</code> may relay across nodes and masquerades the source IP to keep the return path sane; <code>Local</code> stays on the receiving node and keeps the client's real IP, but only works where a pod actually lives.</figcaption>
+    </figure>
+
+    <details class="recall"><summary>Think first: you <code>curl</code> a node's IP on the NodePort, and that specific node runs zero pods for the Service. Does the connection fail?</summary>
+      <div class="body">
+        <p>Under the default policy, no — it works fine. Every node runs the exact same kube-proxy rules for every Service's NodePort, regardless of whether that node happens to host a matching pod. The <code>KUBE-NODEPORTS</code> chain on that node jumps into the identical per-Service chain a ClusterIP request would use, which may pick an endpoint on a completely different node — the pod network then carries the packet the rest of the way, same as any cross-node Service call. The port being open everywhere is precisely the point: you can dial <em>any</em> node and get a working answer, which is what lets a dumb TCP load balancer (or a human with a script) treat every node as an equally good target.</p>
+      </div>
+    </details>
+
+    <h2 id="internals"><span class="beat">Internal working</span>From Service object to an open port on every node</h2>
+    <ol class="steps">
+      <li><b>You create (or the controller creates) a Service with <code>type: NodePort</code> or <code>type: LoadBalancer</code>.</b> Kubernetes allocates a port from the cluster's NodePort range — default <code>30000–32767</code>, set via the API server's <code>--service-node-port-range</code> flag — unless you pin one yourself with <code>spec.ports[].nodePort</code>. A <code>LoadBalancer</code> Service gets a NodePort too, automatically, unless you explicitly opt out with <code>allocateLoadBalancerNodePorts: false</code> on a controller that supports routing straight to pod IPs.</li>
+      <li><b>kube-proxy on <em>every</em> node programs the same rule.</b> In iptables mode, the top-level <code>KUBE-SERVICES</code> chain has a fallback rule matching "destination is one of this node's own local addresses" that jumps to <code>KUBE-NODEPORTS</code>; that chain matches the port and jumps into the very same <code>KUBE-SVC-&lt;hash&gt;</code> chain a ClusterIP request for this Service would use. There is no separate NodePort datapath — it's an extra entry ramp onto the road Chapter 43 already paved.</li>
+      <li><b>For <code>type: LoadBalancer</code>, the cloud-controller-manager's service controller reacts.</b> It watches for Services of that type and calls the cloud's API to provision a real load balancer, pointed at the NodePort on some set of nodes. On AWS this creates a Classic/Network/Application Load Balancer depending on annotations; in kind, nothing in the cluster can call a cloud API, so the field <code>status.loadBalancer.ingress</code> simply stays empty forever — the classic "my LoadBalancer Service is stuck pending" symptom on a cluster with no cloud integration. <b>MetalLB</b> fills that gap for bare-metal and local clusters: it watches the same Service objects and, instead of calling a cloud API, announces the assigned external IP itself, over ARP (Layer 2 mode) or BGP, from one of your own nodes.</li>
+      <li><b>The packet arrives at a node's NodePort and follows the policy.</b> With <code>externalTrafficPolicy: Cluster</code> (the default), kube-proxy treats it exactly like ClusterIP traffic: any ready endpoint anywhere in the cluster is fair game, and if the chosen pod is on a different node, the packet is masqueraded (SNAT'd to the receiving node's own IP) before being forwarded. The masquerade exists so the reply has somewhere sane to go back to — the pod's default route doesn't know how to reach the original external client directly, but it always knows how to reach its own node.</li>
+      <li><b>With <code>externalTrafficPolicy: Local</code>, kube-proxy restricts the endpoint list to pods on the <em>receiving</em> node only</b>, and skips the masquerade entirely — since the packet never leaves the node, the pod can reply directly and the client's real source IP survives end to end. If the receiving node happens to have no ready local pod for this Service, kube-proxy's rule for that case is a straight drop: no relay to another node, no silent success, just gone.</li>
+      <li><b>kube-proxy opens one more port to make <code>Local</code> usable: <code>healthCheckNodePort</code>.</b> It's a small HTTP endpoint on every node that answers <code>200</code> with the count of local ready endpoints when that count is above zero, and <code>503</code> when it's zero. A cloud load balancer configured for a <code>Local</code>-policy Service polls this on every node and only forwards traffic to the ones answering healthy — which is exactly what stops the drop case in the previous step from ever being hit in a properly wired setup.</li>
+    </ol>
+    <div class="box keypoint"><div class="h">Why the client IP disappears under Cluster policy</div>
+      <p>It's not an oversight — it's the price of letting any node forward to any pod. The moment kube-proxy might relay your packet to a different node, it has to masquerade, because the chosen pod's only reliable way home is back through the node it trusts as a gateway. <code>Local</code> buys back the real IP by giving up that flexibility: it only ever answers where a pod already lives, so no relay, no masquerade, and no ambiguity about the return path.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: with <code>externalTrafficPolicy: Local</code> and an Auto Scaling-style pool of nodes where pods are unevenly spread — say one node runs 6 replicas and nine nodes run none — what happens to load distribution?</summary>
+      <div class="body">
+        <p>It gets lopsided in a way that has nothing to do with the pods' own capacity. A cloud load balancer that's health-checking via <code>healthCheckNodePort</code> only sends traffic to nodes reporting a local endpoint — here, exactly one node — so <em>all</em> external traffic funnels through that single node's local kube-proxy rules, which then spread it across that node's 6 replicas. The other nine nodes are invisible to the load balancer even though they're perfectly healthy, simply because they host nothing for this Service. This is the trade you accept for <code>Local</code>: preserving the client IP means load balancing quality now depends on how evenly your scheduler happens to have spread replicas across nodes, not on the load balancer's own algorithm. Wide, even pod spread (anti-affinity, topology spread constraints) matters far more under <code>Local</code> than under <code>Cluster</code>.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces and what each owns</h2>
+    <ul>
+      <li><b>The NodePort range.</b> A cluster-wide slice of ports (default <code>30000–32767</code>) that the API server hands out from. Owns nothing about routing — it's just an allocation ledger so two Services never collide on the same port.</li>
+      <li><b>kube-proxy's <code>KUBE-NODEPORTS</code> chain (or its IPVS/nftables equivalent).</b> The entry ramp on every node that recognises "this port, addressed to me" and hands off into the same per-Service chain ClusterIP traffic uses. It also owns the policy branch — Cluster's masquerade-and-any-endpoint versus Local's node-local-only-and-drop.</li>
+      <li><b>The cloud-controller-manager's service controller.</b> Watches <code>type: LoadBalancer</code> Services and talks to a cloud API to create, update, and tear down the actual external load balancer and its health checks. This is the piece kind has no equivalent for out of the box.</li>
+      <li><b>MetalLB (or another bare-metal LB implementation).</b> Plays the cloud-controller's role on clusters with no cloud underneath them: assigns an external IP from a configured pool and announces it itself, so <code>type: LoadBalancer</code> actually produces a reachable address on a laptop.</li>
+      <li><b><code>healthCheckNodePort</code>.</b> A per-node HTTP health endpoint that exists specifically to make <code>externalTrafficPolicy: Local</code> safe to use — it's how an external load balancer learns which nodes currently have a live local pod, before it ever sends real traffic there.</li>
+      <li><b>conntrack.</b> Same connection-tracking table from Chapter 43, now also remembering the masquerade (if any) so replies get un-NATed correctly on the way back out.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one external request, then the same one under Local</h2>
+    <p>A browser at <code>203.0.113.9</code> opens a connection to your service's public DNS name, which resolves to a cloud load balancer's IP. The load balancer accepts the connection and forwards it — unmodified, still carrying the browser's real source IP — to node A on the Service's NodePort, <code>31240</code>. Under the default <code>Cluster</code> policy, node A's kube-proxy rules treat this exactly like a ClusterIP hit: the per-Service chain rolls its endpoint dice cluster-wide and happens to pick a pod on node B. Because that pod isn't local, kube-proxy masquerades the source to node A's own IP before forwarding across the pod network; the pod on node B replies to node A, node A un-NATs it back to the load balancer, and the load balancer relays it to the browser. The browser had a perfectly normal experience; your pod's access log shows every single request as coming from node A's IP, no matter which of a thousand browsers actually called.</p>
+    <p>Switch the Service to <code>externalTrafficPolicy: Local</code> and re-run the same request. Now the load balancer has already been polling <code>healthCheckNodePort</code> on every node and only forwards to ones reporting a local endpoint. If node A has one, the packet lands there, kube-proxy restricts the pick to node A's own pod, skips the masquerade, and the pod's access log shows <code>203.0.113.9</code> — the browser's actual address. If node A had reported zero local endpoints, the load balancer would simply never have sent traffic there in the first place — which is the entire reason <code>healthCheckNodePort</code> exists.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>You need a kind cluster and <a href="https://metallb.io/">MetalLB</a>, which plays the role your cloud's load-balancer controller would play in production. Build a three-node cluster so there's real room for traffic to land on a node with no local pod:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>kind create cluster --name netlab --config - &lt;&lt;'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker2
+EOF
+
+<span class="c"># Install MetalLB, then give it an IP pool inside kind's own docker network:</span>
+kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.8/config/manifests/metallb-native.yaml
+kubectl -n metallb-system rollout status deployment/controller --timeout=120s
+
+SUBNET=$(docker network inspect kind -f '{{(index .IPAM.Config 0).Subnet}}')   <span class="c"># e.g. 172.18.0.0/16</span>
+echo "kind docker subnet: $SUBNET"    <span class="c"># pick a small unused range inside it, e.g. 172.18.255.200-172.18.255.250</span>
+kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata: { name: pool, namespace: metallb-system }
+spec: { addresses: ["172.18.255.200-172.18.255.250"] }
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata: { name: l2, namespace: metallb-system }
+spec: { ipAddressPools: ["pool"] }
+EOF</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — a NodePort that answers on every node</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Deploy a Service that reports its own pod name, expose it as a NodePort, and dial <em>every</em> node's IP on that port — including nodes with no replica scheduled to them.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl create deployment echo --image=hashicorp/http-echo -- /http-echo -listen=:8080 -text="hi from $(HOSTNAME)"
+kubectl expose deployment echo --port=8080 --type=NodePort
+NODEPORT=$(kubectl get svc echo -o jsonpath='{.spec.ports[0].nodePort}')
+echo "NodePort: $NODEPORT"
+
+<span class="c"># Which node actually runs the pod?</span>
+kubectl get pods -l app=echo -o wide
+
+<span class="c"># Now hit ALL three nodes on that port, including ones with no pod:</span>
+for n in netlab-control-plane netlab-worker netlab-worker2; do
+  IP=$(docker inspect -f '{{.NetworkSettings.Networks.kind.IPAddress}}' "$n")
+  echo -n "$n ($IP): "; curl -s -m3 "http://$IP:$NODEPORT" || echo "no answer"
+done</code></pre></div>
+        <div class="out"><span class="ol">Output</span>netlab-control-plane (172.18.0.2): hi from echo-7d9f...
+netlab-worker (172.18.0.3): hi from echo-7d9f...
+netlab-worker2 (172.18.0.4): hi from echo-7d9f...</code></div>
+        <p>All three answer, from the same single pod, even though that pod runs on only one node. That's the whole primitive: the port is open everywhere, and kube-proxy relays for you when the local node isn't the lucky one.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — watch the client IP survive or die by policy</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Turn the Deployment into a real LoadBalancer Service and capture what the pod actually sees as the source address, under both policies. First, the default:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl patch service echo -p '{"spec":{"type":"LoadBalancer"}}'
+sleep 5
+EXT_IP=$(kubectl get svc echo -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+echo "External IP: $EXT_IP"
+kubectl logs -l app=echo --tail=5
+curl -s "http://$EXT_IP:8080"
+kubectl logs -l app=echo --tail=1        <span class="c"># http-echo logs the remote address per request</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>External IP: 172.18.255.200
+... "remote_addr":"172.18.0.4:52110" ...   <span class="c"># a NODE's IP, not your laptop's</span></code></div>
+        <p>The logged address is a cluster node, not the machine you ran <code>curl</code> from — that's the masquerade from Cluster policy in action, even for a request that started outside the cluster entirely. Now flip the policy and repeat:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl patch service echo -p '{"spec":{"externalTrafficPolicy":"Local"}}'
+sleep 3
+curl -s "http://$EXT_IP:8080"
+kubectl logs -l app=echo --tail=1</code></pre></div>
+        <div class="out"><span class="ol">Output</span>... "remote_addr":"172.18.0.1:54321" ...   <span class="c"># your laptop's address on the kind docker network</span></code></div>
+        <p>Same Service, same pod, one field changed — and the address the app sees flips from "some node" to "the real caller." If your app does IP-based rate limiting, audit logging, or GeoIP lookups, this one field is the difference between those features working and silently logging your own infrastructure.</p>
+      </div>
+    </div>
+
+    <details class="recall"><summary>Think first: after switching to <code>Local</code>, MetalLB's speaker still announces the external IP from whichever node it elected as leader. What has to be true for the request to succeed at all?</summary>
+      <div class="body">
+        <p>The leader node MetalLB is announcing from has to actually have a ready local pod for the Service — otherwise <code>Local</code>'s drop rule kicks in and the request fails outright, even though the external IP itself answers ARP requests fine. This is a real gap in a minimal MetalLB setup: MetalLB's Layer-2 mode doesn't natively consult <code>healthCheckNodePort</code> the way a cloud NLB integration does, so it's possible to elect a leader node that has zero local endpoints and blackhole every request until MetalLB re-elects a different leader. In production cloud environments this exact failure is why the NLB-to-<code>healthCheckNodePort</code> wiring matters so much — the load balancer is actively steering away from empty nodes, not just hoping the DNAT works out.</p>
+      </div>
+    </details>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — a Local-policy node with nothing to serve</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Force the exact scenario the analogy warned about: pin the single replica away from a specific node, keep <code>Local</code> policy, and hit that empty node's NodePort directly.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl patch deployment echo -p '{"spec":{"template":{"spec":{"nodeName":"netlab-worker"}}}}'
+kubectl delete pod -l app=echo   <span class="c"># force a reschedule onto netlab-worker specifically</span>
+kubectl wait --for=condition=Ready pod -l app=echo --timeout=60s
+kubectl get pods -l app=echo -o wide     <span class="c"># confirm: only on netlab-worker</span>
+
+NODEPORT=$(kubectl get svc echo -o jsonpath='{.spec.ports[0].nodePort}')
+EMPTY_IP=$(docker inspect -f '{{.NetworkSettings.Networks.kind.IPAddress}}' netlab-worker2)
+curl -s -m3 "http://$EMPTY_IP:$NODEPORT" || echo "NO RESPONSE"</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NO RESPONSE</code></div>
+        <p>Compare that with hitting <code>netlab-control-plane</code> or <code>netlab-worker</code> on the same port right now — before you check, predict which ones answer and which one goes silent, and why <code>netlab-worker2</code> specifically fails closed instead of relaying like it would under <code>Cluster</code>.</p>
+        <details class="recall"><summary>Reveal what's happening</summary>
+          <div class="body">
+            <p><code>netlab-worker2</code> has no local pod for this Service, and the policy is <code>Local</code>, so kube-proxy's rule on that node is a straight drop — no relay to <code>netlab-worker</code>, no error message, just a connection that times out. <code>netlab-worker</code> (the node actually running the pod) answers instantly, and <code>netlab-control-plane</code> also drops, for the identical reason. This is the mechanism, working exactly as designed — the danger is entirely in <em>which nodes an external load balancer chooses to send to</em>. A properly wired cloud LoadBalancer never sends here because it's watching <code>healthCheckNodePort</code>; a hand-rolled health check, a bare TCP load balancer with no health-check awareness, or a client that resolved a node's bare IP from somewhere and dials it directly will hit exactly this wall. Revert with <code>kubectl patch deployment echo --type=json -p '[{"op":"remove","path":"/spec/template/spec/nodeName"}]'</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — read <code>healthCheckNodePort</code> like the load balancer does</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Rather than guessing which nodes are "safe" under <code>Local</code>, query the exact endpoint a real cloud load balancer polls. Kubernetes allocates it automatically the moment you set the policy.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>HC_PORT=$(kubectl get svc echo -o jsonpath='{.spec.healthCheckNodePort}')
+echo "healthCheckNodePort: $HC_PORT"
+for n in netlab-control-plane netlab-worker netlab-worker2; do
+  IP=$(docker inspect -f '{{.NetworkSettings.Networks.kind.IPAddress}}' "$n")
+  echo -n "$n: "; curl -s -o /dev/null -w '%{http_code}\n' "http://$IP:$HC_PORT/healthz"
+done</code></pre></div>
+        <div class="out"><span class="ol">Output</span>netlab-control-plane: 503
+netlab-worker: 200
+netlab-worker2: 503</code></div>
+        <p>That's the entire signal a real load balancer's health check acts on — <code>200</code> means "route here," <code>503</code> means "don't." This single query would have told you, before running Lab 3, exactly which node was safe to dial and which two would drop. In production, if you ever see <code>Local</code>-policy traffic dropping intermittently, this is the first thing to check — not the pods, not the CNI, this endpoint on each node. If a cloud NLB isn't configured to actually use it (a misconfigured health-check port on the LB side), you get exactly Lab 3's blackhole, cluster-wide and unpredictable, because the LB is guessing instead of asking.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — design for both real client IPs and even load</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>A team wants two things at once from one Service: accurate client IPs in their access logs (needed for abuse detection) <em>and</em> load spread evenly across a 20-node cluster where only 6 nodes happen to run a replica at any moment (a small Deployment, big cluster). Using only what this chapter covers, is that possible with a single Service? Reason it out before opening the answer.</p>
+        <details class="recall"><summary>Reveal the reasoning</summary>
+          <div class="body">
+            <p><b>Not with policy alone — you're trading one property for the other, and you have to attack the second one differently.</b> <code>Cluster</code> gives you even load (any of the 6 replicas, from any of the 20 nodes) but destroys the client IP. <code>Local</code> gives you the real client IP but ties your effective load balancing to wherever the scheduler happened to place those 6 pods — with 14 nodes reporting unhealthy on <code>healthCheckNodePort</code> and only 6 ever receiving traffic at all.</p>
+            <p>The fix is to stop asking the NodePort layer to solve a problem it can't, and use <code>Local</code> deliberately <em>plus</em> control where the pods land. Two levers, usually combined: first, use a <b>Pod Topology Spread Constraint</b> (or anti-affinity) so the scheduler is forced to spread the 6 replicas across 6 <em>different</em> nodes rather than letting several stack on one — this makes <code>Local</code>'s "only nodes with a local pod get traffic" cover 6 well-distributed entry points instead of 1 or 2. Second, if you need every one of the 20 nodes to be a valid entry point regardless of where pods land, that's the sign you actually want more replicas (closer to node count) or you want L7 routing in front (an Ingress controller, Chapter 46) that itself uses <code>Local</code> correctly on a wide DaemonSet-style deployment, since a controller you run as a DaemonSet naturally has one pod per node. There is no Service-level flag that gives you both properties for free — that tension is exactly why real production traffic usually terminates at something smarter than a raw NodePort, which is where the next two chapters go.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · every request logged from the same one or two IPs</div>
+      <p><b>Symptom:</b> access logs, rate limiters, or GeoIP-based fraud checks show a tiny handful of source IPs responsible for all traffic, and they turn out to be your own cluster nodes. <b>First cut:</b> <code>kubectl get svc &lt;name&gt; -o jsonpath='{.spec.externalTrafficPolicy}'</code> — is it <code>Cluster</code> (the default) or unset? <b>Confirm:</b> the logged IPs match node IPs, not real clients. <b>Fix:</b> switch to <code>externalTrafficPolicy: Local</code> if your load balancer supports its health check — and only after checking that your pods are spread across enough nodes to keep load reasonably even (Lab 5).</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · intermittent timeouts hitting a LoadBalancer Service</div>
+      <p><b>Symptom:</b> a fraction of requests to a <code>Local</code>-policy Service time out, seemingly at random, while most succeed. <b>First cut:</b> check <code>healthCheckNodePort</code> on every node directly — are some answering <code>503</code>? <b>Confirm:</b> correlate failures with the load balancer occasionally still routing to a node that just lost its last local pod (a rollout in progress, a node drain) before the health check catches up. <b>Cause is usually:</b> a rollout or scale-down briefly leaving a node with zero local endpoints while the LB's health-check interval hasn't yet marked it unhealthy — a timing gap, not a config error. Tightening the health-check interval and using a <code>PodDisruptionBudget</code> to slow rollouts both narrow the window.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · LoadBalancer Service stuck Pending forever</div>
+      <p><b>Symptom:</b> <code>kubectl get svc</code> shows <code>&lt;pending&gt;</code> under <code>EXTERNAL-IP</code> indefinitely. <b>First cut:</b> is there anything in the cluster that implements the cloud-controller's service-controller role at all? <b>Confirm:</b> <code>kubectl describe svc</code> shows no events about a load balancer being created; on a self-managed or bare-metal cluster, nothing is watching <code>type: LoadBalancer</code> Services. <b>Cause is usually:</b> a cluster with no cloud-controller-manager and no MetalLB (or equivalent) installed — the NodePort underneath is actually fine; there's simply no automation to provision the front door. This is the single most common reason a fresh kind or on-prem cluster's LoadBalancer Services never get an IP.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Default to <code>Cluster</code>, switch to <code>Local</code> deliberately.</b> Most teams don't need the real client IP badly enough to accept <code>Local</code>'s coupling between pod placement and load distribution. Reach for <code>Local</code> when something downstream genuinely depends on the true source IP — abuse detection, per-tenant rate limiting, compliance logging that legally must record the real caller — and pair it with topology spread constraints so the nodes your load balancer sees as "healthy" are actually spread out.</p>
+    <p><b>Don't forget the health-check interval is a real window of risk.</b> <code>healthCheckNodePort</code> only protects you as fast as your load balancer polls it. A slow health-check interval combined with a fast rollout can leave a brief gap where the LB still thinks a now-empty node is good. Tie your rollout speed (via <code>maxUnavailable</code>/<code>maxSurge</code> and a <code>PodDisruptionBudget</code>) to how fast your LB can actually notice a node going empty, not the other way around.</p>
+    <p><b>Know what your cloud is actually doing underneath <code>LoadBalancer</code>.</b> Some cloud integrations, in some modes, skip the NodePort hop entirely once you're inside the cluster — the AWS Load Balancer Controller can register pod IPs as targets directly (Chapter 52's <code>ip</code> target type), which sidesteps this whole chapter's extra hop and SNAT question altogether. Read your cloud's controller documentation before assuming "LoadBalancer" always means "NodePort plus a cloud LB" — on EKS specifically, it frequently doesn't. <b>Common mistakes:</b> assuming client IPs are preserved by default (they're not); leaving a Service on <code>Local</code> policy without ever checking pod spread; treating a stuck-<code>Pending</code> LoadBalancer as a networking bug when it's a missing controller; and health-checking a bare NodePort from a script that doesn't know about <code>healthCheckNodePort</code> and so can't tell a healthy node from an empty one.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>Every "how does traffic get from the internet to my service" design question is really this chapter, layered under something fancier. On AWS specifically, the <code>ip</code> target-type pattern from <a href="ch52-load-balancing-alb-nlb-target-groups-health.html">Chapter 52</a> is the production answer to the exact tension Lab 5 raises — instead of choosing between <code>Cluster</code>'s even load and <code>Local</code>'s real client IP, a target group that registers pod IPs directly gets both, because the load balancer itself becomes endpoint-aware and kube-proxy is removed from the path completely. That only works because pods have real, directly addressable IPs, which is <a href="ch58-vpc-cni-the-deep-one.html">Chapter 58</a>'s whole subject. Where the underlying CNI is an overlay instead, target groups can't reach pod IPs from outside the cluster, and NodePort-based entry — with its accompanying trade-offs — is what you're stuck reasoning about. Either way, an Ingress controller or Gateway (next chapter) is itself just another Service of this exact type sitting at the edge, which is why understanding NodePort cold makes every layer built on top of it easier to place.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's the difference between a NodePort and a LoadBalancer Service?</summary>
+        <div class="a"><p>A NodePort reserves one port on every node and wires it into the same kube-proxy DNAT rules a ClusterIP uses — you can reach it by dialing any node's IP on that port. A LoadBalancer Service is a NodePort plus automation: the cloud-controller-manager (or something like MetalLB on bare metal) watches for it and provisions an actual external load balancer pointed at that NodePort on some or all nodes. There's no separate datapath for LoadBalancer — it's a NodePort with a real front door built in front of it.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through what happens to a packet from <code>externalTrafficPolicy: Cluster</code> versus <code>Local</code>.</summary>
+        <div class="a"><p>Both start identically: an external load balancer forwards to some node's NodePort, and that node's kube-proxy rules take over via the same chain a ClusterIP hit would use. Under <code>Cluster</code>, the default, kube-proxy can pick any ready endpoint cluster-wide; if it lands on a pod on a different node, the source IP gets masqueraded to the receiving node's own IP before the packet crosses the pod network, because the pod's only reliable return path is through that node. The upside is even load across the whole cluster; the cost is that the app never sees the real client IP, and there's an occasional extra network hop. Under <code>Local</code>, kube-proxy only considers endpoints on the node that actually received the packet — no masquerade needed, since the reply goes straight back out the same node — so the real client IP survives, but if that node has zero local endpoints for the Service, the packet is dropped rather than relayed. That drop is why <code>Local</code> ships with <code>healthCheckNodePort</code>, a per-node health endpoint that reports whether local endpoints exist, so a properly integrated load balancer learns to route only to nodes that can actually serve the request.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Why does Kubernetes need to masquerade the source IP for cross-node NodePort traffic at all?</summary>
+        <div class="a"><p>Because of return-path routing, not because of anything intrinsic to NAT. When a NodePort packet lands on node A but gets forwarded to a pod on node B, that pod's network namespace has a default route back through node B's networking stack, not through node A — it has no idea an external client is even involved, let alone how to route a reply straight back to that client's address across the internet. If Kubernetes didn't rewrite the source, the pod would try to reply directly, which either fails outright (no route) or, worse, succeeds via some other path and breaks the connection's expected symmetry with whatever sits in front — the load balancer, a stateful firewall, anything tracking the flow by its original 4-tuple. Masquerading the source to node A's own IP means the reply naturally flows back through node A, which un-NATs it via conntrack and forwards it the way it originally came. <code>externalTrafficPolicy: Local</code> sidesteps the whole problem by refusing to ever relay cross-node in the first place — no relay, no asymmetry, no masquerade needed.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>Your team just noticed every request in the app's logs comes from one of two IP addresses, and rate limiting is now blocking legitimate users. What's going on and what do you check?</summary>
+        <div class="a"><p>My first suspect is <code>externalTrafficPolicy</code> sitting at its default, <code>Cluster</code>, on a LoadBalancer or NodePort Service — the "one or two IPs" are almost certainly cluster node addresses, because under Cluster policy any cross-node relay masquerades the source to the receiving node's IP, and with only a handful of nodes actually facing the load balancer you get exactly a handful of distinct source addresses. I'd confirm with <code>kubectl get svc -o jsonpath='{.spec.externalTrafficPolicy}'</code> and by cross-checking the logged IPs against <code>kubectl get nodes -o wide</code>. The fix is switching to <code>externalTrafficPolicy: Local</code> so pods see the real client IP — but before flipping it, I'd check where the pods for this Service are actually scheduled, because Local ties your effective load distribution to that placement, and I'd want topology spread in place so I'm not trading one incident for a load-imbalance incident. I'd also double check the load balancer or ingress path isn't already supposed to be preserving the IP via a header like <code>X-Forwarded-For</code> that the app simply isn't reading — sometimes the IP was never lost, just ignored.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>How does an EKS ALB or NLB relate to all of this?</summary>
+        <div class="a"><p>It depends entirely on the target type. If the AWS Load Balancer Controller is configured with <code>instance</code> targets, it's registering nodes and their NodePorts as targets — which is exactly this chapter's mechanism, complete with the possible cross-node hop and, unless you've set <code>Local</code>, the lost client IP. If it's configured with <code>ip</code> targets instead, the controller registers pod IPs directly in the target group, because the VPC CNI gives every pod a real, routable VPC address — that bypasses kube-proxy and this entire NodePort layer completely, so the load balancer talks straight to the pod, keeps the real client IP without needing <code>Local</code> at all, and load-balances evenly regardless of where pods happen to be scheduled. That's why <code>ip</code> mode is the default recommendation on EKS: it gets you both of the properties that a plain NodePort setup forces you to choose between.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>A ClusterIP only exists inside the cluster, so reaching a pod from outside needs a port opened on the nodes themselves — that's a NodePort, allocated from a cluster-wide range (default 30000–32767) and wired by kube-proxy into the exact same DNAT chain a ClusterIP uses via a <code>KUBE-NODEPORTS</code> entry ramp. A LoadBalancer Service is that same NodePort plus automation — the cloud-controller-manager, or MetalLB on bare metal — that provisions a real external front door pointed at it. <code>externalTrafficPolicy: Cluster</code> (default) can relay to any pod cluster-wide but masquerades the source IP on any cross-node hop, so apps see node IPs, not client IPs. <code>externalTrafficPolicy: Local</code> only serves node-local pods, preserving the real client IP and skipping the extra hop, but drops the packet outright on any node with zero local endpoints — which is why it ships with <code>healthCheckNodePort</code>, the signal a real load balancer needs to avoid sending traffic to an empty node. There's no third mechanism hiding anywhere in this layer.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>A NodePort opens the same port on every node, wired into the identical per-Service DNAT chain a ClusterIP uses.</li>
+      <li>Default NodePort range is 30000–32767, set by the API server's <code>--service-node-port-range</code>.</li>
+      <li>A LoadBalancer Service is a NodePort plus a controller (cloud-controller-manager, or MetalLB) that provisions a real front door.</li>
+      <li><code>externalTrafficPolicy: Cluster</code> (default): any ready pod cluster-wide, with SNAT on any cross-node relay.</li>
+      <li><code>externalTrafficPolicy: Local</code>: node-local pods only, no SNAT, real client IP preserved.</li>
+      <li>A <code>Local</code>-policy node with zero local endpoints drops the packet — it never relays elsewhere.</li>
+      <li><code>healthCheckNodePort</code> reports local-endpoint count per node; it's what keeps a real LB away from empty nodes.</li>
+      <li>Client-IP loss under Cluster policy shows up as requests logged from one or two node IPs — check <code>externalTrafficPolicy</code> first.</li>
+      <li>Local policy ties load distribution to pod placement — pair it with topology spread constraints.</li>
+      <li>A stuck-<code>Pending</code> LoadBalancer Service usually means no cloud-controller or MetalLB equivalent is installed, not a network bug.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch43-services-and-the-datapath-pod-to-service.html"><b>Ch 43</b> Services &amp; the datapath</a>
+      <a href="ch45-coredns-and-service-discovery.html"><b>Ch 45</b> CoreDNS</a>
+      <a href="ch46-ingress-and-the-gateway-api.html"><b>Ch 46</b> Ingress &amp; Gateway API</a>
+      <a href="ch52-load-balancing-alb-nlb-target-groups-health.html"><b>Ch 52</b> ALB/NLB target groups</a>
+      <a href="ch58-vpc-cni-the-deep-one.html"><b>Ch 58</b> VPC CNI &amp; pod IPs</a>
+      <a href="ch60-end-to-end-synthesis-internet-to-alb.html"><b>Ch 60</b> Internet → ALB → Pod</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/services-networking/service/">Service</a>: NodePort and LoadBalancer types, port allocation, and <code>externalTrafficPolicy</code>.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/reference/networking/virtual-ips/">Virtual IPs and Service Proxies</a>: the <code>KUBE-NODEPORTS</code> chain, masquerading, and <code>healthCheckNodePort</code> in detail.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/tutorials/services/source-ip/">Using Source IP</a>: the tutorial explaining exactly why and when the client IP is preserved or rewritten.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/architecture/cloud-controller/">Cloud Controller Manager</a>: the component that turns a <code>LoadBalancer</code> Service into a real cloud load balancer.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/tasks/access-application-cluster/create-external-load-balancer/">Create an External Load Balancer</a>: the task walkthrough this chapter's labs mirror.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch43-services-and-the-datapath-pod-to-service.html"><span class="dir">← Prev</span><div class="ti">Ch 43 — Services and the datapath: Pod → Service</div></a>
+      <a class="nx" href="ch45-coredns-and-service-discovery.html"><span class="dir">Next →</span><div class="ti">Ch 45 — CoreDNS and service discovery</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 44 of 121 · Part V · Kubernetes Networking at Packet Level. You can now trace a packet from the open internet to a specific pod, and say exactly what it cost you to get there.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Internet → LB → node → pod</a>
+    <a href="#internals">Port to open port</a>
+    <a href="#components">The components</a>
+    <a href="#flow">Following a request</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

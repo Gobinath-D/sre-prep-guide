@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 86 — The Data Layer: MySQL &amp; PostgreSQL</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part IX · Distributed Systems &nbsp;·&nbsp; Chapter 86</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part IX · Distributed Systems, Data &amp; Reliability · Chapter 86</div>
+      <h1>The data layer — MySQL and PostgreSQL</h1>
+      <p class="tagline">Every "stateless" service you've ever run is a thin wrapper around a database that isn't stateless at all. The day it can't keep up, kubectl scale stops helping and you're reading lock tables at 2 a.m.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~50 min read · Docker lab (MySQL + PostgreSQL)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain why a B-tree index turns a table scan into a handful of page reads, and why the wrong index doesn't help at all.</li>
+          <li>Say what a transaction isolation level actually changes about what one connection can see of another's work.</li>
+          <li>Read an <code>EXPLAIN</code> plan and tell whether it's using an index or quietly scanning the whole table.</li>
+          <li>Explain MVCC well enough to say why a long-running <code>SELECT</code> doesn't block writers, and why that isn't free.</li>
+          <li>Diagnose connection exhaustion and lock contention from first principles, not from a runbook you memorized.</li>
+          <li>Plan a schema change on a live, busy table without taking an outage to do it.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem every database is actually solving</h2>
+    <p>Your app has state. A user's balance, an order's status, a session — something has to remember it after the request that created it is long gone. You could keep it in a process's memory, but that memory disappears the moment the process restarts, and it's invisible to every other process that also needs to read or change that same fact. So you put it somewhere shared and durable: a file, then a table, then a database.</p>
+    <p>The moment you do that, three problems show up at once. Many callers want to read and write the same rows at the same time, and if you let them do it carelessly they'll corrupt each other's work — two requests both reading a balance of 100, both subtracting 30, both writing back 70, and now 30 dollars just vanished. The machine can crash mid-write, and when it comes back the data has to be exactly as correct as it was the instant before the crash, not "mostly." And someone is going to ask a question you didn't precompute an answer for — "which orders shipped late last Tuesday" — and it has to come back in milliseconds, not by reading every row ever written.</p>
+    <p>MySQL and PostgreSQL are the two relational databases you'll run into constantly as an SRE. They solve the same three problems — concurrency, durability, fast lookup — with genuinely different internals, and the differences are exactly where the interesting incidents live. This chapter is about the machinery underneath the SQL: what a B-tree actually does, what a transaction is actually promising you, and what happens the instant two people try to touch the same row.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>A relational database is a concurrency-control system with a storage engine bolted on, not the other way around. Almost every production incident you'll hit — deadlocks, connection storms, a migration that hung — is a concurrency problem wearing a SQL costume.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a library, not a filing cabinet</h2>
+    <p>Forget "database" for a second and picture a library that's open 24 hours, with thousands of people walking in and out.</p>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>The books themselves, sitting on shelves in whatever order they were shelved, are your <b>table's rows</b>. Finding a book by walking every shelf works, but it's slow once the library gets big. So the library keeps a <b>card catalog</b> — index cards sorted by title, pointing you straight to a shelf and position. That catalog is your <b>index</b>: a B-tree, sorted, letting you jump to the right neighborhood in a handful of steps instead of scanning the whole building.</p>
+      <p>Now, two people want the same reference copy of a book at once. The library can hand out a "reading room" copy that says <em>as of the moment you sat down</em> — you keep reading your version undisturbed even if someone else checks out and replaces the real copy five minutes later. That's <b>MVCC</b>: readers work off a consistent snapshot instead of getting blocked by writers, or seeing a half-finished change.</p>
+      <p>But some things can't be duplicated — there's exactly one master ledger of who currently has book #4471 checked out. Only one person edits that ledger entry at a time; everyone else waits their turn. That's a <b>row lock</b>. And when the front desk has exactly 100 numbered visitor badges and 150 people are waiting for one, that's <b>connection exhaustion</b> — the building isn't full, the badges are.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In the database</th></tr>
+      <tr><td>Books on shelves, in no useful order</td><td>The table heap / clustered data pages</td></tr>
+      <tr><td>The card catalog, sorted, pointing to a shelf position</td><td>A B-tree index</td></tr>
+      <tr><td>A reading-room copy frozen at the moment you sat down</td><td>An MVCC snapshot</td></tr>
+      <tr><td>The one master ledger entry for who holds a book</td><td>A row lock (shared or exclusive)</td></tr>
+      <tr><td>A fixed stack of numbered visitor badges at the front desk</td><td>A connection pool bounded by <code>max_connections</code></td></tr>
+      <tr><td>Re-shelving overnight without ever closing the doors</td><td>An online, expand/contract schema change</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>From your app to a page on disk</h2>
+    <p>Every query travels the same rough path: your app opens or borrows a connection, sends SQL text, the engine turns that text into a plan, the plan touches an index and then the underlying rows, and somewhere in there the engine has to decide what you're allowed to see and what you're allowed to lock.</p>
+    <p>The two engines differ from the very first hop. <b>MySQL/InnoDB</b> hands each connection a thread; the thread lives for the connection's lifetime and is comparatively cheap, though still bounded by <code>max_connections</code> (151 by default in MySQL 8). <b>PostgreSQL</b> forks an entire OS process per connection — heavier, with its own memory footprint, but a genuinely simpler mental model for isolation between sessions. That one architectural choice is why PgBouncer or another external pooler is close to mandatory on Postgres at any real scale, and it's the root cause behind one of the labs later in this chapter.</p>
+    <p>The other architectural fork is how rows are actually stored. InnoDB is <b>index-organized</b>: the primary key's B-tree leaf pages <em>are</em> the row data, and every secondary index stores the indexed columns plus the primary key value, not a raw pointer. Postgres stores rows in a plain <b>heap</b> — insertion order, mostly — and every index, including the primary key's, is a separate structure holding a pointer (a page number and slot, called a TID) back into that heap. Practically: an InnoDB primary-key lookup is one B-tree walk, full stop. A Postgres primary-key lookup is a B-tree walk followed by a heap fetch. Neither is "better" — it's a tradeoff between write amplification, clustering locality, and how updates are handled — but if you've ever wondered why the two engines behave differently under the same-looking schema, this is usually why.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 430" role="img" aria-label="A query moving from the app through a connection pool, the planner, a B-tree index, and the lock manager, down to the buffer pool and disk">
+        <rect x="18" y="18" width="684" height="70" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="34" y="38" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">CLIENT LAYER</text>
+        <rect x="42" y="48" width="220" height="30" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="152" y="68" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">your app — N pods</text>
+        <rect x="300" y="48" width="220" height="30" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="410" y="68" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">connection pool</text>
+
+        <line x1="200" y1="88" x2="200" y2="114" style="stroke:var(--deep);stroke-width:2" marker-end="url(#a)"/>
+        <text x="212" y="106" style="fill:var(--deep);font:600 11px sans-serif">one SQL statement, one borrowed connection</text>
+
+        <rect x="18" y="120" width="684" height="152" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="34" y="140" style="fill:var(--accent);font:700 12px sans-serif;letter-spacing:.05em">QUERY ENGINE</text>
+
+        <rect x="42" y="152" width="140" height="42" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="112" y="176" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">parser + planner</text>
+
+        <text x="248" y="152" text-anchor="middle" style="fill:var(--muted);font:600 10.5px sans-serif">index B-tree</text>
+        <rect x="220" y="158" width="56" height="24" rx="6" style="fill:var(--chip);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="248" y="174" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">root</text>
+        <line x1="232" y1="182" x2="212" y2="200" style="stroke:var(--accent2);stroke-width:1.5"/>
+        <line x1="264" y1="182" x2="284" y2="200" style="stroke:var(--line);stroke-width:1.5"/>
+        <rect x="180" y="202" width="60" height="22" rx="6" style="fill:var(--chip);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="210" y="217" text-anchor="middle" style="fill:var(--ink);font:600 10px sans-serif">branch</text>
+        <rect x="254" y="202" width="60" height="22" rx="6" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="284" y="217" text-anchor="middle" style="fill:var(--muted);font:600 10px sans-serif">branch</text>
+        <line x1="196" y1="224" x2="182" y2="240" style="stroke:var(--accent2);stroke-width:1.5"/>
+        <rect x="146" y="242" width="74" height="22" rx="6" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="183" y="257" text-anchor="middle" style="fill:var(--accent2);font:700 10px sans-serif">leaf → row 42</text>
+
+        <rect x="470" y="152" width="200" height="96" rx="8" style="fill:var(--chip);stroke:var(--deep);stroke-width:1.5"/>
+        <text x="570" y="174" text-anchor="middle" style="fill:var(--deep);font:700 12px sans-serif">lock manager</text>
+        <text x="570" y="194" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">row 42 : X-lock</text>
+        <text x="570" y="212" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">held by txn 7</text>
+        <text x="570" y="230" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">txn 9 waits → timeout or deadlock</text>
+
+        <line x1="315" y1="183" x2="468" y2="188" style="stroke:var(--line);stroke-width:1.5;stroke-dasharray:5 4"/>
+
+        <line x1="360" y1="272" x2="360" y2="296" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#b)"/>
+        <text x="372" y="288" style="fill:var(--accent2);font:600 11px sans-serif">page number(s) to fetch</text>
+
+        <rect x="18" y="302" width="684" height="56" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="34" y="322" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">BUFFER POOL / SHARED_BUFFERS — in RAM</text>
+        <text x="360" y="344" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">a hit here never touches disk</text>
+
+        <line x1="360" y1="358" x2="360" y2="380" style="stroke:var(--muted);stroke-width:2;stroke-dasharray:5 4" marker-end="url(#a)"/>
+        <text x="372" y="374" style="fill:var(--muted);font:600 11px sans-serif">on a miss</text>
+
+        <rect x="18" y="386" width="684" height="36" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="360" y="408" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">DISK — table heap pages &amp; index pages</text>
+
+        <defs>
+          <marker id="a" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--deep)"/></marker>
+          <marker id="b" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+        </defs>
+      </svg>
+      <figcaption>The planner picks an index (or doesn't), the lock manager decides who has to wait, and the buffer pool decides whether any of this touches a disk.</figcaption>
+    </figure>
+
+    <details class="recall"><summary>Think first: your query has a <code>WHERE</code> clause on an indexed column, but <code>EXPLAIN</code> shows a full table scan anyway. Is the index broken?</summary>
+      <div class="body">
+        <p>Almost never. The optimizer decides an index is worth using based on estimated selectivity — if it thinks the <code>WHERE</code> clause matches a large fraction of the table, a scan can genuinely be cheaper than millions of index-then-heap round trips. Common real causes: stale statistics (run <code>ANALYZE</code>), a function or implicit type cast wrapped around the column (<code>WHERE YEAR(created_at) = 2024</code> can't use a plain index on <code>created_at</code>), or a leading wildcard in a <code>LIKE</code>. The index isn't broken; the query just isn't shaped for it.</p>
+      </div>
+    </details>
+
+    <h2 id="internals"><span class="beat">Internal working</span>What a transaction actually does, step by step</h2>
+    <p>Say your app runs <code>UPDATE accounts SET balance = balance - 100 WHERE id = 42;</code> and commits. Here's the machinery underneath, in both engines' rough shape:</p>
+    <ol class="steps">
+      <li><b>Parse and plan.</b> The engine turns SQL text into a parse tree, then the optimizer picks a plan using table statistics — here, "use the primary key index on <code>id</code>."</li>
+      <li><b>Walk the index.</b> A B-tree traversal — root, branch, leaf — lands on row 42 in a handful of page reads, usually 3-4 even on a huge table, because a B-tree's height grows logarithmically with row count.</li>
+      <li><b>Acquire the lock.</b> The lock manager checks whether row 42 is free. If another open transaction already holds an exclusive lock on it, this one queues, and if it waits past <code>innodb_lock_wait_timeout</code> or Postgres's <code>lock_timeout</code>, it gives up with an error instead of hanging forever.</li>
+      <li><b>Apply MVCC visibility.</b> Before changing anything, the engine has to know what this transaction is even allowed to see. InnoDB keeps the old row version reachable through an <b>undo log</b>; Postgres keeps it directly in the heap as a separate tuple with hidden <code>xmin</code>/<code>xmax</code> columns marking which transactions created and deleted it. Either way, other transactions with an earlier snapshot keep seeing the old balance until you commit.</li>
+      <li><b>Write ahead, then touch the page.</b> Durability is bought with a rule, not a hope: the change is written to a sequential log first — InnoDB's <b>redo log</b>, Postgres's <b>WAL</b> — before the in-memory data page is modified. If the machine dies right after, replaying the log on restart reproduces the change. The actual data page just gets marked dirty in the buffer pool; it's flushed to disk later, at a checkpoint, not immediately.</li>
+      <li><b>Commit: fsync and release.</b> On commit, the engine forces the log to durable storage (an <code>fsync</code>) and only then tells your app "done." The row lock is released, and the new balance becomes visible to transactions that start a snapshot from this point on.</li>
+    </ol>
+    <p>Isolation levels are the knob that decides how loose step 4 is allowed to be. The SQL standard defines four: <b>read uncommitted</b> (you can see another transaction's uncommitted change — a "dirty read"), <b>read committed</b> (you never see uncommitted data, but a second read in the same transaction can see a different value if someone else committed in between), <b>repeatable read</b> (your snapshot is fixed for the whole transaction), and <b>serializable</b> (transactions behave as if run one at a time). Here's the fact that trips people up in interviews and in production: <b>MySQL/InnoDB defaults to REPEATABLE READ; PostgreSQL defaults to READ COMMITTED.</b> Move an app between them without checking, and its behavior under concurrent load genuinely changes.</p>
+    <div class="box gotcha"><div class="h">A sharp edge: gap locks</div>
+      <p>Under InnoDB's REPEATABLE READ, a locking read doesn't just lock the row you matched — it can lock the <b>gap</b> before it too, to stop phantom inserts (a "next-key lock"). That means an <code>UPDATE ... WHERE id BETWEEN 10 AND 20</code> can block an <code>INSERT</code> of a value that doesn't even exist yet in that range. Switching that session to READ COMMITTED disables gap locking for plain searches. Postgres doesn't use gap locks; its repeatable read is snapshot isolation, and true serializable behavior comes from a separate mechanism (SSI, with predicate locking) that can abort a transaction with a serialization failure instead of blocking it.</p>
+    </div>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces you'll name in every incident</h2>
+    <ul>
+      <li><b>Buffer pool / <code>shared_buffers</code>.</b> The page cache for the database — RAM holding recently used table and index pages. Sized wrong, everything else in this chapter gets worse.</li>
+      <li><b>WAL / redo log + undo log.</b> The append-only durability record (Postgres's WAL, InnoDB's redo log), plus InnoDB's undo log holding old row versions for MVCC and rollback.</li>
+      <li><b>Lock manager.</b> Tracks who holds what lock on what row or table, queues waiters, and detects deadlocks.</li>
+      <li><b>Background writer / checkpointer.</b> Flushes dirty pages from the buffer pool to disk on its own schedule, so a crash never has to replay an unbounded amount of log.</li>
+      <li><b>Replication stream.</b> MySQL ships a binary log (binlog) of logical or row-based changes; Postgres streams the WAL itself. Either way, a replica is applying a change log, slightly behind.</li>
+      <li><b>Vacuum / purge.</b> Postgres's <code>autovacuum</code> removes dead row versions the heap is holding onto; InnoDB's purge thread does the equivalent for the undo log. Fall behind on either and the database bloats.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one write to a replica</h2>
+    <p>Take that same balance update, now with a read replica behind it. Your app's write goes to the primary, which runs the six steps above and commits. The WAL record (or binlog event) for that commit is shipped to the replica — usually within milliseconds, asynchronously. The replica replays it, applying the same change to its own copy. A read hitting the replica a moment too soon sees the old balance; this is <b>replication lag</b>, and it's a real, physical delay, not a bug. If your app reads its own write back from a replica right after writing to the primary, you will occasionally see stale data — which is why "read your own writes" flows usually pin to the primary or a synchronous replica for that one read.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>Start both engines locally. Keep both terminals open — several labs need two sessions against the same database.</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># MySQL 8, with a throwaway database:</span>
+docker run --rm -d --name sre-mysql -e MYSQL_ROOT_PASSWORD=sre -e MYSQL_DATABASE=shop -p 3306:3306 mysql:8.4
+
+<span class="c"># PostgreSQL 16, same idea:</span>
+docker run --rm -d --name sre-pg -e POSTGRES_PASSWORD=sre -e POSTGRES_DB=shop -p 5432:5432 postgres:16
+
+<span class="c"># give them a few seconds, then connect:</span>
+docker exec -it sre-mysql mysql -uroot -psre shop
+docker exec -it sre-pg psql -U postgres -d shop</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — EXPLAIN a slow query, then fix it</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>In the MySQL session, build a table big enough to feel a scan, and query it without an index:</p>
+        <div class="codewrap"><span class="lang">sql</span><pre><code>CREATE TABLE orders (id INT PRIMARY KEY AUTO_INCREMENT, customer_id INT, status VARCHAR(20), created_at DATETIME);
+<span class="c">-- load ~200k rows with a stored procedure loop, or any seed script; then:</span>
+EXPLAIN SELECT * FROM orders WHERE customer_id = 4471;</code></pre></div>
+        <div class="out"><span class="ol">Output</span>+----+-------------+--------+------+---------------+------+---------+------+--------+-------------+
+| id | select_type | table  | type | possible_keys | key  | key_len | ref  | rows   | Extra       |
++----+-------------+--------+------+---------------+------+---------+------+--------+-------------+
+|  1 | SIMPLE      | orders | ALL  | NULL          | NULL | NULL    | NULL | 198341 | Using where |</code></div>
+        <p><code>type: ALL</code> is the tell — a full table scan, <code>rows: 198341</code> examined for one customer. Add the missing index and ask again:</p>
+        <div class="codewrap"><span class="lang">sql</span><pre><code>CREATE INDEX idx_orders_customer ON orders(customer_id);
+EXPLAIN SELECT * FROM orders WHERE customer_id = 4471;</code></pre></div>
+        <div class="out"><span class="ol">Output</span>| 1  | SIMPLE      | orders | ref  | idx_orders_customer | idx_orders_customer | 5 | const | 12 | NULL |</code></div>
+        <p><code>type: ref</code>, <code>rows: 12</code>. Same question, twelve rows examined instead of two hundred thousand. This is the entire job of an index in one before/after.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — watch MVCC let a reader ignore a writer</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>In Postgres, open two <code>psql</code> sessions against the same row. Session A:</p>
+        <div class="codewrap"><span class="lang">sql</span><pre><code>CREATE TABLE accounts(id INT PRIMARY KEY, balance INT);
+INSERT INTO accounts VALUES (42, 500);
+BEGIN;
+UPDATE accounts SET balance = 400 WHERE id = 42;  <span class="c">-- do NOT commit yet</span></code></pre></div>
+        <p>Session B, while A's transaction is still open:</p>
+        <div class="codewrap"><span class="lang">sql</span><pre><code>SELECT balance FROM accounts WHERE id = 42;</code></pre></div>
+        <div class="out"><span class="ol">Output</span> balance
+---------
+     500
+(1 row)</code></div>
+        <p>Session B reads instantly and sees <code>500</code> — the pre-update value — with no wait at all. It isn't blocked by A's uncommitted exclusive lock on that row, because a plain read doesn't take a lock; it reconstructs a consistent snapshot from the row's version info. Now commit A and re-run B's <code>SELECT</code>: it flips to <code>400</code>. Readers never block writers and writers never block readers under MVCC — only writer-versus-writer contention takes a lock.</p>
+      </div>
+    </div>
+
+    <details class="recall"><summary>Think first: if readers never block on MVCC, why does a table ever need "vacuuming"?</summary>
+      <div class="body">
+        <p>Because every update in Postgres doesn't overwrite the row — it writes a brand new tuple version and marks the old one dead, right there in the heap. Nothing physically removes the old version until <code>VACUUM</code> confirms no active snapshot can still need it, then reclaims the space. Skip vacuuming (or let <code>autovacuum</code> fall behind on a hot table) and the table bloats with dead versions the index still has to skip past on every scan — a real, common cause of a table that "used to be fast."</p>
+      </div>
+    </details>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — cause a real deadlock</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Two sessions, MySQL this time, each locking the same two rows in opposite order. Session A:</p>
+        <div class="codewrap"><span class="lang">sql</span><pre><code>CREATE TABLE accounts(id INT PRIMARY KEY, balance INT);
+INSERT INTO accounts VALUES (1, 100), (2, 100);
+BEGIN;
+UPDATE accounts SET balance = balance - 10 WHERE id = 1;  <span class="c">-- A now holds the lock on row 1</span></code></pre></div>
+        <p>Session B:</p>
+        <div class="codewrap"><span class="lang">sql</span><pre><code>BEGIN;
+UPDATE accounts SET balance = balance - 10 WHERE id = 2;  <span class="c">-- B holds row 2</span>
+UPDATE accounts SET balance = balance + 10 WHERE id = 1;  <span class="c">-- B now waits on A's lock</span></code></pre></div>
+        <p>Back in session A, ask for row 2:</p>
+        <div class="codewrap"><span class="lang">sql</span><pre><code>UPDATE accounts SET balance = balance + 10 WHERE id = 2;</code></pre></div>
+        <p>Before you run it: A wants row 2, which B holds. B wants row 1, which A holds. Neither can finish. What does the database do about it — hang forever, or something else? Decide, then run it.</p>
+        <details class="recall"><summary>Reveal what happens</summary>
+          <div class="body">
+            <div class="out"><span class="ol">Output</span>ERROR 1213 (40001): Deadlock found when trying to get lock; try restarting transaction</div>
+            <p>InnoDB's lock manager runs a wait-for-graph check, finds the cycle, and kills the transaction that did the least work (session A, here) so the other can proceed. Postgres does the same thing with error <code>40P01</code>. Neither engine will ever leave two transactions stuck forever — but the killed transaction's work is gone, and it's <em>your</em> application's job to catch that error and retry. An app that doesn't handle a deadlock error is an app that occasionally, silently drops a write.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — exhaust every connection</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Postgres, freshly started, defaults to <code>max_connections = 100</code>. Lower it to something you can hit fast and restart:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker exec -it sre-pg psql -U postgres -c "ALTER SYSTEM SET max_connections = 10;"
+docker restart sre-pg</code></pre></div>
+        <p>Now open eleven simultaneous connections and leave them idle (a quick Python loop with <code>psycopg2.connect(...)</code> and no <code>close()</code>, or eleven manual <code>psql</code> tabs). The eleventh gets:</p>
+        <div class="out"><span class="ol">Output</span>psql: error: connection to server failed: FATAL: sorry, too many clients already</div>
+        <p>The database isn't slow, isn't down, and every existing connection still works fine. It is simply out of badges at the front desk. Before reading on: how would you confirm this is the cause on a real, unfamiliar production database, and what would you check to find out <em>who</em> is holding the connections?</p>
+        <details class="recall"><summary>Reveal an approach</summary>
+          <div class="body">
+            <div class="codewrap"><span class="lang">sql</span><pre><code>SELECT count(*), state, application_name FROM pg_stat_activity GROUP BY state, application_name;</code></pre></div>
+            <p>If most connections sit in <code>idle</code> state from one <code>application_name</code>, that's a client-side leak or a pool that's too large for what the server allows — the classic version of this is a Kubernetes <code>Deployment</code> that scaled from 10 pods to 50, each opening its own 20-connection pool, quietly asking a database configured for 100 connections for 1,000. The database didn't get slower; math ran out. The fix is almost never "raise <code>max_connections</code>" — each Postgres connection is a full OS process with real memory overhead, and cranking the limit just moves the failure to an out-of-memory one. The fix is a connection pooler like PgBouncer in front of the database, and a hard cap on pool size per pod tied to replica count.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — a migration that won't move</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>Simulate the classic "the migration is just hanging" incident. Session A opens a transaction and never finishes it — a common real cause is a web request that opened a transaction and then made a slow HTTP call before committing:</p>
+        <div class="codewrap"><span class="lang">sql</span><pre><code><span class="c">-- Session A (Postgres):</span>
+BEGIN;
+SELECT * FROM accounts WHERE id = 1 FOR UPDATE;  <span class="c">-- and just... sit here</span></code></pre></div>
+        <p>Session B tries to run a routine deploy-time migration:</p>
+        <div class="codewrap"><span class="lang">sql</span><pre><code><span class="c">-- Session B:</span>
+ALTER TABLE accounts ADD COLUMN status TEXT NOT NULL DEFAULT 'active';</code></pre></div>
+        <p>It hangs — no error, no progress, just silence. Your deploy pipeline is now stuck too. Before revealing the cause: what lock would an <code>ALTER TABLE</code> need, and what would already be holding it?</p>
+        <details class="recall"><summary>Reveal the cause and the fix</summary>
+          <div class="body">
+            <p><code>ALTER TABLE</code> needs an <code>ACCESS EXCLUSIVE</code> lock on the table — the strongest one there is — and it has to wait behind session A's row lock from the still-open <code>FOR UPDATE</code>, even though A only touched one row. Check with:</p>
+            <div class="codewrap"><span class="lang">sql</span><pre><code>SELECT pid, state, wait_event_type, query FROM pg_stat_activity WHERE state != 'idle';</code></pre></div>
+            <p>A long-idle-in-transaction session blocking DDL for everyone is one of the most common "why is the deploy stuck" incidents there is. The immediate fix is killing the offending session (<code>pg_terminate_backend</code>) and setting <code>idle_in_transaction_session_timeout</code> so it can't happen unattended again. The durable fix is how you write the migration in the first place: use <b>expand/contract</b> instead of one big blocking change. Add the new column as nullable with no default rewrite required, ship code that writes both old and new, backfill in small batched transactions, cut reads over, then drop the old column later — never one statement that needs the strongest lock in the database held against a live table.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · connection exhaustion after a scale-out</h4>
+      <p><b>Symptom:</b> right after a deployment scales up pod replicas, new requests start failing with connection errors, even though the database's CPU and disk look fine. <b>First cut:</b> check the database's current connection count against <code>max_connections</code>. <b>Confirm:</b> <code>pg_stat_activity</code> or <code>SHOW PROCESSLIST</code>, grouped by source host or app name. <b>Cause is usually:</b> replica count × per-pod pool size now exceeds what the database allows — nobody did that multiplication before the scale-out.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · lock contention from one slow transaction</div>
+      <p><b>Symptom:</b> a specific set of queries suddenly time out or queue, while the database otherwise looks idle. <b>First cut:</b> <code>SHOW ENGINE INNODB STATUS</code> (MySQL) or <code>pg_locks</code> joined to <code>pg_stat_activity</code> (Postgres) to find the blocking session. <b>Cause is usually:</b> a transaction opened, then left idle mid-request — a slow downstream API call, a bug that forgot to commit, a debugger breakpoint hit inside a transaction in staging that got copy-pasted into a prod code path.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · the migration that took the site down</div>
+      <p><b>Symptom:</b> a routine deploy runs a schema change, and suddenly every write to that table stalls. <b>First cut:</b> is the migration holding an exclusive table lock while ordinary traffic keeps arriving and queuing behind it. <b>Cause is usually:</b> an <code>ALTER TABLE</code> that needs a full table rewrite (changing a column type, adding a <code>NOT NULL</code> without a fast path) run directly against a large, busy table during business hours, with no lock timeout set to fail fast instead of queuing every other writer behind it.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Security.</b> Application database users should hold exactly the privileges their code needs — a reporting job doesn't need <code>DELETE</code>, and almost nothing needs a superuser or root account. Credentials belong in a secrets manager the app reads at startup, not in a ConfigMap or a baked-in image layer. Network access should be restricted to the subnets and security groups that actually run your application, not "anywhere in the VPC."</p>
+    <p><b>Performance.</b> Buffer pool or <code>shared_buffers</code> sizing is the single highest-leverage setting either engine has — roughly 60-75% of available RAM on a dedicated database host is a reasonable starting point, tuned from there against your actual cache-hit ratio. Read replicas move read load off the primary but introduce lag you have to design around. The N+1 query pattern — one query to list rows, then one more query per row in application code — turns a single request into hundreds of round trips and is still the most common self-inflicted latency problem in any codebase with an ORM.</p>
+    <p><b>Common mistakes.</b> Foreign key columns with no index on them, which turns every parent-row delete into a full scan of the child table. Migrations run with no statement or lock timeout, so a small mistake becomes an hours-long stall instead of a fast, safe failure. Treating a read replica as instantly consistent with the primary. And sizing connection pools per-pod without ever multiplying by replica count — the single most common way teams find <code>max_connections</code> the hard way.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>Replication topology is a design decision, not an afterthought: asynchronous replication risks losing the last few committed transactions on failover, semi-synchronous trades a little write latency for a durability guarantee that at least one replica has the data before you acknowledge the client. Either way, promoting a replica to primary during a failover is the moment split-brain becomes possible — two nodes both believing they're the writable primary — which is why failover automation needs a fencing mechanism, not just a health check and a DNS flip. We build on this in <a href="ch82-consistency-replication-partitioning.html">Chapter 82</a> and <a href="ch90-disaster-recovery.html">Chapter 90</a>.</p>
+    <p>At scale, the database is almost never the first thing that sees a request — a cache absorbs the read traffic that would otherwise hit it (<a href="ch85-caching.html">Chapter 85</a>), and a connection pooler sits between a fleet of stateless pods and a database that can only hold a few hundred real connections open. Sharding and read replicas both buy you more capacity, but neither one is free: sharding gives up cross-shard transactions and joins, replicas give up strict read-after-write consistency. Knowing exactly which guarantee you're trading away is the actual system-design skill here — not knowing that replicas or shards exist.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's the difference between a B-tree index and the table itself?</summary>
+        <div class="a"><p>The table holds the actual row data; an index is a separate, sorted structure that lets you find a row without scanning every one. In InnoDB the primary key index and the row data are the same structure — it's index-organized. In Postgres they're separate: an index stores a pointer into a heap where the row actually lives. Either way, a query that can use an index turns an O(n) scan into an O(log n) tree walk.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through what happens when a transaction commits.</summary>
+        <div class="a"><p>The engine parses and plans the statement, walks whatever index applies, and acquires the locks it needs on the rows it touches — waiting if someone else holds a conflicting lock. Before touching the actual data page, it writes the change to a sequential log — the WAL in Postgres, the redo log in InnoDB — because that log write is what durability is actually built on. The in-memory page gets modified and marked dirty; it's flushed to disk later, not synchronously. On commit, the engine forces that log to durable storage and only then tells the client it succeeded, then releases the row locks so the new value becomes visible to future snapshots. If the machine crashes after the log fsync but before the data page is flushed, recovery replays the log and reproduces the change — that's the whole guarantee.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Explain MVCC, and why it isn't free.</summary>
+        <div class="a"><p>MVCC lets a reader work off a consistent snapshot of the data instead of taking a lock that would block writers, by keeping more than one version of a row around. Postgres keeps old versions directly in the heap with hidden <code>xmin</code>/<code>xmax</code> transaction-id columns marking validity; InnoDB keeps them in an undo log and reconstructs an older view on demand. The cost shows up later: those old versions don't disappear on their own. Postgres needs <code>VACUUM</code> to reclaim dead tuples once no snapshot can still need them, and a long-running transaction anywhere in the system can pin an old snapshot in place, which stops vacuum from doing its job and lets the table bloat. InnoDB's purge thread has the same job for the undo log. MVCC buys you non-blocking reads at the cost of a cleanup process you now have to keep healthy.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>Every new request is suddenly failing to reach the database, right after a deploy. How do you investigate?</summary>
+        <div class="a"><p>First I check whether the database itself is healthy — CPU, disk, replication lag — because if those look normal, this isn't a database performance problem, it's a connection or lock problem. I'd look at current connection count against the configured max, broken down by source: if one deployment's pods are holding most of them, that's a pool-sizing math error following a scale-out, and the fix is capping pool size per replica or fronting the database with a pooler, not raising the connection limit. If connections are fine but queries are queuing, I'd check for a blocking transaction — something holding a lock and sitting idle, often from a slow call made while inside an open transaction. Either way I'm finding who's holding the resource before I touch any configuration.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>How would you change a large, frequently-written table's schema with zero downtime?</summary>
+        <div class="a"><p>I wouldn't run one statement that needs a long-held exclusive lock against live traffic. I'd use expand/contract: add the new column or table in an additive, non-blocking way — nullable, or with a default that doesn't force a full rewrite — deploy application code that writes to both the old and new shape, backfill existing rows in small batched transactions so no single transaction holds a lock for long, cut reads over to the new shape once backfill is verified, and only then drop the old column in a later, separate deploy. I'd also set a lock timeout on the migration itself, so if it can't get its lock quickly it fails fast and retries later instead of queuing every other writer behind it.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>A database is a concurrency-control system first. Indexes are sorted structures that turn a scan into a handful of page reads — but only for queries shaped to use them. Isolation levels decide how much of another transaction's in-flight work you can see; MySQL defaults to REPEATABLE READ, Postgres to READ COMMITTED, and that difference has teeth. MVCC lets readers ignore writers by keeping old row versions around, which is why vacuum/purge exist and why they matter. Locks serialize writers, and a deadlock is the database refusing to let two transactions wait on each other forever — your app still has to retry. Connections are a finite resource independent of query performance, and Postgres's one-process-per-connection model makes that ceiling lower than people expect. And a schema change on a busy table is a concurrency problem before it's a syntax problem.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>A relational database's real job is safe concurrency; storage is the easy part.</li>
+      <li>A B-tree index turns an O(n) scan into an O(log n) walk — but only if the query can use it.</li>
+      <li>InnoDB is index-organized (the PK index holds the row); Postgres is heap-plus-separate-indexes.</li>
+      <li>MySQL's default isolation is REPEATABLE READ; Postgres's is READ COMMITTED. That's a real behavioral difference, not trivia.</li>
+      <li>MVCC means readers never block writers and writers never block readers — only writer-vs-writer contention locks.</li>
+      <li>Old row versions don't clean themselves up. Vacuum/purge falling behind is a real, common cause of "this table got slow."</li>
+      <li>A deadlock is detected and resolved by killing one transaction — your application must catch that error and retry.</li>
+      <li>Connections are bounded independently of database load. Postgres's per-connection process makes that ceiling especially real.</li>
+      <li>Writes are durable because the log is written before the data page — not because the data page is written fast.</li>
+      <li>Schema changes on live tables want expand/contract, not one big blocking statement holding the strongest lock available.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds toward:</span>
+      <a href="ch85-caching.html"><b>Ch 85</b> Caching</a>
+      <a href="ch87-redis-and-in-memory-data.html"><b>Ch 87</b> Redis &amp; in-memory data</a>
+      <a href="ch82-consistency-replication-partitioning.html"><b>Ch 82</b> Replication &amp; partitioning</a>
+      <a href="ch04-filesystems-inodes-file-descriptors-disk-i-o.html"><b>Ch 4</b> Disk I/O</a>
+      <a href="ch90-disaster-recovery.html"><b>Ch 90</b> Backups &amp; DR</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>MySQL 8.4 Reference Manual — <a href="https://dev.mysql.com/doc/refman/8.4/en/innodb-locking.html">InnoDB Locking</a> and <a href="https://dev.mysql.com/doc/refman/8.4/en/innodb-multi-versioning.html">InnoDB Multi-Versioning</a>.</li>
+      <li>MySQL 8.4 Reference Manual — <a href="https://dev.mysql.com/doc/refman/8.4/en/using-explain.html">Optimizing Queries with EXPLAIN</a>.</li>
+      <li>MySQL 8.4 Reference Manual — <a href="https://dev.mysql.com/doc/refman/8.4/en/replication.html">Replication</a>.</li>
+      <li>PostgreSQL Documentation — <a href="https://www.postgresql.org/docs/current/mvcc.html">Chapter 13, Concurrency Control</a> and <a href="https://www.postgresql.org/docs/current/explicit-locking.html">Explicit Locking</a>.</li>
+      <li>PostgreSQL Documentation — <a href="https://www.postgresql.org/docs/current/index.html">PostgreSQL Documentation home</a>.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch85-caching.html"><span class="dir">← Prev</span><div class="ti">Ch 85 — Caching</div></a>
+      <a class="nx" href="ch87-redis-and-in-memory-data.html"><span class="dir">Next →</span><div class="ti">Ch 87 — Redis &amp; in-memory data</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 86 of 121 · Part IX · Distributed Systems, Data &amp; Reliability. Run the labs against real containers; lock waits are not the same read on a screen as they are on a clock.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">App to disk</a>
+    <a href="#internals">What a transaction does</a>
+    <a href="#components">The components</a>
+    <a href="#flow">One write to a replica</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

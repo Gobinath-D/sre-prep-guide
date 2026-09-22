@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 8 — Bash and shell scripting for automation</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part I · Linux &nbsp;·&nbsp; Chapter 8</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part I · Linux &amp; OS Foundations · Chapter 8</div>
+      <h1>Bash and shell scripting for automation</h1>
+      <p class="tagline">Bash is the glue holding every Linux platform together — the entrypoint of your container, the body of your cron job, the first ten lines of every CI pipeline. It's also a minefield of quoting and silent failure. This chapter teaches you to write it deliberately, and to know the exact moment it stops being the right tool.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~40 min read · Linux lab (Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Build a log-analysis pipeline one stage at a time and explain what each of <code>grep</code>, <code>awk</code>, <code>sed</code>, <code>cut</code>, <code>sort</code>, <code>uniq</code>, <code>xargs</code> transforms.</li>
+          <li>Explain exit codes, <code>$?</code>, and <code>PIPESTATUS</code>, and why a broken pipeline can still "succeed" without them.</li>
+          <li>Start every script with <code>set -euo pipefail</code> and know precisely what each flag does and where <code>-e</code> quietly won't fire.</li>
+          <li>Quote correctly — and reproduce the classic unquoted-variable disaster on purpose so you never ship it.</li>
+          <li>Write a safe, idempotent script with functions, a cleanup <code>trap</code>, and graceful signal handling — and say when to reach for Python instead.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem: gluing programs together</h2>
+    <p>Half of operations is moving text between programs. A log file comes out of nginx; you need the top IPs by error count. A command prints a list of pods; you need to restart the ones older than a day. A deploy needs to run four steps in order and stop if any of them fails. None of this deserves a compiled program. It deserves a few lines that wire existing tools together — and the thing that wires them together, on literally every Linux box you'll ever touch, is the shell.</p>
+    <p>That ubiquity is exactly why it matters. You don't get to skip bash by preferring Python, because bash is already there: it's <code>ENTRYPOINT ["/bin/sh","-c", …]</code> in your Dockerfile, the <code>command:</code> in your Kubernetes manifest, the <code>run:</code> steps in your CI, the health-check probe, the init script. If you can't read and write it confidently, large parts of your own platform are opaque to you.</p>
+    <p>And here's the tension. Bash makes the easy things trivial and the medium things dangerous. A missing quote turns <code>rm -rf "$dir/"</code> into <code>rm -rf /</code> when <code>$dir</code> is empty. A pipeline reports success while its most important stage failed silently. A cron job runs half-way, errors, and exits <code>0</code> so nobody notices until the data's wrong. This chapter is about writing bash on purpose — with the guardrails that turn it from a foot-gun into a dependable tool — and about recognising the line past which you should stop and write Python (<a href="ch09-python-for-sre-automation.html">Chapter 9</a>).</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>Bash's defaults are hostile: it keeps going after errors, splits unquoted variables on whitespace, and hides all but the last exit code in a pipeline. Every safe script starts by turning those defaults off. The language didn't change; you changed how strict it is.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: an assembly line of small machines</h2>
+    <p>The Unix idea underneath the shell is old and simple: build a few small programs that each do one thing well, and let them read from standard input and write to standard output, so you can chain them. The shell's job is to stand up that chain and connect the machines.</p>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Picture a factory conveyor belt. Raw material — a log file — drops onto the belt at one end. It passes through a line of single-purpose machines: one <em>filters out</em> everything that isn't an error (<code>grep</code>), the next <em>cuts</em> a single column off each item (<code>awk</code>), the next <em>groups identical items</em> (<code>sort</code>), the next <em>counts each group</em> (<code>uniq -c</code>), the last <em>ranks and keeps the top few</em> (<code>sort -rn | head</code>). Each machine takes what the previous one produced and hands its result down the line. None of them knows or cares what the others do.</p>
+      <p>The belt itself — the thing carrying material from one machine's output to the next machine's input — is the <b>pipe</b> (<code>|</code>). And every machine, when it finishes, flips a little green or red light: an <b>exit code</b>, 0 for "I did my job," nonzero for "I failed." The danger is that by default the factory only looks at the <em>last</em> machine's light. If the filter jammed in the middle but the ranker at the end ran fine, the line reports success and ships a wrong result. <code>pipefail</code> is the supervisor who checks every machine's light, not just the last one.</p>
+    </div>
+    <table class="t">
+      <tr><th>On the assembly line</th><th>In the shell</th></tr>
+      <tr><td>Raw material dropped on the belt</td><td>A file or a command's output on stdin</td></tr>
+      <tr><td>A single-purpose machine</td><td>One command — <code>grep</code>, <code>awk</code>, <code>sort</code> …</td></tr>
+      <tr><td>The belt between machines</td><td>The pipe <code>|</code> — one command's stdout becomes the next's stdin</td></tr>
+      <tr><td>The finished-part chute</td><td>stdout (fd 1); the reject bin is stderr (fd 2)</td></tr>
+      <tr><td>The green/red light on each machine</td><td>Exit code — <code>0</code> = success, nonzero = failure, in <code>$?</code></td></tr>
+      <tr><td>The supervisor checking every light</td><td><code>set -o pipefail</code> + <code>${PIPESTATUS[@]}</code></td></tr>
+      <tr><td>Stopping the line on the first jam</td><td><code>set -e</code></td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>How a pipeline is wired</h2>
+    <p>A pipeline isn't a single program reading the file five ways. It's five separate processes, running at the same time, with the kernel carrying bytes between them. Here's the exact shape of the top-offending-IPs pipeline, the one you'll build in the labs.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 340" role="img" aria-label="A five-stage shell pipeline showing text streaming from a log file through grep, awk, sort/uniq, and sort/head to a ranked list of IPs">
+        <defs>
+          <marker id="pf" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+        </defs>
+        <text x="360" y="20" text-anchor="middle" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.04em">FIVE PROCESSES, RUNNING AT ONCE — THE KERNEL CARRIES BYTES BETWEEN THEM</text>
+        <!-- 5 stage boxes -->
+        <g>
+          <rect x="10" y="46" width="128" height="52" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+          <text x="74" y="68" text-anchor="middle" style="fill:var(--ink);font:600 11.5px monospace">access.log</text>
+          <text x="74" y="86" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">raw lines</text>
+        </g>
+        <g>
+          <rect x="158" y="46" width="128" height="52" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.4"/>
+          <text x="222" y="68" text-anchor="middle" style="fill:var(--ink);font:600 11px monospace">grep ' 500 '</text>
+          <text x="222" y="86" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">filter errors</text>
+        </g>
+        <g>
+          <rect x="306" y="46" width="128" height="52" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.4"/>
+          <text x="370" y="68" text-anchor="middle" style="fill:var(--ink);font:600 10px monospace">awk '{print $1}'</text>
+          <text x="370" y="86" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">pull the IP</text>
+        </g>
+        <g>
+          <rect x="454" y="46" width="128" height="52" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.4"/>
+          <text x="518" y="68" text-anchor="middle" style="fill:var(--ink);font:600 10.5px monospace">sort | uniq -c</text>
+          <text x="518" y="86" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">group + count</text>
+        </g>
+        <g>
+          <rect x="602" y="46" width="108" height="52" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.4"/>
+          <text x="656" y="66" text-anchor="middle" style="fill:var(--ink);font:600 10px monospace">sort -rn</text>
+          <text x="656" y="80" text-anchor="middle" style="fill:var(--ink);font:600 10px monospace">| head</text>
+          <text x="656" y="93" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">rank top N</text>
+        </g>
+        <!-- pipe arrows between -->
+        <line x1="138" y1="72" x2="156" y2="72" style="stroke:var(--accent);stroke-width:1.8" marker-end="url(#pf)"/>
+        <line x1="286" y1="72" x2="304" y2="72" style="stroke:var(--accent);stroke-width:1.8" marker-end="url(#pf)"/>
+        <line x1="434" y1="72" x2="452" y2="72" style="stroke:var(--accent);stroke-width:1.8" marker-end="url(#pf)"/>
+        <line x1="582" y1="72" x2="600" y2="72" style="stroke:var(--accent);stroke-width:1.8" marker-end="url(#pf)"/>
+        <text x="360" y="118" text-anchor="middle" style="fill:var(--accent);font:600 10.5px sans-serif">each &quot;|&quot; is a kernel pipe: left stdout (fd 1) → right stdin (fd 0)</text>
+        <!-- data samples under -->
+        <rect x="10" y="132" width="700" height="96" rx="9" style="fill:var(--code-bg);stroke:var(--code-dim)"/>
+        <text x="24" y="152" style="fill:var(--code-dim);font:10px monospace">stage 1  10.2.0.9 - - [..] &quot;GET /&quot; 200 …   10.2.0.9 - - [..] &quot;GET /x&quot; 500 …   198.51.100.7 … 500 …</text>
+        <text x="24" y="170" style="fill:var(--code-green);font:10px monospace">stage 2  10.2.0.9 - - [..] &quot;GET /x&quot; 500 …   198.51.100.7 - - [..] &quot;POST /y&quot; 500 …</text>
+        <text x="24" y="188" style="fill:var(--code-amber);font:10px monospace">stage 3  10.2.0.9   198.51.100.7   10.2.0.9   10.2.0.9   198.51.100.7</text>
+        <text x="24" y="206" style="fill:var(--code-blue);font:10px monospace">stage 4      3 10.2.0.9      2 198.51.100.7      (sorted, then counted)</text>
+        <text x="24" y="222" style="fill:var(--code-ink);font:10px monospace">stage 5      3 10.2.0.9      2 198.51.100.7      ← top offenders</text>
+        <!-- exit code note -->
+        <rect x="10" y="248" width="700" height="72" rx="9" style="fill:var(--panel);stroke:var(--deep);stroke-width:1.4"/>
+        <text x="24" y="272" style="fill:var(--deep);font:700 11.5px sans-serif">Every machine flips a light when it finishes:</text>
+        <text x="24" y="292" style="fill:var(--ink);font:600 11px monospace">$?  = exit code of the LAST stage only  (0 = ok)</text>
+        <text x="24" y="310" style="fill:var(--ink);font:600 11px monospace">${PIPESTATUS[@]} = every stage's code — the only way to see a mid-pipe failure</text>
+      </svg>
+      <figcaption>The shell forks all five processes at once and connects them with kernel pipes. By default only the last exit code survives in <code>$?</code> — which is why a jammed middle stage can look like success.</figcaption>
+    </figure>
+
+    <p>That "runs at the same time" detail matters. The pipeline doesn't wait for <code>grep</code> to finish the whole file before <code>awk</code> starts; they run concurrently and the kernel back-pressures the fast ones when a slow one can't keep up. It's genuine parallelism, which is part of why a shell pipeline can chew through a multi-gigabyte log faster than a naive single-threaded script.</p>
+
+    <h2 id="internals"><span class="beat">Internal working</span>What the shell does with a line you type</h2>
+    <p>When you press Enter on <code>grep ' 500 ' access.log | awk '{print $1}'</code>, the shell does a precise, ordered dance. Knowing the order is what lets you predict — instead of discover — how quoting and expansion behave.</p>
+    <ol class="steps">
+      <li><b>Expansion, in a fixed order.</b> Before any program runs, the shell rewrites the line: brace expansion, then tilde (<code>~</code>), then parameter/variable expansion (<code>$var</code>), command substitution (<code>$(…)</code>), and arithmetic, then — critically — <b>word splitting</b> on <code>IFS</code>, then <b>pathname expansion</b> (globbing <code>*</code>). Word splitting and globbing happen to the <em>result</em> of the variable expansion, which is the whole reason unquoted variables are dangerous.</li>
+      <li><b>Fork a process per stage.</b> For each command in the pipeline, the shell calls <code>fork()</code> to make a child (<a href="ch01-kernel-and-system-calls.html">Chapter 1</a>'s syscalls at work).</li>
+      <li><b>Wire the pipes with <code>dup2</code>.</b> The shell creates a kernel pipe between each pair and uses <code>dup2()</code> to point the left child's fd 1 (stdout) and the right child's fd 0 (stdin) at the two ends. This is why "stdout becomes stdin" is literal, not a metaphor.</li>
+      <li><b><code>exec</code> the real program.</b> Each child replaces itself with the actual <code>grep</code>/<code>awk</code> binary. If it's a shell builtin (<code>cd</code>, <code>echo</code>, <code>[[</code>) there's no fork/exec — the shell runs it itself, which is why <code>cd</code> in a subshell can't change your current directory.</li>
+      <li><b>Wait and collect exit codes.</b> The shell <code>wait()</code>s for the children. The exit status of the <em>last</em> command lands in <code>$?</code>; the full set lands in the array <code>${PIPESTATUS[@]}</code>. This is the single most important internal detail for reliability: <b>a pipeline's <code>$?</code> is only its last stage.</b></li>
+      <li><b>The <code>set</code> flags change the rules.</b> <code>set -e</code> makes the shell exit the moment a command returns nonzero (with exceptions — see the gotcha). <code>set -u</code> turns any reference to an unset variable into an error instead of an empty string. <code>set -o pipefail</code> makes a pipeline's exit code the rightmost <em>nonzero</em> one, so a mid-pipe failure is no longer swallowed.</li>
+    </ol>
+    <div class="box gotcha"><div class="h">Where <code>set -e</code> quietly won't save you</div>
+      <p><code>set -e</code> does <em>not</em> trigger for a command whose result is being tested: anything in an <code>if</code>, <code>while</code>, or <code>until</code> condition, anything joined by <code>&amp;&amp;</code> or <code>||</code>, or a command negated with <code>!</code>. So <code>if grep foo file; then …</code> won't exit even when <code>grep</code> "fails" (finds nothing) — which is correct, but surprises people. Worse, a failing command inside a function called in one of those contexts also won't abort. And <code>local x=$(false)</code> hides the failure because <code>local</code>'s own success masks it. This is why <code>set -e</code> is a helpful default but never your <em>only</em> error handling — you still check the exit codes that matter explicitly.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: <code>grep ERROR app.log | wc -l</code> prints <code>0</code> and <code>$?</code> is <code>0</code>. But the log file doesn't exist. Why did it look like success, and what would have caught it?</summary>
+      <div class="body">
+        <p>Two things conspired. First, <code>grep</code> failed (no such file), but its error went to stderr and its <em>output</em> to <code>wc -l</code> was empty, so <code>wc -l</code> happily printed <code>0</code> and exited <code>0</code>. Second, <code>$?</code> is only the <em>last</em> stage — <code>wc</code> — so <code>grep</code>'s failure never reached it. With <code>set -o pipefail</code>, the pipeline's exit code would become <code>grep</code>'s nonzero status and you'd know. To see it directly: after the pipeline, inspect <code>${PIPESTATUS[@]}</code> and you'd find <code>2 0</code> — stage one failed, stage two succeeded. This exact shape is how broken cron jobs report success for months.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, named</h2>
+    <p>You'll reach for the same small set constantly. Each does one job; the skill is combining them.</p>
+    <ul>
+      <li><b><code>grep</code> — filter lines.</b> Keeps (or with <code>-v</code>, drops) lines matching a pattern. <code>-i</code> ignore case, <code>-E</code> extended regex, <code>-c</code> count, <code>-o</code> print only the match, <code>-P</code> Perl regex when you need lookahead. Your first-line filter in almost every pipeline.</li>
+      <li><b><code>awk</code> — column-aware processing.</b> The heavy hitter: splits each line into fields (<code>$1</code>, <code>$2</code>, …), matches patterns, does arithmetic and aggregation. <code>awk '$9==500 {print $1}'</code> filters and extracts in one step. When you find yourself piping <code>grep | cut | grep</code>, awk usually replaces all three.</li>
+      <li><b><code>sed</code> — stream edit.</b> Substitution and line surgery: <code>sed 's/old/new/g'</code>, delete lines, print ranges. Great for in-place text transforms; reach for awk once you need fields or logic.</li>
+      <li><b><code>cut</code> — grab fixed columns.</b> Simple field extraction by delimiter (<code>cut -d: -f1 /etc/passwd</code>) or byte range. Lighter than awk when the split is trivial.</li>
+      <li><b><code>sort</code> / <code>uniq</code> — order and dedupe.</b> <code>uniq</code> only collapses <em>adjacent</em> duplicates, so it's almost always <code>sort | uniq</code>. <code>sort -rn</code> ranks numerically descending; <code>uniq -c</code> counts. The "top N of anything" idiom is <code>sort | uniq -c | sort -rn | head</code>.</li>
+      <li><b><code>xargs</code> — turn output into arguments.</b> Takes a list on stdin and runs a command with those items as arguments. <code>-n1</code> one at a time, <code>-P</code> in parallel, and always <code>-0</code> with <code>find -print0</code> to survive filenames with spaces. This is how you bridge "a list of things" to "do something to each."</li>
+      <li><b>Exit codes, <code>$?</code>, <code>PIPESTATUS</code>.</b> The success/failure channel, separate from output. Every reliability decision hangs off these.</li>
+      <li><b>Functions.</b> Named blocks with their own <code>local</code> variables and their own exit code (via <code>return</code> or the last command). They keep a script readable past twenty lines and make behaviour testable.</li>
+      <li><b>Traps and signals.</b> <code>trap 'cmd' EXIT</code> runs cleanup no matter how the script ends; <code>trap 'cmd' INT TERM</code> handles Ctrl-C and <code>kill</code>. This is how you avoid leaving temp files, lock files, or half-applied changes behind (signals in depth: <a href="ch02-processes-threads-scheduling-signals.html">Chapter 2</a>).</li>
+      <li><b>Tests — <code>[[ … ]]</code>.</b> The bash conditional: <code>[[ -f "$f" ]]</code> file exists, <code>[[ -z "$x" ]]</code> empty, <code>[[ "$a" == "$b" ]]</code>. Prefer <code>[[ ]]</code> over the older <code>[ ]</code> — it doesn't word-split and has saner operators.</li>
+    </ul>
+
+    <details class="recall"><summary>Think first: <code>cat access.log | grep " 500 " | wc -l</code> works — so why would a senior rewrite it?</summary>
+      <div class="body">
+        <p>Two smells. The <code>cat</code> is redundant — a "useless use of cat" — because <code>grep</code> reads files directly: <code>grep -c " 500 " access.log</code> does the whole job in one process, and <code>grep -c</code> even replaces the <code>wc -l</code>. So three processes collapse to one. It's not about the microseconds saved; it's that fewer moving parts means fewer places to get quoting, exit codes, and <code>pipefail</code> wrong, and the intent reads clearer. The habit generalises: whenever a pipeline has a stage that only exists to feed the next tool something it could have read itself, cut it. Reserve pipes for genuine transformations, not for shuffling data a tool already accepts directly.</p>
+      </div>
+    </details>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following the top-IPs one-liner</h2>
+    <p>Trace one real request-for-data end to end. You've been asked: "which clients are causing our 500s?" The pipeline is <code>awk '$9==500 {print $1}' access.log | sort | uniq -c | sort -rn | head</code>. Watch the stream change shape at each stage. <code>awk</code> reads the log line by line, keeps only lines whose 9th field (the HTTP status) is <code>500</code>, and emits just the client IP from field 1 — so a megabyte of log becomes a thin column of IPs, most repeated. <code>sort</code> brings identical IPs next to each other (because <code>uniq</code> only sees adjacent lines). <code>uniq -c</code> collapses each run into a single line prefixed by its count. <code>sort -rn</code> re-sorts those counts, largest first. <code>head</code> keeps the top ten. Out the end drops exactly what was asked: the worst offenders and how many 500s each caused. That's the whole discipline — every stage is a small, total transformation, and you can stop the pipeline at any <code>|</code> to see the intermediate shape when something looks wrong. That "cut the pipe and look" habit is how you debug one-liners, and it's the lab you're about to do.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>Run these in a throwaway container so nothing you do touches your Mac.</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>docker run --rm -it --name shlab ubuntu:24.04 bash
+apt-get update &amp;&amp; apt-get install -y gawk sed grep coreutils findutils procps</code></pre></div>
+    <p>Make a small synthetic access log to work on (combined log format, so field 9 is the status):</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>cat &gt; /tmp/gen.sh &lt;&lt;'EOF'
+#!/usr/bin/env bash
+ips=(10.2.0.9 198.51.100.7 203.0.113.4 10.2.0.9 10.2.0.9 198.51.100.7)
+codes=(200 200 200 500 404 500 200 500)
+for i in $(seq 1 300); do
+  ip=${ips[$((RANDOM % ${#ips[@]}))]}
+  code=${codes[$((RANDOM % ${#codes[@]}))]}
+  printf '%s - - [10/Oct/2024:13:55:36 +0000] "GET /p HTTP/1.1" %s 128\n' "$ip" "$code"
+done
+EOF
+bash /tmp/gen.sh &gt; /tmp/access.log
+wc -l /tmp/access.log</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — the top-offenders pipeline, one stage at a time</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Build it incrementally and <em>look at each intermediate result</em>. This is how you write pipelines for real — never all at once.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>awk '$9==500 {print $1}' /tmp/access.log | head        <span class="c"># stage 1+2: just 500s, just the IP</span>
+awk '$9==500 {print $1}' /tmp/access.log | sort | head  <span class="c"># stage 3: identical IPs now adjacent</span>
+awk '$9==500 {print $1}' /tmp/access.log | sort | uniq -c        <span class="c"># stage 4: counted</span>
+awk '$9==500 {print $1}' /tmp/access.log | sort | uniq -c | sort -rn | head   <span class="c"># stage 5: ranked</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>     41 10.2.0.9
+     27 198.51.100.7
+     14 203.0.113.4</div>
+        <p>There's your answer: <code>10.2.0.9</code> caused 41 of the 500s. Notice <code>awk</code> did the work of a <code>grep</code> plus a <code>cut</code> in one step — <code>$9==500</code> filters, <code>{print $1}</code> extracts. That's the idiom to reach for whenever you catch yourself chaining <code>grep | cut</code>.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — exit codes and pipefail</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Make the silent-failure problem visible, then fix it.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>grep 500 /tmp/nope.log | wc -l ; echo "exit=$?"    <span class="c"># file doesn't exist</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>grep: /tmp/nope.log: No such file or directory
+0
+exit=0</div>
+        <p>Exit <code>0</code> — "success" — even though <code>grep</code> failed. That's <code>$?</code> reporting only <code>wc</code>. Now see the truth two ways:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>grep 500 /tmp/nope.log | wc -l ; echo "codes=${PIPESTATUS[@]}"
+set -o pipefail
+grep 500 /tmp/nope.log | wc -l ; echo "exit=$?"</code></pre></div>
+        <div class="out"><span class="ol">Output</span>codes=2 0
+...
+exit=2</div>
+        <p><code>PIPESTATUS</code> shows <code>2 0</code> — stage one failed, stage two didn't — and with <code>pipefail</code> the whole pipeline now reports <code>2</code>. Put <code>set -o pipefail</code> in every script and this class of bug disappears.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — the quoting disaster</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Reproduce the mistake that has wiped real directories, in a safe sandbox. Watch word-splitting turn one argument into many.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>mkdir -p /tmp/demo &amp;&amp; cd /tmp/demo
+touch "important file.txt" a b c
+f="important file.txt"
+for x in $f; do echo "would delete: [$x]"; done     <span class="c"># unquoted $f</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>would delete: [important]
+would delete: [file.txt]</div>
+        <p>One filename became <em>two</em> arguments because the shell split <code>$f</code> on the space. An unquoted <code>rm $f</code> would have tried to delete <code>important</code> and <code>file.txt</code> — not your file. Now the truly dangerous version: what does an <em>empty or unset</em> variable do?</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>dir=""
+echo rm -rf $dir/          <span class="c"># echo first — NEVER run the real thing to test</span></code></pre></div>
+        <p>What did <code>echo</code> reveal the real command would have been? Work it out before you look — this is the exact bug behind famous production disasters.</p>
+        <details class="recall"><summary>Reveal — why this deletes the world</summary>
+          <div class="body">
+            <p>With <code>dir=""</code>, <code>$dir/</code> expands to just <code>/</code>, so <code>rm -rf $dir/</code> becomes <code>rm -rf /</code>. The empty variable vanished and left the slash behind. Two habits prevent it forever: <b>always quote</b> (<code>rm -rf "$dir/"</code> would try to delete a directory literally named "/", which fails safely), and <b>always <code>set -u</code></b> so an unset <code>$dir</code> aborts the script instead of expanding to nothing. Add <code>: "${dir:?dir must be set}"</code> at the top of destructive scripts to hard-fail on an empty value. And when in doubt, <code>echo</code> the command first — exactly as you just did.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — the script that isn't idempotent</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Here's a "reap old temp files" script a teammate wrote. Run it twice and watch it misbehave on the second run and on failure.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>cat &gt; /tmp/reap.sh &lt;&lt;'EOF'
+#!/usr/bin/env bash
+work=/tmp/reap-work
+mkdir /tmp/reap-work                 # fails on 2nd run: already exists
+echo "scratch data" &gt; "$work/scratch"
+find /var/log -name '*.log' -mtime +7 &gt; "$work/old"   # may find nothing
+process_the_list "$work/old"         # a command that might not exist → error mid-run
+rm -r /tmp/reap-work
+EOF
+bash /tmp/reap.sh ; echo "exit=$?"
+bash /tmp/reap.sh ; echo "exit=$?"   <span class="c"># run again</span>
+ls -d /tmp/reap-work 2&gt;/dev/null &amp;&amp; echo "LEFTOVER dir still here"</code></pre></div>
+        <p>You'll see it fail the second time (<code>mkdir</code> can't recreate the dir), and when the middle command errors it leaves <code>/tmp/reap-work</code> behind — so the next run is now guaranteed to fail too. What two changes make it safe to run any number of times, and clean up even when it crashes? Think before revealing.</p>
+        <details class="recall"><summary>Reveal — make it idempotent and self-cleaning</summary>
+          <div class="body">
+            <p>Two fixes. First, <b>idempotency</b>: use <code>mkdir -p</code> (succeeds whether or not the dir exists) or a fresh <code>mktemp -d</code> each run, so re-running is always safe. Second, <b>guaranteed cleanup</b> via a <code>trap</code> on <code>EXIT</code>, so the scratch dir is removed no matter how the script ends — success, error, or Ctrl-C. Here's the safe rewrite:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>#!/usr/bin/env bash
+set -euo pipefail
+work="$(mktemp -d)"                       <span class="c"># unique dir every run</span>
+trap 'rm -rf "$work"' EXIT                <span class="c"># always cleans up</span>
+echo "scratch data" &gt; "$work/scratch"
+find /var/log -name '*.log' -mtime +7 &gt; "$work/old" || true   <span class="c"># tolerate no matches</span>
+echo "found $(wc -l &lt; "$work/old") old logs"</code></pre></div>
+            <p>Now every run gets its own directory, the trap removes it even on failure, and <code>set -euo pipefail</code> stops the script the instant a real error happens instead of blundering onward. Idempotency plus a cleanup trap is the backbone of every ops script you'll trust in cron.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — a safe script with signal handling</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>Put it together: a script that holds a lock so two copies can't run at once, cleans up on any exit, and shuts down gracefully when Kubernetes sends it <code>SIGTERM</code>. This is the shape of a real maintenance job.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>cat &gt; /tmp/job.sh &lt;&lt;'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly LOCK=/tmp/job.lock
+log() { printf '%s %s\n' "$(date -Is)" "$*" &gt;&amp;2; }   # structured-ish log to stderr
+
+cleanup() { rm -f "$LOCK"; log "cleaned up, exiting"; }
+trap cleanup EXIT
+trap 'log "caught SIGTERM, finishing current item"; STOP=1' TERM INT
+
+if ! ( set -o noclobber; : &gt; "$LOCK" ) 2&gt;/dev/null; then
+  log "another run holds the lock; exiting"; exit 0        # idempotent: safe no-op
+fi
+
+STOP=0
+for item in one two three four five; do
+  [[ "$STOP" == 1 ]] &amp;&amp; { log "stopping early, was on $item"; break; }
+  log "processing $item"
+  sleep 1
+done
+log "done"
+EOF
+bash /tmp/job.sh &amp;
+sleep 2 &amp;&amp; kill -TERM %1     <span class="c"># simulate Kubernetes stopping the pod</span>
+wait</code></pre></div>
+        <div class="out"><span class="ol">Output</span>2024-... processing one
+2024-... processing two
+2024-... caught SIGTERM, finishing current item
+2024-... stopping early, was on three
+2024-... cleaned up, exiting</div>
+        <p>It finished the item it was on, then stopped cleanly and released the lock — no corruption, no orphaned lock file. Now the senior question, the one that decides whether this should even be bash: at what point should you rewrite this in Python?</p>
+        <details class="recall"><summary>Reveal — when bash stops being the right tool</summary>
+          <div class="body">
+            <p>Stop reaching for bash the moment you need any of these: <b>real data structures</b> (nested maps, anything past flat strings and simple arrays); <b>parsing structured data</b> like JSON, YAML, or XML (piping through <code>jq</code> once is fine; building logic around it is a smell); <b>calling HTTP APIs with retries, pagination, and error handling</b>; <b>non-trivial math</b> (bash is integer-only); <b>concurrency you have to coordinate</b>; and <b>anything you need to unit-test</b> or that will outlive a quick fix. A rough line: past ~100–200 lines, or the second time you fight quoting instead of writing logic, you've left bash's comfort zone. Bash is unbeatable glue for "run these commands in order, wire their I/O, check their exit codes." When the <em>logic between</em> the commands becomes the point, that's Python — <a href="ch09-python-for-sre-automation.html">Chapter 9</a>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · the cron job that "succeeded" for months</div>
+      <p><b>Symptom:</b> a nightly job is green in every log, but the data it produces has been subtly wrong or stale for weeks. <b>First cut:</b> read the script for a pipeline without <code>set -o pipefail</code> and for a missing <code>set -e</code>. <b>Confirm:</b> add <code>set -euo pipefail</code> and re-run; watch it fail where it always silently did. <b>Cause is usually:</b> a mid-pipeline stage failing while the last stage returned <code>0</code>, so <code>$?</code> — and therefore cron — saw success. The fix is strict mode plus checking <code>PIPESTATUS</code> where it matters.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · the destructive unquoted variable</div>
+      <p><b>Symptom:</b> a script deleted, moved, or overwrote far more than intended. <b>First cut:</b> grep the script for unquoted <code>$var</code> in <code>rm</code>, <code>mv</code>, <code>cp</code>, and redirects, and for a variable that can be empty. <b>Cause is usually:</b> word-splitting a value with spaces, or an empty variable collapsing so <code>rm -rf "$base/$sub"</code> became <code>rm -rf /</code>-adjacent. The prevention is permanent: quote every expansion, run <code>set -u</code>, guard destructive paths with <code>${x:?}</code>, and lint with ShellCheck in CI.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · the counter that resets to zero</div>
+      <p><b>Symptom:</b> a script counts things in a <code>while read</code> loop fed by a pipe, but the total is always <code>0</code> afterward. <b>First cut:</b> look for <code>… | while read line; do ((n++)); done; echo "$n"</code>. <b>Cause is usually:</b> the piped <code>while</code> runs in a <em>subshell</em>, so <code>n</code> is incremented in the child and lost when it exits. Fix by feeding the loop with process substitution — <code>while read line; do …; done &lt; &lt;(command)</code> — so the loop runs in the current shell and keeps its variables.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Strict mode is not optional.</b> Every script you commit starts with <code>#!/usr/bin/env bash</code> and <code>set -euo pipefail</code>. It's the difference between a script that stops at the first problem and one that charges ahead corrupting state. Pair it with a cleanup <code>trap … EXIT</code> and idempotency (safe to run twice) and you've covered the majority of what makes shell automation dangerous.</p>
+    <p><b>Lint it.</b> Run <a href="https://www.shellcheck.net/">ShellCheck</a> on every script, in your editor and in CI. It catches unquoted variables, useless-<code>cat</code>, subshell-loop bugs, and the <code>[ ]</code> vs <code>[[ ]]</code> traps automatically. There is no reason to ship unlinted shell; the tool knows the footguns better than you do at 3am.</p>
+    <p><b>Security lives in quoting and input.</b> Never build a command out of untrusted input and <code>eval</code> it — that's shell injection, and it's how a filename or an environment variable becomes remote code execution. Quote everything, set a sane <code>PATH</code> at the top rather than trusting the caller's, use <code>printf</code> instead of <code>echo</code> for anything with user data, and treat every external string as hostile. A script that runs as root and interpolates untrusted input is a vulnerability with a shebang.</p>
+    <p><b>Know the ceiling, and cross it on purpose.</b> Bash is glue: brilliant for orchestrating commands, wiring I/O, and gating on exit codes. It is bad at data structures, structured formats, HTTP with retries, floating-point math, testing, and anything long-lived. The mature move is not "always bash" or "never bash" — it's using bash for the ten-line orchestration and switching to Python the moment the logic between the commands becomes the hard part. Fighting quoting instead of writing logic is the tell that you've crossed the line.</p>
+    <p><b>Common mistakes</b> beyond the incidents above: parsing <code>ls</code> output (use globs or <code>find -print0 | xargs -0</code>); forgetting that <code>uniq</code> needs a prior <code>sort</code>; assuming <code>sort</code> orders numbers without <code>-n</code>; and ignoring locale, which can make <code>sort</code> and <code>grep</code> behave differently across machines (pin <code>LC_ALL=C</code> for byte-stable, faster text processing in scripts).</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>Shell is the substrate the rest of the platform sits on, which is why fluency here pays off everywhere later. A container's <code>ENTRYPOINT</code> is almost always a shell script that sets up the environment and then <code>exec</code>s the real process — and <code>exec</code> matters, because without it the shell stays PID 1 and swallows the <code>SIGTERM</code> Kubernetes sends to stop the pod gracefully (the signal-handling you just practised is the same problem, <a href="ch30-the-node-kubelet-kube-proxy-runtime-cri.html">Chapter 30</a>). Every CI/CD pipeline is a sequence of shell steps whose exit codes decide whether the build goes green (<a href="ch73-ci-cd-and-progressive-delivery.html">Chapter 73</a>); a stage that swallows a failure ships a broken artifact. Health-check and readiness probes are frequently one-line shell tests. Init and bootstrap scripts, log-rotation, backup jobs, the "glue" between two systems that don't quite fit — all shell. The design lesson is where to draw the boundary: shell for orchestration at the edges, real programs and services for logic and state. Draw it well and your platform is debuggable; draw it badly — business logic buried in a 900-line bash script — and you've built something no one can safely change.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What does <code>set -euo pipefail</code> do?</summary>
+        <div class="a"><p>It turns off bash's dangerous defaults. <code>-e</code> exits the script the moment any command fails instead of charging on. <code>-u</code> treats a reference to an unset variable as an error rather than silently expanding to empty — which is what stops the classic <code>rm -rf $dir/</code> disaster. <code>-o pipefail</code> makes a pipeline fail if <em>any</em> stage fails, not just the last one, so a broken middle command can't be masked by a successful <code>wc -l</code> at the end. Together they make bash fail loud and early, which is exactly what you want in automation.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through a pipeline to find the top 10 IPs causing HTTP 500s in an access log.</summary>
+        <div class="a"><p><code>awk '$9==500 {print $1}' access.log | sort | uniq -c | sort -rn | head</code>. <code>awk</code> reads each line, keeps only those where the 9th field — the status code in combined log format — is 500, and prints field 1, the client IP; that filters and extracts in one pass. <code>sort</code> puts identical IPs next to each other, which matters because <code>uniq</code> only collapses <em>adjacent</em> duplicates. <code>uniq -c</code> turns each run of the same IP into one line with a count. <code>sort -rn</code> re-sorts by that count, numerically, largest first. <code>head</code> keeps the top ten. I'd build it stage by stage, checking the intermediate output at each <code>|</code>, and in a script I'd run under <code>set -o pipefail</code> so a missing file doesn't look like success. If I needed to do more with the result than rank it, that's my cue to move to Python.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Why does <code>cmd | while read x; do ((n++)); done; echo $n</code> print 0, and how do you fix it?</summary>
+        <div class="a"><p>Because each stage of a pipeline runs in its own process. The <code>while</code> loop on the right of the pipe runs in a <em>subshell</em>, so <code>n++</code> increments a variable in that child process; when the subshell exits at the end of the pipeline, its environment — including <code>n</code> — is discarded, and the parent's <code>n</code> was never touched. It's the same fork-per-stage mechanics that make <code>cd</code> in a subshell not change your directory. The fix is to run the loop in the current shell instead of a subshell, by feeding it with process substitution: <code>while read x; do ((n++)); done &lt; &lt;(cmd)</code>. Now the loop is in the parent, so <code>n</code> survives. Bash's <code>shopt -s lastpipe</code> (non-interactive shells) also runs the last pipeline stage in the current shell, but process substitution is the portable habit.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A nightly cron script has reported success for months, but its output is wrong. How do you find out why?</summary>
+        <div class="a"><p>My first suspicion is swallowed failure. I'd read the script for two things: a pipeline without <code>set -o pipefail</code>, and the absence of <code>set -e</code>. The classic cause is a pipeline like <code>generate | transform | write</code> where <code>transform</code> failed but <code>write</code> exited 0, so <code>$?</code> — and therefore cron's success/failure — only saw the last stage. I'd confirm by adding <code>set -euo pipefail</code> and inspecting <code>${PIPESTATUS[@]}</code> after the suspect pipeline; I'd expect to see a nonzero code in a middle position. Other candidates: a <code>while read</code> subshell losing its accumulated result, an unquoted variable matching nothing, or a command whose failure was hidden inside an <code>if</code> or a <code>local x=$(…)</code>. The durable fix is strict mode, explicit checks on the exit codes that matter, and running ShellCheck in CI so this never ships again.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>When would you refuse to write something in bash and reach for Python?</summary>
+        <div class="a"><p>When the hard part stops being "run these commands in order" and becomes "the logic between them." Concretely: I need nested data structures, not flat strings; I'm parsing JSON/YAML and building real logic on it, not just piping through <code>jq</code> once; I'm calling an HTTP API with retries, pagination, timeouts, and typed error handling; I need floating-point math, which bash can't do; I need concurrency I have to coordinate; or I need to unit-test the code. A practical threshold is around 100–200 lines, or the second time I'm fighting quoting instead of writing logic. Bash stays unbeatable for the thin orchestration layer — the container entrypoint, the CI step, the glue — and I keep it there deliberately rather than letting business logic accrete into an unmaintainable script.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>Bash is the universal glue: it stands up pipelines of small, single-purpose programs and wires their standard streams together with kernel pipes, running every stage concurrently. Its defaults are unsafe — it continues after errors, splits unquoted variables on whitespace, and hides all but the last exit code in a pipeline — so every real script opens with <code>set -euo pipefail</code>, quotes every expansion, and installs a cleanup <code>trap … EXIT</code>. <code>$?</code> is only the last stage; <code>${PIPESTATUS[@]}</code> and <code>pipefail</code> reveal the rest. The core toolkit is <code>grep</code> (filter), <code>awk</code> (columns and logic), <code>sed</code> (edit), <code>cut</code>/<code>sort</code>/<code>uniq</code> (shape and count), and <code>xargs</code> (list to arguments); the "top N of anything" idiom is <code>sort | uniq -c | sort -rn | head</code>. Build pipelines one stage at a time and look at each intermediate. Write scripts to be idempotent and to handle <code>SIGTERM</code> gracefully. And when the logic between commands becomes the point — data structures, JSON, HTTP, tests, ~150+ lines — stop, and switch to Python.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>A pipeline is N concurrent processes; each <code>|</code> is a kernel pipe from one's stdout to the next's stdin.</li>
+      <li><code>$?</code> is only the last stage's exit code — use <code>${PIPESTATUS[@]}</code> and <code>set -o pipefail</code> to catch mid-pipe failures.</li>
+      <li>Start every script with <code>set -euo pipefail</code>; know that <code>-e</code> won't fire inside <code>if</code>/<code>&amp;&amp;</code>/<code>||</code>/<code>local x=$(…)</code>.</li>
+      <li>Quote every expansion (<code>"$var"</code>, <code>"$@"</code>); unquoted variables word-split and glob, and empty ones collapse dangerously.</li>
+      <li><code>set -u</code> plus <code>${x:?msg}</code> stops the empty-variable <code>rm -rf $dir/</code> catastrophe cold.</li>
+      <li><code>awk</code> filters and extracts columns in one pass — reach for it when you're chaining <code>grep | cut</code>.</li>
+      <li><code>uniq</code> only collapses adjacent lines, so it's always <code>sort | uniq</code>; ranking is <code>sort -rn | head</code>.</li>
+      <li>Make scripts idempotent (<code>mkdir -p</code>, <code>mktemp -d</code>) and install <code>trap cleanup EXIT</code> so failures don't leave state behind.</li>
+      <li>Handle <code>SIGTERM</code>/<code>INT</code> with a trap so cron and Kubernetes can stop your job cleanly; <code>exec</code> the real process in entrypoints.</li>
+      <li>Bash is for orchestration; when you need data structures, JSON, HTTP, math, or tests, switch to Python.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on and toward:</span>
+      <a href="ch01-kernel-and-system-calls.html"><b>Ch 1</b> fork/exec &amp; pipes</a>
+      <a href="ch02-processes-threads-scheduling-signals.html"><b>Ch 2</b> Signals</a>
+      <a href="ch07-the-sre-linux-toolkit-as-a-diagnostic.html"><b>Ch 7</b> The SRE toolkit</a>
+      <a href="ch09-python-for-sre-automation.html"><b>Ch 9</b> Python for SRE</a>
+      <a href="ch73-ci-cd-and-progressive-delivery.html"><b>Ch 73</b> CI/CD</a>
+      <a href="ch118-timed-scripting-and-log-wrangling-sre-coding.html"><b>Ch 118</b> Log-wrangling under time</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>GNU — <a href="https://www.gnu.org/software/bash/manual/">Bash Reference Manual</a> (first-party): the authoritative reference for expansions, <code>set</code> options, traps, and pipelines.</li>
+      <li>The Open Group — <a href="https://pubs.opengroup.org/onlinepubs/9699919799/utilities/V3_chap02.html">POSIX Shell Command Language</a>: the standard defining portable shell behaviour and word expansion order.</li>
+      <li>GNU — <a href="https://www.gnu.org/software/gawk/manual/">GAWK: Effective AWK Programming</a> and the <a href="https://www.gnu.org/software/sed/manual/">sed manual</a>: the official references for the two text-processing workhorses.</li>
+      <li>GNU — <a href="https://www.gnu.org/software/coreutils/manual/">Coreutils manual</a>: <code>sort</code>, <code>uniq</code>, <code>cut</code>, <code>wc</code>, and the rest of the pipeline machines.</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man1/xargs.1.html">xargs(1)</a> and <a href="https://man7.org/linux/man-pages/man7/signal.7.html">signal(7)</a>: argument handling and the signals your traps catch.</li>
+      <li>ShellCheck — <a href="https://www.shellcheck.net/">shellcheck.net</a> (first-party project): the static analyser that catches quoting and exit-code bugs before they ship.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch07-the-sre-linux-toolkit-as-a-diagnostic.html"><span class="dir">← Prev</span><div class="ti">Ch 7 — The SRE Linux toolkit as a diagnostic system</div></a>
+      <a class="nx" href="ch09-python-for-sre-automation.html"><span class="dir">Next →</span><div class="ti">Ch 9 — Python for SRE automation</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 8 of 121 · Part I · Linux &amp; OS Foundations. Write bash on purpose: strict mode, quotes, traps — then know when to walk away from it.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">How a pipeline is wired</a>
+    <a href="#internals">What the shell does</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">The top-IPs one-liner</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

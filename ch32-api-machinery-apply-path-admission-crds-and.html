@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 32 — API machinery: apply path, admission, CRDs and operators</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part IV · Kubernetes &nbsp;·&nbsp; Chapter 32</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part IV · Kubernetes — Architecture &amp; Internals · Chapter 32</div>
+      <h1>API machinery: apply path, admission, CRDs and operators</h1>
+      <p class="tagline">Every <code>kubectl apply</code> is a request that gets authenticated, mutated, validated, and only then written to etcd — and you can splice your own code into that path, add your own object types, and write a controller that reconciles them. That is the whole extension model of Kubernetes in one chapter.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~40 min read · kind</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Trace a write from <code>kubectl apply</code> through authn, admission, validation, and into etcd — naming each stage.</li>
+          <li>Explain the difference between a mutating and a validating admission webhook, and where each runs in the chain.</li>
+          <li>Say what server-side apply is, why <code>managedFields</code> exists, and how two controllers can share one object without a fight.</li>
+          <li>Define a CRD, create a custom resource, and explain how that plus a controller equals an operator.</li>
+          <li>Diagnose the two API-machinery incidents that page you: a webhook outage that blocks every write, and an object stuck Terminating on a finalizer.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem: a shared API that anyone can extend</h2>
+    <p>By now you can create a Deployment and watch it reconcile (<a href="ch31-the-reconciliation-loop-controllers-informers.html">Chapter 31</a>). But two questions were left hanging. First: when you run <code>kubectl apply -f app.yaml</code>, what actually happens between "the YAML leaves your laptop" and "the object exists in etcd"? It is not a dumb write. The API server has to decide who you are, whether you may do this, fill in the defaults you left out, reject anything malformed, and only then persist it. That pipeline is the same for every object, and half of your "why did my apply do <em>that</em>?" questions live inside it.</p>
+    <p>Second: the built-in objects — Pod, Deployment, Service — cover generic workloads, but your platform has its own nouns. "A database cluster." "A hosted CI runner." "A certificate." You could bolt those on with a pile of Helm templates and a cron job, but then they are second-class: no <code>kubectl get</code>, no RBAC, no watch, no reconciliation. Kubernetes offers something better. You can teach the API server a new object type — a <b>CustomResourceDefinition</b> — and write a controller that reconciles it. From that moment your "database cluster" is a first-class API object, with the same declarative, self-healing loop as everything else. That combination is an <b>operator</b>.</p>
+    <p>Both answers come from one place: the API machinery. It is the request pipeline plus the extension points wired into it. Learn the pipeline and you can reason about every write; learn the extension points and you can make the platform speak your language.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>The API server is not a database with a REST veneer. It is a <b>validation and admission pipeline</b> in front of etcd. Every write passes through authentication, authorization, mutating admission, schema validation, and validating admission before it is stored. Webhooks and CRDs are how you extend that pipeline and that schema with your own logic and your own object types — without recompiling Kubernetes.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a permit office</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Think of the API server as a city <b>building-permit office</b>. You walk in with an application (your <code>apply</code>). At the front desk they check your ID (<b>authentication</b>) and your file to confirm you're allowed to file this kind of permit (<b>authorization</b>). Neither of those changes your form; they decide whether you get to the next window at all.</p>
+      <p>Then a clerk takes your form and <em>fills in the standard blanks</em> you left empty — the default setback, the standard inspection schedule — and stamps a reference number on it. That clerk is <b>mutating admission</b>: it can change the document. Next, an inspector checks the finished form against the building code, line by line, and either passes it or rejects it with a reason — but changes nothing. That's <b>validating admission</b>. Only a form that survives both gets filed in the official register (<b>etcd</b>).</p>
+      <p>Here's the extension part. The office can hire outside <b>consultants</b> for specialised checks — a fire-safety firm, a heritage board. The office sends your form out to them and waits for a yes/no (an <b>admission webhook</b>). If the consultant's phone is dead and the office is configured to refuse permits it can't get a ruling on, the whole permit desk grinds to a halt — a real failure you will cause at least once. And the office can agree to start accepting a brand-new kind of permit form it never handled before — a "backyard-observatory permit" — by registering its template (a <b>CRD</b>). After that, filing one is as routine as any other.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In Kubernetes</th></tr>
+      <tr><td>Checking your ID at the desk</td><td><b>Authentication</b> — who is this request from?</td></tr>
+      <tr><td>Confirming you may file this permit</td><td><b>Authorization</b> (RBAC) — may they do this verb on this resource?</td></tr>
+      <tr><td>The clerk filling in standard blanks</td><td><b>Mutating admission</b> — defaulting and injection (can change the object)</td></tr>
+      <tr><td>The inspector checking against code</td><td><b>Validating admission</b> + schema validation (can only accept/reject)</td></tr>
+      <tr><td>Filing in the official register</td><td>Persisting to <b>etcd</b></td></tr>
+      <tr><td>An outside consultant you phone for a ruling</td><td>An <b>admission webhook</b> (a service you run)</td></tr>
+      <tr><td>Registering a new kind of permit form</td><td>A <b>CustomResourceDefinition</b> (CRD)</td></tr>
+      <tr><td>The inspectors who make the building match the permit</td><td>A <b>controller / operator</b> reconciling the object</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>The write path: apply → admission → etcd → controller</h2>
+    <p>Here is the shape of one write. Read it left to right: your request enters the API server, passes through the gauntlet, lands in etcd, and only <em>then</em> does a controller — watching via the mechanism from Chapter 31 — notice and act. Nothing reconciles until the object is safely stored.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 430" role="img" aria-label="A write flows from kubectl apply into the API server pipeline: authentication and authorization, then mutating admission which may call a webhook, then schema validation, then validating admission which may call a webhook, then persisted to etcd; a controller watches the API server and reconciles, acting back on the API server">
+        <defs>
+          <marker id="m1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="m2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+          <marker id="m3" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" style="fill:var(--violet)"/></marker>
+        </defs>
+
+        <!-- client -->
+        <rect x="12" y="150" width="92" height="60" rx="10" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="58" y="176" text-anchor="middle" style="fill:var(--accent);font:700 12px sans-serif">kubectl</text>
+        <text x="58" y="194" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">apply (PATCH)</text>
+
+        <!-- apiserver band -->
+        <rect x="120" y="30" width="486" height="250" rx="12" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="134" y="52" style="fill:var(--muted);font:700 11.5px sans-serif;letter-spacing:.05em">KUBE-APISERVER — the write pipeline</text>
+
+        <rect x="134" y="66" width="108" height="52" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="188" y="88" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">AuthN / AuthZ</text>
+        <text x="188" y="104" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">who · may they</text>
+
+        <rect x="258" y="66" width="108" height="52" rx="8" style="fill:var(--panel);stroke:var(--violet);stroke-width:1.5"/>
+        <text x="312" y="85" text-anchor="middle" style="fill:var(--violet);font:700 11px sans-serif">Mutating</text>
+        <text x="312" y="99" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">admission</text>
+        <text x="312" y="111" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">defaults · inject</text>
+
+        <rect x="382" y="66" width="100" height="52" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="432" y="88" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">Schema</text>
+        <text x="432" y="104" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">validate (OpenAPI)</text>
+
+        <rect x="498" y="66" width="94" height="52" rx="8" style="fill:var(--panel);stroke:var(--violet);stroke-width:1.5"/>
+        <text x="545" y="85" text-anchor="middle" style="fill:var(--violet);font:700 11px sans-serif">Validating</text>
+        <text x="545" y="99" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">admission</text>
+        <text x="545" y="111" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">accept / reject</text>
+
+        <!-- arrows through pipeline -->
+        <line x1="104" y1="180" x2="188" y2="120" style="stroke:var(--accent);stroke-width:2" marker-end="url(#m1)"/>
+        <line x1="242" y1="92" x2="256" y2="92" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#m1)"/>
+        <line x1="366" y1="92" x2="380" y2="92" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#m1)"/>
+        <line x1="482" y1="92" x2="496" y2="92" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#m1)"/>
+
+        <!-- webhook callout -->
+        <rect x="300" y="150" width="230" height="50" rx="9" style="fill:var(--panel);stroke:var(--violet);stroke-width:1.5;stroke-dasharray:5 4"/>
+        <text x="415" y="170" text-anchor="middle" style="fill:var(--violet);font:700 11px sans-serif">admission webhooks (you run these)</text>
+        <text x="415" y="186" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">out-of-process · failurePolicy decides on outage</text>
+        <line x1="312" y1="118" x2="360" y2="148" style="stroke:var(--violet);stroke-width:1.5;stroke-dasharray:4 3" marker-end="url(#m3)"/>
+        <line x1="470" y1="148" x2="545" y2="120" style="stroke:var(--violet);stroke-width:1.5;stroke-dasharray:4 3" marker-end="url(#m3)"/>
+
+        <!-- persist to etcd -->
+        <line x1="592" y1="92" x2="648" y2="92" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#m2)"/>
+        <rect x="628" y="66" width="80" height="52" rx="10" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="668" y="88" text-anchor="middle" style="fill:var(--accent2);font:700 12px sans-serif">etcd</text>
+        <text x="668" y="104" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">persisted</text>
+
+        <!-- controller -->
+        <rect x="240" y="330" width="240" height="64" rx="10" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="360" y="356" text-anchor="middle" style="fill:var(--accent);font:700 12px sans-serif">controller / operator</text>
+        <text x="360" y="374" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">watch → reconcile → act</text>
+
+        <!-- watch arrow from apiserver down to controller -->
+        <path d="M300,280 L300,330" fill="none" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#m2)"/>
+        <text x="238" y="308" text-anchor="middle" style="fill:var(--accent2);font:600 9.5px sans-serif">watch (new object)</text>
+        <!-- act arrow from controller back to apiserver -->
+        <path d="M420,330 L420,282" fill="none" style="stroke:var(--accent);stroke-width:2" marker-end="url(#m1)"/>
+        <text x="486" y="308" text-anchor="middle" style="fill:var(--accent);font:600 9.5px sans-serif">act (create children)</text>
+      </svg>
+      <figcaption>A write is authenticated and authorized, then <em>mutated</em> (defaults, injection), then schema-validated, then <em>validated</em>, then stored. Webhooks hook into the two admission stages. Reconciliation happens only after the object is in etcd — the controller watches for it.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>Because both admission stages sit in the <em>synchronous path of every write</em>, they are a single point of failure you install yourself. A webhook you deployed with <code>failurePolicy: Fail</code> and a pod that later crashes will make the API server reject creates cluster-wide — including, if you're not careful, the pods that would restart your webhook. That is the classic self-inflicted outage of this chapter, and it is entirely preventable once you understand where webhooks sit.</p>
+    </div>
+
+    <h2 id="requestpath"><span class="beat">Internal working</span>What happens between apply and etcd</h2>
+
+    <h4>1 · Every object is spec and status</h4>
+    <p>Almost every Kubernetes object has two halves. <code>spec</code> is <em>desired state</em> — what you asked for, written by you. <code>status</code> is <em>observed state</em> — what is actually true, written by the controller. You <code>apply</code> the spec; the controller reconciles reality toward it and reports back in status. The API server enforces this split: a normal write to a resource with a <b>status subresource</b> ignores your status, and a write to <code>/status</code> ignores your spec. That's why you can't "fix" a Deployment by editing its status — status is a readout, not a control. Keep this straight and half of "my change didn't take" mysteries dissolve.</p>
+
+    <h4>2 · The pipeline, stage by stage</h4>
+    <p>When your <code>apply</code> arrives (as an HTTP PATCH or POST), the API server runs it through a fixed sequence:</p>
+    <ol class="steps">
+      <li><b>Authentication.</b> Who is this? A client cert, a bearer token, or an OIDC identity is resolved to a username and groups. No identity, no entry.</li>
+      <li><b>Authorization.</b> May this identity perform this verb (<code>create</code>, <code>update</code>, <code>patch</code>) on this resource in this namespace? RBAC answers (<a href="ch39-security-rbac-admission-policy-securitycontext.html">Chapter 39</a>). A no ends here with a 403.</li>
+      <li><b>Mutating admission.</b> Built-in mutating plugins and any registered <b>MutatingWebhookConfiguration</b> run. They may <em>rewrite</em> the object: apply defaults, inject a sidecar, add labels. Webhooks are called one at a time and can each patch the object further.</li>
+      <li><b>Schema validation.</b> The (possibly mutated) object is checked against the resource's OpenAPI schema — required fields present, types correct, enums valid. For a CRD, this is the schema you wrote in the CRD. This is also where structural rules and defaulting from the CRD apply.</li>
+      <li><b>Validating admission.</b> Built-in validating plugins, any <b>ValidatingAdmissionPolicy</b> (in-cluster CEL rules, no server to run), and any <b>ValidatingWebhookConfiguration</b> run. They may only accept or reject — no mutation. Rejections come back with a reason.</li>
+      <li><b>Persist.</b> The object is serialized and written to etcd through a quorum write (<a href="ch29-the-control-plane-api-server-etcd-scheduler.html">Chapter 29</a>). Its <code>resourceVersion</code> is bumped. Only now is it real.</li>
+      <li><b>Watchers notified.</b> The write becomes a watch event, and every informer watching that type — including the controllers that will reconcile it — sees it. Reconciliation begins.</li>
+    </ol>
+    <p>The order is not arbitrary. Mutating runs <em>before</em> validating so that defaults and injections are in place before anyone judges the object — otherwise a webhook would validate a half-filled form. And admission runs <em>before</em> persistence so that nothing invalid ever reaches etcd.</p>
+
+    <h4>3 · Mutating vs validating webhooks</h4>
+    <p>A webhook is an HTTPS service you run in the cluster. The API server POSTs it an <code>AdmissionReview</code> and reads back an allow/deny (and, for mutating, a JSON patch). Two kinds, two jobs:</p>
+    <ul>
+      <li><b>MutatingWebhookConfiguration</b> — runs in the mutating phase, returns a patch. Used to inject things: a service mesh injecting its sidecar, a policy engine adding default resource limits. Order matters and later webhooks see earlier webhooks' changes.</li>
+      <li><b>ValidatingWebhookConfiguration</b> — runs in the validating phase, returns only allow/deny with a message. Used to enforce policy: "every pod must have resource limits," "no <code>:latest</code> tags." It cannot change the object, only refuse it.</li>
+    </ul>
+    <p>Both carry the field that will page you one day: <code>failurePolicy</code>. <code>Fail</code> means "if you can't reach me, reject the request." <code>Ignore</code> means "if you can't reach me, allow it through." <code>Fail</code> is safer for security policy and more dangerous for availability. Both carry <code>timeoutSeconds</code> (keep it small — a slow webhook slows every write it matches) and selectors (<code>namespaceSelector</code>, <code>objectSelector</code>) to scope <em>which</em> requests they intercept. Scoping is not optional at scale; an unscoped <code>Fail</code> webhook is a cluster-wide fuse.</p>
+    <div class="box keypoint"><div class="h">Prefer in-tree policy where you can</div>
+      <p>For pure validation — "reject pods without limits," "require a label" — you often don't need a webhook at all. <b>ValidatingAdmissionPolicy</b> (GA since Kubernetes 1.30) lets you write the rule in <b>CEL</b> as an API object that the API server evaluates itself. No server to run, no <code>failurePolicy</code> outage to cause, no extra network hop on every write. Reach for a webhook only when you need to mutate, or when your logic can't be expressed in CEL. This is the current, recommended default for policy enforcement.</p>
+    </div>
+
+    <h4>4 · Server-side apply and managedFields</h4>
+    <p>Old <code>kubectl apply</code> computed diffs on the client using a "last-applied-configuration" annotation — fragile, and it lost track when more than one actor edited an object. <b>Server-side apply</b> (SSA) moved that logic into the API server. Each actor declares a <b>field manager</b> name and sends only the fields it owns; the API server records, per field, <em>who owns it</em> in <code>metadata.managedFields</code>. If two managers try to own the same field with different values, you get a <b>conflict</b> — surfaced instead of silently overwritten. You resolve it by force-applying (take ownership) or by not touching fields you don't own.</p>
+    <p>This is why controllers and GitOps engines use SSA: it lets a Deployment's replicas be owned by an HPA while its image is owned by your CI, on the same object, without them clobbering each other. When you see <code>managedFields</code> cluttering a <code>kubectl get -o yaml</code>, that's SSA bookkeeping — the record of who owns what.</p>
+
+    <h4>5 · Finalizers: deletion with a pause</h4>
+    <p>A <b>finalizer</b> is a string in <code>metadata.finalizers</code> that means "don't actually delete this object until I've cleaned up." When you delete an object that has finalizers, the API server does <em>not</em> remove it. Instead it sets <code>metadata.deletionTimestamp</code> — the object is now "marked for deletion" but still present. A controller that owns the finalizer notices the timestamp, performs its cleanup (deregister DNS, delete a cloud load balancer, snapshot a volume), then removes its finalizer string. When the last finalizer is gone, the API server deletes the object for real. Finalizers are how Kubernetes guarantees external cleanup happens before an object vanishes — and, when the owning controller is dead, exactly why objects get stuck Terminating forever.</p>
+
+    <details class="recall"><summary>Think first: you register a validating webhook with <code>failurePolicy: Fail</code>, then its pod crashes. What happens to unrelated <code>kubectl apply</code> commands?</summary>
+      <div class="body">
+        <p>They fail — if they match the webhook's rules. With <code>failurePolicy: Fail</code>, the API server must get an allow from the webhook before persisting a matching object; if it can't reach the webhook, it rejects the write with an error like <code>failed calling webhook ... connection refused</code>. So every create/update the webhook was scoped to now returns an error, even though the object itself is fine and etcd is healthy. The blast radius is exactly the webhook's <code>rules</code> and selectors: an unscoped webhook that matches <code>pods</code> in all namespaces will block pod creation cluster-wide — potentially including the webhook's own replacement pod, which is how these turn into deadlocks. The fixes are all preventive: scope tightly with selectors, exclude <code>kube-system</code>, keep <code>timeoutSeconds</code> low, run the webhook HA, and use <code>Ignore</code> (or in-tree policy) for anything that isn't a hard security gate.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, named</h2>
+    <ul>
+      <li><b>kube-apiserver</b> — runs the whole pipeline: authn, authz, admission, schema validation, persistence, and watch. Everything in this chapter is a stage or an extension point inside it.</li>
+      <li><b>Admission plugins (built-in)</b> — compiled-in mutating and validating controllers (defaulting, <code>NamespaceLifecycle</code>, <code>ResourceQuota</code>, <code>PodSecurity</code>, and others). They run before any webhook.</li>
+      <li><b>MutatingWebhookConfiguration / ValidatingWebhookConfiguration</b> — API objects that register your out-of-process webhooks into the mutating and validating phases, with <code>rules</code>, selectors, <code>failurePolicy</code>, and <code>timeoutSeconds</code>.</li>
+      <li><b>ValidatingAdmissionPolicy</b> — in-tree CEL policy evaluated by the API server itself; the webhook-free way to enforce validation rules (GA since 1.30).</li>
+      <li><b>CustomResourceDefinition (CRD)</b> — <code>apiextensions.k8s.io/v1</code>. Teaches the API server a new resource type, with its OpenAPI schema, versions, and whether it has a <code>status</code> subresource.</li>
+      <li><b>Custom Resource (CR)</b> — an instance of a CRD's type. Once the CRD exists, a CR behaves like any built-in object: stored in etcd, RBAC-controlled, watchable, gettable with <code>kubectl</code>.</li>
+      <li><b>Controller / operator</b> — the reconcile loop (Chapter 31) that watches your CRs and makes reality match them. CRD + controller = operator.</li>
+      <li><b>Finalizers &amp; managedFields</b> — the two <code>metadata</code> fields this chapter turns from mystery into tool: deletion hooks, and server-side-apply ownership.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one <code>kubectl apply</code> of a Deployment</h2>
+    <p>Watch a single <code>kubectl apply -f deploy.yaml</code> go all the way through:</p>
+    <ol class="steps">
+      <li>kubectl reads your file and sends a <b>server-side apply PATCH</b> to <code>/apis/apps/v1/namespaces/default/deployments/web</code>, with a field-manager name of <code>kubectl</code>.</li>
+      <li>The API server authenticates you and checks RBAC: may you <code>patch</code> deployments here? Yes.</li>
+      <li><b>Mutating admission</b> runs: defaulting fills in the fields you omitted (strategy, revisionHistoryLimit), and any mutating webhook — say a mesh injector — patches in a sidecar container.</li>
+      <li>The merged object is <b>schema-validated</b> against the <code>apps/v1</code> Deployment schema. Missing a required field or a bad type fails here.</li>
+      <li><b>Validating admission</b> runs: <code>ResourceQuota</code> checks you're within namespace limits, <code>PodSecurity</code> checks the pod template against the namespace's standard, and any validating webhook or policy has its say. All allow.</li>
+      <li>The API server records field ownership in <code>managedFields</code> (yours as <code>kubectl</code>), writes the object to <b>etcd</b>, and bumps its <code>resourceVersion</code>.</li>
+      <li>The write is now a <b>watch event</b>. The Deployment controller's informer sees the new object, reconciles it into a ReplicaSet, which reconciles into Pods (<a href="ch33-workloads-i-pod-replicaset-deployment.html">Chapter 33</a>). None of that happened during your apply — your apply just made the desired state real; the loop took it from there.</li>
+    </ol>
+    <p>Every one of those stages can reject you, and each rejection has a distinct fingerprint: 401 (authn), 403 (RBAC), a defaulting surprise (mutating), a schema error (validation), a policy denial (validating). Knowing which stage spoke tells you where to look.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>All local, on a throwaway kind cluster. Nothing here touches a real cluster.</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>kind create cluster --name apim
+kubectl version --short   <span class="c"># confirm client + server are talking</span></code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — define a CRD and create a custom resource</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Teach the API server a new type, then use it like any built-in. Save this CRD — a toy "Widget" with a schema and a status subresource:</p>
+        <div class="codewrap"><span class="lang">yaml</span><pre><code><span class="c"># widget-crd.yaml</span>
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: widgets.demo.example.com
+spec:
+  group: demo.example.com
+  scope: Namespaced
+  names: { kind: Widget, plural: widgets, singular: widget, shortNames: [wg] }
+  versions:
+  - name: v1
+    served: true
+    storage: true
+    subresources: { status: {} }
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            required: [size]
+            properties:
+              size: { type: integer, minimum: 1, maximum: 10 }
+          status:
+            type: object
+            properties:
+              phase: { type: string }</code></pre></div>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl apply -f widget-crd.yaml
+kubectl api-resources | grep widgets
+kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: demo.example.com/v1
+kind: Widget
+metadata: { name: w1 }
+spec: { size: 3 }
+EOF
+kubectl get widgets</code></pre></div>
+        <div class="out"><span class="ol">Output</span>widgets   demo.example.com/v1   true   Widget
+NAME   AGE
+w1     4s</code></div>
+        <p>You just extended the API. <code>widgets</code> is now a first-class resource: <code>kubectl get/describe/edit</code> work, RBAC applies, and informers can watch it. Prove the schema is real — try an out-of-range value:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: demo.example.com/v1
+kind: Widget
+metadata: { name: bad }
+spec: { size: 99 }
+EOF</code></pre></div>
+        <div class="out"><span class="ol">Output</span>The Widget "bad" is invalid: spec.size: Invalid value: 99: spec.size in body should be less than or equal to 10</code></div>
+        <p>That rejection came from schema validation, stage 4 of the pipeline — the API server enforcing <em>your</em> CRD schema. There is no controller yet, so nothing acts on the Widget; a CRD alone gives you storage and validation. Add a reconciler and you have an operator.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — server-side apply and field ownership</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>See <code>managedFields</code> record who owns what, then trigger a conflict on purpose.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl create deployment web --image=nginx:1.27-alpine
+<span class="c"># Actor A ("ci") owns the image via server-side apply:</span>
+kubectl apply --server-side --field-manager=ci -f - &lt;&lt;'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: web }
+spec:
+  template:
+    spec:
+      containers:
+      - { name: nginx, image: nginx:1.27-alpine }
+EOF
+kubectl get deploy web -o jsonpath='{range .metadata.managedFields[*]}{.manager}{"\n"}{end}'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>kubectl
+ci</code></div>
+        <p>Two managers own different slices of the same object. Now have a <em>second</em> actor try to set the same image to a different value, without forcing:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl apply --server-side --field-manager=other -f - &lt;&lt;'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: web }
+spec:
+  template:
+    spec:
+      containers:
+      - { name: nginx, image: nginx:1.25 }
+EOF</code></pre></div>
+        <div class="out"><span class="ol">Output</span>error: Apply failed with 1 conflict: conflict with "ci": .spec.template.spec.containers[name="nginx"].image
+Please review the fields above--they currently have a manager. You may co-own fields ... or --force-conflicts.</code></div>
+        <p>That conflict is the whole point of SSA: two actors wanting the same field is surfaced, not silently resolved by whoever wrote last. In a GitOps setup this is how Argo CD (<a href="ch65-argo-cd.html">Chapter 65</a>) detects that something else is fighting it for a field. You'd resolve it deliberately — one owner per field, or an explicit <code>--force-conflicts</code> to take over.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — a webhook outage blocks every apply</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>You don't need to write a webhook server to feel the failure mode — you just need to register a webhook that points at a service that isn't there, with <code>failurePolicy: Fail</code>. This is the single most common self-inflicted API-machinery outage, reproduced safely.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata: { name: doomed }
+webhooks:
+- name: doomed.demo.example.com
+  admissionReviewVersions: ["v1"]
+  sideEffects: None
+  failurePolicy: Fail
+  timeoutSeconds: 5
+  clientConfig:
+    service: { name: nowhere, namespace: default, path: "/validate" }
+  rules:
+  - apiGroups: [""]
+    apiVersions: ["v1"]
+    operations: ["CREATE"]
+    resources: ["configmaps"]
+EOF
+<span class="c"># Now try to create a ConfigMap — the webhook it points to does not exist:</span>
+kubectl create configmap probe --from-literal=k=v</code></pre></div>
+        <div class="out"><span class="ol">Output</span>Error from server (InternalError): Internal error occurred: failed calling webhook "doomed.demo.example.com": failed to call webhook: Post "https://nowhere.default.svc:443/validate?timeout=5s": service "nowhere" not found</code></div>
+        <p>Every ConfigMap create in the cluster now fails — not because ConfigMaps are broken, but because a <code>Fail</code> webhook in the write path can't be reached. You caused a cluster-wide outage with one manifest and no running code. Before you clean it up, notice the shape of the error: <code>failed calling webhook</code> is the fingerprint. Now think about the safe version.</p>
+        <details class="recall"><summary>How would you have made this webhook safe to deploy?</summary>
+          <div class="body">
+            <p>Four levers, and you'd use all of them. <b>Scope it</b> with a <code>namespaceSelector</code> so it only intercepts the namespaces it must — and always exclude control-plane namespaces (label <code>kube-system</code> and add a selector that skips it), so a broken webhook can never block the pods that would fix it. <b>Choose <code>failurePolicy: Ignore</code></b> unless this is a hard security gate; a policy webhook that fails open degrades gracefully, one that fails closed takes an outage. <b>Keep <code>timeoutSeconds</code> small</b> (1–5s) so a slow webhook doesn't add latency to every write it matches. And <b>run the webhook HA</b> with a PodDisruptionBudget so a single node drain doesn't down it. For pure validation, skip the webhook entirely and use a <code>ValidatingAdmissionPolicy</code> — no server, no outage to cause. Clean up: <code>kubectl delete validatingwebhookconfiguration doomed</code>, and ConfigMap creates work again instantly.</p>
+          </div>
+        </details>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl delete validatingwebhookconfiguration doomed</code></pre></div>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — a custom resource stuck Terminating</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Give the Widget a finalizer that no controller owns, then delete it and watch it refuse to go.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl patch widget w1 --type=merge \
+  -p '{"metadata":{"finalizers":["demo.example.com/cleanup"]}}'
+kubectl delete widget w1 --wait=false
+kubectl get widget w1</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME   AGE
+w1     5m        <span class="c"># still here — the delete "succeeded" but the object remains</span></code></div>
+        <p>The delete returned without error, yet <code>w1</code> is still listed. Why is it stuck, and what is the difference between the safe fix and the dangerous one? Work it out before revealing.</p>
+        <details class="recall"><summary>Reveal the diagnosis</summary>
+          <div class="body">
+            <p>The object now carries a <code>deletionTimestamp</code> (it's marked for deletion) but its <code>finalizers</code> list is non-empty, and the API server will not remove an object until every finalizer is cleared. Normally a controller owns that finalizer: it sees the <code>deletionTimestamp</code>, runs its cleanup, removes its finalizer, and the object disappears. Here nothing owns <code>demo.example.com/cleanup</code>, so it hangs in Terminating forever. Confirm:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl get widget w1 -o jsonpath='{.metadata.deletionTimestamp}{"  "}{.metadata.finalizers}{"\n"}'</code></pre></div>
+            <div class="out"><span class="ol">Output</span>2026-09-21T10:14:03Z  ["demo.example.com/cleanup"]</code></div>
+            <p>The <b>right</b> fix in production is to make the owning controller healthy again so it completes cleanup and removes its own finalizer. The <b>blunt</b> fix — only when the controller is gone for good and you accept skipping whatever cleanup it would have done — is to clear the finalizer by hand: <code>kubectl patch widget w1 --type=merge -p '{"metadata":{"finalizers":null}}'</code>, after which it deletes instantly. Force-clearing finalizers on real resources (a namespace stuck Terminating, a PV) can orphan external infrastructure — a cloud load balancer or disk the controller never got to delete — so it is a last resort, not a reflex. This exact shape recurs everywhere finalizers do: operators, namespaces, PVs.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — design a mutating webhook you can trust</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>Your platform team wants to inject a default set of resource limits into every pod that lacks them, cluster-wide, via a mutating webhook. That is a webhook in the write path of every pod creation — including system pods and its own. Sketch how you'd deploy it without ever taking the cluster down. Reason first.</p>
+        <details class="recall"><summary>Reveal the approach</summary>
+          <div class="body">
+            <p>Start by questioning the webhook at all: if you only need to <em>enforce</em> that limits exist, a <code>ValidatingAdmissionPolicy</code> in CEL does it with no server. But injection is a mutation, so a mutating webhook is justified here. Then make it safe by construction:</p>
+            <ul>
+              <li><b>Scope by namespace.</b> Use a <code>namespaceSelector</code> that opts namespaces <em>in</em> (a label like <code>limits-injection=enabled</code>) rather than matching everything. Explicitly exclude <code>kube-system</code> and your own webhook's namespace so the control plane and the injector itself are never intercepted.</li>
+              <li><b><code>failurePolicy: Ignore</code>, at least at first.</b> A defaulting webhook that fails open lets pods through un-injected during an outage — degraded, not down. You can tighten to <code>Fail</code> later once it has proven reliable, and only if the injection is truly mandatory.</li>
+              <li><b>Small <code>timeoutSeconds</code> and HA.</b> 1–2 seconds, at least two replicas across nodes, a PDB with <code>minAvailable: 1</code>, and — critically — the webhook's own pods excluded from its rules so it can always restart.</li>
+              <li><b><code>reinvocationPolicy</code> and idempotency.</b> Other mutating webhooks may run after yours; set <code>reinvocationPolicy: IfNeeded</code> if order matters, and make the patch idempotent so re-invocation doesn't double-inject.</li>
+              <li><b>Roll out behind a canary namespace.</b> Enable the opt-in label on one test namespace, verify injection, then widen. Watch API-server request latency and webhook error rate as you go.</li>
+            </ul>
+            <p>The through-line: a webhook is infrastructure in the synchronous path of writes, so you engineer its availability like any other critical dependency — scope, timeouts, HA, fail-open by default, and a self-exclusion so it can never wedge its own recovery. Clean up the lab: <code>kind delete cluster --name apim</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · a webhook outage blocks all writes</div>
+      <p><b>Symptom:</b> <code>kubectl apply</code> and controllers start failing across the cluster with <code>failed calling webhook ...</code>; new pods won't create, deployments stall. <b>First cut:</b> read the error — it names the webhook. <code>kubectl get validatingwebhookconfigurations,mutatingwebhookconfigurations</code> and find the one whose backing service is unhealthy. <b>Usual cause:</b> a webhook with <code>failurePolicy: Fail</code> whose pods are down (node drain, crash, image pull) and which is scoped too broadly. <b>Fix now:</b> restore the webhook's pods; if they can't start because the webhook blocks their own creation, delete the offending <code>WebhookConfiguration</code> to break the deadlock, then fix and re-apply it with a self-exclusion and tighter scope.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · object stuck Terminating on a finalizer</div>
+      <p><b>Symptom:</b> a delete "succeeds" but the object lingers in Terminating for minutes or forever — common with namespaces and CRs from operators. <b>Confirm:</b> read <code>metadata.deletionTimestamp</code> and <code>metadata.finalizers</code>; the object is marked for deletion but a finalizer remains. <b>Cause:</b> the controller that owns that finalizer is down, uninstalled, or erroring during cleanup. <b>Fix:</b> make that controller healthy so it finishes cleanup and removes its finalizer; force-remove the finalizer only when you've accepted the orphaned external resources.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · SSA field conflicts / fields flapping</div>
+      <p><b>Symptom:</b> a field (often <code>replicas</code> or an image) keeps reverting, or apply fails with <code>conflict with "&lt;manager&gt;"</code>. <b>Cause:</b> two actors own the same field — a manifest and the HPA both setting <code>replicas</code>, or two GitOps tools managing one object. <b>Confirm:</b> read <code>metadata.managedFields</code> to see who owns the contested field. <b>Fix:</b> decide one owner per field — stop managing <code>replicas</code> from git if the HPA owns it — rather than force-applying in a loop, which just moves the fight.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Webhooks are availability risks, so treat them as critical infrastructure.</b> Every admission webhook you register sits in the synchronous path of the writes it matches, which means its availability is now your cluster's write availability for those objects. Scope every webhook with selectors, exclude control-plane namespaces, keep timeouts to a few seconds, run at least two replicas with a PDB, and default to <code>failurePolicy: Ignore</code> unless the check is a hard security gate that you'd genuinely rather fail closed. Never let a webhook match its own pods. For pure validation, prefer <code>ValidatingAdmissionPolicy</code> — no server means no outage to cause.</p>
+    <p><b>CRDs are a schema and an API contract — version them like one.</b> A CRD's OpenAPI schema is the validation for its CRs, so write it tightly (required fields, ranges, enums) rather than accepting free-form objects. When the schema changes incompatibly, add a new version and a conversion strategy; don't mutate a served version's meaning under running controllers. Mark exactly one version as <code>storage: true</code>. Remember the etcd cost: thousands of CRs are thousands of objects the API server lists and watches, so a chatty operator that creates a CR per request will pressure the control plane the same way any object churn does (<a href="ch29-the-control-plane-api-server-etcd-scheduler.html">Chapter 29</a>).</p>
+    <p><b>Admission is a security control, but PodSecurity Admission replaced PSP.</b> The built-in <b>Pod Security Admission</b> controller enforces the Pod Security Standards (privileged / baseline / restricted) per namespace via labels — this is the current mechanism; PodSecurityPolicy was removed in 1.25 and you should never reach for it. Layer your own policy on top with <code>ValidatingAdmissionPolicy</code> or a policy engine (Kyverno, Gatekeeper) running as webhooks. Keep in mind that admission runs <em>after</em> authorization, so it's defense in depth on top of RBAC, not a replacement for it.</p>
+    <p><b>Common mistakes:</b> an unscoped <code>Fail</code> webhook (the outage in Lab 3); a webhook that matches its own namespace and deadlocks its recovery; treating a CRD's schema as optional and getting garbage CRs; force-applying in a loop to "win" an SSA conflict instead of fixing ownership; and adding a finalizer from an operator that later gets uninstalled, leaving objects un-deletable. Each one is avoidable with the model in this chapter.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>This chapter is why Kubernetes is a <em>platform</em> and not just a container runner. The CRD-plus-controller pattern means the API server is an extensible, watchable, RBAC-governed database of desired state that <em>you</em> get to add nouns to — and the reconcile loop (<a href="ch31-the-reconciliation-loop-controllers-informers.html">Chapter 31</a>) makes each new noun self-healing for free. That's the foundation of the entire operator ecosystem: cert-manager reconciles <code>Certificate</code> objects against a CA, external-dns reconciles DNS records, and a database operator reconciles a <code>PostgresCluster</code> into StatefulSets, Services, and backups. When you design an internal platform, the decision "should this be a CRD or just config?" is really "does this deserve a control loop, RBAC, and status?" — if yes, model it as a CRD and you inherit the whole machine. Admission is the other half of the design story: it's where org-wide policy lives — no <code>:latest</code> images, mandatory limits, required labels — enforced uniformly at the one chokepoint every write must pass. And server-side apply is what makes GitOps engines like Argo CD (<a href="ch65-argo-cd.html">Chapter 65</a>) able to co-manage objects with HPAs and other controllers without an endless overwrite war. Get this layer right and your platform is declarative, governed, and extensible; get it wrong and you've either bolted brittle automation onto the side or installed a fuse that blows the whole cluster.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What is the difference between a mutating and a validating admission webhook?</summary>
+        <div class="a"><p>Both are HTTPS services the API server calls during a write, but they run in different phases and have different powers. A mutating webhook runs first and can <em>change</em> the object — return a patch to add defaults or inject a sidecar. A validating webhook runs after, once the object is finalized, and can only <em>accept or reject</em> it with a reason — it cannot mutate. Mutating before validating is deliberate, so the object is fully formed before anyone judges it. Both carry a <code>failurePolicy</code> that decides what happens if the webhook is unreachable.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through what happens from <code>kubectl apply</code> to the object being stored.</summary>
+        <div class="a"><p>kubectl sends the manifest as a request to the API server — with server-side apply, a PATCH tagged with a field-manager name. The API server authenticates the caller, then authorizes with RBAC: may this identity perform this verb on this resource here? Then mutating admission runs — built-in defaulting plus any mutating webhooks — which can rewrite the object, adding defaults or injecting containers. The merged object is validated against its OpenAPI schema (for a CRD, the schema you defined). Then validating admission runs — ResourceQuota, PodSecurity, any validating webhook or CEL policy — which can only accept or reject. If everything allows, the API server records field ownership in <code>managedFields</code>, writes the object to etcd via a quorum write, and bumps its <code>resourceVersion</code>. That write becomes a watch event, and only then do controllers see it and begin reconciling. The key idea: the API server is an admission pipeline in front of etcd, and reconciliation is a separate, later step driven by watch.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>What is server-side apply solving, and how do <code>managedFields</code> work?</summary>
+        <div class="a"><p>The problem is multiple actors editing one object. The old client-side apply stored your last-applied config in an annotation and diffed against it on the client, which broke when anything other than you also edited the object — you'd silently clobber a field an HPA or another controller set. Server-side apply moves the merge into the API server and tracks ownership per field. Each actor supplies a field-manager name and sends only the fields it intends to own; the API server records, in <code>metadata.managedFields</code>, which manager owns which field paths. If a second manager tries to set a field a different manager already owns to a conflicting value, the apply fails with a conflict instead of overwriting — you either co-own, hand off, or explicitly force. This is what lets a Deployment's <code>replicas</code> be owned by an HPA while its image is owned by CI, on the same object, without a fight, and it's how Argo CD detects drift and rival managers. The cost is the <code>managedFields</code> bookkeeping cluttering objects, but the payoff is deterministic multi-writer semantics. It pairs naturally with the reconcile loop: controllers apply only the fields they own, every reconcile, idempotently.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>Suddenly no new pods can be created cluster-wide and applies fail with "failed calling webhook." What do you do?</summary>
+        <div class="a"><p>I read the error first — it names the webhook. That tells me an admission webhook with <code>failurePolicy: Fail</code> is in the write path and unreachable. I list <code>validatingwebhookconfigurations</code> and <code>mutatingwebhookconfigurations</code>, find the named one, and check its backing service and pods — almost always they're down: a node drain, a crash, an image-pull failure, or the webhook got scoped so broadly it's now blocking its own replacement pod from starting, a deadlock. To restore writes immediately I delete that WebhookConfiguration, which removes it from the path; pod creation recovers at once. Then I fix the root cause — get the webhook's pods healthy — and re-register it, this time scoped with a namespaceSelector that excludes kube-system and the webhook's own namespace, with a small timeout, HA replicas plus a PDB, and <code>failurePolicy: Ignore</code> unless it's a hard security gate. The lesson I'd state: a webhook is a synchronous dependency of every write it matches, so its availability is cluster write availability, and it must never be able to block its own recovery.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>What exactly is an operator, and when should something be a CRD?</summary>
+        <div class="a"><p>An operator is a custom controller plus the custom resource type it reconciles: you define a CRD — say <code>PostgresCluster</code> — with its schema and status, then run a controller (usually built with controller-runtime, which wires up the informer, work queue, and workers for you) that watches those CRs and makes real infrastructure match them: StatefulSets, Services, backups, failover. It's the exact reconcile loop from the controllers chapter, pointed at your domain. Something should be a CRD when it deserves a control loop and an API: when you want <code>kubectl get</code>, RBAC, watch, status, and self-healing reconciliation for a concept your platform owns. If it's just static values a pod reads once, a ConfigMap is enough — you don't need an API object or a controller. The test I use: does this thing have a desired state that drifts and must be continuously reconciled against reality? If yes, model it as a CRD and inherit the whole machine; if no, it's config. cert-manager, external-dns, and every database operator are this pattern, and so is Argo CD reconciling git into the cluster.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>The API server is an admission pipeline in front of etcd, not a plain datastore. Every write is authenticated, authorized (RBAC), mutated (defaulting and mutating webhooks, which can change the object), schema-validated, then validated (built-in checks, CEL policy, validating webhooks, which can only accept or reject), then persisted — and only after persistence do controllers see it via watch and reconcile. Objects are split into <code>spec</code> (desired, yours) and <code>status</code> (observed, the controller's). Server-side apply tracks per-field ownership in <code>managedFields</code> so multiple actors can co-manage one object and conflicts surface instead of silently clobbering. Finalizers pause deletion until an owning controller cleans up and removes them — and a finalizer whose controller is gone is why objects stick in Terminating. You extend the platform with CRDs (new object types with their own schema) plus controllers that reconcile them; CRD + controller = operator. The two incidents that page you: a broadly-scoped <code>failurePolicy: Fail</code> webhook whose outage blocks all matching writes, and a stuck-Terminating object waiting on an unowned finalizer.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>The API server runs a pipeline before etcd: authn → authz → mutating admission → schema validation → validating admission → persist → watch.</li>
+      <li><code>spec</code> is desired state (you write it); <code>status</code> is observed state (the controller writes it) — editing status doesn't change reality.</li>
+      <li>Mutating webhooks run first and can change the object; validating webhooks run after and can only accept or reject.</li>
+      <li><code>failurePolicy: Fail</code> makes an unreachable webhook block matching writes; scope tightly, exclude kube-system, prefer <code>Ignore</code> for non-security checks.</li>
+      <li>For pure validation, use in-tree <code>ValidatingAdmissionPolicy</code> (CEL, GA 1.30) — no server, no outage to cause.</li>
+      <li>Server-side apply tracks per-field ownership in <code>managedFields</code>; conflicting owners surface a conflict instead of overwriting.</li>
+      <li>A finalizer pauses deletion (sets <code>deletionTimestamp</code>) until its owning controller cleans up and removes it.</li>
+      <li>A CRD (<code>apiextensions.k8s.io/v1</code>) teaches the API server a new type with its own OpenAPI schema, versions, and status subresource.</li>
+      <li>CRD + a controller that reconciles it = an operator; that's the platform's whole extension model.</li>
+      <li>Pod Security Admission (not PSP, removed in 1.25) enforces Pod Security Standards per namespace; admission runs after RBAC, as defense in depth.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch29-the-control-plane-api-server-etcd-scheduler.html"><b>Ch 29</b> API server &amp; etcd</a>
+      <a href="ch31-the-reconciliation-loop-controllers-informers.html"><b>Ch 31</b> The reconcile loop</a>
+      <a href="ch33-workloads-i-pod-replicaset-deployment.html"><b>Ch 33</b> Workloads I</a>
+      <a href="ch39-security-rbac-admission-policy-securitycontext.html"><b>Ch 39</b> RBAC &amp; admission policy</a>
+      <a href="ch65-argo-cd.html"><b>Ch 65</b> Argo CD &amp; GitOps</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/">Admission Controllers Reference</a>: the built-in plugins and the pipeline order.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/">Dynamic Admission Control</a>: mutating and validating webhooks, <code>failurePolicy</code>, selectors, and pitfalls.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/">Validating Admission Policy</a>: in-tree CEL policy, the webhook-free option (GA 1.30).</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/extend-kubernetes/api-extension/custom-resources/">Custom Resources</a> and <a href="https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definitions/">CustomResourceDefinitions</a>: defining and versioning your own types.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/reference/using-api/server-side-apply/">Server-Side Apply</a>: field management, <code>managedFields</code>, and conflicts.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/extend-kubernetes/operator/">Operator pattern</a> and <a href="https://kubernetes.io/docs/concepts/overview/working-with-objects/finalizers/">Finalizers</a>: the extension model and the deletion hook.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch31-the-reconciliation-loop-controllers-informers.html"><span class="dir">← Prev</span><div class="ti">Ch 31 — The reconciliation loop, controllers, informers</div></a>
+      <a class="nx" href="ch33-workloads-i-pod-replicaset-deployment.html"><span class="dir">Next →</span><div class="ti">Ch 33 — Workloads I: Pod, ReplicaSet, Deployment</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 32 of 121 · Part IV · Kubernetes — Architecture &amp; Internals. You can now extend the API and reason about every write. Next: the workloads built on top of it — Pod, ReplicaSet, Deployment.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">apply → admission → etcd</a>
+    <a href="#requestpath">Inside the pipeline</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">Following an apply</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

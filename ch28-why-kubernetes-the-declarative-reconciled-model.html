@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 28 — Why Kubernetes: the declarative, reconciled model</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part IV · Kubernetes &nbsp;·&nbsp; Chapter 28</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part IV · Kubernetes — Architecture &amp; Internals · Chapter 28</div>
+      <h1>Why Kubernetes: the declarative, reconciled model</h1>
+      <p class="tagline">You stop telling the system what to <em>do</em> and start telling it what you <em>want</em>. Then something runs forever, comparing what you asked for against what's real, and quietly closing the gap. Grasp that one shift and the other twelve chapters of Kubernetes become variations on a theme.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~35 min read · kind (Kubernetes-in-Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>State the orchestration problem plainly — the thing scripts and <code>docker run</code> can't solve past a handful of nodes.</li>
+          <li>Explain imperative vs declarative, and desired state vs observed state, without hand-waving.</li>
+          <li>Describe level-triggered reconciliation and why it self-heals where an edge-triggered script wouldn't.</li>
+          <li>Read any Kubernetes object as <code>spec</code> (what you want) and <code>status</code> (what is), and know who owns each.</li>
+          <li>Prove it on a real cluster: apply a Deployment, delete a pod and watch it return, scale and watch it converge.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The orchestration problem</h2>
+    <p>Parts I–III got you to a container: a process, isolated by the kernel, that you can start with one command. On one laptop that's the whole story. Now scale it up to a real system and count the jobs.</p>
+    <p>You have 40 microservices. Each runs several replicas for capacity and redundancy. They live on 30 machines. A node dies at 03:00 — who notices, and who starts its containers somewhere else? A container segfaults — who restarts it, and how many times before giving up? You push a new version — who rolls it out replica by replica, checks each one is healthy, and rolls back if not, all without dropping traffic? Traffic doubles at lunchtime — who adds replicas, and where's the room? A replica moved to a new node and got a new IP — who tells everything that talks to it?</p>
+    <p>You can script all of this. People did, for years — Bash, Ansible, a home-grown scheduler, a spreadsheet of which service runs where. It works until it doesn't: the script assumes a starting state that drifted, a node was down when the script ran so it's now missing a replica forever, two engineers run the script at once and fight. The scripts describe <em>steps</em>, and steps assume the world hasn't changed since you last looked. In a system with 30 nodes and constant churn, the world always changed.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>Orchestration is not "start these containers." It's <b>keep these containers running the way I asked, forever, while the world keeps breaking underneath them.</b> That "forever, despite failures" part is what a pile of scripts can't give you and what Kubernetes is built to give you — through one idea, reconciliation, applied everywhere.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a thermostat, not a light switch</h2>
+    <p>The shift is from <b>imperative</b> ("do this sequence of actions") to <b>declarative</b> ("here is the state I want; you figure out the actions"). The cleanest way to feel the difference is heating.</p>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>An <b>imperative</b> heater is a switch: you flip it on, it runs, you flip it off. If you leave the room, or a window opens, or you fall asleep, the switch doesn't care — it does exactly what you last told it, which is now wrong. To keep the room comfortable you have to keep coming back and flipping the switch. That's <code>docker run</code> and a cron job.</p>
+      <p>A <b>thermostat</b> is declarative. You set one number — 21°C, the <b>desired state</b>. From then on the thermostat runs a loop forever: read the actual temperature (the <b>observed state</b>), compare it to 21, and act to close the gap — heat if it's cold, rest if it's warm. Open a window and the room cools; the thermostat notices and heats more. You never told it "turn on for ten minutes." You told it the goal, and it continuously drives reality toward the goal.</p>
+      <p>Kubernetes is a thermostat for your infrastructure. You declare "3 replicas of this image, this much memory, reachable on this name." Controllers run the loop forever: observe what's actually running, compare to what you declared, and create, delete, or replace pods until the two match — then keep watching, because the world will drift again.</p>
+    </div>
+    <p>The mapping is exact:</p>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In Kubernetes</th></tr>
+      <tr><td>The number you dial in (21°C)</td><td>The <code>spec</code> — your declared desired state</td></tr>
+      <tr><td>The thermometer reading</td><td>The <code>status</code> — the observed actual state</td></tr>
+      <tr><td>The thermostat's forever-loop</td><td>A controller's reconcile loop</td></tr>
+      <tr><td>"Heat until it matches, then rest"</td><td>Create/delete/update objects until <code>status</code> = <code>spec</code></td></tr>
+      <tr><td>Window opens, room cools on its own</td><td>A node dies, a pod vanishes — drift happens</td></tr>
+      <tr><td>Thermostat re-heats without you</td><td>The controller reschedules the pod — self-healing</td></tr>
+      <tr><td>The dial itself, remembered on the wall</td><td>etcd — where desired state is durably stored</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>The reconcile loop, drawn</h2>
+    <p>Everything Kubernetes does is this one loop, run by dozens of controllers over dozens of object types. Learn it once here; you'll recognise it in every later chapter.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 380" role="img" aria-label="The reconciliation loop: a controller compares desired state to observed state and acts to close the gap, forever">
+        <!-- desired -->
+        <rect x="34" y="40" width="250" height="70" rx="10" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="159" y="66" text-anchor="middle" style="fill:var(--accent);font:700 12px sans-serif;letter-spacing:.04em">DESIRED STATE · spec</text>
+        <text x="159" y="88" text-anchor="middle" style="fill:var(--ink);font:600 14px sans-serif">replicas: 3</text>
+        <text x="159" y="104" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">what you declared · stored in etcd</text>
+        <!-- observed -->
+        <rect x="436" y="40" width="250" height="70" rx="10" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="561" y="66" text-anchor="middle" style="fill:var(--accent2);font:700 12px sans-serif;letter-spacing:.04em">OBSERVED STATE · status</text>
+        <text x="561" y="88" text-anchor="middle" style="fill:var(--ink);font:600 14px sans-serif">running: 2</text>
+        <text x="561" y="104" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">what is actually true right now</text>
+        <!-- controller -->
+        <rect x="210" y="158" width="300" height="74" rx="10" style="fill:var(--chip);stroke:var(--deep);stroke-width:1.5"/>
+        <text x="360" y="184" text-anchor="middle" style="fill:var(--deep);font:700 12px sans-serif;letter-spacing:.04em">CONTROLLER · reconcile()</text>
+        <text x="360" y="206" text-anchor="middle" style="fill:var(--ink);font:600 13.5px sans-serif">diff = desired − observed</text>
+        <text x="360" y="223" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">3 − 2 = 1 → create one pod</text>
+        <!-- cluster -->
+        <rect x="210" y="288" width="300" height="64" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="360" y="314" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">CLUSTER · pods on nodes</text>
+        <text x="360" y="332" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">the real world the controller steers</text>
+        <!-- arrows -->
+        <defs>
+          <marker id="d" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="g" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+          <marker id="r" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--deep)"/></marker>
+        </defs>
+        <!-- desired -> controller -->
+        <path d="M159,110 L159,195 L206,195" fill="none" style="stroke:var(--accent);stroke-width:2" marker-end="url(#d)"/>
+        <text x="120" y="150" style="fill:var(--accent);font:600 11px sans-serif">read spec</text>
+        <!-- observed -> controller -->
+        <path d="M561,110 L561,195 L514,195" fill="none" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#g)"/>
+        <text x="520" y="150" style="fill:var(--accent2);font:600 11px sans-serif">watch status</text>
+        <!-- controller -> cluster (act) -->
+        <line x1="360" y1="232" x2="360" y2="286" style="stroke:var(--deep);stroke-width:2.5" marker-end="url(#r)"/>
+        <text x="368" y="264" style="fill:var(--deep);font:700 11px sans-serif">act: create pod</text>
+        <!-- cluster -> observed (report), up the right side -->
+        <path d="M510,320 L640,320 L640,112" fill="none" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#g)"/>
+        <text x="600" y="360" text-anchor="middle" style="fill:var(--accent2);font:600 11px sans-serif">report actual</text>
+        <!-- repeat loop -->
+        <path d="M210,175 C150,175 150,300 205,315" fill="none" style="stroke:var(--muted);stroke-width:1.5;stroke-dasharray:5 4" marker-end="url(#r)"/>
+        <text x="95" y="245" style="fill:var(--muted);font:italic 11px sans-serif">forever</text>
+      </svg>
+      <figcaption>One loop, run continuously: read what you want, observe what's real, act to close the gap, observe again. No end state — just convergence, maintained.</figcaption>
+    </figure>
+
+    <p>And the object it operates on always has the same shape. Every Kubernetes API object — a Pod, a Deployment, a Service, a Node — carries four parts:</p>
+    <ul>
+      <li><b><code>apiVersion</code> + <code>kind</code></b> — which type and which version of its schema (e.g. <code>apps/v1</code>, <code>Deployment</code>).</li>
+      <li><b><code>metadata</code></b> — name, namespace, labels, annotations, and the <code>ownerReferences</code> that link objects into a tree.</li>
+      <li><b><code>spec</code></b> — the desired state. <em>You</em> write this.</li>
+      <li><b><code>status</code></b> — the observed state. A <em>controller</em> writes this; you read it.</li>
+    </ul>
+    <p>That's the entire mental model: objects with a spec and a status, and loops that push status toward spec. Deployment, StatefulSet, Job, Ingress, even a Node — same shape, same loop, different nouns.</p>
+
+    <h2 id="internals"><span class="beat">Internal working</span>Level-triggered reconciliation, and why it self-heals</h2>
+    <p>The word that makes reconciliation hold up under a messy world is <b>level-triggered</b>. It's borrowed from electronics, and the distinction is the whole reason Kubernetes survives the messiness of real infrastructure.</p>
+    <ul>
+      <li><b>Edge-triggered</b> logic reacts to <em>events</em> — the transitions. "A pod was deleted → create a replacement." If you miss the event (your controller was restarting, the message was dropped), the action never happens and the system is permanently wrong.</li>
+      <li><b>Level-triggered</b> logic reacts to <em>state</em> — the current level. "Whenever I run, I count the pods; if there are fewer than desired, I create the difference." It doesn't matter how the world got here or whether I saw the event that changed it. I look at what <em>is</em>, compare to what <em>should be</em>, and act.</li>
+    </ul>
+    <p>A controller's reconcile function is level-triggered. Stripped to its essence it's this:</p>
+    <div class="codewrap"><span class="lang">go</span><pre><code><span class="c">// The shape of every controller, from ReplicaSet to a custom operator.</span>
+for {
+    desired  := readSpec(object)         <span class="c">// what you asked for</span>
+    observed := listRealWorld(cluster)   <span class="c">// what is actually there, right now</span>
+    if !equal(desired, observed) {
+        act(diff(desired, observed))     <span class="c">// create/delete/update to close the gap</span>
+    }
+    <span class="c">// then wait for a change notification, or a periodic resync, and loop</span>
+}</code></pre></div>
+    <p>Now watch why this self-heals. Say you want 3 replicas and a node dies, taking one pod with it:</p>
+    <ol class="steps">
+      <li>The pod on the dead node stops reporting; eventually its record is removed. Observed replicas drop to 2.</li>
+      <li>The ReplicaSet controller reconciles: desired is 3, observed is 2, diff is +1. It creates one new pod object.</li>
+      <li>The scheduler places the new pod on a healthy node; a kubelet there starts it. Observed climbs back to 3.</li>
+      <li>The controller reconciles again, sees 3 = 3, and does nothing. Equilibrium — until the next disturbance.</li>
+    </ol>
+    <p>Nobody handled a "node died" event with bespoke logic. The controller just kept asking "do I have 3?" and the answer drove the action. That's why you can kill a Kubernetes controller mid-operation, restart it, and it picks up correctly: on start it re-observes the whole world and reconciles from the current level. An edge-triggered script that crashed between "detect" and "act" would have lost the work. This is also why the API stores desired state durably in etcd (the dial on the wall) — restart the entire control plane and the goal is still there to reconcile toward.</p>
+
+    <details class="recall"><summary>Think first: you run <code>kubectl delete pod</code> on a pod that belongs to a Deployment. What happens, and why?</summary>
+      <div class="body">
+        <p>A new pod appears within seconds. You changed the observed world (one fewer pod), but you didn't change the desired state — the Deployment still says "3 replicas," and it owns a ReplicaSet that says the same. On the next reconcile the ReplicaSet controller counts 2, wants 3, and creates one. To <em>actually</em> reduce the count you have to change the desired state: <code>kubectl scale deployment ... --replicas=2</code>, or edit the YAML. Deleting the pod fought the symptom; the controller restored the declared goal. First-timers find this maddening ("why won't it stay deleted?!"); it's the system working exactly as designed.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces of the declarative model</h2>
+    <p>We meet the concrete control-plane binaries in <a href="ch29-the-control-plane-api-server-etcd-scheduler.html">Chapter 29</a>. Here, keep it conceptual:</p>
+    <ul>
+      <li><b>The API object</b> — a typed record with <code>spec</code> and <code>status</code>. The unit of desired state. Everything you do is create, read, update, or delete one of these.</li>
+      <li><b>The API server</b> — the single front door. Every read and write goes through it; it validates objects and persists them. It is the only thing that talks to etcd, and the only source of truth other components consult.</li>
+      <li><b>etcd</b> — the durable store behind the API server. Your desired state lives here, so it survives restarts.</li>
+      <li><b>Controllers</b> — the loops. Each watches a kind of object and reconciles it: the Deployment controller manages ReplicaSets, the ReplicaSet controller manages Pods, the Node controller watches node health, and so on.</li>
+      <li><b>Labels &amp; selectors</b> — the loose coupling that makes it all compose. A ReplicaSet doesn't hold pointers to its pods; it has a label <em>selector</em> (<code>app=web</code>) and owns whatever pods match. A Service routes to whatever pods match its selector. Sets, not lists — which is exactly why the model tolerates pods coming and going.</li>
+      <li><b><code>kubectl apply</code></b> — your side of the contract. It sends a desired-state document to the API server. It is declarative: run it twice and the second time is a no-op, because you're describing an end state, not issuing commands.</li>
+    </ul>
+
+    <details class="recall"><summary>Think first: you run the exact same <code>kubectl apply -f web.yaml</code> a second time. What happens?</summary>
+      <div class="body">
+        <p>Effectively nothing — and that's the point. <code>apply</code> sends your desired state and the API server reconciles the stored object toward it; the second time the live object already matches the file, so the diff is empty and no controller has a gap to close. That idempotency is why apply is safe to run in a loop, safe to re-run in CI after a half-failed deploy, and safe for a GitOps controller to re-apply every few minutes. Contrast imperative <code>kubectl create</code>, which errors the second time because the object already exists — it describes an action, not a state, so repeating it is not a no-op.</p>
+      </div>
+    </details>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one <code>kubectl apply</code> end to end</h2>
+    <p>Watch a single <code>kubectl apply -f deployment.yaml</code> (3 replicas) ripple through the system. Notice that no single component does much — each just reconciles its own object and hands off by writing state:</p>
+    <ol class="steps">
+      <li><b>kubectl → API server.</b> Your YAML becomes an HTTP request. The API server authenticates you, validates the Deployment, and writes it to etcd. Desired state now exists. Your command returns — the work has barely started.</li>
+      <li><b>Deployment controller reconciles.</b> It sees a Deployment with no matching ReplicaSet at the right version. Diff: create a ReplicaSet (also desired-state, 3 replicas). It writes that to the API server.</li>
+      <li><b>ReplicaSet controller reconciles.</b> It sees a ReplicaSet wanting 3 pods and 0 existing that match its selector. Diff: +3. It creates 3 Pod objects — but with no node assigned yet.</li>
+      <li><b>Scheduler reconciles.</b> It watches for pods with no node. For each, it picks a node that fits and writes the choice back (<code>spec.nodeName</code>). Still just updating desired state — nothing is running yet.</li>
+      <li><b>kubelet reconciles.</b> Each node's kubelet watches for pods assigned to <em>it</em>. It sees its new pods, calls the container runtime to pull images and start containers, and reports back by writing <code>status</code>.</li>
+      <li><b>Status flows up.</b> Pod status → ReplicaSet status → Deployment status. When all three pods report Ready, the Deployment's status shows <code>3/3</code>. The loops fall quiet until something drifts.</li>
+    </ol>
+    <p>Every arrow in that chain is one component <em>writing desired state to the API server</em> and another component <em>watching for it and reconciling</em>. There's no central conductor issuing orders. It's a chain of thermostats, each closing its own small gap. That decoupling is why the whole thing keeps working when any one piece restarts.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>Time to feel it. We use <b>kind</b> — Kubernetes running inside Docker on your laptop, the standard local cluster. Install <code>kind</code> and <code>kubectl</code>, then:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># One control-plane node inside Docker. ~30s to ready.</span>
+kind create cluster --name lab
+kubectl get nodes</code></pre></div>
+    <div class="out"><span class="ol">Output</span>NAME                 STATUS   ROLES           AGE   VERSION
+lab-control-plane    Ready    control-plane   28s   v1.31.x</code></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — declare a Deployment and watch it happen</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Write desired state, apply it, and see the machinery produce pods you never explicitly created:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>cat &gt; web.yaml &lt;&lt;'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: web }
+  template:
+    metadata:
+      labels: { app: web }
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27-alpine
+EOF
+kubectl apply -f web.yaml
+kubectl get deploy,replicaset,pods -l app=web</code></pre></div>
+        <div class="out"><span class="ol">Output</span>deployment.apps/web   READY 3/3   UP-TO-DATE 3   AVAILABLE 3
+replicaset.apps/web-6f9c7   DESIRED 3  CURRENT 3  READY 3
+pod/web-6f9c7-2xk4p   Running
+pod/web-6f9c7-8mtq9   Running
+pod/web-6f9c7-lz7vd   Running</code></div>
+        <p>You declared one Deployment. It created a ReplicaSet, which created three Pods, which the scheduler placed and the kubelet started. You issued zero <code>run</code> commands. That's the declarative model doing the imperative work for you — and the chain of ownership (Deployment → ReplicaSet → Pods) is exactly the flow from the last section.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — read spec vs status on a live object</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>The whole model is spec (yours) and status (the controller's). See both on the running Deployment:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl get deploy web -o yaml | grep -A4 '^spec:'
+echo '---'
+kubectl get deploy web -o yaml | grep -A6 '^status:'</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>spec:
+  replicas: 3                 # &lt;- YOU wrote this: desired
+  ...
+---
+status:
+  availableReplicas: 3        # &lt;- the CONTROLLER wrote this: observed
+  readyReplicas: 3
+  observedGeneration: 1</code></div>
+        <p>You own everything under <code>spec</code>; you never write <code>status</code> — the controller does, as its report of reality. <code>kubectl explain deploy.spec</code> and <code>kubectl explain deploy.status</code> document each field, and every object type follows this split. Internalising "spec is my intent, status is the system's observation" is 80% of learning to read Kubernetes.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — delete a pod and watch reconciliation win</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Fight the controller and lose. In one terminal, watch the pods live:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl get pods -l app=web --watch</code></pre></div>
+        <p>In another, delete one:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl delete pod -l app=web --field-selector … 2&gt;/dev/null; \
+kubectl delete pod $(kubectl get pod -l app=web -o name | head -1)</code></pre></div>
+        <div class="out"><span class="ol">Output (the --watch terminal)</span>web-6f9c7-2xk4p   Terminating
+web-6f9c7-pv8sd   Pending
+web-6f9c7-pv8sd   ContainerCreating
+web-6f9c7-pv8sd   Running        <span class="c"># a replacement, within ~2s</span></code></div>
+        <p>You removed a pod (changed observed state to 2). The ReplicaSet controller wants 3, saw 2, and created one. You did not ask for a replacement — the declared desired state did. This is self-healing in four seconds, and it's the exact mechanism that survives a node dying at 3am: nobody's awake, but the loop is.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — scale up, then jam the loop with a bad image</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>First, change desired state the right way and watch convergence:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl scale deployment web --replicas=5
+kubectl get deploy web -w   <span class="c"># READY climbs 3/5 → 5/5</span></code></pre></div>
+        <p>Now break it. Point the Deployment at an image tag that doesn't exist and watch what the loop does — and doesn't do:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl set image deployment/web web=nginx:does-not-exist
+kubectl get pods -l app=web</code></pre></div>
+        <div class="out"><span class="ol">Output</span>web-6f9c7-...   Running            <span class="c"># old replicas: still up</span>
+web-7d2aa-...   ImagePullBackOff   <span class="c"># new replica: can't start</span></code></div>
+        <p>The Deployment is stuck at partial readiness. Why doesn't the whole app go down, and why won't it "just work"? Reason about it before revealing.</p>
+        <details class="recall"><summary>Reveal what the loop is doing</summary>
+          <div class="body">
+            <p>Two things, both by design. First, the <b>rolling update</b> is level-triggered and safety-gated: the Deployment won't kill healthy old pods until new ones become Ready, and the new ones never do (the image can't be pulled), so it holds — your old version keeps serving. Second, the reconcile loop doesn't give up; it keeps retrying the pull with backoff (<code>ImagePullBackOff</code>), because desired state still says "run this image." The status tells you the truth:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl describe pod -l app=web | grep -A3 Events
+kubectl rollout status deployment/web   <span class="c"># reports it's not progressing</span></code></pre></div>
+            <p>The fix is to change desired state to something achievable — <code>kubectl rollout undo deployment/web</code> (back to the good image) or set a valid tag. The lesson: a "stuck" Kubernetes object is usually a desired state that can't be met. Read <code>status</code> and events; they say <em>why</em> the gap won't close. The loop is fine — the goal was impossible.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — imperative edits and the drift they cause</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>This is the trap that bites teams moving to GitOps. Mix an imperative command with a declarative file and predict who wins. You still have <code>web.yaml</code> declaring <code>replicas: 3</code>. Run:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl scale deployment web --replicas=10   <span class="c"># imperative: bump live to 10</span>
+kubectl get deploy web                        <span class="c"># READY 10/10</span>
+kubectl apply -f web.yaml                      <span class="c"># re-apply the file that says 3</span>
+kubectl get deploy web</code></pre></div>
+        <p>What's the replica count after the <code>apply</code>? And what does this tell you about running <code>kubectl scale</code> by hand in a repo-driven cluster? Decide, then check.</p>
+        <details class="recall"><summary>Reveal the answer and the lesson</summary>
+          <div class="body">
+            <p>It goes back to <b>3</b>. <code>kubectl apply</code> sends the file's desired state, and the file says <code>replicas: 3</code>, so the API server records 3 and the controller scales down. Your imperative <code>scale</code> to 10 was overwritten — the file is the source of truth for the fields it sets. (Server-side apply tracks field ownership, but the principle holds: whoever last declared the field owns it.)</p>
+            <p>This is <b>configuration drift</b>, and it's why platform teams forbid manual <code>kubectl edit</code>/<code>scale</code> on anything managed by a repo. In GitOps (<a href="ch64-gitops-principles.html">Chapter 64</a>, <a href="ch65-argo-cd.html">Chapter 65</a>) a controller like Argo CD continuously re-applies the git state, so your 3am hotfix via <code>kubectl</code> silently reverts on the next sync — and you're paged again, baffled. The mindset to keep: <b>the declared source of truth wins, always.</b> If you must change something, change the declaration. Clean up: <code>kind delete cluster --name lab</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · "I fixed it manually and it undid itself"</div>
+      <p><b>Symptom:</b> an on-call engineer edits a live object (scales up, patches an env var) and it works — then minutes to hours later the change vanishes and the alert returns. <b>Cause:</b> a controller (a Deployment, or Argo CD in a GitOps setup) is reconciling toward a declared state that doesn't include the manual change, so it reverts it. <b>Fix:</b> make the change where desired state lives — the git repo or the YAML — not on the live object. The manual edit was always going to lose.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · a Deployment that won't progress</div>
+      <p><b>Symptom:</b> <code>kubectl rollout status</code> hangs; <code>READY</code> sits at, say, <code>2/3</code> for a long time. <b>First cut:</b> <code>kubectl get pods</code> and <code>kubectl describe</code> the unhealthy one; read Events. <b>Usual causes:</b> an image that can't be pulled (<code>ImagePullBackOff</code>), a pod that can't be scheduled (no node fits — see <a href="ch29-the-control-plane-api-server-etcd-scheduler.html">Chapter 29</a>), a failing readiness probe, or a crash loop. <b>The point:</b> the loop isn't broken — it's telling you, via <code>status</code> and Events, that the desired state can't currently be reached. Believe the status.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Declare everything; command nothing.</b> The production discipline that follows from this chapter is: your cluster's desired state lives in files, in version control, and reaches the cluster through <code>kubectl apply</code> or a GitOps controller — never through a person typing imperative commands against production. That gives you a reviewable history, a rollback (revert the commit), and a single source of truth. Imperative commands (<code>kubectl run</code>, <code>kubectl scale</code>, <code>kubectl edit</code>) are for exploration on scratch clusters and emergencies, and even then you go back and encode the fix in the declaration.</p>
+    <p><b>Idempotency is the property you're buying.</b> Because <code>apply</code> describes an end state, applying the same manifest ten times leaves the cluster identical to applying it once. That's what makes CI/CD pipelines safe to re-run and controllers safe to restart. When you write your own automation against Kubernetes, preserve this: converge to a state, don't fire off one-shot actions.</p>
+    <p><b>Watch out for the fields you don't own.</b> A common mistake is setting <code>replicas</code> in a manifest while also running the Horizontal Pod Autoscaler, which <em>also</em> writes <code>replicas</code> — now two controllers fight over the same field and the count flaps. The rule: exactly one owner per field. Server-side apply and leaving autoscaled fields out of your manifest are how you avoid the tug-of-war.</p>
+    <p><b>The mindset shift is the real deliverable.</b> Every question in Kubernetes has the same answer shape: "what's the desired state, what's the observed state, and which controller closes the gap?" Debugging becomes "read spec, read status, read the controller's events." Once that's reflex, the thirteen chapters ahead are the same idea with more nouns.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>Reconciliation is not a Kubernetes quirk — it's a general pattern for building systems that survive partial failure, and you'll see it everywhere once you have the eye for it. Terraform reconciles cloud resources toward a declared state (<a href="ch62-terraform-i-model-resources-state-the-dependency.html">Chapter 62</a>). Argo CD reconciles a cluster toward a git repo (<a href="ch65-argo-cd.html">Chapter 65</a>). A database's replication reconciles replicas toward the primary. The common thread is <b>store desired state durably, observe actual state continuously, and drive the gap to zero with idempotent actions</b> — which beats a script of steps precisely because it doesn't assume the world held still. When you design a control system of your own — a job scheduler, a certificate rotator, an autoscaler — reach for a level-triggered loop over event handlers, and you inherit the same self-healing and restart-safety. It's also the deep reason Kubernetes scales operationally: humans declare intent, and a swarm of small loops does the relentless, error-prone work of keeping reality in line.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What does "declarative" mean in Kubernetes, versus imperative?</summary>
+        <div class="a"><p>Imperative is a sequence of commands — "start this container, then that one" — where you own the steps and they assume the world hasn't changed. Declarative means you submit the desired end state — "I want 3 replicas of this image" — and controllers continuously make reality match it. You describe the goal, not the path. The payoff is self-healing and idempotency: apply the same manifest repeatedly and you always land in the same state, and if reality drifts (a node dies), the system converges back on its own.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Explain the reconciliation loop and level-triggered logic.</summary>
+        <div class="a"><p>A controller runs a loop forever: read the desired state from the object's <code>spec</code>, observe the actual state of the world, and if they differ, take idempotent actions to close the gap — then wait for a change or a resync and do it again. It's level-triggered, meaning it acts on the current <em>state</em> ("do I have 3 pods?") rather than on <em>events</em> ("a pod was deleted"). That matters because events can be missed — the controller might have been restarting — but the level is always re-observable. So the loop shrugs off crashes and dropped notifications: on startup it re-lists the world and reconciles from whatever it finds. Concretely, if a node dies and a pod vanishes, the ReplicaSet controller just notices observed is 2 against desired 3 and creates one; nobody wrote "handle node death" logic. Desired state is stored durably in etcd, so even a full control-plane restart resumes reconciling toward the same goal.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Why is level-triggered more resilient than edge-triggered for orchestration?</summary>
+        <div class="a"><p>Edge-triggered logic reacts to transitions, so correctness depends on observing every transition exactly once. In a distributed system that's a bad bet: watch connections drop, controllers restart, events coalesce or arrive out of order. Miss one edge and an edge-triggered system is permanently inconsistent, because nothing will re-fire the event. Level-triggered logic instead reads the full current state each pass and computes the diff, so a missed notification only delays convergence until the next observation — it never corrupts it. Kubernetes leans into this: informers deliver change events as an optimisation to avoid constant polling, but the reconcile always reads the current state from a cache and acts on that, and a periodic resync re-drives everything even if no events arrive. So events are a hint about <em>when</em> to reconcile; the <em>what</em> always comes from observed level versus desired level. That's why you can kill and restart any controller and it self-corrects. We'll see the machinery — watch, informer, work queue — in Chapter 31.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A teammate deletes a pod to "restart" a service and it keeps coming back. What's going on?</summary>
+        <div class="a"><p>They're changing observed state without changing desired state. The pod belongs to a ReplicaSet (via a Deployment) whose spec still says N replicas, so on the next reconcile the controller counts one short and recreates it — that's the system working. Deleting a managed pod <em>is</em> a valid way to force a single restart (you get a fresh pod), but it won't reduce the count or stop the service. To actually take it down you change the declaration: scale the Deployment to 0, or delete the Deployment (which garbage-collects its ReplicaSet and pods via <code>ownerReferences</code>). The teaching point is that in Kubernetes you steer by editing desired state, not by fighting the live objects the controllers own.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>Where does the desired state actually live, and why does that matter?</summary>
+        <div class="a"><p>It lives in etcd, behind the API server — the only component that reads and writes etcd. That matters for two reasons. First, durability: because desired state is persisted, the whole control plane can restart and every controller resumes reconciling toward the same goal; nothing is lost. Second, single source of truth: every component gets its picture of "what should be" from the API server, so there's no disagreement about intent. In practice, the operational source of truth sits one level up — your git repo of manifests — and something (<code>kubectl apply</code> or Argo CD) keeps etcd in sync with git. But within the cluster, etcd is the durable dial on the wall that reconciliation reads. Chapter 29 is where we open up etcd and the API server.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>The orchestration problem is keeping many containers running as declared, forever, while nodes and processes fail underneath — something imperative scripts can't do because steps assume a world that already changed. Kubernetes solves it by being declarative: you write desired state (an object's <code>spec</code>), and controllers run reconcile loops that observe actual state (<code>status</code>) and act to close the gap. The loops are level-triggered — they act on current state, not on events — so they self-heal, survive restarts, and are idempotent. Every object shares the shape apiVersion/kind/metadata/spec/status; you own spec, controllers own status. Delete a managed pod and it returns, because desired state didn't change. A "stuck" object is a desired state that can't be met — read status and events to learn why. The whole discipline is: declare in version control, apply, let the loops do the work, and never fix production by hand.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>Orchestration = keep containers running as declared, forever, through failure. Scripts of steps can't do that.</li>
+      <li>Imperative says "do these actions"; declarative says "here's the state I want" and lets the system find the actions.</li>
+      <li>Every object has a <code>spec</code> (desired, yours) and a <code>status</code> (observed, the controller's).</li>
+      <li>A controller runs a reconcile loop forever: read spec, observe status, act to close the gap, repeat.</li>
+      <li>Reconciliation is level-triggered — it acts on current state, so missed events only delay, never corrupt.</li>
+      <li>That's why it self-heals: a node dies, observed drops, the loop recreates — with no bespoke event handler.</li>
+      <li>Desired state is stored durably in etcd behind the API server, so the control plane can restart and resume.</li>
+      <li>Labels + selectors couple objects as sets, not lists, so pods can come and go without breaking references.</li>
+      <li><code>kubectl apply</code> is idempotent: applying twice equals applying once, because you describe an end state.</li>
+      <li>A "stuck" object usually means an impossible desired state; read <code>status</code> and Events — the loop isn't broken.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds toward:</span>
+      <a href="ch29-the-control-plane-api-server-etcd-scheduler.html"><b>Ch 29</b> The control plane</a>
+      <a href="ch31-the-reconciliation-loop-controllers-informers.html"><b>Ch 31</b> Controllers &amp; informers</a>
+      <a href="ch32-api-machinery-apply-path-admission-crds-and.html"><b>Ch 32</b> CRDs &amp; operators</a>
+      <a href="ch33-workloads-i-pod-replicaset-deployment.html"><b>Ch 33</b> Deployments</a>
+      <a href="ch64-gitops-principles.html"><b>Ch 64</b> GitOps</a>
+      <a href="ch65-argo-cd.html"><b>Ch 65</b> Argo CD</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/overview/">Overview</a> and <a href="https://kubernetes.io/docs/concepts/architecture/controller/">Controllers</a>: the declarative model and the reconcile loop from the source.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/overview/working-with-objects/">Objects In Kubernetes</a>: apiVersion/kind/metadata/spec/status, spelled out.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/architecture/self-healing/">Self-Healing</a>: how reconciliation recovers from pod and node loss.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/tasks/manage-kubernetes-objects/declarative-config/">Declarative Management of Objects</a> and <a href="https://kubernetes.io/docs/concepts/workloads/controllers/deployment/">Deployments</a>: apply, and the object you'll use most.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/workloads/controllers/replicaset/">ReplicaSet</a> and <a href="https://kubernetes.io/docs/concepts/overview/working-with-objects/owners-dependents/">Owners and Dependents</a>: the ownership tree behind self-healing.</li>
+      <li>kind — <a href="https://kind.sigs.k8s.io/docs/user/quick-start/">Quick Start</a>: the local cluster used in every lab from here on.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch27-container-security-and-process-to-container-to.html"><span class="dir">← Prev</span><div class="ti">Ch 27 — Container security &amp; the isolation spectrum</div></a>
+      <a class="nx" href="ch29-the-control-plane-api-server-etcd-scheduler.html"><span class="dir">Next →</span><div class="ti">Ch 29 — The control plane: API server, etcd, scheduler</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 28 of 121 · Part IV · Kubernetes — Architecture &amp; Internals. You have the mindset: make it so, don't run this. Next we open the box and meet the components that run the loops.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">The reconcile loop</a>
+    <a href="#internals">Level-triggered logic</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">One apply, end to end</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

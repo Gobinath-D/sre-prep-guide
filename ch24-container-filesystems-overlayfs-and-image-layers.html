@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 24 — Container Filesystems: overlayfs &amp; Image Layers</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part III · Containers &nbsp;·&nbsp; Chapter 24</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part III · Containers &amp; Container Internals · Chapter 24</div>
+      <h1>Container filesystems: overlayfs &amp; image layers</h1>
+      <p class="tagline">A hundred containers from the same image share one copy of its files on disk and each still gets a private, writable root. The trick is a stacked filesystem and copy-on-write — and it's why Dockerfile line order decides your build time and your image size.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~45 min read · Linux lab (Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain overlayfs — <code>lowerdir</code>, <code>upperdir</code>, <code>workdir</code>, <code>merged</code> — and what each one holds.</li>
+          <li>Describe copy-on-write and whiteouts, and predict exactly where a container's write lands.</li>
+          <li>Read an image's layers with <code>docker history</code> and <code>image inspect</code>, and find its overlay mount.</li>
+          <li>Order a Dockerfile so the build cache actually helps you, and say why a bad order costs minutes per build.</li>
+          <li>Diagnose image bloat and a writable layer that quietly fills a node's disk.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem overlayfs solves</h2>
+    <p>Run twenty containers from the <code>python:3.12-slim</code> image on one node. That image is maybe 120&nbsp;MB of files — Python, libc, a userland. The naive approach copies all 120&nbsp;MB twenty times: 2.4&nbsp;GB of disk to run twenty identical bases, minutes of copying before anything starts, and every byte duplicated. That doesn't scale, and it throws away the one thing you know for certain: the base files are read-only and identical across all twenty.</p>
+    <p>But you can't just share one directory read-only, because each container <em>does</em> need to write — a log here, a temp file there, a config it rewrites on boot. So you want two things that sound contradictory: one shared, read-only copy of the image, and a private, writable view per container. The resolution is a <b>union filesystem</b>: stack a thin, per-container writable layer on top of the shared read-only image, and present the combination as one normal-looking filesystem tree. Reads fall through to the shared layer; writes land in the private one. On Linux that union filesystem is <b>overlayfs</b>, and it's what every mainstream container runtime uses today.</p>
+    <p>This isn't a storage detail you can ignore. The layer model reaches straight up into how you build images — because an image <em>is</em> a stack of these read-only layers, and the order you create them in decides what the build cache can reuse. Get it right and rebuilds take seconds; get it wrong and every one-character code change reinstalls all your dependencies. Same mechanism, two consequences: cheap containers at runtime, and fast (or slow) builds.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>An image is read-only, shared, and content-addressed. A container adds exactly one thin writable layer on top. Everything the container writes goes there, and it's deleted when the container is removed. If you don't put persistent data on a volume, you're storing it in a layer that's designed to be thrown away.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: sheets of glass over a printed page</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Picture a printed reference page under a stack of clear acetate sheets — the kind animators used. The <b>printed page</b> at the bottom is the image: fixed, read-only, and you can print it once and lay a hundred stacks over the same master. Looking straight down through the stack, you see a single combined picture — that's the <b>merged view</b>, the filesystem the container thinks it has.</p>
+      <p>You only ever draw on the <b>top clear sheet</b> (the writable layer). Want to change a word that's printed on the page? You can't touch the print, so you copy that word up onto the top sheet and edit it there — now the stack shows your version, but the master page is untouched. That copy-up is exactly <b>copy-on-write</b>. Want to remove something printed below? You can't erase the print either, so you paint an opaque blob over it on the top sheet so it no longer shows through — that opaque blob is a <b>whiteout</b>.</p>
+      <p>Peel off the top sheet and throw it away, and you're back to the pristine master, ready for the next stack. That's what happens when a container is deleted: the writable sheet is discarded, the shared image untouched. And because the heavy master is shared, adding another container is just laying down one new blank sheet — cheap and instant.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In overlayfs</th></tr>
+      <tr><td>The printed master page(s), read-only, shareable</td><td><code>lowerdir</code> — the image's stacked layers</td></tr>
+      <tr><td>The blank top sheet you draw on</td><td><code>upperdir</code> — the container's writable layer</td></tr>
+      <tr><td>Looking down through the whole stack</td><td><code>merged</code> — the unified mount the container sees</td></tr>
+      <tr><td>A scratch area for making edits cleanly</td><td><code>workdir</code> — overlay's staging dir (same fs as upper)</td></tr>
+      <tr><td>Copying a printed word up to edit it</td><td>copy-up (copy-on-write) on first write to a lower file</td></tr>
+      <tr><td>Painting an opaque blob over something below</td><td>a whiteout (a 0/0 char device) that hides a lower file</td></tr>
+      <tr><td>Peeling off and binning the top sheet</td><td>deleting the container: its <code>upperdir</code> is discarded</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>Four directories become one filesystem</h2>
+    <p>An overlay mount is built from four directories, and the kernel's own documentation names them exactly. You give it <code>lowerdir</code>, <code>upperdir</code>, and <code>workdir</code>; it produces the <code>merged</code> mount point:</p>
+    <ul>
+      <li><b><code>lowerdir</code></b> — one or more read-only directory trees, the image's layers. Multiple lowers are joined with colons, and they stack: in <code>lowerdir=L3:L2:L1</code>, <code>L3</code> is the top and <code>L1</code> the bottom. When a name exists in several, the higher one wins.</li>
+      <li><b><code>upperdir</code></b> — a single writable directory. Everything the container creates or modifies lands here. This is the container's private layer.</li>
+      <li><b><code>workdir</code></b> — an empty directory on the <em>same filesystem</em> as <code>upperdir</code>, which overlay uses as scratch space to make copy-ups and renames atomic. You never look in it; it just has to exist and be on the right filesystem.</li>
+      <li><b><code>merged</code></b> — the mount point. This is what the container sees as <code>/</code>. Reads resolve top-down through upper then the lowers; writes go to upper.</li>
+    </ul>
+    <p>The rule for resolving a path is simple and worth memorising: <b>upper wins over lower; among lowers, higher wins</b>. If <code>/app/config</code> exists in both the writable layer and a base layer, the container sees the writable one. Directories are the exception — when a directory name appears at several levels, overlay <em>merges</em> their contents rather than hiding the lower one, which is how <code>/usr/bin</code> from the base and <code>/usr/bin</code> from a later layer combine into one directory.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 430" role="img" aria-label="Stacked read-only image layers plus a writable upper layer, unified into a merged view">
+        <text x="360" y="20" text-anchor="middle" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">OVERLAYFS — STACKED LAYERS UNIONED INTO ONE VIEW</text>
+        <text x="165" y="44" text-anchor="middle" style="fill:var(--muted);font:700 10.5px sans-serif;letter-spacing:.04em">ON DISK — STACKED DIRECTORIES</text>
+        <!-- upper -->
+        <rect x="40" y="54" width="250" height="46" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.7"/>
+        <text x="165" y="74" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">upperdir · container RW layer</text>
+        <text x="165" y="91" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">writes + copy-ups + whiteouts land here</text>
+        <!-- lower 3 -->
+        <rect x="40" y="108" width="250" height="42" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="165" y="128" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">layer 3 (lower, top) · COPY app.py</text>
+        <text x="165" y="143" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">read-only</text>
+        <!-- lower 2 -->
+        <rect x="40" y="158" width="250" height="42" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="165" y="178" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">layer 2 (lower) · RUN pip install</text>
+        <text x="165" y="193" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">read-only</text>
+        <!-- lower 1 -->
+        <rect x="40" y="208" width="250" height="42" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="165" y="228" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">layer 1 (lower, base) · python:slim</text>
+        <text x="165" y="243" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">read-only · shared by all containers</text>
+        <text x="165" y="270" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">lowerdir = L3:L2:L1 · workdir = scratch (same fs as upper)</text>
+        <!-- arrow -->
+        <defs>
+          <marker id="m1" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 Z" style="fill:var(--accent2)"/></marker>
+        </defs>
+        <line x1="300" y1="150" x2="404" y2="150" style="stroke:var(--accent2);stroke-width:2.4" marker-end="url(#m1)"/>
+        <text x="352" y="140" text-anchor="middle" style="fill:var(--accent2);font:600 10.5px sans-serif">union</text>
+        <!-- merged box -->
+        <text x="558" y="44" text-anchor="middle" style="fill:var(--muted);font:700 10.5px sans-serif;letter-spacing:.04em">WHAT THE CONTAINER SEES AT /</text>
+        <rect x="418" y="54" width="282" height="196" rx="9" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="434" y="80" style="fill:var(--ink);font:12px ui-monospace,monospace">/usr/bin/python3</text>
+        <text x="640" y="80" text-anchor="end" style="fill:var(--muted);font:10px sans-serif">← L1</text>
+        <text x="434" y="104" style="fill:var(--ink);font:12px ui-monospace,monospace">/app/requirements.txt</text>
+        <text x="640" y="104" text-anchor="end" style="fill:var(--muted);font:10px sans-serif">← L2</text>
+        <text x="434" y="128" style="fill:var(--ink);font:12px ui-monospace,monospace">/app/app.py</text>
+        <text x="640" y="128" text-anchor="end" style="fill:var(--muted);font:10px sans-serif">← L3</text>
+        <text x="434" y="152" style="fill:var(--accent);font:12px ui-monospace,monospace">/app/app.py (edited)</text>
+        <text x="640" y="152" text-anchor="end" style="fill:var(--accent);font:10px sans-serif">← UPPER</text>
+        <text x="434" y="176" style="fill:var(--accent);font:12px ui-monospace,monospace">/tmp/out.log (new)</text>
+        <text x="640" y="176" text-anchor="end" style="fill:var(--accent);font:10px sans-serif">← UPPER</text>
+        <text x="434" y="200" style="fill:var(--deep);font:12px ui-monospace,monospace">/app/cache (deleted)</text>
+        <text x="640" y="200" text-anchor="end" style="fill:var(--deep);font:10px sans-serif">whiteout</text>
+        <text x="434" y="226" style="fill:var(--muted);font:10px sans-serif">rule: upper &gt; lower; among lowers, higher wins</text>
+        <!-- annotations -->
+        <rect x="40" y="300" width="660" height="46" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="52" y="320" style="fill:var(--ink);font:11px sans-serif"><tspan style="fill:var(--accent);font-weight:700">copy-up:</tspan> first write to a lower file copies it into upperdir; the lower copy is never touched.</text>
+        <text x="52" y="338" style="fill:var(--ink);font:11px sans-serif"><tspan style="fill:var(--deep);font-weight:700">whiteout:</tspan> deleting a lower file writes a 0/0 char device in upperdir so it stops showing through.</text>
+        <rect x="40" y="356" width="660" height="46" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="52" y="376" style="fill:var(--ink);font:11px sans-serif"><tspan style="fill:var(--accent2);font-weight:700">shared:</tspan> L1–L3 are read-only and shared by every container from this image — stored once on disk.</text>
+        <text x="52" y="394" style="fill:var(--ink);font:11px sans-serif"><tspan style="fill:var(--accent2);font-weight:700">ephemeral:</tspan> delete the container and its upperdir is discarded; the image layers remain pristine.</text>
+      </svg>
+      <figcaption>Reads fall through the stack (upper first, then lowers top-to-bottom); writes land in <code>upperdir</code>. The image layers are shared read-only across every container built from that image.</figcaption>
+    </figure>
+
+    <h2 id="internals"><span class="beat">Internal working</span>Copy-up, whiteouts, and content-addressed layers</h2>
+    <ol class="steps">
+      <li><b>Reading a file that lives only in a lower layer</b> is nearly free: overlay resolves the name down the stack, finds it in, say, layer 1, and hands the container direct access to the read-only file. No copying, no overhead — this is why a hundred containers reading the same base library cost one copy of that library on disk.</li>
+      <li><b>Writing to a lower file triggers copy-up.</b> The first time the container opens a lower-layer file for write (or changes its metadata, or hard-links it), overlay <em>copies it up</em> into <code>upperdir</code> first: it recreates the parent directories in upper, copies the file's metadata, then its data, then its extended attributes, using <code>workdir</code> to stage the operation atomically. After that the file lives in upper and every future access goes straight there. The lower copy is never modified — that's what keeps the layer shareable.</li>
+      <li><b>Deleting a lower file creates a whiteout.</b> You can't remove a file from a read-only layer, so overlay records the deletion in upper as a <b>whiteout</b> — a character device with device number 0/0 (or, in newer setups, a zero-size file tagged with the <code>trusted.overlay.whiteout</code> xattr). When overlay sees that whiteout in upper, it hides the matching lower name. Deleting a whole directory that has lower contents uses an <b>opaque directory</b> marker (the <code>trusted.overlay.opaque=y</code> xattr) so nothing shows through.</li>
+      <li><b>A copy-up can surprise you on space and time.</b> Modifying one byte of a 2&nbsp;GB file in a lower layer copies the entire 2&nbsp;GB into upper before the write completes — copy-up is whole-file for data. That's a real latency spike and a real disk-usage jump the first time a big lower file is touched, and it's why databases and other write-heavy workloads must use volumes, not the overlay writable layer.</li>
+      <li><b>Image layers are content-addressed diffs.</b> Each image layer is a tar archive of the filesystem <em>changes</em> that instruction made — new/changed files, plus whiteout entries for deletions — identified by the SHA-256 digest of its contents. Identical layers have identical digests, so they're stored once and shared across images and pulled once. The image's config records the ordered list of layer digests (the <code>diff_ids</code>); the manifest ties config and layers together. This is the OCI image model you'll formalise in <a href="ch26-docker-containerd-runc-and-the-oci-model.html">Chapter 26</a>.</li>
+      <li><b>The build cache keys on the instruction and its inputs.</b> When building, the runtime reuses a cached layer if the instruction text is unchanged, the parent layer is unchanged, and — for <code>COPY</code>/<code>ADD</code> — the checksums of the copied files are unchanged. The moment one layer's key changes, that layer and <em>every layer after it</em> must be rebuilt, because each layer is defined relative to the one below. Cache invalidation cascades downward, never upward. This single fact dictates Dockerfile order.</li>
+    </ol>
+
+    <div class="box keypoint"><div class="h">The kernel's own analogy</div>
+      <p>The overlayfs documentation frames an overlay mount as morally equivalent to <code>cp -a lower upper &amp;&amp; mount --bind upper merged</code> — same resulting permissions and contents. The only difference is <em>when</em> the copy happens: overlay copies each file lazily, on first write, instead of all up front. That "copy on demand, not up front" is the whole performance win, and it's the definition of copy-on-write.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: your Dockerfile ends with <code>RUN rm -rf /tmp/build-cache</code> to shrink the image, but the image is exactly the same size. Why didn't the delete save space?</summary>
+      <div class="body">
+        <p>Because layers are additive and a delete in a later layer doesn't remove anything from an earlier one — it only writes a whiteout in the <em>new</em> layer that hides the files. The bytes of <code>/tmp/build-cache</code> still sit in the layer where they were created, contributing their full size to the image, and now you've added a small extra layer on top for the whiteouts. To actually shrink the image, the files must never enter a persisted layer in the first place: create and delete them within a <em>single</em> <code>RUN</code> (so the layer's net diff is empty), or use a multi-stage build and copy only the artefacts you want into the final stage. This is the same reason a secret you <code>COPY</code> then <code>rm</code> in a later step is still fully recoverable from the image.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces and where they live</h2>
+    <ul>
+      <li><b>The overlay driver</b> (Docker's <code>overlay2</code> storage driver, containerd's <code>overlayfs</code> snapshotter) manages the layer directories and assembles the mount. On Docker it keeps everything under <code>/var/lib/docker/overlay2/</code>, one directory per layer with a <code>diff/</code> subdirectory holding that layer's files.</li>
+      <li><b>The image config and manifest</b> — JSON documents. The config lists the ordered layer <code>diff_ids</code> and the build history (what each layer's instruction was); the manifest references the config and the layer blobs by digest. These are what <code>docker image inspect</code> and a registry serve.</li>
+      <li><b>The writable layer (container layer)</b> — the per-container <code>upperdir</code>, created when the container starts and destroyed when it's removed. Its growth is charged to the node's disk under <code>/var/lib/docker</code>.</li>
+      <li><b>Volumes and <code>tmpfs</code></b> — the escape hatch from the layer model. A volume mount bypasses overlay entirely and writes to a persistent location (or RAM, for <code>tmpfs</code>); it's where anything you want to keep, or anything write-heavy, belongs. Kubernetes <code>emptyDir</code>, <code>hostPath</code>, and PVs are the same idea (<a href="ch38-storage-volumes-pv-pvc-storageclass-csi.html">Chapter 38</a>).</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following a build and a run</h2>
+    <p>You run <code>docker build</code>. For each instruction, the builder checks its cache key; on a miss it runs the instruction in a temporary container, captures the filesystem diff as a new read-only layer, digests it, and moves on — each layer stacked on the last. The finished image is that ordered stack of digested layers plus a config. When you then <code>docker run</code> it, the runtime creates a fresh <code>upperdir</code> and <code>workdir</code>, points <code>lowerdir</code> at the image's layers, and mounts the overlay as the container's root filesystem. The process starts and reads its files straight from the shared lowers. The first time it writes to <code>/app/app.py</code>, that file copies up into the new upper; the first time it writes <code>/tmp/out.log</code>, that's created directly in upper; when it deletes a base file, a whiteout appears in upper. Stop and remove the container and the upper is gone — the image layers sit untouched, ready for the next run. The labs make every one of these visible on disk.</p>
+
+    <details class="recall"><summary>Think first: you already run one container from a 500&nbsp;MB image, and you start a second from the same image. How much extra disk does the second one use?</summary>
+      <div class="body">
+        <p>Almost none — kilobytes, not megabytes. The 500&nbsp;MB of image layers are read-only <code>lowerdir</code>s stored once and shared by every container from that image; the second container adds only its own thin, empty <code>upperdir</code>, which starts at essentially nothing and grows only as it writes. That's the whole economic point of the layer model: the heavy shared part is paid for once per node, and each additional container costs only what it actually changes. It's the same reason pulling an image whose base you already have is fast — only the layers you're missing come down the wire.</p>
+      </div>
+    </details>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>Some labs run <code>docker</code> commands from your Mac terminal; the deep-dive lab builds an overlay mount by hand inside a privileged container so you can see the directories directly.</p>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — see an image's layers</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Pull an image and look at the stack it's made of. <code>docker history</code> shows one row per layer with the instruction that made it and its size; <code>image inspect</code> shows the layer digests and the live overlay paths.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker pull python:3.12-slim
+docker history python:3.12-slim --no-trunc --format 'table {{.Size}}\t{{.CreatedBy}}'</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>SIZE      CREATED BY
+0B        CMD ["python3"]
+0B        ENV PYTHON_VERSION=3.12...
+45.2MB    RUN set -eux; ... pip install ...
+0B        ENV LANG=C.UTF-8
+78.9MB    /bin/sh -c #(nop) ADD file:... in /   (the base rootfs)</code></div>
+        <p>Every non-zero row is a layer that carries real bytes; the <code>0B</code> rows are metadata-only instructions (<code>ENV</code>, <code>CMD</code>) that still create a layer but add no files. Now list the content-addressed layer IDs and the overlay directories a running container would stack:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker image inspect python:3.12-slim --format '{{json .RootFS.Layers}}' | tr ',' '\n'
+docker image inspect python:3.12-slim --format '{{json .GraphDriver.Data}}'</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>["sha256:9c1b6...","sha256:2f4e0...","sha256:7ad88..."]
+{"LowerDir":"/var/lib/docker/overlay2/abc/diff:/var/lib/docker/overlay2/def/diff",
+ "MergedDir":"...","UpperDir":"...","WorkDir":"..."}</code></div>
+        <p>Those <code>sha256:</code> values are the <code>diff_ids</code> — the digests of each layer's contents. Two images that share a base layer share that digest and store it once. The <code>GraphDriver.Data</code> block is overlayfs in the flesh: a colon-separated <code>LowerDir</code> stack and the <code>Upper</code>/<code>Work</code>/<code>Merged</code> directories the runtime will assemble.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — build an overlay by hand and watch copy-on-write</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>The clearest way to internalise overlayfs is to mount one yourself. Do it in a privileged container so the directories are right in front of you.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker run --rm -it --privileged ubuntu:24.04 bash
+
+<span class="c"># Inside: make the four directories and seed the "image" (lower):</span>
+mkdir -p /ov/lower /ov/upper /ov/work /ov/merged
+echo "from the base image" &gt; /ov/lower/base.txt
+echo "also from the base"  &gt; /ov/lower/keep.txt
+mount -t overlay overlay -o lowerdir=/ov/lower,upperdir=/ov/upper,workdir=/ov/work /ov/merged
+ls /ov/merged &amp;&amp; cat /ov/merged/base.txt   <span class="c"># the union shows lower's files</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>base.txt  keep.txt
+from the base image</code></div>
+        <p>Now modify a file that exists only in the lower layer, and watch copy-up happen:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>echo "appended by the container" &gt;&gt; /ov/merged/base.txt
+ls /ov/upper                 <span class="c"># base.txt has appeared in upper — it was copied up</span>
+cat /ov/lower/base.txt       <span class="c"># the LOWER copy is unchanged</span>
+rm /ov/merged/keep.txt       <span class="c"># delete a lower file through the merged view</span>
+ls -l /ov/upper              <span class="c"># keep.txt is now a 0/0 char device: a whiteout</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>base.txt
+from the base image
+crw-r--r-- 1 root root 0, 0 ... keep.txt</code></div>
+        <p>There it is, the whole model in five commands. Editing <code>base.txt</code> copied it up into <code>upper</code> while the <code>lower</code> original stayed pristine (copy-on-write). Deleting <code>keep.txt</code> couldn't touch the read-only lower, so overlay wrote a <b>whiteout</b> — the <code>crw-</code> character device with major/minor <code>0, 0</code> — into upper to hide it. This is exactly what a container's writable layer accumulates as it runs.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — a Dockerfile that busts its own cache</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Build an image, rebuild it (everything cached), then change one line of application code and watch what rebuilds. First the <em>good</em> order:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>mkdir demo &amp;&amp; cd demo
+printf 'flask==3.0.0\n' &gt; requirements.txt
+printf 'print("v1")\n'  &gt; app.py
+cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+COPY app.py .
+CMD ["python","app.py"]
+EOF
+docker build -t demo:1 .
+docker build -t demo:1 .        <span class="c"># second build: every step says CACHED</span>
+printf 'print("v2")\n' &gt; app.py <span class="c"># change ONLY the app code</span>
+docker build -t demo:2 .</code></pre></div>
+        <div class="out"><span class="ol">Output (third build, trimmed)</span> =&gt; CACHED [2/5] WORKDIR /app
+ =&gt; CACHED [3/5] COPY requirements.txt .
+ =&gt; CACHED [4/5] RUN pip install -r requirements.txt
+ =&gt; [5/5] COPY app.py .</code></div>
+        <p>The <code>pip install</code> stayed <b>CACHED</b> even though you changed the code — only the last <code>COPY app.py</code> and anything after it rebuilt. Now break it: reorder the Dockerfile so <code>COPY . .</code> comes <em>before</em> the install, change the code again, and rebuild. The install re-runs every single time. Figure out why before revealing.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM python:3.12-slim
+WORKDIR /app
+COPY . .
+RUN pip install -r requirements.txt
+CMD ["python","app.py"]
+EOF
+docker build -t demo:3 .
+printf 'print("v3")\n' &gt; app.py
+docker build -t demo:4 .        <span class="c"># watch the pip install line</span></code></pre></div>
+        <details class="recall"><summary>Reveal why the install re-ran</summary>
+          <div class="body">
+            <p>Cache invalidation cascades <em>downward</em>. The build reuses a layer only if its instruction, its parent layer, and (for <code>COPY</code>) the copied files' checksums are all unchanged. In the bad Dockerfile, <code>COPY . .</code> pulls in <code>app.py</code>, so editing the code changes that layer's checksum — which invalidates it and <b>every layer built on top of it</b>, including the expensive <code>pip install</code>. In the good Dockerfile, <code>requirements.txt</code> is copied and the dependencies installed <em>before</em> the volatile <code>app.py</code> is copied, so a code change only invalidates the cheap final <code>COPY</code>. The rule that falls out: order instructions from least-likely-to-change to most-likely-to-change — base image, then system packages, then dependency manifests and their install, then application code last. On a real service this is the difference between a 3-second rebuild and a 3-minute one, multiplied by every push all day.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — the writable layer that fills the disk</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>A node's disk is filling and pods start getting evicted for disk pressure, yet nobody deployed anything new and no volumes look full. Reproduce the shape: a container writing to its own root filesystem instead of a volume.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker run -d --name hog busybox sh -c \
+  'i=0; while true; do dd if=/dev/zero of=/big.$i bs=1M count=20 2&gt;/dev/null; i=$((i+1)); sleep 1; done'
+sleep 20
+docker ps -s --filter name=hog --format 'table {{.Names}}\t{{.Size}}'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAMES     SIZE
+hog       412MB (virtual 4.68MB)</code></div>
+        <p>The <code>SIZE</code> column is the size of the container's writable layer, climbing every second, while the "virtual" figure (the shared image) stays tiny. The disk is filling but no volume is involved and no new image was pulled. Where is the space going, and what's the fix? Reason it out, then reveal.</p>
+        <details class="recall"><summary>Reveal the cause and fix</summary>
+          <div class="body">
+            <p>The writes are landing in the container's <b>ephemeral writable layer</b> (its <code>upperdir</code> under <code>/var/lib/docker/overlay2</code>), because <code>/big.*</code> is on the container root filesystem, not a volume. That layer counts against the node's disk, and nothing caps it by default — a chatty app writing logs, temp files, or caches to its own rootfs will grow until the node runs out. Confirm with <code>docker ps -s</code> (the writable-layer size) and, on a node, <code>du -sh</code> of the overlay diff directory. The fixes: send anything persistent or high-volume to a <b>volume</b> or Kubernetes <code>emptyDir</code> (and set a size limit on it), configure log rotation, and don't write application data to the container root. In Kubernetes this surfaces as node <b>disk pressure</b> and pod eviction — the container's <em>ephemeral storage</em> usage is exactly this writable layer, and it's why <code>ephemeral-storage</code> requests/limits exist. Deleting the container reclaims it instantly (<code>docker rm -f hog</code>), which is the tell that it was the writable layer and not a volume.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — the secret that's still in the image</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>A teammate "removed" a secret from an image by deleting it in a later build step. Build their image and decide whether the secret is actually gone — then extract the image and check.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>mkdir leak &amp;&amp; cd leak
+printf 'SUPER-SECRET-TOKEN-abc123\n' &gt; secret.txt
+cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM busybox
+COPY secret.txt /secret.txt
+RUN cat /secret.txt &gt; /dev/null   # "use" it during build
+RUN rm -f /secret.txt            # "delete" it so it's not in the image
+EOF
+docker build -t leaky:1 .
+docker run --rm leaky:1 ls /secret.txt   <span class="c"># gone from the running container...</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>ls: /secret.txt: No such file or directory</code></div>
+        <p>The running container can't see it — the final layer has a whiteout. But is the secret <em>in the image</em>? The senior question: can someone who pulls <code>leaky:1</code> recover the token, and if so, how do you actually keep secrets out of images? Decide before revealing.</p>
+        <details class="recall"><summary>Reveal — extract the layers and the lesson</summary>
+          <div class="body">
+            <p>The secret is fully recoverable. The <code>rm</code> only added a whiteout in the top layer; the layer created by <code>COPY secret.txt</code> still contains the plaintext token, and anyone with the image can unpack that layer:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>docker save leaky:1 -o leaky.tar
+mkdir x &amp;&amp; tar -xf leaky.tar -C x
+<span class="c"># each blob under x/blobs/sha256 is a layer tarball; search them for the token:</span>
+for b in x/blobs/sha256/*; do tar -xOf "$b" 2&gt;/dev/null | grep -a SUPER-SECRET &amp;&amp; echo "  ^ found in $b"; done</code></pre></div>
+            <div class="out"><span class="ol">Output</span>SUPER-SECRET-TOKEN-abc123
+  ^ found in x/blobs/sha256/6b2f...</code></div>
+            <p>There's the token, sitting in an intermediate layer, retrievable by anyone who can pull the image. Deleting a file in a later layer never removes it from an earlier one — layers are additive and immutable. The right ways to keep secrets out: use <b>build secrets</b> (<code>RUN --mount=type=secret</code>) so the file is mounted only during that step and never persisted to a layer; use <b>multi-stage builds</b> and copy only the final artefacts into a clean last stage; and inject runtime secrets through the environment or a secrets manager, never <code>COPY</code>. The same additive-layer fact is why "just <code>rm</code> the build cache at the end" doesn't shrink an image — the bytes already live in a lower layer. Slim images come from creating-and-cleaning within one <code>RUN</code>, multi-stage builds, and a minimal base, not from deleting things afterward.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · node disk pressure with no obvious culprit</div>
+      <p><b>Symptom:</b> a node hits disk pressure, the kubelet evicts pods, and <code>df</code> shows <code>/var/lib/docker</code> (or the containerd root) full. <b>First cut:</b> <code>docker ps -s</code> (or per-container ephemeral-storage metrics) to find containers with a large writable layer. <b>Usual cause:</b> an app writing logs, caches, or temp files to its container root instead of a volume, so its <code>upperdir</code> grows unbounded. <b>Fix:</b> route that data to a volume/<code>emptyDir</code> with a size limit, add log rotation, and set <code>ephemeral-storage</code> requests/limits so the scheduler and eviction know about it.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · builds that take minutes for a one-line change</div>
+      <p><b>Symptom:</b> CI rebuilds dependencies on every commit even when only application code changed. <b>First cut:</b> read the Dockerfile top to bottom and find where volatile inputs (source code, <code>COPY . .</code>) sit above expensive steps (package installs). <b>Usual cause:</b> instruction order that copies source before installing dependencies, so any code change invalidates the install layer and everything below it. <b>Fix:</b> reorder least-volatile to most-volatile — deps first, code last — and use build caches/cache mounts for package managers.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · images far larger than expected</div>
+      <p><b>Symptom:</b> a "small" service image is 1.5&nbsp;GB, slow to pull, slow to schedule. <b>First cut:</b> <code>docker history</code> to find the fat layers. <b>Usual cause:</b> build tools, caches (apt/pip), or large intermediate files baked into layers and only "deleted" later (which doesn't shrink anything), or a heavyweight base image. <b>Fix:</b> multi-stage builds that ship only artefacts, cleaning within the same <code>RUN</code> that created the mess, and a minimal base. Smaller images pull faster, schedule faster, and shrink attack surface.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Treat the writable layer as scratch.</b> Anything you want to keep, and anything write-heavy, goes on a volume — full stop. Databases, queues, and log-heavy apps writing to the overlay layer will both lose data on restart and risk filling the node. Set <code>ephemeral-storage</code> requests and limits so the platform can account for and cap the writable layer, and rotate logs so they don't accumulate there.</p>
+    <p><b>Performance.</b> Overlay reads are essentially native — the container reads shared lower files directly. The costs are specific and predictable: the first write to a large lower file pays a whole-file copy-up, and write-heavy workloads see overhead from copy-up churn, so they belong on volumes. Deep lower stacks (dozens of layers) add lookup cost and slow pulls; keep layer counts sane. And because layers are shared and cached, a good base-image strategy — everyone on the same slim base — means most of an image is already present on the node and only your thin top layers get pulled.</p>
+    <p><b>Security.</b> Images are not opaque: every layer is extractable, so any secret, key, or credential that ever entered a layer is recoverable even if a later step deletes it. Use build secrets and multi-stage builds, never <code>COPY</code> a secret, and scan images for leaked credentials in CI. Pin and verify base images by digest so a mutated upstream tag can't swap the foundation of your stack underneath you — the provenance story that continues in <a href="ch27-container-security-and-process-to-container-to.html">Chapter 27</a>.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>Content-addressed, shared, immutable layers are what make container distribution scale. Because a layer is identified by its digest, a registry stores each unique layer once and a node pulls it once no matter how many images reference it — the base layer of a hundred services is downloaded a single time per node. That's the property your whole delivery pipeline leans on: fast pulls, deduplicated storage, cacheable builds, and reproducible artefacts you can pin by digest for supply-chain integrity. The immutability also underwrites the "cattle not pets" model — an image is a fixed, verifiable unit you roll forward or back atomically, which is the foundation for the deployment and rollback strategies in <a href="ch73-ci-cd-and-progressive-delivery.html">Chapter 73</a>. When you design a build-and-release system, layer caching and image size are not afterthoughts; they set your CI throughput, your rollout speed, and your storage bill.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first, then open it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What is overlayfs and why do containers use it?</summary>
+        <div class="a"><p>It's a union filesystem that stacks a read-only lower (the image's layers) under a writable upper (the container's private layer) and presents them as one merged tree. Reads fall through to the shared lowers; writes land in upper, copying a file up from lower on first modification. That lets many containers share one on-disk copy of an image while each gets its own writable root, so containers are cheap to start and cheap to store. The writable layer is ephemeral — deleted with the container.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Explain copy-on-write and whiteouts in overlayfs.</summary>
+        <div class="a"><p>Reading a file that only exists in a lower layer is direct and free. The first time the container writes to such a file — or changes its metadata or hard-links it — overlay copies it up into the writable upper layer first: it recreates the parent dirs, copies metadata then data then xattrs, staged atomically via the workdir. After that the file lives in upper and the lower copy is never touched, which is what keeps lowers shareable. That's copy-on-write, and one gotcha is that copy-up is whole-file, so touching one byte of a huge lower file copies the whole thing. Deletion works the opposite way: you can't remove a file from a read-only lower, so overlay records a whiteout in upper — a 0/0 character device — that hides the lower name; a whole deleted directory uses an opaque-directory xattr. The practical upshots are that write-heavy data belongs on volumes, and that deleting a file in a later image layer never reclaims the space it used in an earlier one.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Why does Dockerfile instruction order affect build speed, and how do you order it well?</summary>
+        <div class="a"><p>Because each image layer is a diff defined relative to the layer below it, and the build cache reuses a layer only if its instruction, its parent, and — for <code>COPY</code>/<code>ADD</code> — the copied files' checksums are unchanged. So invalidating one layer forces every layer after it to rebuild; cache invalidation cascades strictly downward. If you copy source code early and install dependencies after it, any code change changes the source layer's checksum and re-runs the install. The fix is to order instructions from least-volatile to most-volatile: base image, then OS packages, then the dependency manifest and its install, then the application code last, so a routine code change only invalidates the cheap final copy. On a busy service this is minutes saved per build, every build. I'd also mention build caches/cache mounts for package managers to speed even the cold path.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A node fills its disk and evicts pods, but no volumes are full and nothing new deployed. What's happening?</summary>
+        <div class="a"><p>Almost certainly a container's ephemeral writable layer growing. Writes to the container root filesystem — logs, caches, temp files not on a volume — land in that container's overlay upperdir under the runtime's data directory, and it grows unbounded by default, counting against the node's disk as ephemeral storage. I'd confirm with <code>docker ps -s</code> or ephemeral-storage metrics to find the container with a large writable layer, and check <code>du</code> of the overlay diff dir on the node. The fix is to move that data to a volume or <code>emptyDir</code> with a size limit, add log rotation, and set <code>ephemeral-storage</code> requests/limits so the scheduler and eviction account for it. Deleting the offending container reclaims the space immediately, which also confirms it wasn't a volume.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>Someone deleted a secret in a later build step. Is it out of the image?</summary>
+        <div class="a"><p>No. Layers are additive and immutable, so deleting a file in a later layer only writes a whiteout that hides it — the bytes still live in the earlier layer that added them, and anyone who can pull the image can <code>docker save</code> it and extract that layer to recover the secret. The same fact explains why "rm the cache at the end" doesn't shrink an image. To actually keep secrets out, they must never be persisted to a layer: use build secrets (<code>RUN --mount=type=secret</code>) so the file exists only during that step, use multi-stage builds that copy only clean artefacts into the final stage, and inject runtime secrets via environment or a secrets manager rather than <code>COPY</code>. And rotate anything that did leak, because it must be assumed compromised.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>overlayfs stacks read-only image layers (<code>lowerdir</code>) under a per-container writable layer (<code>upperdir</code>), with a <code>workdir</code> for atomic operations, and presents the union as <code>merged</code> — the container's root. Reads fall through the stack (upper wins over lower; among lowers, higher wins; directories merge); writes go to upper. Modifying a lower file copies it up first (copy-on-write, whole-file); deleting one writes a whiteout (a 0/0 char device) that hides it. An image is an ordered stack of content-addressed layer diffs identified by SHA-256, shared and stored once. The build cache reuses a layer only if its instruction, parent, and copied-file checksums are unchanged, and invalidation cascades downward — so order Dockerfiles least-volatile to most-volatile, code last. The writable layer is ephemeral and uncapped by default: keep persistent and write-heavy data on volumes, and remember that deleting a file in a later layer never reclaims earlier-layer space, which is why secrets and bloat survive.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>overlayfs = <code>lowerdir</code> (RO image layers) + <code>upperdir</code> (RW container layer) + <code>workdir</code> (scratch) → <code>merged</code> (what the container sees).</li>
+      <li>Resolution rule: upper beats lower; among lowers, higher beats lower; same-named directories merge their contents.</li>
+      <li>Copy-on-write: first write to a lower file copies the whole file up to upper; the lower stays pristine and shareable.</li>
+      <li>Whiteout: deleting a lower file writes a 0/0 character device in upper to hide it; it can't erase the lower.</li>
+      <li>A container adds exactly one thin writable layer; it's discarded when the container is removed.</li>
+      <li>An image is an ordered stack of content-addressed (SHA-256) layer diffs, stored and pulled once per unique layer.</li>
+      <li>Build cache reuses a layer only if instruction + parent + copied-file checksums are unchanged; invalidation cascades downward.</li>
+      <li>Order Dockerfiles least-volatile → most-volatile: base, packages, dependency install, then application code last.</li>
+      <li>Deleting a file in a later layer never reclaims earlier-layer space — secrets and bloat survive; use multi-stage builds and build secrets.</li>
+      <li>The writable layer is ephemeral and uncapped; put persistent and write-heavy data on volumes and set ephemeral-storage limits.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch04-filesystems-inodes-file-descriptors-disk-i-o.html"><b>Ch 4</b> Filesystems &amp; I/O</a>
+      <a href="ch22-linux-namespaces.html"><b>Ch 22</b> Namespaces</a>
+      <a href="ch23-cgroups-v2-cpu-memory-io-limits.html"><b>Ch 23</b> cgroups v2</a>
+      <a href="ch26-docker-containerd-runc-and-the-oci-model.html"><b>Ch 26</b> OCI &amp; the runtime stack</a>
+      <a href="ch38-storage-volumes-pv-pvc-storageclass-csi.html"><b>Ch 38</b> Kubernetes storage</a>
+      <a href="ch73-ci-cd-and-progressive-delivery.html"><b>Ch 73</b> CI/CD &amp; delivery</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>The Linux Kernel documentation — <a href="https://docs.kernel.org/filesystems/overlayfs.html">Overlay Filesystem</a>: the authoritative reference for <code>lowerdir</code>/<code>upperdir</code>/<code>workdir</code>, copy-up, whiteouts, opaque directories, and multiple lower layers.</li>
+      <li>Docker documentation — <a href="https://docs.docker.com/engine/storage/drivers/overlayfs-driver/">Use the OverlayFS storage driver</a>: how <code>overlay2</code> lays out layers on disk and assembles the container mount.</li>
+      <li>Docker documentation — <a href="https://docs.docker.com/build/cache/">Docker build cache</a> and <a href="https://docs.docker.com/build/building/best-practices/">Building best practices</a>: layer ordering, cache invalidation, and multi-stage builds.</li>
+      <li>Docker documentation — <a href="https://docs.docker.com/engine/storage/">Storage overview</a>: writable layer versus volumes and where persistent data belongs.</li>
+      <li>Open Container Initiative — <a href="https://github.com/opencontainers/image-spec">Image Format Specification</a>: the layer, config, and manifest model behind content-addressed images.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch23-cgroups-v2-cpu-memory-io-limits.html"><span class="dir">← Prev</span><div class="ti">Ch 23 — cgroups v2: CPU, memory, I/O limits</div></a>
+      <a class="nx" href="ch25-container-networking.html"><span class="dir">Next →</span><div class="ti">Ch 25 — Container networking</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 24 of 121 · Part III · Containers &amp; Container Internals. Mount an overlay by hand once; layers stop being abstract.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Four dirs, one fs</a>
+    <a href="#internals">Copy-up &amp; layers</a>
+    <a href="#components">The components</a>
+    <a href="#flow">Following build &amp; run</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

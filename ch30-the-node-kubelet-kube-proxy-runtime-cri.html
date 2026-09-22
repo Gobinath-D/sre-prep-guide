@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 30 — The node: kubelet, kube-proxy, runtime, CRI</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part IV · Kubernetes &nbsp;·&nbsp; Chapter 30</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part IV · Kubernetes — Architecture &amp; Internals · Chapter 30</div>
+      <h1>The node: kubelet, kube-proxy, runtime, CRI</h1>
+      <p class="tagline">The scheduler decided <em>where</em>. Now a single agent on that machine — the kubelet — has to make it real: pull images, ask the runtime to start containers, watch that they stay alive, report health, and shed load when the node runs low. When a node goes NotReady, pods get evicted, or "PLEG is not healthy" shows up, this chapter is the difference between reading tea leaves and reading a diagnosis.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~50 min read · kind + crictl</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Describe the kubelet sync loop and PLEG, and explain the "PLEG is not healthy" incident.</li>
+          <li>Trace how a pod actually starts on a node through the CRI — sandbox, images, containers.</li>
+          <li>Name the node conditions and explain how a node goes NotReady and when its pods get rescheduled.</li>
+          <li>State the default node-pressure eviction thresholds and which pods get evicted first, and tell eviction apart from OOMKilled.</li>
+          <li>Say what kube-proxy does — and, just as important, what it does <em>not</em> do.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>Deciding isn't doing</h2>
+    <p>Chapter 29 ended with the scheduler writing <code>spec.nodeName</code> — a decision recorded in etcd. But a decision is just a note on a whiteboard. Nothing is running yet. No image has been pulled, no namespace created, no process started. Somebody standing <em>on that machine</em> has to read the note and do the work.</p>
+    <p>And it's not a one-shot "start it and walk away." That machine's agent has to keep the containers in the state the spec asks for: restart one that crashes, run its health probes, mount its volumes, wire up its network, and report back honestly whether the pod is healthy. It has to notice when a container dies even though nothing told it. And when the machine itself runs low on memory or disk, it has to make a hard call — start killing pods to keep the node alive rather than let the whole thing fall over.</p>
+    <p>That agent is the <b>kubelet</b>, and this chapter is where all the frightening node-level symptoms come from. "Pod stuck in ContainerCreating." "Node NotReady." "Pods Evicted." "PLEG is not healthy." Every one of those is the kubelet (or something it depends on) telling you exactly what's wrong — if you know how it works. The data plane is also where your apps actually live, so this is the layer that's up at 3am when the control plane isn't.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>The kubelet is a <b>level-triggered reconciler for one node</b>, exactly like the controllers in Chapter 28 — but its "desired state" is "the pods assigned to me" and its "actual state" is "what the container runtime is really running." It watches, it compares, it acts, forever. Everything below is that loop with the details filled in.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a franchise store manager</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Head office (the control plane) decides which products each store carries and posts assignments to a shared board. Each <b>store manager</b> (the kubelet) runs one shop and does everything local. They read the board for products assigned to <em>their</em> store, order stock from suppliers (pull container images), and put it on the shelves (start containers). They don't stock shelves personally — they phone the <b>warehouse crew</b> (the container runtime, containerd) and hand them a precise packing slip (the CRI request); the crew do the lifting with their forklifts (runc).</p>
+      <p>The manager walks the floor every minute to check nothing's fallen off a shelf (PLEG relisting containers), and calls head office regularly to say "store's open, all good" (the node heartbeat / Lease). If those calls stop, head office assumes the store is dark and re-routes its products to other stores (the node goes NotReady, pods reschedule).</p>
+      <p>And when the store is running out of shelf space or the power's failing (disk or memory pressure), the manager doesn't wait for a total blackout — they start pulling the least important stock off the shelves to keep the store open (eviction), sacrificing the cheap impulse-buys before the premium goods. Out front, a <b>directory sign</b> (kube-proxy) points a customer asking for "the pharmacy" to whichever aisle currently has it, even as aisles get rearranged.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>On the node</th></tr>
+      <tr><td>The store manager</td><td>The <b>kubelet</b> — one per node, runs everything local</td></tr>
+      <tr><td>Reading the assignment board</td><td>Watching the API server for pods bound to this node</td></tr>
+      <tr><td>Phoning the warehouse crew with a packing slip</td><td>Calling the runtime over the <b>CRI</b> (gRPC)</td></tr>
+      <tr><td>The warehouse crew + forklifts</td><td><b>containerd</b> (CRI runtime) + <b>runc</b> (OCI runtime)</td></tr>
+      <tr><td>Walking the floor every minute</td><td><b>PLEG</b> relisting containers to detect changes</td></tr>
+      <tr><td>Calling head office "all good"</td><td>Node status + renewing the <b>Lease</b> (~every 10s)</td></tr>
+      <tr><td>Calls stop → office assumes dark</td><td>Missed heartbeats → node <b>NotReady</b> → pods reschedule</td></tr>
+      <tr><td>Pulling cheap stock to keep the lights on</td><td><b>Eviction</b> under memory/disk pressure, lowest QoS first</td></tr>
+      <tr><td>The directory sign out front</td><td><b>kube-proxy</b> — routes Service traffic to live pod IPs</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>kubelet → CRI → runtime, and the node-condition flow</h2>
+    <p>Two pictures carry this chapter. First, the path a pod takes from "assigned to me" down to running containers — the kubelet talks to nothing but the API server above and the runtime (over the CRI) below:</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 462" role="img" aria-label="The kubelet watches the API server and drives the container runtime over the CRI, which uses runc and CNI to run the pod's containers">
+        <!-- api server -->
+        <rect x="270" y="14" width="180" height="42" rx="9" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="360" y="40" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">kube-apiserver</text>
+        <!-- kubelet -->
+        <rect x="150" y="86" width="420" height="94" rx="12" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="360" y="110" text-anchor="middle" style="fill:var(--accent);font:700 12.5px sans-serif;letter-spacing:.03em">KUBELET — the node agent</text>
+        <text x="360" y="132" text-anchor="middle" style="fill:var(--ink);font:12px sans-serif">syncLoop · per-pod workers · probes</text>
+        <text x="360" y="150" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">PLEG relist (~1s) · NodeStatus + Lease (~10s) · cAdvisor stats</text>
+        <text x="360" y="168" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">eviction manager · volume + secret mounts</text>
+        <!-- arrows api<->kubelet -->
+        <defs>
+          <marker id="n" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="ng" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+          <marker id="nm" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" style="fill:var(--muted)"/></marker>
+        </defs>
+        <line x1="330" y1="84" x2="330" y2="58" style="stroke:var(--accent);stroke-width:2" marker-end="url(#n)"/>
+        <text x="196" y="74" style="fill:var(--accent);font:600 10px sans-serif">watch pods bound to me</text>
+        <line x1="410" y1="58" x2="410" y2="84" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#ng)"/>
+        <text x="415" y="74" style="fill:var(--accent2);font:600 10px sans-serif">report status + lease</text>
+        <!-- CRI boundary -->
+        <line x1="150" y1="200" x2="570" y2="200" style="stroke:var(--deep);stroke-width:1.5;stroke-dasharray:7 5"/>
+        <text x="360" y="196" text-anchor="middle" style="fill:var(--deep);font:700 10.5px sans-serif;letter-spacing:.03em">CRI — gRPC · RuntimeService + ImageService</text>
+        <!-- containerd -->
+        <rect x="150" y="214" width="270" height="60" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="285" y="240" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">containerd — CRI implementation</text>
+        <text x="285" y="258" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">pulls images · manages sandboxes</text>
+        <!-- CNI -->
+        <rect x="440" y="214" width="130" height="60" rx="10" style="fill:var(--chip);stroke:var(--accent2)"/>
+        <text x="505" y="240" text-anchor="middle" style="fill:var(--accent2);font:600 12px sans-serif">CNI plugin</text>
+        <text x="505" y="258" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">pod netns + IP</text>
+        <line x1="420" y1="244" x2="440" y2="244" style="stroke:var(--muted)" marker-end="url(#nm)"/>
+        <!-- runc -->
+        <rect x="150" y="302" width="270" height="52" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="285" y="333" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">runc — OCI runtime (creates the container)</text>
+        <!-- containers -->
+        <rect x="150" y="382" width="128" height="60" rx="9" style="fill:var(--chip);stroke:var(--violet)"/>
+        <text x="214" y="408" text-anchor="middle" style="fill:var(--violet);font:600 12px sans-serif">pause</text>
+        <text x="214" y="426" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">holds netns</text>
+        <rect x="292" y="382" width="128" height="60" rx="9" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="356" y="408" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">app container</text>
+        <text x="356" y="426" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">joins pause's netns</text>
+        <!-- spine arrows -->
+        <line x1="285" y1="180" x2="285" y2="212" style="stroke:var(--deep);stroke-width:2" marker-end="url(#n)"/>
+        <line x1="285" y1="274" x2="285" y2="300" style="stroke:var(--muted);stroke-width:2" marker-end="url(#nm)"/>
+        <text x="292" y="292" style="fill:var(--muted);font:10px sans-serif">OCI create</text>
+        <line x1="214" y1="354" x2="214" y2="380" style="stroke:var(--muted);stroke-width:2" marker-end="url(#nm)"/>
+        <line x1="356" y1="354" x2="356" y2="380" style="stroke:var(--muted);stroke-width:2" marker-end="url(#nm)"/>
+      </svg>
+      <figcaption>The kubelet is the only thing that spans both worlds: it watches the API server (up) and drives containerd over the CRI (down). containerd pulls images, calls CNI to give the pod a network namespace and IP, and uses runc to create the pause container plus your app containers.</figcaption>
+    </figure>
+
+    <p>Second, how a node's health is decided — two independent paths, one for resource pressure and one for lost heartbeats:</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 250" role="img" aria-label="Two paths that change a node's state: crossing an eviction threshold, and missing heartbeats">
+        <text x="360" y="18" text-anchor="middle" style="fill:var(--muted);font:700 11px sans-serif;letter-spacing:.05em">TWO WAYS A NODE CHANGES STATE</text>
+        <defs>
+          <marker id="f" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--deep)"/></marker>
+        </defs>
+        <!-- lane A: pressure -->
+        <rect x="14" y="40" width="150" height="56" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="89" y="62" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">kubelet watches</text>
+        <text x="89" y="78" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">mem/disk/pid signals</text>
+        <rect x="188" y="40" width="204" height="56" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="290" y="60" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">below threshold?</text>
+        <text x="290" y="76" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">mem&lt;100Mi · nodefs&lt;10% · imagefs&lt;15%</text>
+        <rect x="416" y="40" width="140" height="56" rx="8" style="fill:var(--panel);stroke:var(--deep)"/>
+        <text x="486" y="62" text-anchor="middle" style="fill:var(--deep);font:600 10.5px sans-serif">condition → True</text>
+        <text x="486" y="78" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">e.g. DiskPressure</text>
+        <rect x="580" y="40" width="126" height="56" rx="8" style="fill:var(--panel);stroke:var(--deep)"/>
+        <text x="643" y="60" text-anchor="middle" style="fill:var(--deep);font:600 10.5px sans-serif">evict pods</text>
+        <text x="643" y="76" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">BestEffort → Burstable</text>
+        <line x1="164" y1="68" x2="186" y2="68" style="stroke:var(--deep)" marker-end="url(#f)"/>
+        <line x1="392" y1="68" x2="414" y2="68" style="stroke:var(--deep)" marker-end="url(#f)"/>
+        <line x1="556" y1="68" x2="578" y2="68" style="stroke:var(--deep)" marker-end="url(#f)"/>
+        <!-- lane B: heartbeat -->
+        <rect x="14" y="150" width="150" height="56" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="89" y="172" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">kubelet heartbeat</text>
+        <text x="89" y="188" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">Lease every ~10s</text>
+        <rect x="188" y="150" width="204" height="56" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="290" y="172" text-anchor="middle" style="fill:var(--ink);font:600 10.5px sans-serif">silent &gt; grace period?</text>
+        <text x="290" y="188" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">node-monitor-grace ~40s</text>
+        <rect x="416" y="150" width="140" height="56" rx="8" style="fill:var(--panel);stroke:var(--deep)"/>
+        <text x="486" y="172" text-anchor="middle" style="fill:var(--deep);font:600 10.5px sans-serif">node → NotReady</text>
+        <text x="486" y="188" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">Ready = Unknown</text>
+        <rect x="580" y="150" width="126" height="56" rx="8" style="fill:var(--panel);stroke:var(--deep)"/>
+        <text x="643" y="172" text-anchor="middle" style="fill:var(--deep);font:600 10px sans-serif">NoExecute taint</text>
+        <text x="643" y="188" text-anchor="middle" style="fill:var(--muted);font:9px sans-serif">pods rescheduled</text>
+        <line x1="164" y1="178" x2="186" y2="178" style="stroke:var(--deep)" marker-end="url(#f)"/>
+        <line x1="392" y1="178" x2="414" y2="178" style="stroke:var(--deep)" marker-end="url(#f)"/>
+        <line x1="556" y1="178" x2="578" y2="178" style="stroke:var(--deep)" marker-end="url(#f)"/>
+      </svg>
+      <figcaption>Top lane: the <em>kubelet</em> reacts to local resource pressure by evicting pods. Bottom lane: the <em>node controller</em> reacts to missing heartbeats by marking the node NotReady and tainting it so pods reschedule elsewhere. Two mechanisms, two owners.</figcaption>
+    </figure>
+
+    <h2 id="internals"><span class="beat">Internal working</span>The sync loop, PLEG, CRI startup, and eviction</h2>
+
+    <h4>1 · The kubelet sync loop</h4>
+    <p>At its core the kubelet runs <code>syncLoop</code>, which wakes on any of several channels and, for each pod, reconciles reality toward the spec:</p>
+    <ul>
+      <li><b>API updates</b> — a new/changed/deleted pod assigned to this node arrives over the watch.</li>
+      <li><b>PLEG events</b> — a container changed state (started, died) since last time.</li>
+      <li><b>A periodic sync</b> — a timer (~1s) that re-reconciles every pod even if nothing signalled, because it's level-triggered and shouldn't rely on catching every event.</li>
+      <li><b>Probe results</b> — a liveness/readiness/startup probe changed a container's status.</li>
+      <li><b>Housekeeping</b> — clean up dead containers, orphaned volumes, unused images.</li>
+    </ul>
+    <p>Each pod gets its own worker goroutine running <code>syncPod</code>: compute the pod's current status from the runtime, then make it match — ensure the sandbox exists, ensure each container is running the right image in the right state, (re)start what's missing, run the probes, and write the pod's status back to the API server. Kill the kubelet and restart it and it simply re-observes every container from the runtime and reconciles — the same restart-safety you saw in every other controller.</p>
+
+    <h4>2 · PLEG — how the kubelet notices a container died</h4>
+    <p>Here's a subtlety that trips people up: nothing pushes "your container just crashed" to the kubelet reliably. So the <b>Pod Lifecycle Event Generator (PLEG)</b> polls. Every second it asks the runtime for the full list of containers, diffs it against the previous list, and generates events (<code>ContainerStarted</code>, <code>ContainerDied</code>) that wake <code>syncLoop</code> to react — restart a crashed container, update status.</p>
+    <p>That relist is cheap when a node has 20 containers and a healthy runtime. It gets expensive when the node is dense (hundreds of containers) or the runtime is struggling (slow disk, a wedged containerd). PLEG records the timestamp of its last successful relist; if that goes stale past the <b>3-minute threshold</b>, the kubelet declares itself unhealthy, which flips the node's Ready condition and you see the infamous line:</p>
+    <div class="codewrap"><span class="lang">text</span><pre><code>Ready   False   ... KubeletNotReady   PLEG is not healthy: pleg was last seen active 3m0s ago; threshold is 3m0s</code></pre></div>
+    <p>So "PLEG is not healthy" almost never means PLEG is broken — it means the <em>runtime</em> couldn't answer the relist fast enough, which points at disk I/O, containerd health, or container density. (Newer kubelets can use <b>event-driven PLEG</b>, consuming CRI container events instead of relisting constantly, which cuts this class of problem — but the relist safety net remains.)</p>
+
+    <h4>3 · How a pod actually starts, over the CRI</h4>
+    <p>The kubelet never runs a container itself. It speaks the <b>Container Runtime Interface</b> — a gRPC API with two services, <code>RuntimeService</code> (sandboxes and containers) and <code>ImageService</code> (images) — to the runtime (containerd). For one pod, in order:</p>
+    <ol class="steps">
+      <li><b>Admit the pod.</b> The kubelet checks the node can take it (resources, security policy). If not, it rejects it locally rather than starting anything.</li>
+      <li><b>Pull images.</b> <code>ImageService.PullImage</code> for each container image, honouring <code>imagePullPolicy</code> and any pull secrets. A stuck pull here is your <code>ImagePullBackOff</code>.</li>
+      <li><b>RunPodSandbox — create the pod's shared context.</b> The runtime creates the <b>pause container</b>, which owns the pod's network and IPC namespaces, and invokes the <b>CNI plugin</b> to set up the network namespace and assign the pod its IP. A failure here is the classic "stuck in ContainerCreating" — no IP, no sandbox.</li>
+      <li><b>Run init containers, in order.</b> Each must complete successfully before the next; the app containers wait.</li>
+      <li><b>Create and start the app containers.</b> <code>CreateContainer</code> then <code>StartContainer</code> per container; each joins the pause container's network namespace, so they all share the pod IP and reach each other on <code>localhost</code>. containerd uses <b>runc</b> to actually create each one (the OCI handoff from Chapter 26).</li>
+      <li><b>Run probes, report status.</b> Startup → liveness/readiness probes run; when readiness passes, the pod is marked Ready and its status flows up to the API server. Only now does kube-proxy start routing Service traffic to it.</li>
+    </ol>
+    <p>Note there's no Docker anywhere in that path. The old Docker shim was removed in Kubernetes 1.24; today the kubelet talks CRI to containerd or CRI-O directly. That's why "Kubernetes deprecated Docker" only ever meant "the kubelet stopped using Docker as its runtime" — your Docker-built images run unchanged, because they're just OCI images.</p>
+
+    <h4>4 · Node status, heartbeats, and going NotReady</h4>
+    <p>The kubelet tells the control plane it's alive two ways: it periodically writes full <b>NodeStatus</b> (capacity, conditions, addresses), and — to keep that cheap at scale — it renews a lightweight <b>Lease</b> object in <code>kube-node-lease</code> roughly every 10 seconds. The node lifecycle controller (in the controller manager, Chapter 29) watches those heartbeats. If a node stops renewing for the <b>node-monitor-grace-period</b> (about 40 seconds by default), the controller sets the node's Ready condition to <code>Unknown</code> — the node is <b>NotReady</b> — and taints it <code>NoExecute</code>. Pods on a NotReady node aren't killed instantly; by default they tolerate the taint for 300 seconds, after which they're evicted and rescheduled elsewhere. That delay is intentional: a 30-second network blip shouldn't reschedule the whole node's workload.</p>
+
+    <h4>5 · Node-pressure eviction</h4>
+    <p>Separately from the node-controller path, the kubelet defends its own node. Its eviction manager watches signals and acts when one crosses a threshold. The <b>default hard thresholds</b> are worth memorising:</p>
+    <table class="t">
+      <tr><th>Signal</th><th>Default hard threshold</th><th>Meaning</th></tr>
+      <tr><td><code>memory.available</code></td><td>&lt; 100Mi</td><td>Node is nearly out of RAM</td></tr>
+      <tr><td><code>nodefs.available</code></td><td>&lt; 10%</td><td>The kubelet/root filesystem is filling up</td></tr>
+      <tr><td><code>imagefs.available</code></td><td>&lt; 15%</td><td>The image/container-writable filesystem is filling up</td></tr>
+      <tr><td><code>nodefs.inodesFree</code></td><td>&lt; 5%</td><td>Out of inodes (many small files)</td></tr>
+    </table>
+    <p>When a threshold is crossed, the kubelet sets the matching condition (<code>MemoryPressure</code>, <code>DiskPressure</code>, <code>PIDPressure</code>), tries to reclaim first (delete dead containers, unused images), and if that's not enough, <b>evicts pods</b> — ranked by <b>QoS class and usage over requests</b>: BestEffort pods go first, then Burstable pods exceeding their requests, and Guaranteed pods last (Pod Priority also factors in). An evicted pod ends up with phase <code>Failed</code> and reason <code>Evicted</code>.</p>
+    <div class="box gotcha"><div class="h">Eviction is not the same as OOMKilled</div>
+      <p>Two different killers, and confusing them wastes incident time. <b>Kubelet eviction</b> is proactive and node-level: the kubelet sees pressure building and gracefully removes whole pods to protect the node — you get <code>Evicted</code> pods and a <code>MemoryPressure</code>/<code>DiskPressure</code> condition. <b>OOMKilled</b> is reactive and kernel-level: a container blew past its cgroup memory limit and the Linux OOM killer terminated <em>that process</em> instantly (Chapter 3) — you get a container with reason <code>OOMKilled</code> that usually restarts in place. Eviction is the manager clearing shelves; OOMKilled is a breaker tripping on one appliance.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: a node flips to NotReady, then back to Ready 90 seconds later, and no pods moved. What likely happened, and why didn't pods reschedule?</summary>
+      <div class="body">
+        <p>Most likely the kubelet briefly stopped heart-beating — a transient (a kubelet restart, a short API-server connectivity blip, or a PLEG stall that cleared) — long enough to exceed the ~40s grace period, so the node controller marked it NotReady and applied the <code>NoExecute</code> taint. Pods didn't reschedule because the default toleration for that taint is 300 seconds, and the node recovered (kubelet resumed heartbeats, Ready flipped back, taint removed) well inside that window. The lesson: NotReady is not automatically an outage — there's a deliberate grace period before, and a deliberate 5-minute delay after, precisely so short blips don't cause pod churn. If you want a flap like this to <em>not</em> even reach NotReady, you chase the root cause of the missed heartbeat (often kubelet↔apiserver networking or a slow runtime), not the timers.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The node's pieces, named</h2>
+    <ul>
+      <li><b>kubelet</b> — the node agent. Owns: reconciling assigned pods, calling the runtime over CRI, mounting volumes and Secrets, running probes, collecting stats (cAdvisor), reporting node/pod status, and eviction. One per node, run by systemd (not itself a pod).</li>
+      <li><b>CRI</b> — the gRPC contract between kubelet and runtime (<code>RuntimeService</code> + <code>ImageService</code>). A clean interface, which is why runtimes are swappable.</li>
+      <li><b>Container runtime — containerd (or CRI-O)</b> — implements the CRI: pulls images, manages sandboxes and containers, streams logs. Uses an OCI runtime underneath.</li>
+      <li><b>OCI runtime — runc</b> — actually creates the container: namespaces, cgroups, seccomp, and <code>execve</code> (Chapters 22–27). Swap it for a sandboxed runtime (gVisor's <code>runsc</code>, Kata) via RuntimeClass for stronger isolation.</li>
+      <li><b>CNI plugin</b> — sets up the pod's network namespace and assigns its IP during sandbox creation. The whole of Part V is this boundary; here, just know the kubelet/runtime calls it and a failure shows as ContainerCreating.</li>
+      <li><b>kube-proxy</b> — the Service datapath on each node. Watches Services and EndpointSlices and programs the kernel (iptables by default; IPVS for very large Service counts; the newer nftables mode) so that traffic to a Service's stable ClusterIP is load-balanced to the current set of healthy pod IPs. It does <em>not</em> do pod-to-pod networking (that's the CNI) and it does <em>not</em> proxy every packet in userspace — it installs kernel rules and gets out of the way. Details in <a href="ch43-services-and-the-datapath-pod-to-service.html">Chapter 43</a>.</li>
+      <li><b>The pause container</b> — the tiny process that holds a pod's namespaces so the IP survives app-container restarts.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one pod as it lands on the node</h2>
+    <p>The scheduler bound the pod in Chapter 29. Now, on the node:</p>
+    <ol class="steps">
+      <li>The kubelet's watch delivers a pod with <code>spec.nodeName</code> = this node. <code>syncLoop</code> wakes.</li>
+      <li>The kubelet admits it, then calls <code>ImageService.PullImage</code> for the container image(s).</li>
+      <li>It calls <code>RunPodSandbox</code>: containerd creates the pause container and invokes CNI, which hands back the pod IP. The pod now has a network identity.</li>
+      <li>Init containers run to completion, then the kubelet <code>CreateContainer</code>/<code>StartContainer</code>s the app containers via runc; they join the pause namespace and share the IP.</li>
+      <li>Probes run; readiness passes; the kubelet writes pod <code>status: Ready</code> up to the API server. PLEG will keep relisting to catch any later death.</li>
+      <li>kube-proxy, watching EndpointSlices, sees this pod become a ready endpoint of its Service and updates the node's kernel rules so Service traffic now reaches it. The pod is serving.</li>
+    </ol>
+
+    <details class="recall"><summary>Think first: a pod shows <code>Running</code> but not <code>Ready</code>, and gets no traffic. What's the difference, and who decides?</summary>
+      <div class="body">
+        <p><code>Running</code> means the kubelet started the container process; <code>Ready</code> means the container's <b>readiness probe</b> is passing, and the kubelet is what runs that probe. They're deliberately separate: an app can be up but still warming caches, loading config, or waiting on a dependency — not yet safe to serve. Only <em>Ready</em> pods are published as Service endpoints, so kube-proxy routes traffic only to them. So "Running but not Ready, no traffic" is the system working as designed — check the readiness probe and what it gates on (<code>kubectl describe pod</code> shows probe failures). It's also why a too-strict readiness probe can quietly pull a perfectly healthy pod out of rotation and look like a traffic bug.</p>
+      </div>
+    </details>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>We work on a <b>kind</b> cluster whose node is a Docker container. That lets us use <code>crictl</code> (the CRI debugging tool) and read kubelet logs directly on the node.</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>kind create cluster --name node
+NODE=node-control-plane      <span class="c"># the Docker container that is our k8s node</span></code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — see the real containers with crictl</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p><code>kubectl</code> shows you pods; <code>crictl</code> shows you what the runtime is actually running, one layer lower — including the pause sandboxes you never see from <code>kubectl</code>. Run it inside the node:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker exec $NODE crictl pods        <span class="c"># pod sandboxes (one per pod)</span>
+docker exec $NODE crictl ps          <span class="c"># running containers</span>
+docker exec $NODE crictl images | head</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>POD ID        STATE    NAME                      NAMESPACE
+b1c2...       Ready    coredns-...               kube-system
+a9f8...       Ready    kube-apiserver-...        kube-system
+CONTAINER     STATE    NAME            ATTEMPT   POD
+7d3e...       Running  coredns         0         coredns-...
+5a1b...       Running  kube-apiserver  0         kube-apiserver-...</code></div>
+        <p><code>crictl pods</code> lists sandboxes (each backed by a pause container); <code>crictl ps</code> lists the actual app containers inside them. This is the view you drop to when <code>kubectl</code> says a pod is Running but the app is misbehaving — <code>crictl</code>, <code>crictl inspect</code>, and <code>crictl logs</code> talk straight to containerd, bypassing the API server entirely. Vital when the control plane is the thing that's sick.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — read the kubelet's logs and config</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>The kubelet runs as a systemd unit on the node. Its logs are where node-level truth lives:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker exec $NODE journalctl -u kubelet --no-pager | tail -n 20
+<span class="c"># The kubelet's live config, served over the API:</span>
+kubectl get --raw "/api/v1/nodes/$NODE/proxy/configz" | python3 -m json.tool | grep -A6 evictionHard</code></pre></div>
+        <div class="out"><span class="ol">Output</span>"evictionHard": {
+    "imagefs.available": "15%",
+    "memory.available": "100Mi",
+    "nodefs.available": "10%",
+    "nodefs.inodesFree": "5%"
+}</code></div>
+        <p>There are the eviction thresholds this node will act on — the exact numbers from the internals section, live. Now read the node's conditions and its heartbeat:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl describe node $NODE | sed -n '/Conditions/,/Addresses/p'
+kubectl get lease -n kube-node-lease</code></pre></div>
+        <div class="out"><span class="ol">Output</span>Conditions:
+  Type             Status   Reason                       Message
+  MemoryPressure   False    KubeletHasSufficientMemory   kubelet has sufficient memory available
+  DiskPressure     False    KubeletHasNoDiskPressure     kubelet has no disk pressure
+  PIDPressure      False    KubeletHasSufficientPID      ...
+  Ready            True     KubeletReady                 kubelet is posting ready status</code></div>
+        <p>Four conditions, all healthy. When an incident hits, this block is the first thing to read — a <code>True</code> on any pressure condition, or a <code>False</code>/<code>Unknown</code> Ready with a reason, tells you what the node is complaining about.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — cordon and drain a node for maintenance</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>The everyday node operation: take a node out of service safely. First put a workload on it, then cordon (stop new pods landing) and drain (evict existing ones):</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl create deployment demo --image=nginx:1.27-alpine --replicas=3
+kubectl cordon $NODE
+kubectl get node $NODE            <span class="c"># STATUS now: Ready,SchedulingDisabled</span>
+kubectl drain $NODE --ignore-daemonsets --delete-emptydir-data --force</code></pre></div>
+        <div class="out"><span class="ol">Output</span>node/node-control-plane cordoned
+evicting pod default/demo-...
+evicting pod default/demo-...
+node/node-control-plane drained</code></div>
+        <p><code>cordon</code> marks the node <code>Unschedulable</code> so the scheduler stops placing new pods; <code>drain</code> then evicts the existing pods (respecting PodDisruptionBudgets and skipping DaemonSet pods, which belong to every node). In a real multi-node cluster the drained pods reschedule onto other nodes before you reboot or replace this one. Put it back in service with <code>kubectl uncordon $NODE</code>. This exact two-step is the safe front half of every node upgrade and every "this node is misbehaving, get workloads off it" response.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — a pod stuck in ContainerCreating</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Uncordon first (<code>kubectl uncordon $NODE</code>). Now a pod that references a Secret that doesn't exist — a very common cause of a pod that schedules but never starts:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: Pod
+metadata: { name: stuck }
+spec:
+  containers:
+    - name: c
+      image: nginx:1.27-alpine
+      volumeMounts: [{ name: cfg, mountPath: /cfg }]
+  volumes:
+    - name: cfg
+      secret: { secretName: does-not-exist }
+EOF
+kubectl get pod stuck</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME    READY   STATUS              RESTARTS   AGE
+stuck   0/1     ContainerCreating   0          20s</code></div>
+        <p>It scheduled fine (it has a node) but the container never creates. The scheduler is done; this is a <em>kubelet</em> problem. Where does the kubelet record why? Work it out before revealing.</p>
+        <details class="recall"><summary>Reveal the diagnosis</summary>
+          <div class="body">
+            <p>The kubelet posts the reason as a pod Event — always your first stop for ContainerCreating:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl describe pod stuck | sed -n '/Events/,$p'</code></pre></div>
+            <div class="out"><span class="ol">Output</span>Warning  FailedMount  kubelet  MountVolume.SetUp failed for volume "cfg" :
+         secret "does-not-exist" not found</code></div>
+            <p>The kubelet can't mount the volume, so it won't create the container — it's blocked at a pre-start step, reconciling and retrying forever until the Secret appears. ContainerCreating has a short list of usual causes, and the Event names which: a missing Secret/ConfigMap (this), a volume that won't attach/mount, an image still pulling, or CNI failing to give the pod an IP. The fix follows from the Event — here, create the Secret. The habit to build: <code>ContainerCreating</code> or <code>Pending</code> → <code>kubectl describe</code> → read Events; the kubelet almost always told you exactly what it's waiting on. Clean up: <code>kubectl delete pod stuck</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — induce disk-pressure eviction</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>See the eviction manager act. We'll fill the node's writable filesystem until <code>nodefs.available</code> drops below the 10% threshold and watch the kubelet evict. <b>Safety:</b> this consumes disk <em>inside the kind node container</em>, not your Mac's home directory, and we delete it after — but don't run it on a cluster you care about.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># A BestEffort pod (no requests/limits) writing a large file to ephemeral storage.</span>
+kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: Pod
+metadata: { name: hog, labels: { app: hog } }
+spec:
+  containers:
+    - name: hog
+      image: busybox:1.36
+      command: ["sh","-c","dd if=/dev/zero of=/data/fill bs=1M count=200000 || sleep 3600"]
+      volumeMounts: [{ name: d, mountPath: /data }]
+  volumes: [{ name: d, emptyDir: {} }]
+EOF
+kubectl get pod hog -w</code></pre></div>
+        <p>Before it finishes, the node crosses the disk threshold. The question: what condition appears, which pod gets evicted and why <em>that</em> one, and how would you tell this apart from an OOMKill in a postmortem? Reason it through, then check.</p>
+        <details class="recall"><summary>Reveal what happens and why</summary>
+          <div class="body">
+            <p>As free space drops under 10%, the kubelet sets <code>DiskPressure=True</code> on the node, tries to reclaim (delete unused images and dead containers), and when that isn't enough, evicts pods — starting with BestEffort ones consuming the resource, which is exactly our <code>hog</code>:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl get pod hog -o jsonpath='{.status.phase} {.status.reason}{"\n"}'
+kubectl describe node $NODE | grep -A2 DiskPressure
+kubectl get events | grep -i evict</code></pre></div>
+            <div class="out"><span class="ol">Output</span>Failed Evicted
+DiskPressure   True    KubeletHasDiskPressure
+Warning  Evicted  ... The node was low on resource: ephemeral-storage.</code></div>
+            <p><b>Why that pod:</b> eviction ranks by QoS then usage over requests — <code>hog</code> is BestEffort (no requests) and is the one consuming the disk, so it's first out. Give a pod <code>requests</code>/<code>limits</code> (Burstable/Guaranteed) and it's protected relative to BestEffort, which is the whole practical reason to set them on anything important. <b>Eviction vs OOMKilled:</b> this shows phase <code>Failed</code>, reason <code>Evicted</code>, and a node <code>DiskPressure</code> (or <code>MemoryPressure</code>) condition — a proactive, node-level, whole-pod action by the kubelet. An OOMKill instead shows a <em>container</em> with reason <code>OOMKilled</code> that restarts in place, driven by the kernel hitting a cgroup memory limit, with no node condition. In a postmortem, "Evicted + pressure condition" points at node capacity/headroom; "OOMKilled" points at a single container's memory limit. Clean up: <code>kubectl delete pod hog</code>, then <code>kind delete cluster --name node</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · node NotReady</div>
+      <p><b>Symptom:</b> a node shows <code>NotReady</code>; after a few minutes its pods start rescheduling. <b>First cut:</b> <code>kubectl describe node</code> and read the Ready condition's reason; then, on the node, <code>journalctl -u kubelet</code>. <b>Usual causes:</b> the kubelet crashed or can't reach the API server (so heartbeats stopped), the runtime is unhealthy, the disk is full, or PLEG went stale. <b>Confirm:</b> can the kubelet talk to the API server; is containerd healthy (<code>crictl ps</code> responds quickly)? <b>Fix</b> is cause-specific, but the flow is always describe-node → kubelet logs → runtime health.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · PLEG is not healthy</div>
+      <p><b>Symptom:</b> Ready condition flips False with "PLEG is not healthy: pleg was last seen active 3m…". <b>Cause:</b> the runtime can't answer the ~1s container relist fast enough — nearly always disk I/O saturation, a wedged/very busy containerd, or too many containers per node. <b>Confirm:</b> node disk latency and containerd health; container count. <b>Fix:</b> relieve the disk (it's often the same event as DiskPressure), restart/upgrade containerd if wedged, and cap pods-per-node. It is not a bug in "PLEG" — it's a slow runtime.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · a wave of Evicted pods</div>
+      <p><b>Symptom:</b> many pods show <code>Evicted</code>, concentrated on one node, with a pressure condition set. <b>Cause:</b> the node hit a memory or disk eviction threshold; the kubelet shed BestEffort and over-request Burstable pods to survive. <b>Confirm:</b> which condition (<code>MemoryPressure</code> vs <code>DiskPressure</code>) and what filled it — a log-spewing app filling <code>nodefs</code>, images filling <code>imagefs</code>, or genuine memory over-commit. <b>Fix:</b> set requests/limits so important pods aren't BestEffort, reserve resources for the system, and leave headroom. Evicted pod objects linger for visibility; garbage-collect them once understood.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Give the node headroom, and reserve it explicitly.</b> Set <code>--system-reserved</code> and <code>--kube-reserved</code> so the OS and the kubelet/containerd always have CPU and memory the scheduler won't hand to pods — otherwise a full node starves the very agents that keep it alive, and you get cascading NotReady. Keep eviction thresholds as an intentional safety margin, not something you disable. Don't pack nodes to 100% of allocatable; the gap between "requests fit" and "actually out of memory" is what eviction and the OOM killer live in.</p>
+    <p><b>Set requests and limits — QoS is your eviction insurance.</b> A pod with no requests is BestEffort and first to be evicted; a pod whose requests equal its limits is Guaranteed and evicted last. For anything that matters, set them. This is the concrete, node-level reason the abstract advice "always set resource requests" exists.</p>
+    <p><b>Make node maintenance boring.</b> The runbook is cordon → drain (respecting PodDisruptionBudgets) → do the work → uncordon. Define PDBs so drain can't take down all replicas of a service at once, and use graceful node shutdown so a planned reboot gives pods their termination grace period. This is 90% of day-to-day node ops.</p>
+    <p><b>Monitor the node's own signals.</b> Alert on node conditions (any pressure True, Ready not True), kubelet health, PLEG relist latency (<code>kubelet_pleg_relist_duration_seconds</code>), disk and inode usage on <code>nodefs</code>/<code>imagefs</code>, and container restart rates. These lead the user-visible symptoms — DiskPressure and PLEG stalls usually share a root cause (a full or slow disk), so watching disk latency catches both early.</p>
+    <p><b>Choose kube-proxy mode deliberately at scale.</b> iptables mode is fine into the low thousands of Services, but rule evaluation grows with Service count; very large clusters move to IPVS (hash-based, O(1) lookup) or the newer nftables mode. It's a per-cluster decision you make once, covered in <a href="ch43-services-and-the-datapath-pod-to-service.html">Chapter 43</a>. <b>Common mistakes:</b> no reserved resources, everything BestEffort, no PDBs (so a drain causes an outage), etcd/runtime on slow disks (PLEG stalls), and confusing OOMKilled with Evicted and chasing the wrong fix.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>The kubelet is a case study in a pattern you'll design with directly: the <b>autonomous edge agent</b>. The control plane decides intent; the agent on each machine acts locally and keeps acting even when it can't reach the control plane — which is why the data plane survives control-plane outages. When you build fleet systems (config agents, edge devices, per-host daemons), copy this: push desired state to the edge, let the edge reconcile locally and buffer, and treat central connectivity as best-effort. Eviction is <b>load-shedding with a priority order</b> — the same discipline as API Priority &amp; Fairness (Chapter 29) and circuit breakers (<a href="ch88-reliability-engineering.html">Chapter 88</a>): when you can't serve everything, drop the least important on purpose rather than failing randomly, and let QoS classes encode "least important." The CRI, CNI, and CSI boundaries are textbook <b>dependency inversion</b>: the kubelet depends on interfaces, not implementations, which is exactly what lets you swap containerd for CRI-O, or runc for gVisor/Kata, without touching Kubernetes — the plug-in architecture that made the ecosystem possible. And the split between "scheduler decides, kubelet acts" is separation of a slow global optimisation from fast local execution, a decomposition that recurs whenever you scale a control system.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What does the kubelet do?</summary>
+        <div class="a"><p>It's the node agent, one per node. It watches the API server for pods assigned to its node and reconciles them into reality: pulls images, tells the container runtime over the CRI to create the pod sandbox and containers, mounts volumes and Secrets, runs health probes, and reports pod and node status back. It also defends the node — evicting pods under memory or disk pressure — and renews the node's heartbeat. It doesn't run containers itself or decide placement; it turns the scheduler's decision into running containers and keeps them in the desired state.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through how a pod starts on a node.</summary>
+        <div class="a"><p>The kubelet's watch delivers a pod bound to its node and the sync loop wakes. It admits the pod against node resources and policy, then pulls the images via the CRI ImageService. Next it runs the pod sandbox: the runtime creates the pause container that holds the pod's network and IPC namespaces and calls the CNI plugin to set up the network namespace and assign the pod IP — a failure here is the classic ContainerCreating hang. Then init containers run to completion in order, and the app containers are created and started via the CRI RuntimeService, each joining the pause namespace so they share the IP and localhost. containerd does this using runc as the OCI runtime. Finally probes run; once readiness passes the pod is Ready, status flows up to the API server, and kube-proxy starts routing Service traffic to it. Throughout, PLEG relists containers about once a second so the kubelet notices if one dies and restarts it. Note there's no Docker in the path — the shim was removed in 1.24; the kubelet talks CRI to containerd directly.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>What is PLEG and what does "PLEG is not healthy" tell you?</summary>
+        <div class="a"><p>PLEG — the Pod Lifecycle Event Generator — is how the kubelet learns that containers changed state without relying on the runtime to push events reliably. It relists all containers from the runtime roughly every second, diffs against its previous view, and emits ContainerStarted/ContainerDied events that wake the sync loop to react. It records the timestamp of its last successful relist; if that goes stale past a 3-minute threshold, the kubelet reports itself unhealthy, which flips the node's Ready condition and surfaces "PLEG is not healthy: pleg was last seen active 3m…". The key insight is that this is almost never a PLEG bug — it means the container runtime couldn't answer the relist in time, which points at disk I/O saturation, a wedged or overloaded containerd, or too many containers per node. So the investigation is node disk latency and containerd health, not PLEG itself. Newer kubelets can run event-driven PLEG that consumes CRI container events instead of constant relisting, reducing this failure mode, but the relisting safety net remains for correctness.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>Half a node's pods show "Evicted" and others "OOMKilled". Are these the same thing?</summary>
+        <div class="a"><p>No — different killers with different meanings, and separating them decides the fix. "Evicted" pods come from the kubelet's node-pressure eviction: the node crossed a memory or disk threshold, so the kubelet proactively removed whole pods to keep the node alive, starting with BestEffort and over-request Burstable pods. You'll see a node condition like MemoryPressure or DiskPressure and pods in phase Failed/Evicted. "OOMKilled" comes from the Linux kernel: a container exceeded its cgroup memory limit and the OOM killer terminated that process; the container typically restarts in place and there's no node condition. So Evicted points me at node capacity and headroom — reserve resources, set requests/limits so important pods aren't BestEffort, stop over-committing, or add nodes. OOMKilled points me at one container's limit — either it has a leak or genuinely needs more memory, so I profile and right-size the limit. Seeing both together often means a node under real memory pressure where some pods hit their own limits and the kubelet is also evicting to protect the node.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>What does kube-proxy do, and what does it not do?</summary>
+        <div class="a"><p>kube-proxy implements Kubernetes Services on each node. It watches Services and EndpointSlices and programs the kernel — iptables by default, IPVS or the newer nftables mode at scale — so that traffic sent to a Service's stable ClusterIP is load-balanced (via DNAT) to the current set of ready pod IPs, and it updates those rules as pods come and go. What it does <em>not</em> do is equally important: it doesn't provide pod-to-pod connectivity — that's the CNI plugin and the cluster network — and in its normal modes it doesn't proxy packets through a userspace process per connection; it installs kernel rules and steps aside, so the datapath cost is just kernel packet processing. So "Service works but pods can't reach each other" is a CNI problem, not kube-proxy, and "Service isn't load-balancing to a new pod" is kube-proxy or EndpointSlices. We take the actual datapath apart in Part V.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>The kubelet is the per-node agent and a level-triggered reconciler: it watches the API server for pods bound to its node and drives the container runtime over the CRI to make them real — pull images, RunPodSandbox (pause container + CNI IP), start init then app containers via containerd/runc, run probes, report status. PLEG relists containers about once a second so the kubelet notices deaths; if the runtime can't answer within 3 minutes you get "PLEG is not healthy," which means a slow runtime/disk, not a PLEG bug. The kubelet heartbeats via a Lease every ~10s; miss the ~40s grace period and the node controller marks the node NotReady and taints it, rescheduling pods after a 300s toleration. Under pressure the kubelet evicts pods at the default thresholds (memory<100Mi, nodefs<10%, imagefs<15%, inodes<5%), lowest QoS first — which is different from a kernel OOMKill of a single container. kube-proxy programs kernel rules so Service IPs reach live pods, but it doesn't do pod-to-pod networking. When a pod is stuck or a node is unhappy, the answer is almost always in <code>kubectl describe</code> Events, node conditions, and <code>journalctl -u kubelet</code>.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>The kubelet is the node agent: it reconciles pods assigned to its node against what the runtime is actually running.</li>
+      <li>It never runs containers itself — it calls the runtime (containerd) over the CRI, which uses runc.</li>
+      <li>Pod startup: admit → pull images → RunPodSandbox (pause + CNI IP) → init → app containers → probes.</li>
+      <li>No Docker in the path since 1.24 (shim removed); the kubelet speaks CRI to containerd/CRI-O.</li>
+      <li>PLEG relists containers ~every 1s; "PLEG is not healthy" (3m threshold) means a slow runtime/disk.</li>
+      <li>The kubelet heartbeats via a Lease (~10s); missing ~40s → node NotReady → NoExecute taint → reschedule after 300s.</li>
+      <li>Node conditions: Ready, MemoryPressure, DiskPressure, PIDPressure — read them first in any node incident.</li>
+      <li>Default hard eviction: memory&lt;100Mi, nodefs&lt;10%, imagefs&lt;15%, inodes&lt;5%; BestEffort evicted first.</li>
+      <li>Evicted (kubelet, node-level, whole pod) ≠ OOMKilled (kernel, cgroup limit, one container).</li>
+      <li>kube-proxy programs kernel rules for Service IPs; it does not do pod-to-pod networking (that's CNI).</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch03-memory-virtual-memory-page-cache-swap-oom.html"><b>Ch 3</b> OOM killer</a>
+      <a href="ch26-docker-containerd-runc-and-the-oci-model.html"><b>Ch 26</b> containerd &amp; runc</a>
+      <a href="ch29-the-control-plane-api-server-etcd-scheduler.html"><b>Ch 29</b> The control plane</a>
+      <a href="ch31-the-reconciliation-loop-controllers-informers.html"><b>Ch 31</b> Informers</a>
+      <a href="ch43-services-and-the-datapath-pod-to-service.html"><b>Ch 43</b> Services datapath</a>
+      <a href="ch107-kubernetes-runbooks.html"><b>Ch 107</b> K8s runbooks</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/architecture/nodes/">Nodes</a> and <a href="https://kubernetes.io/docs/reference/node/node-status/">Node Status</a>: conditions, heartbeats, leases, the lifecycle.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/reference/node/kubelet-sync-loop/">Kubelet Sync Loop</a>: the reconcile loop and its inputs, first-hand.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/architecture/cri/">Container Runtime Interface (CRI)</a>: the gRPC contract between kubelet and runtime.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/">Node-pressure Eviction</a>: signals, default thresholds, and eviction ordering.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/reference/networking/virtual-ips/">Virtual IPs and Service Proxies</a>: what kube-proxy does and its iptables/IPVS/nftables modes.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/tasks/debug/debug-cluster/crictl/">Debugging Nodes with crictl</a>: the CRI-level tool used in the labs.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch29-the-control-plane-api-server-etcd-scheduler.html"><span class="dir">← Prev</span><div class="ti">Ch 29 — The control plane: API server, etcd, scheduler</div></a>
+      <a class="nx" href="ch31-the-reconciliation-loop-controllers-informers.html"><span class="dir">Next →</span><div class="ti">Ch 31 — The reconciliation loop, controllers, informers</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 30 of 121 · Part IV · Kubernetes — Architecture &amp; Internals. You've watched a pod become real containers on a machine. Next we open up the loop itself — watch, informer, work queue — that every controller shares.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">kubelet → CRI → runtime</a>
+    <a href="#internals">Sync loop, PLEG, eviction</a>
+    <a href="#components">The node's pieces</a>
+    <a href="#flow">One pod lands</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

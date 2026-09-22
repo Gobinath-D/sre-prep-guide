@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 29 — The control plane: API server, etcd, scheduler</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part IV · Kubernetes &nbsp;·&nbsp; Chapter 29</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part IV · Kubernetes — Architecture &amp; Internals · Chapter 29</div>
+      <h1>The control plane: API server, etcd, scheduler, controller manager</h1>
+      <p class="tagline">Every <code>kubectl</code> command, every controller, every kubelet talks to one door — the API server — which checks you, stamps your object, and files it in etcd. That request path, and the consensus store behind it, are where a cluster is fast, slow, consistent, or wedged. This is the chapter that turns "the control plane is having issues" into a diagnosis.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~50 min read · kind + etcdctl/crictl</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Trace a write through the API server: authentication → authorization → admission → validation → etcd.</li>
+          <li>Explain etcd as the source of truth — Raft, quorum, why an odd number of members, and the 8&nbsp;GB/latency limits that bite.</li>
+          <li>Describe how the scheduler picks a node (filter, then score) and how it commits the choice.</li>
+          <li>Say what the controller manager is, and why control-plane downtime doesn't stop running pods.</li>
+          <li>Back up and reason about restoring etcd, and recognise API-server throttling (Priority &amp; Fairness / 429s) under load.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>Something has to be the brain — and the ledger</h2>
+    <p>Chapter 28 gave you the model: desired state in, controllers reconcile toward it. But that hand-waved two hard questions. Where does desired state actually live so that it survives a machine dying — and stays consistent when three controllers and two admins all write at once? And who enforces that only the right people can change it, and that what they submit is even valid?</p>
+    <p>Those are the two jobs of the control plane. It needs a <b>ledger</b> — a single, durable, strongly-consistent record of what should be true — and it needs a <b>door</b> in front of that ledger that authenticates callers, authorizes them, validates their objects, and writes them safely. Get the ledger wrong and two clients disagree about reality, or a crash loses your cluster's entire configuration. Get the door wrong and anyone can do anything, or garbage objects poison the loops.</p>
+    <p>There's a payoff for learning this precisely. The control plane is where the confusing production symptoms live: "kubectl is slow," "my apply got a 429," "the cluster stopped scheduling but the apps are fine," "we lost an etcd node." Each of those maps to a specific part of the request path or the store. Vague knowledge here means you guess during incidents. Precise knowledge means you look in the right place first.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>Two facts to anchor everything: <b>the API server is the only component that talks to etcd</b> — every other part of Kubernetes reads and writes state through the API server, never the store directly. And <b>the control plane is separate from the data plane</b> — if the whole control plane goes down, pods already running keep running and serving traffic; you just can't schedule, scale, or self-heal until it's back. Hold both.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a land registry office</h2>
+    <p>The control plane behaves like the office that keeps a country's official property records — a job that is all about one authoritative record and strict rules for changing it.</p>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>You want to register a change of ownership. You go to the <b>front counter</b> (the API server). The clerk first checks your <b>ID</b> (authentication — are you who you say?), then checks you're <b>permitted</b> to file this kind of change (authorization — is this your property?). They make sure the form is filled in correctly and stamp on any mandatory clauses (admission and validation — defaults, policy, schema). Only then do they enter it into the <b>official register</b>.</p>
+      <p>The register itself is kept in a <b>vault by a panel of notaries</b> (etcd). No single notary can declare something official; a <b>majority must agree</b> and co-sign every entry (Raft quorum) before it counts. That's deliberately strict: it means one notary being off sick can't corrupt or lose the record, and two clerks filing at once can't create two conflicting truths.</p>
+      <p>Elsewhere in the building, an <b>assignments officer</b> (the scheduler) watches for newly-registered requests that need a desk and picks a suitable one. And a room of <b>standing-order clerks</b> (the controller manager) each hold one instruction — "there must always be three copies of this on file" — and keep acting until the register matches. The key detail: all of them work by reading and writing at the <em>front counter</em>. None of them is allowed into the vault directly.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In the control plane</th></tr>
+      <tr><td>The front counter &amp; clerk</td><td><code>kube-apiserver</code> — the only entry point, does authn/authz/admission</td></tr>
+      <tr><td>Checking your ID</td><td>Authentication (client cert, bearer/ServiceAccount token, OIDC)</td></tr>
+      <tr><td>Checking you're permitted</td><td>Authorization (RBAC, Node authorizer, webhook)</td></tr>
+      <tr><td>Correct form + mandatory clauses</td><td>Admission control + schema validation</td></tr>
+      <tr><td>The vault + panel of notaries</td><td>etcd — the durable, Raft-replicated store</td></tr>
+      <tr><td>Majority must co-sign</td><td>Quorum: (N/2)+1 members must agree to commit</td></tr>
+      <tr><td>The assignments officer</td><td><code>kube-scheduler</code> — assigns pods to nodes</td></tr>
+      <tr><td>Standing-order clerks</td><td><code>kube-controller-manager</code> — the built-in reconcile loops</td></tr>
+      <tr><td>Everyone works through the counter</td><td>Only the API server touches etcd; all others go through it</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>The request path, and who talks to whom</h2>
+    <p>Here is the whole control plane in one picture: a write enters the API server, runs a gauntlet, lands in etcd; and the scheduler and controllers watch and write <em>through the API server</em>, never touching the store.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 470" role="img" aria-label="A request passing through the API server pipeline into etcd, with the scheduler and controller manager interacting only via the API server">
+        <!-- client -->
+        <rect x="20" y="26" width="200" height="52" rx="9" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="120" y="48" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">kubectl · kubelet · controllers</text>
+        <text x="120" y="66" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">HTTPS + token / client cert</text>
+
+        <!-- api server container -->
+        <rect x="20" y="104" width="680" height="126" rx="12" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="34" y="126" style="fill:var(--accent);font:700 12px sans-serif;letter-spacing:.04em">KUBE-APISERVER — stateless, scalable · the ONLY etcd client</text>
+        <!-- pipeline stages -->
+        <rect x="34" y="150" width="122" height="64" rx="7" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="95" y="176" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">AuthN</text>
+        <text x="95" y="194" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">who are you?</text>
+        <rect x="166" y="150" width="122" height="64" rx="7" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="227" y="176" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">AuthZ</text>
+        <text x="227" y="194" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">RBAC: allowed?</text>
+        <rect x="298" y="150" width="122" height="64" rx="7" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="359" y="172" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">Mutating</text>
+        <text x="359" y="187" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">admission</text>
+        <text x="359" y="203" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">defaults, inject</text>
+        <rect x="430" y="150" width="122" height="64" rx="7" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="491" y="176" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">Validate</text>
+        <text x="491" y="194" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">schema check</text>
+        <rect x="562" y="150" width="124" height="64" rx="7" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="624" y="172" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">Validating</text>
+        <text x="624" y="187" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">admission</text>
+        <text x="624" y="203" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">policy: accept/deny</text>
+        <!-- inline arrows between stages -->
+        <defs>
+          <marker id="k" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" style="fill:var(--muted)"/></marker>
+          <marker id="ka" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="kd" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--deep)"/></marker>
+          <marker id="kg" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+        </defs>
+        <line x1="156" y1="182" x2="166" y2="182" style="stroke:var(--muted)" marker-end="url(#k)"/>
+        <line x1="288" y1="182" x2="298" y2="182" style="stroke:var(--muted)" marker-end="url(#k)"/>
+        <line x1="420" y1="182" x2="430" y2="182" style="stroke:var(--muted)" marker-end="url(#k)"/>
+        <line x1="552" y1="182" x2="562" y2="182" style="stroke:var(--muted)" marker-end="url(#k)"/>
+        <!-- client into api server -->
+        <line x1="120" y1="78" x2="120" y2="148" style="stroke:var(--accent);stroke-width:2" marker-end="url(#ka)"/>
+        <text x="126" y="98" style="fill:var(--accent);font:600 10.5px sans-serif">request</text>
+
+        <!-- etcd -->
+        <rect x="20" y="300" width="430" height="150" rx="12" style="fill:var(--panel);stroke:var(--deep);stroke-width:1.5"/>
+        <text x="34" y="322" style="fill:var(--deep);font:700 12px sans-serif;letter-spacing:.04em">ETCD — source of truth · Raft consensus</text>
+        <rect x="36" y="338" width="120" height="70" rx="7" style="fill:var(--chip);stroke:var(--deep)"/>
+        <text x="96" y="366" text-anchor="middle" style="fill:var(--deep);font:700 12px sans-serif">leader</text>
+        <text x="96" y="384" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">m1</text>
+        <rect x="170" y="338" width="120" height="70" rx="7" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="230" y="366" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">follower m2</text>
+        <rect x="304" y="338" width="120" height="70" rx="7" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="364" y="366" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">follower m3</text>
+        <line x1="156" y1="365" x2="170" y2="365" style="stroke:var(--muted)" marker-end="url(#k)"/>
+        <line x1="290" y1="365" x2="304" y2="365" style="stroke:var(--muted)" marker-end="url(#k)"/>
+        <text x="235" y="432" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">quorum = 2 of 3 must co-sign → survives losing 1 member</text>
+
+        <!-- write to etcd -->
+        <line x1="360" y1="230" x2="235" y2="298" style="stroke:var(--deep);stroke-width:2.5" marker-end="url(#kd)"/>
+        <text x="238" y="268" style="fill:var(--deep);font:700 10.5px sans-serif">write / read (only path)</text>
+
+        <!-- scheduler & controller manager -->
+        <rect x="474" y="300" width="226" height="64" rx="10" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="587" y="326" text-anchor="middle" style="fill:var(--accent2);font:700 11.5px sans-serif">KUBE-SCHEDULER</text>
+        <text x="587" y="345" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">filter → score → bind (nodeName)</text>
+        <rect x="474" y="380" width="226" height="66" rx="10" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="587" y="406" text-anchor="middle" style="fill:var(--accent2);font:700 11.5px sans-serif">KUBE-CONTROLLER-MANAGER</text>
+        <text x="587" y="425" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">the built-in reconcile loops</text>
+        <!-- their arrows go to api server, not etcd -->
+        <path d="M587,300 L587,250 L700,250 L700,230" fill="none" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#kg)"/>
+        <text x="600" y="290" style="fill:var(--accent2);font:600 10px sans-serif">watch + write via API server</text>
+      </svg>
+      <figcaption>A write runs the API-server gauntlet (authn → authz → mutating → validate → validating) and only then reaches etcd. The scheduler and controllers never touch etcd — they watch and update through the API server. That single-writer discipline is what keeps state consistent.</figcaption>
+    </figure>
+
+    <h2 id="internals"><span class="beat">Internal working</span>The request path, etcd, and the scheduler in depth</h2>
+    <p>Three things deserve real depth: what the API server does to a request, what makes etcd trustworthy, and how the scheduler decides. Take them in turn.</p>
+
+    <h4>1 · The API server gauntlet</h4>
+    <p>When any client sends a write — say <code>POST /apis/apps/v1/namespaces/default/deployments</code> — the request passes through fixed stages, and a failure at any stage returns before touching the store:</p>
+    <ol class="steps">
+      <li><b>TLS + Authentication.</b> The connection is mutual-TLS or bearer-token. The API server runs its authenticators in turn — client certificate, ServiceAccount token, OIDC — until one identifies you as a username plus a set of groups. No match → <code>401 Unauthorized</code>. The API server does not manage users; it trusts an external identity source.</li>
+      <li><b>Authorization.</b> Given (user, groups, verb, resource, namespace), the authorizers decide allow/deny. In practice this is <b>RBAC</b>: does a Role/ClusterRole bound to you permit <code>create deployments</code> in this namespace? The Node authorizer scopes what kubelets can touch; a webhook authorizer can defer to an external service. No allow → <code>403 Forbidden</code>.</li>
+      <li><b>Mutating admission.</b> Now the object can be <em>changed</em>. Built-in plugins and your <code>MutatingWebhookConfiguration</code>s run — they inject sidecars (a service mesh does this), set defaults, add labels. This is the last chance to rewrite the object.</li>
+      <li><b>Schema validation &amp; defaulting.</b> The object is checked against the resource's OpenAPI schema and built-in validation, and unset fields get their defaults. Malformed object → <code>422</code>.</li>
+      <li><b>Validating admission.</b> Plugins and <code>ValidatingWebhookConfiguration</code>s (and the newer CEL-based ValidatingAdmissionPolicy) get a yes/no vote — they can reject but not modify. This is where <b>Pod Security Admission</b>, <b>ResourceQuota</b>, and your policy engine (Kyverno/Gatekeeper) say "no, that pod is privileged" and return <code>403</code>.</li>
+      <li><b>Persist to etcd.</b> The accepted object is serialized (protobuf, not JSON, for built-in types) and written to etcd under a key like <code>/registry/deployments/default/web</code>. etcd replicates it to a quorum before acknowledging. Secrets are encrypted at rest here if you configured an <code>EncryptionConfiguration</code>.</li>
+      <li><b>Notify watchers.</b> The write bumps a global <b>resourceVersion</b>. Everyone with an open <em>watch</em> on deployments — the Deployment controller, your dashboards — receives the change and reconciles. No polling; this is push.</li>
+    </ol>
+    <p>That order is worth memorising because it tells you where a request died. A <code>401</code> is identity; a <code>403</code> is either RBAC (authz) or a policy webhook (validating admission) — and you distinguish them by the message. A <code>422</code> is a bad object. A timeout deep in the path often means a slow admission webhook or a slow etcd.</p>
+
+    <details class="recall"><summary>Think first: your <code>kubectl apply</code> comes back <code>403 Forbidden</code>. How do you tell an RBAC denial from a policy-webhook rejection?</summary>
+      <div class="body">
+        <p>Both are 403 but from different stages, and the message tells them apart. An <b>authorization</b> (RBAC) denial reads like "User \"x\" cannot create resource \"deployments\" in namespace \"y\"" — you were stopped before admission ever ran, so the fix is a Role/RoleBinding granting that verb on that resource. A <b>validating admission</b> rejection happens later and names a policy: Pod Security says the pod "violates PodSecurity \"restricted\"", or a webhook like Kyverno/Gatekeeper names its own rule. That fix is to make the object comply, or change the policy. So read the message — "cannot &lt;verb&gt; &lt;resource&gt;" is RBAC; anything naming a policy or a webhook is admission — and confirm the RBAC half in isolation with <code>kubectl auth can-i</code>.</p>
+      </div>
+    </details>
+
+    <h4>2 · etcd: why you can trust the ledger</h4>
+    <p>etcd is a distributed key-value store that uses the <b>Raft</b> consensus algorithm to keep replicas identical. The essentials an SRE must hold:</p>
+    <ul>
+      <li><b>One leader, N members, majority commit.</b> Writes go to the leader, which appends to its log and replicates to followers; the entry is <em>committed</em> only once a <b>quorum</b> — (N/2)+1 members — has persisted it. So a 3-member cluster needs 2 to agree and tolerates losing 1; a 5-member cluster needs 3 and tolerates losing 2.</li>
+      <li><b>Odd numbers only.</b> 3 tolerates 1 failure; 4 <em>also</em> tolerates only 1 (quorum is 3) while adding a member that can fail — so 4 is strictly worse than 3. Run 3 or 5, never 4 or 6.</li>
+      <li><b>Lose quorum, lose writes.</b> If 2 of 3 members are down, there's no majority: etcd goes read-only-ish and the API server can't commit writes. The control plane freezes — but, again, running pods keep running.</li>
+      <li><b>MVCC + watch.</b> etcd keeps a revision history (multi-version concurrency control) and streams changes via watch from a given revision. That's exactly what powers Kubernetes watches and the resourceVersion you saw above.</li>
+      <li><b>It is brutally disk-latency sensitive.</b> Every commit does an <code>fsync</code> of the write-ahead log. Put etcd on slow or network-attached disks and <code>fsync</code> latency climbs, Raft heartbeats miss, leaders flap, and the whole API server feels slow. etcd wants fast local SSD/NVMe. This is the single most common self-inflicted etcd wound.</li>
+      <li><b>The size ceiling.</b> etcd's default storage quota is <b>2&nbsp;GiB</b>; you can raise it, but the recommended maximum is <b>8&nbsp;GB</b>. Cross the quota and etcd raises a <code>NOSPACE</code> alarm and refuses writes until you compact old revisions, defragment, and disarm the alarm. Big clusters and objects that churn a lot (Events, huge ConfigMaps/Secrets) push toward this.</li>
+    </ul>
+
+    <details class="recall"><summary>Think first: your 3-node etcd cluster loses one node to a disk failure. Is the cluster still writable? What if it loses two?</summary>
+      <div class="body">
+        <p>One down: <b>yes, still writable.</b> Quorum for 3 is 2, and 2 remain, so the leader can still get a majority to commit. You're now running without redundancy — a second loss is fatal — so you replace the member urgently, but there's no outage. Two down: <b>no.</b> Only 1 of 3 remains, which can't form a majority, so no writes commit and the API server can't persist changes. Reads may still serve from cache, and — say it with me — running pods keep running, but you can't schedule, scale, or change anything until you restore quorum (bring a member back, or restore from a snapshot and re-form the cluster). This is exactly why 3 or 5 members across failure domains matters, and why you keep tested snapshots.</p>
+      </div>
+    </details>
+
+    <h4>3 · The scheduler: filter, then score, then bind</h4>
+    <p>The scheduler's whole job is to turn a pod with no node into a pod with a node. It watches for pods where <code>spec.nodeName</code> is empty and, for each, runs the scheduling framework's two phases:</p>
+    <ol class="steps">
+      <li><b>Filter (feasibility).</b> Walk the nodes and drop any that can't run this pod: not enough allocatable CPU/memory, a taint the pod doesn't tolerate, a <code>nodeSelector</code>/<code>nodeAffinity</code> that doesn't match, a volume whose topology pins it elsewhere, node not Ready. What survives is the set of <em>feasible</em> nodes. If that set is empty, the pod stays Pending and the scheduler emits a <code>FailedScheduling</code> event saying which predicate eliminated the nodes.</li>
+      <li><b>Score (ranking).</b> Give each feasible node a score from plugins: spread pods of the same app across nodes/zones, prefer least-allocated (or most-allocated, for bin-packing), honour pod affinity/anti-affinity and topology spread. Sum the weighted scores; the highest wins (ties broken randomly to avoid hot-spotting).</li>
+      <li><b>Bind.</b> The scheduler commits its choice by writing a Binding — effectively setting <code>spec.nodeName</code> — via the API server. It does <em>not</em> start anything. The kubelet on the chosen node is watching, sees a pod assigned to it, and takes over (that's Chapter 30).</li>
+    </ol>
+    <p>Notice the scheduler only <em>decides and records</em>; it never places a container. And it's a normal API client — it watches and writes through the API server like everything else. Swap it out for a custom scheduler and nothing else in the system needs to know.</p>
+
+    <h4>4 · The controller manager</h4>
+    <p><code>kube-controller-manager</code> is a single binary that runs dozens of the built-in reconcile loops from Chapter 28 — Deployment, ReplicaSet, Node lifecycle, Job, ServiceAccount, EndpointSlice, and more — each watching its object type through the API server. In an HA control plane you run several replicas, but only one is active at a time: they use <b>leader election</b> (a Lease object) so exactly one instance runs the loops and the others stand by. Same pattern for the scheduler. That's how you get redundancy without two schedulers double-booking a node.</p>
+
+    <h2 id="components"><span class="beat">Components</span>The control-plane binaries, named</h2>
+    <ul>
+      <li><b><code>kube-apiserver</code></b> — the front door and the only etcd client. Stateless, so you scale it horizontally behind a load balancer; all cluster state is in etcd, not in the API server. Hosts the REST API, authn/authz/admission, and API Priority &amp; Fairness.</li>
+      <li><b><code>etcd</code></b> — the stateful, Raft-replicated key-value store holding all cluster state under <code>/registry/...</code>. The one thing you must back up and must give fast disks. Runs as 3 or 5 members.</li>
+      <li><b><code>kube-scheduler</code></b> — assigns Pending pods to nodes via filter/score/bind. Leader-elected in HA.</li>
+      <li><b><code>kube-controller-manager</code></b> — bundles the core controllers; leader-elected in HA.</li>
+      <li><b><code>cloud-controller-manager</code></b> — the loops that talk to a cloud provider: label nodes, wire up LoadBalancer Services to real load balancers, manage routes. Split out so the core stays cloud-agnostic (this is where EKS/GKE plug in — Part VI).</li>
+    </ul>
+    <div class="box gotcha"><div class="h">Where these actually run</div>
+      <p>On a kubeadm or kind cluster, the four core components run as <b>static pods</b> — the kubelet starts them directly from manifests in <code>/etc/kubernetes/manifests</code>, without the scheduler, because you can't schedule the scheduler. That's why they appear in <code>kube-system</code> but with the node name appended (<code>etcd-lab-control-plane</code>). Managed control planes (EKS, GKE) hide all of this and run it for you — you never see the API-server or etcd pods, which is exactly the point of "managed."</p>
+    </div>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one pod from apply to bound</h2>
+    <p>Chapter 28 traced the flow conceptually; now watch the same events land on real components and etcd revisions. You <code>kubectl apply</code> a Deployment (3 replicas):</p>
+    <ol class="steps">
+      <li>kubectl opens HTTPS to the API server, authenticates with your kubeconfig cert/token, and <code>POST</code>s the Deployment. The gauntlet runs; RBAC allows it; admission passes; the object is written to etcd at a new resourceVersion. kubectl returns.</li>
+      <li>The Deployment controller (in the controller manager), watching deployments, receives the create event and reconciles: it creates a ReplicaSet — another <code>POST</code> through the API server, another etcd write.</li>
+      <li>The ReplicaSet controller receives <em>its</em> watch event and creates 3 Pod objects, each with <code>spec.nodeName</code> empty. Three more etcd writes.</li>
+      <li>The scheduler, watching for unassigned pods, wakes for each: filters to feasible nodes, scores them, and <code>POST</code>s a Binding — setting <code>nodeName</code>. Still no container anywhere; just an etcd update per pod.</li>
+      <li>Each target node's kubelet, watching for pods bound to it, sees its pod and starts the containers via the runtime, then <code>PATCH</code>es pod <code>status</code> back through the API server (Chapter 30 opens this up).</li>
+      <li>Status flows up the ownership chain to the Deployment's <code>status</code>. Every arrow here was an API-server call that became an etcd revision — which is why you can literally watch it with <code>kubectl -v=8</code>.</li>
+    </ol>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>Everything runs on a <b>kind</b> cluster, whose control-plane node is a Docker container running the components as static pods — so you can poke at real etcd and a real scheduler on your laptop.</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>kind create cluster --name cp
+kubectl config use-context kind-cp</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — meet the control-plane components</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>They're pods in <code>kube-system</code>. Look:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl get pods -n kube-system -o wide | grep -E 'etcd|apiserver|scheduler|controller'
+kubectl cluster-info</code></pre></div>
+        <div class="out"><span class="ol">Output</span>etcd-cp-control-plane                      1/1   Running
+kube-apiserver-cp-control-plane            1/1   Running
+kube-controller-manager-cp-control-plane   1/1   Running
+kube-scheduler-cp-control-plane            1/1   Running
+Kubernetes control plane is running at https://127.0.0.1:PORT</code></div>
+        <p>Four containers are the entire brain. Confirm they're static pods (kubelet-managed, not scheduled) by checking their manifests inside the node:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>docker exec cp-control-plane ls /etc/kubernetes/manifests</code></pre></div>
+        <div class="out"><span class="ol">Output</span>etcd.yaml  kube-apiserver.yaml  kube-controller-manager.yaml  kube-scheduler.yaml</code></div>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — watch the actual API calls with -v=8</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p><code>kubectl -v=8</code> prints the raw HTTP: verbs, paths, headers, and the resourceVersion. This is how you learn what <code>kubectl</code> really does.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl -v=8 get pods -n kube-system 2&gt;&amp;1 | grep -E 'GET|round trip|Response Status' | head</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>GET https://127.0.0.1:PORT/api/v1/namespaces/kube-system/pods?limit=500
+Request Headers: Authorization: Bearer &lt;masked&gt;  Accept: application/json
+Response Status: 200 OK in 12 milliseconds</code></div>
+        <p>Now see authorization decide, without changing anything, via the <code>SubjectAccessReview</code> the API server exposes:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl auth can-i create deployments            <span class="c"># you (admin): yes</span>
+kubectl auth can-i delete nodes --as=system:serviceaccount:default:default</code></pre></div>
+        <div class="out"><span class="ol">Output</span>yes
+no                                                <span class="c"># the default SA has almost no RBAC</span></code></div>
+        <p>You just exercised authentication (your kubeconfig identity), impersonation (<code>--as</code>), and authorization (RBAC) — the first two stages of the gauntlet — as read-only queries.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Understand — read etcd directly and take a snapshot</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>etcd stores every object under <code>/registry/</code>. Exec into the etcd pod and look (the certs live at a fixed path on kubeadm/kind nodes):</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>ETCD=etcd-cp-control-plane
+CERTS="--cacert /etc/kubernetes/pki/etcd/ca.crt \
+  --cert /etc/kubernetes/pki/etcd/server.crt \
+  --key /etc/kubernetes/pki/etcd/server.key"
+
+<span class="c"># List a few keys — every Kubernetes object is here:</span>
+kubectl -n kube-system exec $ETCD -- sh -c "etcdctl $CERTS get /registry/ --prefix --keys-only | grep deployments"
+<span class="c"># Cluster health, DB size, who is leader:</span>
+kubectl -n kube-system exec $ETCD -- sh -c "etcdctl $CERTS endpoint status --write-out=table"</code></pre></div>
+        <div class="out"><span class="ol">Output</span>/registry/deployments/kube-system/coredns
++------------------+---------+---------+-----------+------------+-----------+
+|     ENDPOINT     |   ID    | VERSION | DB SIZE   | IS LEADER  | RAFT TERM |
++------------------+---------+---------+-----------+------------+-----------+
+| 127.0.0.1:2379   | 8e9e... | 3.5.x   | 2.9 MB    | true       |    3      |
++------------------+---------+---------+-----------+------------+-----------+</code></div>
+        <p>Now the operation you must know cold — back etcd up. A snapshot is a single file that <em>is</em> your entire cluster's state:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl -n kube-system exec $ETCD -- sh -c "etcdctl $CERTS snapshot save /tmp/etcd-backup.db"
+kubectl -n kube-system exec $ETCD -- sh -c "etcdctl snapshot status /tmp/etcd-backup.db --write-out=table"</code></pre></div>
+        <div class="out"><span class="ol">Output</span>{"level":"info","msg":"saved","path":"/tmp/etcd-backup.db"}
++---------+----------+------------+------------+
+|  HASH   | REVISION | TOTAL KEYS | TOTAL SIZE |
++---------+----------+------------+------------+
+| a1b2... |    41027 |        612 |     2.9 MB |
++---------+----------+------------+------------+</code></div>
+        <p>That file, copied off-node, is what stands between you and total cluster loss. Restore is <code>etcdctl snapshot restore</code> into a fresh data dir, then point the etcd member at it — practise it before you need it.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Break — create a pod that can't schedule, and read why</span><span class="phase">Break / Troubleshoot</span></div>
+      <div class="lb">
+        <p>Make the scheduler fail on purpose, then diagnose it the way you would in production. Ask for more CPU than any node has:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl run greedy --image=nginx:1.27-alpine \
+  --overrides='{"spec":{"containers":[{"name":"greedy","image":"nginx:1.27-alpine","resources":{"requests":{"cpu":"500"}}}]}}'
+kubectl get pod greedy</code></pre></div>
+        <div class="out"><span class="ol">Output</span>NAME     READY   STATUS    RESTARTS   AGE
+greedy   0/1     Pending   0          15s</code></div>
+        <p>It's stuck Pending. Before revealing, ask: which stage is this — did the write fail, or is it something after? Where would the reason be recorded?</p>
+        <details class="recall"><summary>Reveal the diagnosis</summary>
+          <div class="body">
+            <p>The write succeeded — the Pod object exists in etcd — so this isn't authn/authz/admission. It's <em>after</em> persistence: the scheduler filtered every node out (none has 500 cores) and left the pod unbound. The scheduler records exactly that as an Event:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl describe pod greedy | sed -n '/Events/,$p'
+<span class="c"># or cluster-wide:</span>
+kubectl get events --field-selector reason=FailedScheduling</code></pre></div>
+            <div class="out"><span class="ol">Output</span>Events:
+  Warning  FailedScheduling  default-scheduler
+  0/1 nodes are available: 1 Insufficient cpu.
+  preemption: 0/1 nodes are available: 1 No preemption victims found.</code></div>
+            <p>"Insufficient cpu" names the failing filter. In a real cluster the same message reads "3 Insufficient memory, 2 node(s) had untolerated taint {...}, 1 node(s) didn't match nodeSelector" — a per-predicate tally telling you precisely why each node was rejected. The fix follows from the message: lower the request, add capacity, tolerate the taint, or relax affinity. Clean up: <code>kubectl delete pod greedy</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — API-server throttling and Priority &amp; Fairness</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>When a client hammers the API server, Kubernetes doesn't fall over — it throttles, via <b>API Priority &amp; Fairness (APF)</b>. Look at the machinery, then reason about an incident. First, the objects that govern it:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl get flowschemas
+kubectl get prioritylevelconfigurations</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>NAME                       PRIORITYLEVEL     MATCHINGPRECEDENCE
+system-leader-election     leader-election   100
+kube-controller-manager    workload-high     800
+service-accounts           workload-low      9000
+...
+NAME               TYPE      NOMINALCONCURRENCYSHARES
+leader-election    Limited   10
+workload-high      Limited   ...
+catch-all          Limited   ...</code></div>
+        <p>Now the scenario: a homegrown controller is doing <code>LIST pods</code> across all namespaces every second, and other teams report their <code>kubectl</code> is suddenly slow and occasionally returns <code>429 Too Many Requests</code>. How does APF explain this, and how would you confirm and fix it without restarting the API server?</p>
+        <details class="recall"><summary>Reveal the approach</summary>
+          <div class="body">
+            <p>APF sorts every request into a <b>FlowSchema</b> (by user/verb/resource), which maps to a <b>PriorityLevel</b> with a bounded concurrency share and fair queuing <em>within</em> the level. Your noisy controller's requests pile into one priority level; APF fair-queues them and, when the level's queue is full, sheds load by returning <code>429</code> with a <code>Retry-After</code> — to requests <em>in that level</em>. Well-behaved traffic in other levels (leader-election, node heartbeats) is deliberately protected, which is the whole point: one bad client can't starve the essentials.</p>
+            <p>Confirm it: the API server exposes APF metrics — <code>apiserver_flowcontrol_rejected_requests_total</code> and <code>apiserver_flowcontrol_current_inqueue_requests</code> by priority level — and <code>kubectl get --raw /debug/api_priority_and_fairness/dump_priority_levels</code> shows live queue depth. That tells you which level and which flow is saturated. The fix is on the <em>client</em>: replace the every-second full LIST with a <b>watch</b>/informer (Chapter 31) so it reads from a cache instead of re-listing, add a rate limiter, and page over large lists. Raising APF limits or LIST costs (heavy full-object lists are expensive to serialize from etcd) only moves the ceiling; the real bug is a client that lists the world on a timer. This exact pattern — a controller with no informer melting the API server — is one of the most common self-inflicted control-plane incidents at scale.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · slow everything, and it's etcd's disk</div>
+      <p><b>Symptom:</b> API calls are slow across the board, <code>kubectl</code> lags, controllers fall behind, occasional 500s. <b>First cut:</b> etcd metrics — <code>etcd_disk_wal_fsync_duration_seconds</code> and <code>etcd_disk_backend_commit_duration_seconds</code>. If p99 fsync is tens of milliseconds or worse, that's your answer. <b>Usual cause:</b> etcd on slow or network-attached storage, a noisy neighbour on the disk, or the DB grown huge. <b>Fix:</b> fast local SSD for etcd, isolate it, compact and defragment to shrink the DB. Never run etcd on EBS-style network disks if you can avoid it.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · etcd out of space (NOSPACE alarm)</div>
+      <p><b>Symptom:</b> all writes start failing with an "etcdserver: mvcc: database space exceeded" error; reads still work. <b>Cause:</b> the DB hit its quota (default 2&nbsp;GiB) because old revisions weren't compacted or something wrote a flood of objects/Events. <b>Fix:</b> compact to the current revision, <code>defrag</code> each member to reclaim space, then <b>disarm the alarm</b> (<code>etcdctl alarm disarm</code>) — writes won't resume until the alarm is cleared. Then find what filled it (often unbounded Events or a controller writing hot).</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · control plane down, apps fine</div>
+      <p><b>Symptom:</b> <code>kubectl</code> times out, dashboards are blank — panic that "the cluster is down." <b>Reality check:</b> curl your actual services; they're very likely still serving, because the data plane (kubelets, running pods, kube-proxy) runs independently of the control plane. <b>What you've lost:</b> scheduling, scaling, self-healing, and any config change — until the API server/etcd is back. <b>Fix:</b> restore quorum (bring etcd members back, or restore a snapshot). Communicate "control plane impaired, workloads serving," which is a very different severity than "outage."</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Make the control plane HA, and etcd's disk fast.</b> Run 3 (or 5 for large/critical) etcd members and multiple API servers behind a load balancer, spread across failure domains so losing one AZ doesn't cost you quorum. Give etcd dedicated, fast, local SSD — this one choice prevents more control-plane incidents than any other. For big clusters, run etcd on separate machines from the API servers (external etcd topology) so they don't contend.</p>
+    <p><b>Back etcd up, and prove you can restore.</b> Take <code>etcdctl snapshot save</code> on a schedule, copy it off the node, and — the part everyone skips — actually run a restore drill into a scratch cluster. An untested backup is a rumour. Keep the DB well under the 8&nbsp;GB ceiling by compacting and defragmenting on a schedule; watch DB size as a first-class metric. Encrypt Secrets at rest with an <code>EncryptionConfiguration</code> (ideally KMS-backed), because otherwise anyone with an etcd snapshot has every Secret in plaintext.</p>
+    <p><b>Protect the API server from clients.</b> Leave API Priority &amp; Fairness on and watch its rejection metrics; it's what keeps one runaway controller from starving leader-election and node heartbeats. Design your own controllers to use informers/watches, not periodic full LISTs, and to page large lists — the most common scaling incident is a client that lists the world on a timer and serializes gigabytes out of etcd. Turn on audit logging so you can answer "who changed this and when."</p>
+    <p><b>Least privilege on the door.</b> RBAC is the lock; keep it tight. Don't hand controllers or humans <code>cluster-admin</code> because it's convenient — scope Roles to the verbs and resources actually needed. Restrict who can create admission webhooks and who can read Secrets. A webhook that's slow or down can also wedge the API server, so set sane <code>timeoutSeconds</code> and <code>failurePolicy</code> on your own webhooks.</p>
+    <p><b>Common mistakes:</b> etcd on network storage; an even number of etcd members; no tested restore; letting Events or CRDs balloon the DB; a mutating/validating webhook with a long timeout and <code>failurePolicy: Fail</code> that takes the cluster down when the webhook is unhealthy; and treating "kubectl is down" as "the site is down" without checking the data plane.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>The control plane is a reference architecture you'll reuse: a <b>stateless, horizontally-scalable API tier</b> (the API server) in front of a <b>strongly-consistent store</b> (etcd via Raft). That split — scale reads/compute by adding stateless replicas, keep exactly one consistent source of truth behind them — is how you build many systems, and the reason the hard part (consensus) is concentrated in one component you can reason about and protect. Raft and quorum are the consensus building blocks we formalise in <a href="ch83-coordination-leader-election-consensus-locks-clocks.html">Chapter 83</a>; leader election for the scheduler/controller-manager is the same idea applied to "only one active instance." The watch mechanism is change-data-capture: publish a durable log of changes and let many consumers react — a pattern you'll see again in event-driven systems (<a href="ch84-async-and-flow-control.html">Chapter 84</a>). And etcd is the reason a single Kubernetes cluster has a ceiling (roughly a few thousand nodes before etcd write throughput and object counts hurt), which is why large organisations shard into many clusters rather than one giant one — a concrete instance of the scaling limits in <a href="ch95-scaling-patterns.html">Chapter 95</a>. Finally, API Priority &amp; Fairness is load-shedding and fair queuing done right: protect the critical traffic and reject excess early, the same discipline you apply at any overloaded service (<a href="ch88-reliability-engineering.html">Chapter 88</a>).</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What happens to a request between <code>kubectl apply</code> and the object being stored?</summary>
+        <div class="a"><p>It hits the API server over TLS and runs a fixed pipeline: authentication (who are you), authorization (are you allowed — usually RBAC), mutating admission (webhooks that can change the object, like sidecar injection), schema validation and defaulting, then validating admission (policy that can only accept or reject, like Pod Security). If it survives all that, the API server serializes it and writes it to etcd, which commits it once a quorum of members agrees. The write bumps a resourceVersion and anyone watching that resource gets notified. Fail at any stage and you get a specific error — 401, 403, 422 — before etcd is ever touched.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Explain etcd's role and why quorum and disk latency matter.</summary>
+        <div class="a"><p>etcd is the cluster's single source of truth — every object lives there under <code>/registry</code>, and the API server is the only thing that reads or writes it. It's a Raft-consensus store: writes go to a leader, replicate to followers, and commit only when a majority — (N/2)+1 — has persisted them. So you run an odd number, 3 or 5, across failure domains; 3 tolerates losing 1, 5 tolerates losing 2. Lose quorum and no writes commit — the control plane freezes, though already-running pods keep serving because the data plane is independent. Disk latency matters because every commit fsyncs the write-ahead log; on slow or network-attached disks fsync latency spikes, Raft heartbeats miss, leaders flap, and the whole API server feels slow. So etcd wants fast local SSD, a size kept under the 8&nbsp;GB recommendation via compaction and defrag, and regular, restore-tested snapshots — because that snapshot file is the entire cluster.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>How does the scheduler choose a node, and how does the choice take effect?</summary>
+        <div class="a"><p>The scheduler watches for pods with no <code>nodeName</code> and runs the scheduling framework in two phases. Filtering removes infeasible nodes — insufficient allocatable CPU/memory, an untolerated taint, a <code>nodeAffinity</code>/<code>nodeSelector</code> mismatch, volume topology constraints, node not Ready — leaving the feasible set; if that's empty the pod stays Pending with a <code>FailedScheduling</code> event naming the failed predicates. Scoring then ranks the feasible nodes with weighted plugins: spread across nodes/zones, least- or most-allocated for bin-packing, pod affinity/anti-affinity, topology spread. The highest score wins, ties broken randomly. Then it <em>binds</em> — writes the chosen node via a Binding subresource through the API server. That's all it does: it decides and records, it never starts a container. The kubelet on that node is watching, sees the pod assigned to it, and actually runs it. Because the scheduler is just another API client, you can run a second custom scheduler for specific pods or replace it entirely without touching the rest of the system.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>Users report <code>kubectl</code> is slow and sometimes returns 429. Where do you look?</summary>
+        <div class="a"><p>429 is API Priority &amp; Fairness shedding load, so I start there rather than assuming the API server is undersized. I check the APF metrics — <code>apiserver_flowcontrol_rejected_requests_total</code> and current in-queue requests by priority level, and the live dump at <code>/debug/api_priority_and_fairness/dump_priority_levels</code> — to see which priority level is saturated and which flow (user/verb/resource) is filling it. Almost always it's a client doing frequent full LISTs — a controller without an informer, or a script polling all pods every second — which is expensive because the API server has to pull and serialize large result sets from etcd. In parallel I check etcd latency, because slow etcd also makes everything slow. The fix is on the client: switch to watch/informers so it reads from a cache, page large lists, add backoff. Bumping APF concurrency is a stopgap; the durable fix is making the noisy client stop listing the world. And I'd confirm essential traffic — leader election, node heartbeats — is still protected in its own priority level, which is what stops this becoming a full outage.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>The entire control plane is down. Are my applications down?</summary>
+        <div class="a"><p>Probably not. The control plane and data plane are decoupled: kubelets, running pods, and kube-proxy on each node keep operating from the state they already have, so existing pods keep running and Services keep routing to them. What you lose while the control plane is down is the ability to <em>change</em> anything — no scheduling of new pods, no scaling, no self-healing if a pod or node dies, no config updates, no new deployments. So a node failure during a control-plane outage is bad, because nothing will reschedule its pods until the control plane returns. The practical implication for incident response is that "control plane impaired" and "site down" are different severities: first thing I do is curl the actual user-facing endpoints to establish whether customers are affected, then work on restoring etcd quorum and the API server. It also argues for HA control planes and, for the data plane, enough spare capacity and anti-affinity that you can ride out a control-plane blip without a node loss turning into an outage.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>The control plane is the brain and the ledger. The API server is the single front door and the only etcd client; every write runs authentication → authorization → mutating admission → schema validation → validating admission → persist to etcd, and a failure at any stage returns before the store is touched. etcd is the Raft-replicated source of truth: writes commit only at quorum ((N/2)+1), so you run 3 or 5 members across failure domains, give them fast local SSD (fsync latency is everything), keep the DB under ~8&nbsp;GB with compaction/defrag, and take restore-tested snapshots. The scheduler turns unbound pods into bound ones by filtering to feasible nodes, scoring them, and writing <code>nodeName</code> — it decides, the kubelet runs. The controller manager bundles the reconcile loops, leader-elected in HA. Under load the API server sheds with Priority &amp; Fairness (429), which is why controllers must use watches, not polling LISTs. And the control plane is independent of the data plane: if it's down, running pods keep serving — you just can't change anything.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>The API server is the only component that talks to etcd; everything else goes through the API server.</li>
+      <li>Write path: authn → authz (RBAC) → mutating admission → schema validation → validating admission → etcd.</li>
+      <li>401 = identity, 403 = RBAC or a policy webhook, 422 = bad object. The stage tells you where it died.</li>
+      <li>etcd uses Raft: writes commit at quorum (N/2)+1. Run 3 or 5 members, never even numbers.</li>
+      <li>Lose etcd quorum → no writes → control plane frozen; but running pods keep running.</li>
+      <li>etcd is disk-latency bound (fsync per commit) — fast local SSD, never network storage.</li>
+      <li>etcd DB quota is 2&nbsp;GiB by default, ~8&nbsp;GB max; compact + defrag, and take tested snapshots.</li>
+      <li>Scheduler = filter (feasible) → score (rank) → bind (write nodeName). It decides; the kubelet runs.</li>
+      <li>controller-manager and scheduler are leader-elected in HA so exactly one instance is active.</li>
+      <li>Under load the API server throttles via Priority &amp; Fairness (429) — so use watches/informers, not polling LISTs.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch28-why-kubernetes-the-declarative-reconciled-model.html"><b>Ch 28</b> Declarative model</a>
+      <a href="ch30-the-node-kubelet-kube-proxy-runtime-cri.html"><b>Ch 30</b> The node</a>
+      <a href="ch31-the-reconciliation-loop-controllers-informers.html"><b>Ch 31</b> Informers &amp; watches</a>
+      <a href="ch32-api-machinery-apply-path-admission-crds-and.html"><b>Ch 32</b> Admission &amp; CRDs</a>
+      <a href="ch39-security-rbac-admission-policy-securitycontext.html"><b>Ch 39</b> RBAC</a>
+      <a href="ch83-coordination-leader-election-consensus-locks-clocks.html"><b>Ch 83</b> Consensus &amp; Raft</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/overview/components/">Cluster Components</a> and <a href="https://kubernetes.io/docs/concepts/architecture/">Cluster Architecture</a>: the canonical overview of every piece here.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/reference/access-authn-authz/authentication/">Authentication</a>, <a href="https://kubernetes.io/docs/reference/access-authn-authz/authorization/">Authorization</a>, and <a href="https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/">Admission Controllers</a>: the gauntlet, stage by stage.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/kube-scheduler/">Kubernetes Scheduler</a> and the <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/">Scheduling Framework</a>: filter/score/bind and its extension points.</li>
+      <li>Kubernetes docs — <a href="https://kubernetes.io/docs/tasks/administer-cluster/configure-upgrade-etcd/">Operating etcd for Kubernetes</a> and <a href="https://kubernetes.io/docs/reference/debug-cluster/flow-control/">API Priority and Fairness</a>: backup/restore, sizing, and throttling.</li>
+      <li>etcd — <a href="https://etcd.io/docs/latest/">etcd documentation</a> (maintenance, tuning, disaster recovery): quotas, defrag, snapshot restore, hardware guidance.</li>
+      <li>Raft — <a href="https://raft.github.io/">The Raft Consensus Algorithm</a> (the paper and visualisations): leader election, log replication, quorum.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch28-why-kubernetes-the-declarative-reconciled-model.html"><span class="dir">← Prev</span><div class="ti">Ch 28 — Why Kubernetes: the declarative, reconciled model</div></a>
+      <a class="nx" href="ch30-the-node-kubelet-kube-proxy-runtime-cri.html"><span class="dir">Next →</span><div class="ti">Ch 30 — The node: kubelet, kube-proxy, runtime, CRI</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 29 of 121 · Part IV · Kubernetes — Architecture &amp; Internals. You've seen where intent is stored and decided. Next we follow it down to a node and watch a pod actually start.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Request path &amp; components</a>
+    <a href="#internals">API server, etcd, scheduler</a>
+    <a href="#components">The binaries</a>
+    <a href="#flow">One pod, apply to bound</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

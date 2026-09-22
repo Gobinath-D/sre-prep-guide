@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 6 — systemd, journald, cron &amp; the Service Lifecycle</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part I · Linux &nbsp;·&nbsp; Chapter 6</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part I · Linux &amp; OS Foundations · Chapter 6</div>
+      <h1>systemd, journald, cron &amp; the service lifecycle</h1>
+      <p class="tagline">On nearly every Linux box you'll ever touch, PID 1 is systemd. It decides what starts and in what order, keeps services alive when they crash, tracks every process a service spawns, and funnels all their logs into one place you can query. Learn its vocabulary and "the service won't start" stops being a mystery and becomes two commands.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~40 min read · Linux lab (Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Explain what a unit is, and how <code>Requires</code>/<code>Wants</code>/<code>After</code> and targets build the dependency graph.</li>
+          <li>Choose the right <code>Type=</code> for a service and say why <code>Type=notify</code> gives correct ordering.</li>
+          <li>Write, enable, and supervise a real unit — with a restart policy and resource limits.</li>
+          <li>Read the journal like a pro: <code>journalctl -u</code>, <code>-b</code>, <code>-p</code>, <code>--since</code>, <code>-f</code>.</li>
+          <li>Diagnose a unit that won't start and a crash-restart loop, including "start request repeated too quickly."</li>
+          <li>Replace a fragile cron job with a systemd timer that catches up, logs, and is resource-limited.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem: booting and babysitting a machine's services</h2>
+    <p>A server boots and has to bring up dozens of things — networking, the clock, mounts, a database, your app, a log shipper — in an order that respects who needs whom. Then it has to <em>keep</em> them running: notice when a daemon crashes and restart it, know which processes belong to which service so it can stop all of them cleanly, capture every service's output so you can read it later, and run scheduled jobs. That's a lot of jobs, and for decades the tooling for it was thin.</p>
+    <p>The old way (SysV init) was a pile of shell scripts run in a fixed, hand-numbered sequence. It had no real dependency model — you encoded order by naming scripts <code>S10foo</code>, <code>S20bar</code> and hoping. It had no supervision — a daemon that crashed simply stayed dead unless some other tool watched it. It had no idea which processes belonged to a service, so stopping one could leak orphaned children. And logs went wherever each script felt like writing them.</p>
+    <p><b>systemd</b> replaced all of that with a declarative model. You describe each service and its dependencies in a <b>unit</b> file; systemd builds a dependency graph, starts independent things in parallel, and supervises everything it launches. Crucially, it puts each service in its own <b>cgroup</b>, so it always knows the exact set of processes a service owns — which fixes the leaked-children problem for good. It captures all output into one queryable log via <b>journald</b>, and it runs scheduled work with <b>timers</b> that are smarter than cron. It's PID 1 on Debian, Ubuntu, RHEL, Fedora, SUSE, Amazon Linux — basically everywhere.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>systemd's superpower is the <b>cgroup per service</b>. Because every process a unit spawns — and every child of those — stays in the unit's cgroup, systemd can answer "what belongs to this service?" exactly, stop <em>all</em> of it with no leaks, attribute CPU and memory to it, and enforce limits on it. This is the same cgroup machinery Kubernetes uses for pods (Chapter 23); a systemd service and a container are cousins.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: the site operations manager</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Picture a large construction site with one <b>operations manager</b> holding the master schedule — that's systemd, and it never leaves. Every job on site comes with a <b>work order</b> (a unit) that says what to do and what must be done first: "pour the foundation" lists "site cleared" as a prerequisite. The manager reads <em>all</em> the work orders, works out the order from those stated dependencies rather than a fixed list, and runs everything that <em>can</em> run in parallel at once.</p>
+      <p>The schedule has named <b>milestones</b> — "site ready for framing," "building ready for tenants" — and the manager drives toward the day's goal milestone. Those are <b>targets</b>. Each crew gets its own <b>marked-off zone</b> so the manager always knows exactly which workers belong to which job; if a crew walks off the site, the manager can send the whole crew home cleanly or call them straight back (the <b>restart policy</b>) — but if a crew keeps quitting every five minutes, the manager stops re-hiring them and flags the job as failed (the restart <b>rate limit</b>).</p>
+      <p>Every crew's radio chatter is recorded, timestamped and labelled with who spoke, in one <b>site logbook</b> — that's <b>journald</b>, and it's why you don't hunt through twenty scattered notebooks. And recurring maintenance — "test the generators every Tuesday at 2 a.m." — goes on a <b>maintenance calendar</b> (a timer). Unlike the old paper calendar (cron), if the site was closed on Tuesday, the manager still runs the test as soon as it reopens.</p>
+    </div>
+    <table class="t">
+      <tr><th>On the site</th><th>In systemd</th></tr>
+      <tr><td>The operations manager, always present</td><td>systemd — PID 1</td></tr>
+      <tr><td>A work order (job + prerequisites)</td><td>A unit (<code>.service</code>, <code>.socket</code>, <code>.timer</code>…)</td></tr>
+      <tr><td>"Do X, but Y must be done first"</td><td><code>Requires=</code>/<code>Wants=</code> + <code>After=</code>/<code>Before=</code></td></tr>
+      <tr><td>Named milestones (framing, tenants)</td><td>Targets (<code>multi-user.target</code>, <code>network-online.target</code>)</td></tr>
+      <tr><td>A crew's marked-off zone</td><td>The service's cgroup (all its processes)</td></tr>
+      <tr><td>Call the crew back / send them home</td><td><code>Restart=</code> policy and stop handling</td></tr>
+      <tr><td>Stop re-hiring a crew that keeps quitting</td><td>Start rate limit (<code>StartLimitBurst</code>)</td></tr>
+      <tr><td>The one site logbook</td><td>journald (query with <code>journalctl</code>)</td></tr>
+      <tr><td>The maintenance calendar with catch-up</td><td>Timers (<code>OnCalendar=</code>, <code>Persistent=true</code>)</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>Units, targets, cgroups, and the journal</h2>
+    <p>systemd is PID 1, and everything it manages is a <b>unit</b>. Units come in types you'll name daily: <code>.service</code> (a process to run), <code>.target</code> (a named group/milestone), <code>.timer</code> (a schedule that triggers a service), <code>.socket</code> (a listening socket that can start a service on demand), <code>.mount</code> (a filesystem mount), and <code>.slice</code> (a node in the cgroup resource tree). Units declare dependencies, and systemd assembles them into one graph it drives toward a goal target at boot.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 430" role="img" aria-label="systemd as PID 1 driving targets and services, each service backed by a cgroup, all logging to journald">
+        <defs>
+          <marker id="s1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--muted)"/></marker>
+          <marker id="s2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+          <marker id="s3" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--applied)"/></marker>
+        </defs>
+        <!-- systemd -->
+        <rect x="24" y="18" width="196" height="46" rx="9" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.6"/>
+        <text x="122" y="40" text-anchor="middle" style="fill:var(--ink);font:700 13px sans-serif">systemd — PID 1</text>
+        <text x="122" y="57" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">reads units, drives the graph</text>
+        <!-- journald -->
+        <rect x="516" y="18" width="180" height="62" rx="9" style="fill:var(--panel);stroke:var(--applied);stroke-width:1.5"/>
+        <text x="606" y="40" text-anchor="middle" style="fill:var(--applied);font:700 12px sans-serif">systemd-journald</text>
+        <text x="606" y="58" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">one log for every unit</text>
+        <text x="606" y="72" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">tagged: unit, pid, time</text>
+        <!-- target chain -->
+        <rect x="40" y="104" width="140" height="36" rx="18" style="fill:var(--chip);stroke:var(--line)"/><text x="110" y="127" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">sysinit.target</text>
+        <rect x="210" y="104" width="130" height="36" rx="18" style="fill:var(--chip);stroke:var(--line)"/><text x="275" y="127" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">basic.target</text>
+        <rect x="370" y="104" width="190" height="36" rx="18" style="fill:var(--chip);stroke:var(--accent);stroke-width:1.3"/><text x="465" y="127" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">multi-user.target (goal)</text>
+        <line x1="180" y1="122" x2="208" y2="122" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#s1)"/>
+        <line x1="340" y1="122" x2="368" y2="122" style="stroke:var(--muted);stroke-width:1.5" marker-end="url(#s1)"/>
+        <text x="194" y="98" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">After</text>
+        <text x="354" y="98" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">After</text>
+        <line x1="122" y1="64" x2="110" y2="102" style="stroke:var(--muted);stroke-width:1.3" marker-end="url(#s1)"/>
+        <!-- services -->
+        <rect x="80" y="196" width="238" height="128" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="199" y="217" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">postgresql.service</text>
+        <rect x="98" y="230" width="202" height="80" rx="8" style="fill:var(--chip);stroke:var(--accent2);stroke-dasharray:4 3"/>
+        <text x="199" y="250" text-anchor="middle" style="fill:var(--accent2);font:600 10.5px sans-serif">cgroup: system.slice/postgresql</text>
+        <text x="199" y="270" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">postgres (main)</text>
+        <text x="199" y="288" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">+ 8 worker children</text>
+        <rect x="400" y="196" width="238" height="128" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="519" y="217" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">web.service</text>
+        <rect x="418" y="230" width="202" height="80" rx="8" style="fill:var(--chip);stroke:var(--accent2);stroke-dasharray:4 3"/>
+        <text x="519" y="250" text-anchor="middle" style="fill:var(--accent2);font:600 10.5px sans-serif">cgroup: system.slice/web</text>
+        <text x="519" y="270" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">gunicorn (main)</text>
+        <text x="519" y="288" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">+ 4 worker children</text>
+        <!-- target -> services (WantedBy) -->
+        <line x1="430" y1="140" x2="220" y2="194" style="stroke:var(--muted);stroke-width:1.3" marker-end="url(#s1)"/>
+        <line x1="480" y1="140" x2="510" y2="194" style="stroke:var(--muted);stroke-width:1.3" marker-end="url(#s1)"/>
+        <text x="300" y="168" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">WantedBy</text>
+        <!-- web depends on postgres -->
+        <line x1="400" y1="260" x2="320" y2="260" style="stroke:var(--deep);stroke-width:1.6" marker-end="url(#s1)"/>
+        <text x="360" y="252" text-anchor="middle" style="fill:var(--deep);font:9.5px sans-serif">Requires= / After=</text>
+        <!-- services -> journald -->
+        <line x1="318" y1="210" x2="514" y2="70" style="stroke:var(--applied);stroke-width:1.3" marker-end="url(#s3)"/>
+        <line x1="600" y1="196" x2="608" y2="82" style="stroke:var(--applied);stroke-width:1.3" marker-end="url(#s3)"/>
+        <text x="470" y="140" text-anchor="middle" style="fill:var(--applied);font:9.5px sans-serif">stdout/stderr</text>
+      </svg>
+      <figcaption>systemd drives the boot from <code>sysinit</code> → <code>basic</code> → <code>multi-user.target</code>, pulling in services via <code>WantedBy</code>. <code>web.service</code> orders itself after (and requires) the database. Each service's processes live in its own cgroup, and all their output flows to one journal.</figcaption>
+    </figure>
+
+    <p>Two independent axes control startup, and mixing them up is the most common unit-file bug. <b>Requirement</b> dependencies say what to pull in: <code>Requires=</code> is hard (if the dependency fails, this unit fails too), <code>Wants=</code> is soft (start it, but don't fail if it doesn't). <b>Ordering</b> dependencies say what goes first: <code>After=</code>/<code>Before=</code>. These are orthogonal — <code>Requires=db.service</code> does <em>not</em> mean "start db first"; you also need <code>After=db.service</code> or the two race. Targets like <code>multi-user.target</code> are just units with no process, used as synchronisation points and boot goals (roughly the modern replacement for SysV runlevels).</p>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>Almost every "the service is down" ticket is answered by two commands: <code>systemctl status &lt;unit&gt;</code> (is it active, failed, or restarting, what's the main PID, what's the cgroup, and the last few log lines) and <code>journalctl -u &lt;unit&gt;</code> (the full story). If you can read a status block — <code>Active: failed (Result: exit-code)</code>, <code>code=exited, status=203/EXEC</code>, "start request repeated too quickly" — you've diagnosed the top three service incidents before you've finished your coffee.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>The lifecycle of a service, start to stop</h2>
+    <ol class="steps">
+      <li><b>systemd loads units.</b> Unit files are read from a search path with clear precedence: <code>/etc/systemd/system</code> (your overrides) beats <code>/run/systemd/system</code> beats <code>/usr/lib/systemd/system</code> (package defaults). After editing any unit file you must <code>systemctl daemon-reload</code> so systemd re-reads them.</li>
+      <li><b>It builds a transaction.</b> On <code>systemctl start web.service</code> (or at boot toward the default target), systemd gathers everything pulled in by <code>Requires</code>/<code>Wants</code> and orders it by <code>After</code>/<code>Before</code>, then starts independent units in parallel.</li>
+      <li><b>It creates the cgroup and runs <code>ExecStart</code>.</b> The service gets its own cgroup under <code>system.slice</code>, and systemd forks the command. When systemd considers the unit "started" depends on <code>Type=</code> — this is the part people get wrong:
+        <ul>
+          <li><code>Type=simple</code> (default): considered up the moment it's forked — even if the app isn't ready yet.</li>
+          <li><code>Type=exec</code>: up once <code>execve</code> succeeds (catches a bad binary path immediately).</li>
+          <li><code>Type=forking</code>: for old-style daemons that fork and let the parent exit; systemd waits for the parent to exit (best paired with a <code>PIDFile=</code>).</li>
+          <li><code>Type=notify</code>: the service calls <code>sd_notify(READY=1)</code> when it's <em>genuinely</em> ready to serve; systemd waits for that. This is what makes "start web only after the DB is truly accepting connections" actually work.</li>
+          <li><code>Type=oneshot</code>: runs to completion, for setup tasks; add <code>RemainAfterExit=yes</code> to have it count as active afterward.</li>
+        </ul>
+      </li>
+      <li><b>It supervises via the cgroup.</b> systemd knows every PID in the unit. When the main process exits, the <code>Restart=</code> policy decides what happens — <code>no</code> (default), <code>on-failure</code> (nonzero exit or signal), <code>always</code>, <code>on-abnormal</code>, and others — after a <code>RestartSec</code> delay. A rate limiter (<code>StartLimitBurst</code> starts within <code>StartLimitIntervalSec</code>, default 5 in 10s) stops infinite tight loops: exceed it and the unit goes to <code>failed</code> with "start request repeated too quickly."</li>
+      <li><b>Stopping is clean because of the cgroup.</b> <code>ExecStop</code> (or a <code>SIGTERM</code> to the whole cgroup), then wait <code>TimeoutStopSec</code>, then <code>SIGKILL</code> anything still alive. Because systemd tracks the cgroup, stray children get killed too — no leaked processes, the exact problem SysV had.</li>
+      <li><b>All output goes to the journal.</b> The service's stdout/stderr are captured by journald and stored as structured records tagged with the unit name, PID, uid, timestamps, and boot ID — queryable later with <code>journalctl</code>, no matter where or whether the app wrote a log file.</li>
+    </ol>
+    <p>One more mechanism worth knowing: <b>socket activation</b>. A <code>.socket</code> unit can hold a listening socket and start its service only on the first connection, passing the ready socket in. It's how systemd starts rarely-used services on demand and how it can begin queuing connections before the service is even up.</p>
+
+    <details class="recall"><summary>Think first: your web service starts "successfully" at boot but the first requests fail because the database isn't ready yet — even though you set <code>After=postgresql.service</code>. What's wrong?</summary>
+      <div class="body">
+        <p><code>After=</code> only orders when systemd <em>starts</em> the database process, not when the database is <em>ready to accept connections</em>. With the database running as <code>Type=simple</code> or <code>Type=forking</code>, systemd marks it "started" long before Postgres has finished recovery and opened its socket — so your web service, correctly ordered after it, still races ahead of actual readiness. The real fix is a proper readiness signal: run the dependency as <code>Type=notify</code> so it reports ready only when it truly is (Postgres and many daemons support this), and keep <code>After=</code>. Ordering plus a real readiness protocol is what makes the dependency meaningful; ordering alone just sequences the fork. As a fallback, an application-level retry/wait-for-dependency loop covers daemons that don't speak notify.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, and what each owns</h2>
+    <ul>
+      <li><b>Unit files &amp; sections.</b> <code>[Unit]</code> (Description, <code>After</code>, <code>Requires</code>, <code>Wants</code>), <code>[Service]</code> (<code>ExecStart</code>, <code>Type</code>, <code>Restart</code>, <code>User</code>, environment, sandboxing, resource limits), and <code>[Install]</code> (<code>WantedBy</code> — what <code>enable</code> hooks the unit into). Edit under <code>/etc/systemd/system</code>; prefer drop-ins (<code>systemctl edit</code>) over editing package files.</li>
+      <li><b>Dependency directives.</b> <code>Requires</code> (hard), <code>Wants</code> (soft), <code>After</code>/<code>Before</code> (ordering only), <code>BindsTo</code> (stop with the dependency), <code>Conflicts</code> (mutually exclusive).</li>
+      <li><b>Targets.</b> Named groups and boot goals: <code>multi-user.target</code> (server default), <code>graphical.target</code>, <code>network-online.target</code> (actually reachable) vs <code>network.target</code> (config applied). <code>systemctl get-default</code> shows the boot goal.</li>
+      <li><b>Slices &amp; resource control.</b> The cgroup tree (<code>system.slice</code>, <code>user.slice</code>). Directives like <code>MemoryMax=</code>, <code>CPUQuota=</code>, and <code>TasksMax=</code> compile straight to cgroup v2 limits (Chapter 23) — resource control for plain services, no container required.</li>
+      <li><b>Sandboxing directives.</b> <code>User=</code>/<code>DynamicUser=</code>, <code>NoNewPrivileges=</code>, <code>ProtectSystem=</code>, <code>ProtectHome=</code>, <code>PrivateTmp=</code>, <code>CapabilityBoundingSet=</code> — the Chapter 5 primitives (users, capabilities, no_new_privs) exposed as one-line unit settings.</li>
+      <li><b>journald.</b> The structured log for every unit. Volatile in <code>/run/log/journal</code> by default; persistent once <code>/var/log/journal</code> exists (or <code>Storage=persistent</code>). Query with <code>journalctl</code>; it can forward to syslog.</li>
+      <li><b>Timers vs cron.</b> A <code>.timer</code> triggers a <code>.service</code> on a schedule (<code>OnCalendar=</code>, <code>OnUnitActiveSec=</code>), with <code>Persistent=true</code> for catch-up and <code>RandomizedDelaySec=</code> to spread a fleet. Classic <code>cron</code> (<code>crontab -e</code>) still exists and is fine for simple, dependency-free jobs.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following <code>systemctl start web.service</code></h2>
+    <ol class="steps">
+      <li>You run <code>systemctl start web.service</code>. <code>systemctl</code> is just a client; it sends the request to systemd (PID 1) over the system D-Bus.</li>
+      <li>systemd resolves the unit's dependencies — it needs the database, so it ensures <code>postgresql.service</code> is started first (<code>Requires</code> + <code>After</code>), waiting for real readiness if that unit is <code>Type=notify</code>.</li>
+      <li>systemd creates <code>system.slice/web.service</code> as a cgroup, applies the unit's <code>User=</code>, capability, and <code>MemoryMax=</code> settings, and forks <code>ExecStart</code> inside it.</li>
+      <li>Per <code>Type=</code>, systemd decides when "started" is true and marks the unit <code>active</code>. The app's stdout/stderr stream into journald, tagged with the unit.</li>
+      <li>The app serves traffic. If it crashes, <code>Restart=on-failure</code> restarts it after <code>RestartSec</code> — unless it's crashed too many times too fast, in which case the rate limiter parks it in <code>failed</code>.</li>
+      <li>You run <code>systemctl status web.service</code> and see: active state, main PID, the full cgroup tree of worker processes, and the last ten journal lines — the whole health picture in one screen.</li>
+    </ol>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>Most containers don't run systemd — the app is PID 1 (Chapter 2). To practice systemd itself, boot it as PID 1 in a privileged container with cgroup v2 (the <code>--privileged</code> and cgroup mount let systemd manage the cgroup tree):</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>docker run -d --name sysd --privileged --cgroupns=host \
+  -v /sys/fs/cgroup:/sys/fs/cgroup:rw ubuntu:24.04 \
+  bash -c 'apt-get update -qq &amp;&amp; apt-get install -y -qq systemd systemd-sysv &gt;/dev/null &amp;&amp; exec /sbin/init'
+
+sleep 20                          <span class="c"># let it boot</span>
+docker exec -it sysd bash         <span class="c"># get a shell inside the running system</span>
+systemctl is-system-running       <span class="c"># 'running' or 'degraded' — either is fine here</span></code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — write, enable, and supervise a unit</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Create a tiny service and hand it to systemd. First the program it runs, then the unit.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>cat &gt; /usr/local/bin/heartbeat.sh &lt;&lt;'EOF'
+#!/bin/bash
+while true; do echo "heartbeat $(date +%T) pid=$$"; sleep 3; done
+EOF
+chmod +x /usr/local/bin/heartbeat.sh
+
+cat &gt; /etc/systemd/system/heartbeat.service &lt;&lt;'EOF'
+[Unit]
+Description=Demo heartbeat service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/heartbeat.sh
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload           <span class="c"># re-read unit files after any edit</span>
+systemctl enable --now heartbeat  <span class="c"># enable (start at boot) + start now</span>
+systemctl status heartbeat</code></pre></div>
+        <div class="out"><span class="ol">Output (trimmed)</span>● heartbeat.service - Demo heartbeat service
+     Loaded: loaded (/etc/systemd/system/heartbeat.service; enabled; ...)
+     Active: active (running) since ...; 5s ago
+   Main PID: 812 (heartbeat.sh)
+     Memory: 512.0K (max: 64.0M)
+     CGroup: /system.slice/heartbeat.service
+             ├─812 /bin/bash /usr/local/bin/heartbeat.sh
+             └─826 sleep 3</code></pre></div>
+        <p>Read that status block — it's the single most useful screen in Linux service management. <code>Active: active (running)</code>, the main PID, the <code>MemoryMax</code> you set, and the <b>cgroup tree</b> showing both the script <em>and</em> its <code>sleep</code> child. systemd owns that whole subtree. Confirm with <code>systemctl cat heartbeat</code> (prints the effective unit file, including any drop-ins).</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — read the journal and the dependency graph</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Everything the service prints went to the journal, tagged by unit. Query it the ways you'll actually use.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>journalctl -u heartbeat --no-pager | tail          <span class="c"># this unit's logs</span>
+journalctl -u heartbeat -f                          <span class="c"># follow live (Ctrl-C to stop)</span>
+journalctl -u heartbeat --since "2 min ago"         <span class="c"># time window</span>
+journalctl -b -p err                                <span class="c"># errors this boot, all units</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>Jun 03 10:22:04 sysd heartbeat.sh[812]: heartbeat 10:22:04 pid=812
+Jun 03 10:22:07 sysd heartbeat.sh[812]: heartbeat 10:22:07 pid=812</code></pre></div>
+        <p>No log file, no hunting — the unit name is the query key. Now look at ordering and the resource tree:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>systemctl list-dependencies heartbeat        <span class="c"># what it pulls in / orders after</span>
+systemctl show -p Type,Restart,WantedBy,MemoryMax heartbeat   <span class="c"># resolved properties</span>
+systemd-cgls /system.slice/heartbeat.service <span class="c"># the cgroup, i.e. every process it owns</span></code></pre></div>
+        <p><code>systemctl show</code> prints the fully-resolved values (not just what's in the file), which is how you confirm what systemd <em>actually</em> thinks a setting is. This trio — <code>status</code>, <code>cat</code>, <code>show</code> — answers "what is this unit configured to do and what is it doing right now."</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — a unit that refuses to start</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Introduce the most common unit bug — an <code>ExecStart</code> that can't be executed — and diagnose it the way you would a real failing service. Don't assume; read the status and the journal.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>cat &gt; /etc/systemd/system/broken.service &lt;&lt;'EOF'
+[Unit]
+Description=A service that won't start
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/does-not-exist --serve
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl start broken            <span class="c"># this fails</span>
+systemctl status broken --no-pager</code></pre></div>
+        <div class="out"><span class="ol">Output</span>× broken.service - A service that won't start
+     Active: failed (Result: exit-code) since ...
+    Process: 901 ExecStart=/usr/local/bin/does-not-exist --serve (code=exited, status=203/EXEC)
+     ...</code></pre></div>
+        <p><code>Active: failed</code> and <code>status=203/EXEC</code>. Before the reveal: what does <code>203/EXEC</code> tell you specifically, and where would you look to confirm?</p>
+        <details class="recall"><summary>Reveal what the exit code means and how to fix it</summary>
+          <div class="body">
+            <p><code>203/EXEC</code> is systemd's code for "I could not <code>execve</code> the <code>ExecStart</code> command" — the binary doesn't exist, isn't on the given path, isn't executable, or has a bad interpreter line. It's distinct from the program running and exiting nonzero (which would show <code>status=1</code> or similar). The journal spells it out:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>journalctl -u broken -n 20 --no-pager</code></pre></div>
+            <div class="out"><span class="ol">Output</span>systemd[1]: broken.service: Failed to locate executable /usr/local/bin/does-not-exist: No such file or directory
+systemd[1]: broken.service: Failed at step EXEC spawning /usr/local/bin/does-not-exist: No such file or directory</code></pre></div>
+            <p>The fix is exactly what the message says: correct the path, ensure the file exists and is <code>chmod +x</code>, and use an <em>absolute</em> path (systemd doesn't search <code>$PATH</code> for <code>ExecStart</code>). The neighbouring exit codes are worth recognising too: <code>200/CHDIR</code> (bad <code>WorkingDirectory=</code>), <code>217/USER</code> (the <code>User=</code> doesn't exist), <code>226/NAMESPACE</code> (a sandboxing directive couldn't be applied). Every one of them is printed in the journal — <code>status</code> tells you it failed, <code>journalctl -xe</code> tells you why.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — the crash-restart loop</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>A service that keeps dying and restarting is a classic 2 a.m. page. Build one — an app that exits nonzero immediately, with <code>Restart=always</code> — and watch systemd's rate limiter kick in.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>cat &gt; /usr/local/bin/flaky.sh &lt;&lt;'EOF'
+#!/bin/bash
+echo "starting up..."
+sleep 1
+echo "config error: cannot connect to db, exiting" &gt;&amp;2
+exit 1
+EOF
+chmod +x /usr/local/bin/flaky.sh
+
+cat &gt; /etc/systemd/system/flaky.service &lt;&lt;'EOF'
+[Service]
+ExecStart=/usr/local/bin/flaky.sh
+Restart=always
+RestartSec=1
+EOF
+systemctl daemon-reload
+systemctl start flaky
+sleep 12
+systemctl status flaky --no-pager</code></pre></div>
+        <div class="out"><span class="ol">Output</span>× flaky.service
+     Active: failed (Result: start-limit-hit) since ...
+     ...
+systemd[1]: flaky.service: Start request repeated too quickly.
+systemd[1]: flaky.service: Failed with result 'start-limit-hit'.</code></pre></div>
+        <p>It restarted a few times, then systemd gave up with <code>start-limit-hit</code>. Two questions to answer before revealing: why did systemd <em>stop</em> restarting, and — more importantly — what's the actual bug, and where is it recorded?</p>
+        <details class="recall"><summary>Reveal the mechanism, the root cause, and the fix</summary>
+          <div class="body">
+            <p>systemd stopped because of the start rate limiter: by default, more than <code>StartLimitBurst</code> (5) starts within <code>StartLimitIntervalSec</code> (10s) trips <code>start-limit-hit</code> and the unit is parked in <code>failed</code> rather than looping forever. That limiter is a feature — it stops a broken service from pinning a core in a tight restart loop and spamming the journal. But it is <em>not</em> the bug. The bug is in the app, and the journal has it verbatim:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>journalctl -u flaky --no-pager | tail</code></pre></div>
+            <div class="out"><span class="ol">Output</span>flaky.sh[...]: starting up...
+flaky.sh[...]: config error: cannot connect to db, exiting</code></pre></div>
+            <p>There it is: "cannot connect to db." <code>Restart=always</code> was <em>masking</em> a real failure by hiding it behind a loop. The correct move is never to just raise the limits — it's to read the journal for the exit reason and fix the root cause (here, a missing/wrong DB dependency or config). Once fixed, clear the failed state with <code>systemctl reset-failed flaky</code> and start it again. If restarts are legitimately expected (a service that occasionally exits by design), tune <code>Restart=on-failure</code>, <code>RestartSec</code>, and the <code>StartLimit*</code> pair deliberately — but only after the journal has told you the loop isn't hiding a bug.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — the scheduled job that silently stopped</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>A nightly backup "hasn't run in three days" and nobody noticed until now. It's a cron job. The senior task: figure out why it silently failed, then rebuild it as a systemd timer that logs, catches up, and can't run the box out of memory. First, feel why cron is easy to lose:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># A cron-style job with no logging and no supervision — where does its output go?</span>
+apt-get install -y -qq cron
+echo '30 2 * * * /usr/local/bin/backup.sh' | crontab -
+crontab -l</code></pre></div>
+        <p>If <code>backup.sh</code> fails, cron mails the output to a local mailbox nobody reads, and there's no record in your logging stack, no catch-up if the box was down at 02:30, and no resource cap. Now build the systemd equivalent and diagnose the "didn't fire" case. Design it before revealing.</p>
+        <details class="recall"><summary>Reveal the production-grade timer and the diagnosis method</summary>
+          <div class="body">
+            <p>A timer triggers a service; you write both. The service is a <code>oneshot</code> with a memory cap and a nice level; the timer schedules it with catch-up and jitter:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>cat &gt; /etc/systemd/system/backup.service &lt;&lt;'EOF'
+[Unit]
+Description=Nightly backup
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/backup.sh
+MemoryMax=512M
+Nice=10
+EOF
+
+cat &gt; /etc/systemd/system/backup.timer &lt;&lt;'EOF'
+[Unit]
+Description=Run backup at 02:30 daily
+[Timer]
+OnCalendar=*-*-* 02:30:00
+Persistent=true              <span class="c"># if the box was off at 02:30, run at next boot</span>
+RandomizedDelaySec=300       <span class="c"># spread load across a fleet</span>
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now backup.timer
+systemctl list-timers --all   <span class="c"># shows NEXT and LAST run for every timer</span></code></pre></div>
+            <p><b>Why this beats cron:</b> the job's output is in the journal (<code>journalctl -u backup.service</code>), <code>Persistent=true</code> gives catch-up cron can't do without anacron, <code>MemoryMax</code>/<code>Nice</code> keep a runaway backup from starving the box, and a failure shows up in <code>systemctl --failed</code> and your monitoring instead of an unread mailbox. <b>Diagnosing "it didn't run"</b> becomes systematic: <code>systemctl list-timers</code> shows whether the timer is active and when it last/next fires; <code>systemctl status backup.timer</code> confirms it's enabled; <code>systemd-analyze calendar "*-*-* 02:30:00"</code> validates the schedule expression; and <code>journalctl -u backup.service</code> shows whether the service fired and failed versus never fired at all. The most common silent-cron causes — a job that errored into a black hole, a missed run while the box was down, no alert on failure — are each visible or prevented here. This resource-control and scheduling model is the same cgroup foundation Kubernetes builds on in <a href="ch23-cgroups-v2-cpu-memory-io-limits.html">Chapter 23</a> and <a href="ch34-workloads-ii-statefulset-daemonset-job-cronjob.html">Chapter 34</a>'s CronJob.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · service won't start</div>
+      <p><b>Symptom:</b> <code>systemctl start</code> returns nonzero, or the unit is <code>Active: failed</code>. <b>First cut:</b> <code>systemctl status &lt;unit&gt;</code> — read the <code>Process:</code> line and its exit code. <b>Confirm:</b> <code>journalctl -u &lt;unit&gt; -xe</code> for the verbatim error. <b>Usual causes by code:</b> <code>203/EXEC</code> (bad/non-absolute/non-executable <code>ExecStart</code> path), <code>217/USER</code> (<code>User=</code> doesn't exist), <code>200/CHDIR</code> (bad <code>WorkingDirectory=</code>), <code>226/NAMESPACE</code> (a sandboxing directive failed), or the app exiting nonzero on a config/dependency problem. <b>Fix:</b> whatever the journal names; and remember <code>daemon-reload</code> after editing a unit.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · crash-restart loop</div>
+      <p><b>Symptom:</b> a unit flaps between <code>activating (auto-restart)</code> and <code>failed</code>, often ending in <code>Result: start-limit-hit</code> with "start request repeated too quickly." <b>First cut:</b> <code>journalctl -u &lt;unit&gt;</code> — the app's own error is in there; the restart loop is a symptom, not the cause. <b>Usual cause:</b> a real startup failure (missing dependency, bad config, unreachable DB) that <code>Restart=</code> keeps papering over. <b>Fix:</b> fix the root cause the journal shows, then <code>systemctl reset-failed</code>. Don't reflexively raise <code>StartLimitBurst</code> — that just restores the tight loop and hides the bug.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · "where are the logs?"</div>
+      <p><b>Symptom:</b> an app doesn't write a log file and you need its output. <b>First cut:</b> it's in the journal — <code>journalctl -u &lt;unit&gt; -b</code> (this boot), add <code>-p err</code> for errors only, <code>--since</code> for a window, <code>-f</code> to follow. <b>Gotcha:</b> if the journal looks empty after a reboot, it's volatile — logs live in <code>/run</code> and vanish on reboot unless <code>/var/log/journal</code> exists. <b>Fix:</b> make it persistent (create <code>/var/log/journal</code> or set <code>Storage=persistent</code>), and cap size with <code>SystemMaxUse=</code> so it doesn't fill the disk. <code>journalctl --disk-usage</code> shows current size.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Model dependencies honestly, and use readiness.</b> The recurring bug is treating <code>After=</code> as "wait until ready." It only orders the fork. For a dependency that must be truly serving before dependents start, run it as <code>Type=notify</code> so it reports real readiness, and have apps that can't rely on that do their own wait-and-retry. Racing a half-started database is a self-inflicted outage.</p>
+    <p><b>Sandboxing is free hardening.</b> The Chapter 5 primitives are one-liners here: <code>User=</code> (never run a service as root without a reason), <code>NoNewPrivileges=yes</code>, <code>ProtectSystem=strict</code>, <code>PrivateTmp=yes</code>, <code>CapabilityBoundingSet=</code> to drop everything but what's needed. Add <code>MemoryMax=</code>, <code>CPUQuota=</code>, and <code>TasksMax=</code> and a plain systemd service gets the same resource isolation as a container — useful on VMs and bare metal where there's no Kubernetes.</p>
+    <p><b>Prefer timers to cron for anything that matters.</b> Timers log to the journal, catch up with <code>Persistent=true</code>, spread fleet load with <code>RandomizedDelaySec=</code>, get resource limits, and surface failures in <code>systemctl --failed</code> and your monitoring. Cron's silent failure into an unread local mailbox is exactly how "the backup hasn't run in three days" happens.</p>
+    <p><b>Common mistakes:</b> forgetting <code>daemon-reload</code> after editing a unit; confusing <code>Requires</code> (pull in) with <code>After</code> (order); using <code>Restart=always</code> to hide a crash instead of reading the journal; a relative or non-executable <code>ExecStart</code> (<code>203/EXEC</code>); a volatile journal that loses everything on reboot; and running services as root out of habit when a <code>User=</code> and a dropped capability set would do.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>systemd is the single-node version of the ideas Kubernetes scales to a cluster, and seeing the parallel makes both click. A unit's declared dependency graph and readiness protocol is a Deployment's readiness probes and init containers. The cgroup-per-service with <code>MemoryMax</code>/<code>CPUQuota</code> is a pod's requests and limits (<a href="ch23-cgroups-v2-cpu-memory-io-limits.html">Chapter 23</a>). <code>Restart=</code> policies are a pod's <code>restartPolicy</code> and the kubelet's back-off. A systemd timer is a Kubernetes CronJob (<a href="ch34-workloads-ii-statefulset-daemonset-job-cronjob.html">Chapter 34</a>). And journald's "one queryable log, tagged by source" is the local seed of centralised logging (<a href="ch78-logging.html">Chapter 78</a>). The declarative, supervised, resource-bounded service is the atom; an orchestrator is the same atom, reconciled across a fleet — which is the mental bridge into <a href="ch28-why-kubernetes-the-declarative-reconciled-model.html">Chapter 28</a>.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What is a systemd unit, and what does systemd do that SysV init didn't?</summary>
+        <div class="a"><p>A unit is a declarative description of something systemd manages — most often a <code>.service</code> (a process to run), but also targets, timers, sockets, and mounts. Compared to SysV init's serial shell scripts, systemd adds a real dependency graph so it can start independent things in parallel and in the right order; process supervision with restart policies so a crashed service comes back; a cgroup per service so it knows and can cleanly stop every process the service spawned, with no leaked children; one structured log for everything via journald; and scheduled jobs via timers. In short, it turned "run these scripts in a numbered order and hope" into "declare what you want and let PID 1 make it so and keep it so."</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through what happens when you start a service.</summary>
+        <div class="a"><p><code>systemctl start</code> is a client that asks systemd, PID 1, over D-Bus to start the unit. systemd resolves the unit's dependencies: it pulls in whatever <code>Requires</code>/<code>Wants</code> name and orders the startup by <code>After</code>/<code>Before</code>, starting independent units in parallel. For the target unit it creates a cgroup under <code>system.slice</code>, applies settings like <code>User=</code>, capability bounding, and <code>MemoryMax=</code>, and forks <code>ExecStart</code> inside that cgroup. When it considers the unit "started" depends on <code>Type=</code>: <code>simple</code> means as soon as it's forked, <code>forking</code> waits for the parent to exit, and <code>notify</code> waits for the app to send a readiness signal — which is what makes ordering actually meaningful. From then on systemd supervises via the cgroup: if the main process exits, the <code>Restart=</code> policy decides whether and when to restart it, with a rate limiter that parks it in <code>failed</code> if it crashes too fast. All the service's output streams to journald tagged by unit. Stopping sends SIGTERM to the whole cgroup, waits, then SIGKILLs stragglers — so nothing leaks. And <code>systemctl status</code> shows the whole picture: state, main PID, the cgroup process tree, and recent logs.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Explain the <code>Type=</code> values and the difference between <code>Requires</code>, <code>Wants</code>, and <code>After</code>.</summary>
+        <div class="a"><p><code>Type=</code> tells systemd when a service counts as started. <code>simple</code> (default) considers it up the instant it's forked, even if the app isn't ready — fine for leaf services, risky for dependencies. <code>exec</code> waits until <code>execve</code> succeeds, so a bad binary path fails immediately. <code>forking</code> is for traditional daemons that double-fork and let the parent exit; systemd waits for that exit, ideally with a <code>PIDFile</code>. <code>oneshot</code> runs to completion for setup tasks, often with <code>RemainAfterExit=yes</code>. And <code>notify</code> is the important one: the service calls <code>sd_notify(READY=1)</code> when it's genuinely ready to serve, and systemd blocks dependents until then. Now the dependency directives, which are two orthogonal axes people conflate. <code>Requires</code> and <code>Wants</code> control <em>what gets pulled in</em>: <code>Requires</code> is a hard dependency — if it fails or stops, this unit fails or stops too — while <code>Wants</code> is soft, pulling the dependency in but tolerating its failure. <code>After</code> and <code>Before</code> control <em>ordering only</em> and say nothing about pulling anything in. The classic bug is writing <code>Requires=db.service</code> and expecting the database to start first — it won't, because requirement isn't ordering; you also need <code>After=db.service</code>. And even correct ordering only sequences the fork, so for real "don't start until the DB is serving," the DB should be <code>Type=notify</code>.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A service is flapping — "start request repeated too quickly." How do you handle it?</summary>
+        <div class="a"><p>I'd treat the restart loop as a symptom and go straight to the cause. First, <code>systemctl status</code> confirms the flap and shows <code>Result: start-limit-hit</code> — systemd's rate limiter (default 5 starts in 10s) parked it in failed so it wouldn't loop forever, which is working as intended. The real bug is in the app, and it's in the journal: <code>journalctl -u &lt;unit&gt;</code> almost always shows the actual error on each start — a missing config, an unreachable dependency, a permissions problem. I fix that root cause, then <code>systemctl reset-failed</code> to clear the failed state and start it again. What I would <em>not</em> do is bump <code>StartLimitBurst</code> or set <code>RestartSec</code> higher to "make it stop failing" — that just re-enables the tight loop and hides the defect. If the service legitimately exits sometimes and restarts are expected, I'd set <code>Restart=on-failure</code> with a sensible <code>RestartSec</code> and tune the start limits deliberately, but only after the journal confirms the loop isn't masking a genuine failure. The discipline is: the loop is never the problem, the exit reason in the journal is.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>When would you use a systemd timer instead of cron?</summary>
+        <div class="a"><p>For anything whose failure matters, I default to a timer. A timer triggers a service, so I get everything systemd services get: the job's output lands in the journal (queryable, centralised, not a local mailbox nobody reads), <code>Persistent=true</code> gives catch-up if the machine was down at the scheduled time — which plain cron can't do without anacron — <code>RandomizedDelaySec</code> spreads a job across a fleet so a thousand nodes don't all hit a backend at 02:00, and I can apply <code>MemoryMax</code>/<code>CPUQuota</code>/<code>Nice</code> so a runaway job doesn't starve the box. Failures surface in <code>systemctl --failed</code> and my monitoring instead of vanishing. Timers can also key off events, like "10 minutes after boot" or "1 hour after the last run," which cron can't express. I'd still use cron for genuinely trivial, dependency-free, best-effort jobs on a box that already uses it — it's simpler and universally present — but for scheduled work in production, the observability and catch-up of timers is worth the extra unit file. It's also the same model as a Kubernetes CronJob, so the concept transfers.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>systemd is PID 1: it reads declarative <b>units</b>, builds a dependency graph from <code>Requires</code>/<code>Wants</code> (what to pull in) and <code>After</code>/<code>Before</code> (ordering — orthogonal to each other), and drives boot toward a goal <b>target</b>. It runs each service in its own <b>cgroup</b>, so it knows and can cleanly stop every process the service owns and can cap its resources. <code>Type=</code> decides when a service counts as started — <code>notify</code> for real readiness — and <code>Restart=</code> with a start rate limiter supervises crashes without looping forever. All output goes to <b>journald</b>, queried by unit with <code>journalctl -u</code> (plus <code>-b</code>, <code>-p</code>, <code>--since</code>, <code>-f</code>). Diagnosing is two commands: <code>systemctl status</code> for state and exit code, <code>journalctl</code> for the verbatim reason. And <b>timers</b> beat cron for anything that matters, thanks to journal logging, catch-up, jitter, and resource control.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>systemd is PID 1; everything it manages is a unit (<code>.service</code>, <code>.target</code>, <code>.timer</code>, <code>.socket</code>, <code>.mount</code>, <code>.slice</code>).</li>
+      <li><code>Requires</code>/<code>Wants</code> control what gets pulled in; <code>After</code>/<code>Before</code> control ordering — they're independent, and you usually need both.</li>
+      <li>Targets are boot goals and sync points (<code>multi-user.target</code>), the modern replacement for runlevels.</li>
+      <li>Each service runs in its own cgroup, so systemd tracks every child, stops it cleanly, and can cap CPU/memory/tasks.</li>
+      <li><code>Type=</code> sets readiness: <code>simple</code> (forked), <code>forking</code>, <code>oneshot</code>, and <code>notify</code> (real "ready" signal) — use <code>notify</code> for dependencies.</li>
+      <li><code>Restart=</code> plus <code>StartLimitBurst</code>/<code>Interval</code> supervise crashes; too-fast restarts hit <code>start-limit-hit</code> and park in failed.</li>
+      <li>Diagnose with two commands: <code>systemctl status</code> (state + exit code like <code>203/EXEC</code>) and <code>journalctl -u &lt;unit&gt; -xe</code> (why).</li>
+      <li>The journal is the log — <code>journalctl -u</code>/<code>-b</code>/<code>-p err</code>/<code>--since</code>/<code>-f</code>; make it persistent with <code>/var/log/journal</code>.</li>
+      <li>Always <code>systemctl daemon-reload</code> after editing a unit; use absolute paths in <code>ExecStart</code>.</li>
+      <li>Prefer timers to cron for real work: journal logging, <code>Persistent=</code> catch-up, <code>RandomizedDelaySec=</code>, and resource limits.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Connects to:</span>
+      <a href="ch02-processes-threads-scheduling-signals.html"><b>Ch 2</b> PID 1, signals &amp; reaping</a>
+      <a href="ch05-users-groups-permissions-capabilities.html"><b>Ch 5</b> User=, caps, NoNewPrivileges</a>
+      <a href="ch23-cgroups-v2-cpu-memory-io-limits.html"><b>Ch 23</b> cgroups behind services</a>
+      <a href="ch28-why-kubernetes-the-declarative-reconciled-model.html"><b>Ch 28</b> The reconciled model</a>
+      <a href="ch34-workloads-ii-statefulset-daemonset-job-cronjob.html"><b>Ch 34</b> CronJob</a>
+      <a href="ch78-logging.html"><b>Ch 78</b> Centralised logging</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>systemd upstream documentation — <a href="https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html">systemd.service</a> (<code>Type=</code>, <code>Restart=</code>, <code>ExecStart</code>) and <a href="https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html">systemd.unit</a> (<code>Requires</code>/<code>Wants</code>/<code>After</code>).</li>
+      <li>systemd upstream documentation — <a href="https://www.freedesktop.org/software/systemd/man/latest/systemctl.html">systemctl</a> and <a href="https://www.freedesktop.org/software/systemd/man/latest/journalctl.html">journalctl</a> (the tools you'll live in).</li>
+      <li>systemd upstream documentation — <a href="https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html">systemd.timer</a> and <a href="https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html">systemd.exec</a> (sandboxing and resource-control directives).</li>
+      <li>The systemd project — <a href="https://systemd.io/">systemd.io</a>: the upstream home, design docs, and the <code>sd_notify</code> readiness protocol.</li>
+      <li>Google — <a href="https://sre.google/sre-book/table-of-contents/"><i>Site Reliability Engineering</i></a> (first-party): service management, supervision, and graceful lifecycle in practice.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch05-users-groups-permissions-capabilities.html"><span class="dir">← Prev</span><div class="ti">Ch 5 — Users, groups, permissions, capabilities</div></a>
+      <a class="nx" href="ch07-the-sre-linux-toolkit-as-a-diagnostic.html"><span class="dir">Next →</span><div class="ti">Ch 7 — The SRE Linux toolkit as a diagnostic system</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 6 of 121 · Part I · Linux &amp; OS Foundations. Run the labs in a container; the reflexes are the point.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Units, targets, cgroups</a>
+    <a href="#internals">The service lifecycle</a>
+    <a href="#components">The components</a>
+    <a href="#flow">Starting a service</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 39 — Security: RBAC, admission policy, securityContext</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part IV · Kubernetes &nbsp;·&nbsp; Chapter 39</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part IV · Kubernetes — Architecture &amp; Internals · Chapter 39</div>
+      <h1>Security: RBAC, admission policy, securityContext</h1>
+      <p class="tagline">Bind a ServiceAccount to <code>cluster-admin</code> and Kubernetes will not stop you — it will hand that token the keys to the whole cluster without a word of protest. Run a pod with no <code>securityContext</code> and it starts as root with every capability by default. Nothing about the defaults protects you; the protection is three separate gates you build yourself — who may ask, what's allowed to exist, and what a running container can actually do.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~50 min read · kind + kubectl lab</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Write a least-privilege Role and RoleBinding for a ServiceAccount, and prove the boundary with <code>kubectl auth can-i</code>.</li>
+          <li>Explain how a ServiceAccount actually authenticates — the modern bound, audience-scoped token versus the legacy long-lived Secret — and use one directly against the API server.</li>
+          <li>Separate the two independent questions every write answers: "is this identity allowed" (RBAC) and "does this object meet our bar" (admission policy: Pod Security Admission, Gatekeeper/OPA, Kyverno).</li>
+          <li>Lock a pod down with <code>securityContext</code> — <code>runAsNonRoot</code>, dropped capabilities, a <code>seccompProfile</code> — and predict exactly what a Restricted namespace and a Kyverno policy will each reject.</li>
+          <li>Diagnose an over-broad RBAC grant before it's exploited, and read the precise, distinct error each gate produces when it blocks a deploy.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>Kubernetes defaults closed on identity, wide open on everything else</h2>
+    <p>Here's the part that surprises people moving from a single app to a shared cluster: Kubernetes RBAC is deny-by-default — a brand-new ServiceAccount with no bindings can do <em>nothing</em>, not even read its own namespace. That half of the story is genuinely safe by default. The other half isn't. Nothing stops a pod spec from asking to run as UID 0 with every Linux capability, mount the host's filesystem, or use the host's network namespace, unless something explicitly says no. And the "safe by default" half doesn't stay safe in practice, because writing a tight Role is tedious and granting <code>cluster-admin</code> to unblock a CI pipeline takes one line.</p>
+    <p>So real clusters need at least three independent controls, and they answer three different questions:</p>
+    <ul>
+      <li><b>Who is allowed to ask?</b> Authentication resolves an identity; RBAC decides what that identity may do. This is access control on the API.</li>
+      <li><b>What is allowed to exist?</b> Admission control — Pod Security Admission, and policy engines like Gatekeeper or Kyverno — inspects the object itself, independent of who submitted it, and can reject it outright.</li>
+      <li><b>What can a running container actually do, even if the first two said yes?</b> <code>securityContext</code>, enforced by the kubelet and the container runtime through the exact mechanisms of <a href="ch27-container-security-and-process-to-container-to.html">Chapter 27</a> — capabilities, seccomp, non-root UIDs — bounds the blast radius of a compromise that gets past everything else.</li>
+    </ul>
+    <p>Confuse these three and you get real incidents: a team that thinks "we have RBAC" means workloads are locked down (RBAC never looked at the pod spec), or a platform team that ships a policy engine and assumes it replaces least-privilege RBAC (it doesn't — it's a second, independent gate). This chapter treats them as three separate layers on purpose, because that's how you debug them: a rejection at one layer looks nothing like a rejection at another, and knowing the shape of the error tells you which layer spoke before you've read a single log line.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>RBAC answers <em>who</em>. Admission policy answers <em>what</em>. <code>securityContext</code> plus the runtime answer <em>how much damage if both of the first two let something through anyway</em>. None of the three substitutes for the others, and a pass at one layer says nothing about the next.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a badge, a door list, and a building inspector</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>You work in an office building. To get past the front desk you show a <b>badge</b> — that's your identity. The guard checks the badge is real and current; that's <b>authentication</b>. Then the guard checks a <b>door access list</b> for your badge — which floors, which rooms — and either lets you through or turns you back; that's <b>authorization</b>, and the access list itself is a <b>Role</b> plus the sheet that says which badges it applies to, a <b>RoleBinding</b>.</p>
+      <p>Getting past the guard doesn't mean you can build whatever you want in your office. A <b>building inspector</b> reviews any renovation plan before work starts — wiring to code, fire exits clear — independent of whose badge submitted the plan. That's <b>admission control</b>: Pod Security Admission enforcing a baseline safety code, or a policy engine like Kyverno or Gatekeeper acting as a specialist inspector with its own rulebook. Your badge can be perfectly valid and the inspector can still reject your plan.</p>
+      <p>Even with a valid badge and an approved plan, a sensible tenant still locks their own office door, keeps the fire exit clear, and doesn't wire the alarm system to their own desk — precautions that only matter if someone gets past the first two checks. That's <code>securityContext</code>: self-imposed limits on the running workload itself. And before any of that: goods arriving at the loading dock get checked against a manifest and a tamper seal before they're even allowed into the building — that's the software supply chain, scanning and signing an image before it's ever offered to the cluster.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In Kubernetes</th></tr>
+      <tr><td>The badge</td><td>An identity — a <code>User</code>, a <code>Group</code>, or a <b>ServiceAccount</b></td></tr>
+      <tr><td>The guard checking the badge is real</td><td><b>Authentication</b> — client cert, bearer token, or OIDC → username + groups</td></tr>
+      <tr><td>The door access list, and who it applies to</td><td><b>Role</b>/<b>ClusterRole</b> (rules) + <b>RoleBinding</b>/<b>ClusterRoleBinding</b> (subjects)</td></tr>
+      <tr><td>The guard's yes/no at the door</td><td><b>Authorization</b> — the RBAC decision</td></tr>
+      <tr><td>The building inspector reviewing the plan</td><td><b>Admission control</b>: Pod Security Admission, OPA/Gatekeeper, Kyverno</td></tr>
+      <tr><td>Locking your own office, keeping the exit clear</td><td><b><code>securityContext</code></b>: <code>runAsNonRoot</code>, dropped capabilities, <code>seccompProfile</code></td></tr>
+      <tr><td>Checking goods at the loading dock before they enter</td><td><b>Supply chain</b>: image scanning, signing (cosign/Sigstore), an SBOM</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>One request, three independent gates</h2>
+    <p>Chapter 32 walked the API server's write pipeline in general — authn, admission, schema validation, persistence. This chapter zooms into the two stages that carry the actual security decisions for a workload: <b>authorization</b> (is this identity allowed to do this at all) and <b>admission policy</b> (does this specific object meet the bar), and then follows through to what the runtime enforces once an object is accepted.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 740 400" role="img" aria-label="A request from a user or a pod's ServiceAccount token is authenticated to an identity, checked against RBAC bindings for authorization, then passed through admission policy such as Pod Security Admission, Gatekeeper, or Kyverno, before being persisted to etcd; a rejection at authorization or admission returns immediately without reaching etcd">
+        <defs>
+          <marker id="sec-ar" markerWidth="10" markerHeight="10" refX="7.5" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" style="fill:var(--accent)"/></marker>
+          <marker id="sec-ar2" markerWidth="10" markerHeight="10" refX="7.5" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" style="fill:var(--deep)"/></marker>
+        </defs>
+        <text x="370" y="20" text-anchor="middle" style="fill:var(--muted);font:700 12px sans-serif;letter-spacing:.05em">REQUEST → AUTHN → AUTHZ (RBAC) → ADMISSION → ETCD</text>
+
+        <rect x="8" y="120" width="118" height="86" rx="9" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="67" y="148" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">kubectl user —</text>
+        <text x="67" y="164" text-anchor="middle" style="fill:var(--ink);font:600 11.5px sans-serif">or a pod's SA</text>
+        <text x="67" y="182" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">bearer token</text>
+
+        <rect x="140" y="36" width="478" height="238" rx="12" style="fill:none;stroke:var(--line);stroke-width:1.5"/>
+        <text x="152" y="54" style="fill:var(--muted);font:700 10.5px sans-serif;letter-spacing:.04em">KUBE-APISERVER PIPELINE</text>
+
+        <rect x="156" y="66" width="138" height="104" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="225" y="88" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">1 · Authentication</text>
+        <text x="225" y="106" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">cert · bearer token</text>
+        <text x="225" y="120" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">· OIDC</text>
+        <text x="225" y="140" text-anchor="middle" style="fill:var(--accent);font:600 10px sans-serif">→ username + groups</text>
+
+        <rect x="308" y="66" width="140" height="104" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="378" y="88" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">2 · Authorization</text>
+        <text x="378" y="106" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">RBAC: union of every</text>
+        <text x="378" y="120" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">bound Role/ClusterRole</text>
+        <text x="378" y="140" text-anchor="middle" style="fill:var(--accent);font:600 10px sans-serif">any rule matches → allow</text>
+
+        <rect x="464" y="66" width="146" height="104" rx="8" style="fill:var(--panel);stroke:var(--violet);stroke-width:1.5"/>
+        <text x="537" y="88" text-anchor="middle" style="fill:var(--violet);font:600 12px sans-serif">3 · Admission</text>
+        <text x="537" y="106" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">mutate: defaults, Kyverno</text>
+        <text x="537" y="120" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">validate: PSA · Gatekeeper</text>
+        <text x="537" y="134" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">· Kyverno · ValidatingAdmissionPolicy</text>
+
+        <rect x="638" y="90" width="94" height="80" rx="8" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="685" y="124" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">etcd</text>
+        <text x="685" y="142" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">persisted</text>
+
+        <g style="stroke:var(--accent);stroke-width:2">
+          <line x1="126" y1="145" x2="154" y2="118" marker-end="url(#sec-ar)"/>
+          <line x1="294" y1="118" x2="306" y2="118" marker-end="url(#sec-ar)"/>
+          <line x1="448" y1="118" x2="462" y2="118" marker-end="url(#sec-ar)"/>
+          <line x1="610" y1="130" x2="636" y2="130" marker-end="url(#sec-ar)"/>
+        </g>
+
+        <line x1="378" y1="170" x2="378" y2="206" style="stroke:var(--deep);stroke-width:1.5;stroke-dasharray:4 3" marker-end="url(#sec-ar2)"/>
+        <text x="378" y="222" text-anchor="middle" style="fill:var(--deep);font:600 10.5px sans-serif">✗ 403 Forbidden</text>
+        <line x1="537" y1="170" x2="537" y2="206" style="stroke:var(--deep);stroke-width:1.5;stroke-dasharray:4 3" marker-end="url(#sec-ar2)"/>
+        <text x="537" y="222" text-anchor="middle" style="fill:var(--deep);font:600 10.5px sans-serif">✗ admission denied</text>
+
+        <rect x="14" y="300" width="712" height="86" rx="9" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="30" y="322" style="fill:var(--ink);font:11px sans-serif"><tspan style="fill:var(--accent);font-weight:700">Two independent gates:</tspan> RBAC says yes only means this identity may attempt the write — it says nothing about whether</text>
+        <text x="30" y="338" style="fill:var(--ink);font:11px sans-serif">the object itself is acceptable. Admission is a second, separate check that runs on every request regardless of who sent it.</text>
+        <text x="30" y="360" style="fill:var(--ink);font:11px sans-serif"><tspan style="fill:var(--deep);font-weight:700">No explicit deny:</tspan> core Kubernetes RBAC has only additive allow rules. There is no rule that overrides another rule's</text>
+        <text x="30" y="376" style="fill:var(--ink);font:11px sans-serif">grant — if <em>any</em> bound Role or ClusterRole allows the verb, the request is allowed, no matter what else is or isn't bound.</text>
+      </svg>
+      <figcaption>Authentication resolves an identity; authorization (RBAC) decides if that identity may attempt the write; admission decides if the object itself is allowed to exist. A rejection at either of the last two stops the request before it ever reaches etcd — and never in the same words.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>These two gates fail in opposite directions operationally. A missing RBAC grant fails <em>one identity</em> — one CI pipeline, one controller — and is usually caught fast because that one thing breaks loudly. A bad admission policy change can fail <em>every</em> deploy cluster-wide in one edit, and if it's a webhook-based engine running <code>failurePolicy: Fail</code>, an outage of the policy engine itself blocks all matching writes even when the objects are perfectly fine — the exact scenario Chapter 32 walks through for webhooks generally. Knowing which of the two just rejected you is the first move in either incident.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>From a bearer token to a hardened container, step by step</h2>
+    <ol class="steps">
+      <li><b>Authentication resolves an identity.</b> A human's request usually carries a client certificate or an OIDC-issued bearer token. A pod's request carries its <b>ServiceAccount token</b> — the pod's own bearer credential. Either way, the API server resolves it to a username and a set of groups; for a ServiceAccount that username is always <code>system:serviceaccount:&lt;namespace&gt;:&lt;name&gt;</code>, and it always carries the groups <code>system:serviceaccounts</code> and <code>system:serviceaccounts:&lt;namespace&gt;</code>. No valid identity, no further stages.</li>
+      <li><b>Authorization evaluates RBAC.</b> The API server finds every <code>RoleBinding</code> and <code>ClusterRoleBinding</code> that names this identity as a subject — directly, by group, or via the implicit <code>system:authenticated</code> group — and unions the rules from every <code>Role</code>/<code>ClusterRole</code> they reference. It then checks whether the requested (verb, apiGroup, resource, optionally resourceName, namespace) is covered by <em>any</em> rule in that union. There is no explicit deny in core RBAC — only additive allow. A denial is really "no rule anywhere said yes," and it comes back as an HTTP 403 naming the exact verb and resource.</li>
+      <li><b>Mutating admission runs.</b> Built-in defaulting, plus any registered mutating webhook or a Kyverno <code>MutatingPolicy</code>, may rewrite the object — inject a sidecar, add a default label, fill in a missing field — before anyone judges it.</li>
+      <li><b>Validating admission runs.</b> This is where policy lives. <b>Pod Security Admission</b> compares the (possibly mutated) pod's effective <code>securityContext</code> against the Pod Security Standard configured on its namespace — <code>privileged</code>, <code>baseline</code>, or <code>restricted</code> — and rejects with a message naming every violated rule at once. Any registered <b>Gatekeeper</b> constraint or <b>Kyverno</b> <code>ValidatingPolicy</code> (or an in-tree <code>ValidatingAdmissionPolicy</code>) runs too, each with its own rulebook and its own rejection message. Any one of them can veto the object outright; none of them can change it.</li>
+      <li><b>If everything passes, it's persisted</b> — and only now does the object exist. A ReplicaSet or other controller reconciles it into a Pod (<a href="ch31-the-reconciliation-loop-controllers-informers.html">Chapter 31</a>), and the kubelet on the chosen node creates the container with the pod's effective <code>securityContext</code>.</li>
+      <li><b>The runtime enforces what admission only checked.</b> This is the handoff to Chapter 27's mechanism: <code>runAsNonRoot</code> becomes the UID the process actually starts as, <code>capabilities.drop</code> becomes the capability set actually stripped from root, and <code>seccompProfile</code> becomes the BPF filter actually loaded before the container's first instruction runs. Admission decided the pod was <em>allowed to be scheduled</em>; the kernel is what actually <em>enforces</em> the resulting container's limits.</li>
+      <li><b>None of this starts at admission time.</b> Before an image is ever offered to the cluster, it was built in CI, scanned for known vulnerabilities, recorded in an SBOM, and — on a hardened pipeline — signed. Some clusters add an admission-time check (a Kyverno <code>ImageValidatingPolicy</code> or a Gatekeeper constraint) that verifies that signature, closing the loop from build time back to admission time.</li>
+    </ol>
+    <div class="box keypoint"><div class="h">There is no "deny" rule in Kubernetes RBAC</div>
+      <p>This trips up almost everyone the first time. You cannot write a Role that says "deny delete on this resource" to carve an exception out of a broader grant. RBAC is purely additive: the request is allowed if <em>any</em> bound rule covers it, full stop. If a ServiceAccount is bound to both a narrow, careful Role and to <code>cluster-admin</code> somewhere else, it has <code>cluster-admin</code> — the narrow Role changes nothing. The only way to "deny" is to never grant it anywhere, or to reject the resulting object at the admission layer instead. When someone says "I added a deny rule and it's not working," the RBAC model is telling them the rule doesn't exist, not that they wrote it wrong.</p>
+    </div>
+
+    <details class="recall"><summary>Think first: a ServiceAccount has a narrowly-scoped Role bound in its own namespace, and is also bound to <code>view</code> at cluster scope via a ClusterRoleBinding. Can it read Secrets in a namespace it has no Role in?</summary>
+      <div class="body">
+        <p>It depends only on whether <em>any</em> bound rule covers it — check what <code>view</code> actually grants, not what you'd assume from the name. The built-in <code>view</code> ClusterRole deliberately excludes Secrets (reading a Secret is treated as sensitive enough that even a broad "look but don't touch" role omits it), so a <code>ClusterRoleBinding</code> to <code>view</code> alone would <em>not</em> grant Secret access anywhere, despite being cluster-wide. If instead it had been bound to <code>edit</code> or a custom role that included <code>secrets: get/list</code>, the answer flips to yes, in every namespace that binding covers, regardless of the narrow namespaced Role sitting alongside it. The lesson isn't about Secrets specifically — it's that RBAC access is the union of every binding anywhere, so auditing "what can this identity do" means listing every binding that names it, not just the one you wrote most recently.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, named</h2>
+    <ul>
+      <li><b>ServiceAccount.</b> The identity type for in-cluster clients — every pod runs as one, defaulting to the namespace's auto-created <code>default</code> ServiceAccount if you don't set <code>serviceAccountName</code>. Treat the default SA as "no specific identity," not as safe-because-unprivileged: it's still a real identity anything in that namespace can use.</li>
+      <li><b>ServiceAccount tokens.</b> The credential a pod presents. The modern form is a <b>bound, projected token</b>: audience-scoped, time-limited, auto-rotated by the kubelet, requested under the hood via the <code>TokenRequest</code> API and mounted as a projected volume. The legacy form — a long-lived token stored in a <code>kubernetes.io/service-account-token</code> Secret and auto-mounted — has no expiry and is the kind you find still live in a leaked backup years later; new clusters default to bound tokens, and you can request one directly with <code>kubectl create token</code>.</li>
+      <li><b>Role / ClusterRole.</b> A list of rules, each an <code>{apiGroups, resources, resourceNames?, verbs}</code> tuple. A <code>Role</code> is namespaced; a <code>ClusterRole</code> is cluster-scoped but can still be bound namespace-by-namespace via a <code>RoleBinding</code> — the usual way to reuse one role definition across many namespaces.</li>
+      <li><b>RoleBinding / ClusterRoleBinding.</b> Connects subjects (a <code>User</code>, <code>Group</code>, or <code>ServiceAccount</code>) to a Role or ClusterRole's rules. A <code>RoleBinding</code> can reference a <code>ClusterRole</code> to reuse it, but the grant it produces is still scoped to that RoleBinding's own namespace.</li>
+      <li><b>Pod Security Admission (PSA).</b> The built-in admission plugin that enforces the <a href="https://kubernetes.io/docs/concepts/security/pod-security-standards/">Pod Security Standards</a> — three levels, <code>privileged</code>, <code>baseline</code>, <code>restricted</code> — applied per namespace via labels, independently in <code>enforce</code>, <code>audit</code>, and <code>warn</code> modes. It's the direct successor to PodSecurityPolicy, which was removed in Kubernetes 1.25.</li>
+      <li><b>OPA / Gatekeeper.</b> A general-purpose policy engine (Open Policy Agent) fronted by Gatekeeper, which runs it as a Kubernetes admission webhook. Policies are written as <code>ConstraintTemplate</code>s in Rego and instantiated as <code>Constraint</code>s — flexible, and a separate language to learn.</li>
+      <li><b>Kyverno.</b> A Kubernetes-native policy engine — policies are Kubernetes CRDs, not a new language. Its current, stable policy types are CEL-based: <code>ValidatingPolicy</code>, <code>MutatingPolicy</code>, and <code>ImageValidatingPolicy</code> (for signature and attestation checks) — all stable since Kyverno v1.18. Its older <code>ClusterPolicy</code> kind (JMESPath-based validate/mutate/generate rules) is officially deprecated and scheduled for removal; write new policies as <code>ValidatingPolicy</code> or <code>MutatingPolicy</code>.</li>
+      <li><b><code>securityContext</code>.</b> Pod-level and container-level fields — <code>runAsNonRoot</code>, <code>runAsUser</code>/<code>runAsGroup</code>, <code>allowPrivilegeEscalation</code>, <code>capabilities.add</code>/<code>drop</code>, <code>seccompProfile</code>, <code>readOnlyRootFilesystem</code> — the declarative request that the kubelet hands to the runtime, which enforces it exactly as Chapter 27 described.</li>
+      <li><b>Supply-chain tooling.</b> Vulnerability scanning of the built image, an SBOM (Software Bill of Materials, typically SPDX or CycloneDX format) recording exactly what's inside it, and signing with <b>cosign</b> (part of the Sigstore project) so a signature can be verified later — in CI, at admission, or both.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one CI-driven deploy through every gate</h2>
+    <p>A CI pipeline runs as a ServiceAccount, <code>system:serviceaccount:ci:deployer</code>, bound to a Role scoped to exactly one namespace, and submits a new Deployment. Authentication resolves the token to that identity. Authorization checks: does any rule bound to <code>deployer</code> allow <code>create</code>/<code>patch</code> on <code>deployments</code> in this namespace? The Role was written for exactly this, so yes — RBAC is satisfied and the request moves on, having proven nothing yet about whether the pod template itself is acceptable.</p>
+    <p>Mutating admission runs: a Kyverno <code>MutatingPolicy</code> injects a default <code>seccompProfile</code> onto any container missing one. Validating admission runs next: Pod Security Admission, because this namespace is labeled <code>restricted</code>, checks the (now-mutated) pod template — is <code>runAsNonRoot</code> true, do all containers drop the full capability set, is <code>allowPrivilegeEscalation</code> false? A separate Kyverno <code>ValidatingPolicy</code> checks that the image reference points at the approved registry. Every one of these can reject independently, and each does so with its own message naming its own rule — a PSA rejection reads nothing like a Kyverno rejection, which reads nothing like the 403 an RBAC failure would have produced two stages earlier. If all of them pass, the object is written to etcd, a controller reconciles it into a Pod, and the kubelet creates the container with that final, hardened <code>securityContext</code> — the runtime drops the capabilities, loads the seccomp filter, and starts the process at the non-root UID it was told to use. The request either fails fast at one specific, identifiable gate, or arrives fully hardened; there's no in-between state where it's "partially secured."</p>
+
+    <details class="recall"><summary>Think first: the CI pipeline's Role only grants <code>create</code> on Deployments — nothing about <code>securityContext</code> fields. A Kyverno <code>MutatingPolicy</code> then injects a <code>seccompProfile</code> the pipeline never asked for. Does the pipeline's ServiceAccount need RBAC permission to set that field?</summary>
+      <div class="body">
+        <p>No — and this is the detail people miss. A mutating webhook (or a Kyverno <code>MutatingPolicy</code>) is invoked by the API server itself, as part of the API server's own pipeline, not as the identity that submitted the original request. RBAC only ever checks the <em>submitter's</em> permission to perform the original verb on the original resource; it never re-checks permission for fields a later admission stage adds. That's precisely why mutating webhooks are powerful and why their own scope and trustworthiness matter so much — a compromised or over-permissive mutating webhook can inject anything into any object its rules match, regardless of how tightly the actual caller was scoped. Least-privilege RBAC on your users and pipelines doesn't limit what your own admission-time automation is allowed to inject.</p>
+      </div>
+    </details>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>Everything runs on a plain <code>kind</code> cluster. Pod Security Admission is built into Kubernetes — no install needed. Kyverno is one manifest away.</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>kind create cluster --name seclab
+kubectl create namespace ci</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — a least-privilege Role and RoleBinding</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Give a ServiceAccount exactly one power: read pods in one namespace. Nothing else.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl -n ci create serviceaccount deployer
+kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { namespace: ci, name: pod-reader }
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+EOF
+kubectl -n ci create rolebinding deployer-pod-reader \
+  --role=pod-reader --serviceaccount=ci:deployer</code></pre></div>
+        <p>Now prove the exact boundary — what it can do, what it can't, and where the grant stops applying:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl auth can-i get pods    --as=system:serviceaccount:ci:deployer -n ci
+kubectl auth can-i create pods --as=system:serviceaccount:ci:deployer -n ci
+kubectl auth can-i get pods    --as=system:serviceaccount:ci:deployer -n default</code></pre></div>
+        <div class="out"><span class="ol">Output</span>yes
+no
+no</code></div>
+        <p>Read all three together. It can read pods in <code>ci</code> — the Role's exact grant. It cannot create pods in <code>ci</code> — <code>get/list/watch</code> never implied <code>create</code>; verbs aren't a hierarchy, they're an explicit list. And it can't even read pods in <code>default</code> — a namespaced Role's grant stops dead at its own namespace, no matter how obviously "related" another namespace looks. See the whole grant at once:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl auth can-i --list --as=system:serviceaccount:ci:deployer -n ci</code></pre></div>
+        <div class="out"><span class="ol">Output</span>Resources   Non-Resource URLs   Resource Names   Verbs
+pods        []                  []               [get list watch]</code></div>
+        <p>That's the entire access this identity has, in one line. Any time you're unsure what a ServiceAccount can do, this is the first command to run — not reading the Role's YAML and hoping you remember every binding that points at it.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — the ServiceAccount token is a real bearer credential</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Run a pod as <code>deployer</code> and use its own mounted token to talk to the API server directly — the same thing any client library inside the pod does.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl -n ci run probe --image=curlimages/curl --serviceaccount=deployer \
+  --command -- sleep infinity
+kubectl -n ci wait --for=condition=Ready pod/probe --timeout=60s
+kubectl -n ci exec probe -- ls /var/run/secrets/kubernetes.io/serviceaccount/</code></pre></div>
+        <div class="out"><span class="ol">Output</span>ca.crt  namespace  token</code></div>
+        <p>That's the modern <b>projected</b> token — no long-lived Secret object anywhere. Look at its shape: a JWT is three base64url parts joined by dots. Decode the payload to see what it actually claims:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl -n ci exec probe -- sh -c \
+  'cut -d. -f2 /var/run/secrets/kubernetes.io/serviceaccount/token | base64 -d 2&gt;/dev/null'</code></pre></div>
+        <div class="out"><span class="ol">Output (formatted)</span>"aud": ["https://kubernetes.default.svc"],
+"exp": 1735689600,
+"iss": "https://kubernetes.default.svc",
+"kubernetes.io": { "namespace": "ci", "serviceaccount": {"name": "deployer"} },
+"sub": "system:serviceaccount:ci:deployer"</code></div>
+        <p>It's audience-scoped (<code>aud</code> — only accepted by the API server, not replayable against some other service) and time-bound (<code>exp</code>) — the kubelet rotates it before it expires. Now use it as a real credential, exactly the way an app in the pod would:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl -n ci exec probe -- sh -c '
+  curl -s --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+    -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" \
+    https://kubernetes.default.svc/api/v1/namespaces/ci/pods | head -c 200'</code></pre></div>
+        <div class="out"><span class="ol">Output</span>{"kind":"PodList","apiVersion":"v1", ... "items":[{"metadata":{"name":"probe", ...</code></div>
+        <p>A real, authenticated, authorized API call — using nothing but the token the kubelet already mounted. This is exactly what RBAC just approved in Lab 1: <code>get/list</code> on pods, nothing more. You can also mint an ad hoc, differently-scoped token on demand instead of using the mounted one:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl -n ci create token deployer --duration=10m</code></pre></div>
+        <p>That's the <code>TokenRequest</code> API directly — the same mechanism the kubelet uses under the hood to mount the projected token in the first place.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — an over-broad RBAC grant</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Someone "temporarily" unblocks a stuck pipeline by binding its ServiceAccount to <code>cluster-admin</code>. Reproduce it — this single command is the incident:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl create clusterrolebinding oops-admin \
+  --clusterrole=cluster-admin --serviceaccount=ci:deployer</code></pre></div>
+        <p>Before you touch anything else: <code>deployer</code>'s Role in Lab 1 still only says <code>get/list/watch</code> on pods in <code>ci</code>. Given what you know about how RBAC combines bindings, what can this ServiceAccount do right now, cluster-wide? Reason about the blast radius before revealing.</p>
+        <details class="recall"><summary>Reveal the blast radius</summary>
+          <div class="body">
+            <p>Everything. <code>cluster-admin</code> is the built-in ClusterRole with <code>*</code> verbs on <code>*</code> resources in <code>*</code> apiGroups, cluster-wide — and because RBAC is purely additive, the narrow Role from Lab 1 changes nothing at all. Prove it from inside the same <code>probe</code> pod, no new credentials needed:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl -n ci exec probe -- sh -c '
+  curl -s --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+    -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" \
+    https://kubernetes.default.svc/api/v1/namespaces/kube-system/secrets | head -c 200'</code></pre></div>
+            <div class="out"><span class="ol">Output</span>{"kind":"SecretList","apiVersion":"v1", ... }   <span class="c"># every Secret in kube-system, readable</span></code></div>
+            <p>Every Secret in every namespace, every ability to create or delete anything, including minting <em>another</em> permanent <code>ClusterRoleBinding</code> for itself as a backdoor before anyone notices the first one. A leaked token from this pod is a cluster compromise, not an app-scoped one. Audit for exactly this pattern — any subject bound to <code>cluster-admin</code> that isn't a human break-glass account:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl get clusterrolebindings -o json \
+  | jq -r '.items[] | select(.roleRef.name=="cluster-admin") | .metadata.name'</code></pre></div>
+            <p>The fix is never "narrow it later" — delete the binding and grant only the verbs the pipeline actually calls: <code>kubectl delete clusterrolebinding oops-admin</code>. If CI truly needs to create Deployments, that's a namespaced <code>Role</code> with <code>create/update/patch</code> on <code>deployments</code>, not a cluster-wide wildcard. "Unblock it now, fix it later" is how <code>oops-admin</code>-shaped bindings end up load-bearing in production for years.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — a deploy blocked by policy, two different ways</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Clean up Lab 3 first (<code>kubectl delete clusterrolebinding oops-admin</code>), then turn on a real guardrail. Label the namespace with the Restricted Pod Security Standard — no extra install required:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl label namespace ci \
+  pod-security.kubernetes.io/enforce=restricted \
+  pod-security.kubernetes.io/enforce-version=latest --overwrite
+
+kubectl -n ci apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: Pod
+metadata: { name: plain }
+spec:
+  containers:
+  - name: c
+    image: nginx:1.27
+EOF</code></pre></div>
+        <div class="out"><span class="ol">Output</span>Error from server (Forbidden): error when creating "STDIN": pods "plain" is forbidden:
+violates PodSecurity "restricted:latest": allowPrivilegeEscalation != false
+(container "c" must set securityContext.allowPrivilegeEscalation=false), unrestricted
+capabilities (container "c" must set securityContext.capabilities.drop=["ALL"]),
+runAsNonRoot != true (pod or container "c" must set securityContext.runAsNonRoot=true),
+seccompProfile (pod or container "c" must set securityContext.seccompProfile.type to
+"RuntimeDefault" or "Localhost")</code></div>
+        <p>Notice the shape: one message, every violated rule listed at once, and it names the exact field for each. This isn't RBAC — the ServiceAccount was never checked; the object itself was rejected on its own merits. Fix it and it goes straight through:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl -n ci apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: Pod
+metadata: { name: hardened }
+spec:
+  containers:
+  - name: c
+    image: nginx:1.27
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 101
+      allowPrivilegeEscalation: false
+      capabilities: { drop: ["ALL"] }
+      seccompProfile: { type: RuntimeDefault }
+EOF</code></pre></div>
+        <p>Now layer a second, independent gate and watch the error shape change again. Install Kyverno and add a CEL-based policy requiring the same non-root posture:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl create -f https://github.com/kyverno/kyverno/releases/download/v1.16.2/install.yaml
+kubectl -n kyverno wait --for=condition=Available deploy/kyverno-admission-controller --timeout=120s
+
+kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata: { name: require-nonroot }
+spec:
+  validationActions: [Deny]
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: [v1]
+      operations: [CREATE, UPDATE]
+      resources: [pods]
+  validations:
+  - message: "every container must set runAsNonRoot:true and capabilities.drop:[ALL]"
+    expression: >-
+      object.spec.containers.all(c,
+        c.?securityContext.?runAsNonRoot.orValue(false) == true &&
+        c.?securityContext.?capabilities.?drop.orValue([]).exists(d, d == 'ALL'))
+EOF</code></pre></div>
+        <p>Try the same broken pod from before, in a fresh namespace without PSA, so you're isolating Kyverno's rejection on its own:</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl create namespace ci2
+kubectl -n ci2 apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: Pod
+metadata: { name: plain }
+spec:
+  containers:
+  - name: c
+    image: nginx:1.27
+EOF</code></pre></div>
+        <p>A different error, from a different subsystem, saying roughly the same thing. Before reading on: how would you tell, from the error text alone and with no other context, whether RBAC, Pod Security Admission, or a policy engine's webhook is the one that stopped you?</p>
+        <details class="recall"><summary>Reveal how to read each shape</summary>
+          <div class="body">
+            <div class="out"><span class="ol">Output</span>Error from server: error when creating "STDIN": admission webhook
+"validate-policy.kyverno.svc-fail" denied the request:
+ValidatingPolicy require-nonroot: every container must set runAsNonRoot:true
+and capabilities.drop:[ALL]</code></div>
+            <p>Three gates, three unmistakable fingerprints. An RBAC rejection is an HTTP <code>403 Forbidden</code> naming a verb, a resource, and a username — it never mentions the object's contents, because RBAC never looked at them. A Pod Security Admission rejection says <code>violates PodSecurity "&lt;level&gt;:&lt;version&gt;"</code> and lists every failing rule by field name in one shot — it's a built-in plugin, not a webhook, so there's no webhook name in the message. A policy-engine rejection says <code>admission webhook "&lt;name&gt;" denied the request</code> followed by that specific policy's own message — the webhook name tells you which engine (Kyverno, Gatekeeper) and the message tells you which policy. Given any denial, read the shape first: <code>403</code> means fix the binding; <code>violates PodSecurity</code> means fix the pod's <code>securityContext</code> or reconsider the namespace's level; <code>admission webhook "…" denied</code> means go find that named policy and read its rule. Clean up: <code>kubectl delete namespace ci2</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — roll out Restricted cluster-wide without an outage</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>The platform team wants Pod Security Admission's Restricted profile and the Kyverno non-root policy enforced in every namespace. Several existing namespaces almost certainly run something that violates one of these rules right now. Flip <code>enforce</code> everywhere at once and you will break running workloads at a time you didn't choose. Design the safe rollout — no commands yet, reason it through first.</p>
+        <details class="recall"><summary>Reveal the rollout strategy</summary>
+          <div class="body">
+            <p><b>Never flip straight to enforce.</b> Both mechanisms support observing without blocking, and they catch different things — know which:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># PSA: audit + warn only. Warn shows up client-side on kubectl apply; audit</span>
+<span class="c"># goes into the API server's audit log. Neither blocks anything, and neither</span>
+<span class="c"># retroactively re-checks Pods that are already running.</span>
+kubectl label namespace prod \
+  pod-security.kubernetes.io/warn=restricted \
+  pod-security.kubernetes.io/warn-version=latest \
+  pod-security.kubernetes.io/audit=restricted \
+  pod-security.kubernetes.io/audit-version=latest --overwrite</code></pre></div>
+            <p>That surfaces violations only on the <em>next</em> create or update in that namespace — a pod that's been running fine for six months stays invisible to it. To find existing violators, use Kyverno's own mechanism instead: set the policy's <code>validationActions</code> to <code>Audit</code> rather than <code>Deny</code>, and rely on its <b>background scan</b>, which periodically re-evaluates resources that already exist — not just new admission requests — and records results as <code>PolicyReport</code> objects:</p>
+            <div class="codewrap"><span class="lang">bash</span><pre><code>kubectl get policyreport -A
+kubectl get policyreport -A -o json \
+  | jq -r '.items[].results[] | select(.result=="fail") | .resources[0].name'</code></pre></div>
+            <p>That list is your real blast radius: every currently-running pod that would be rejected the moment you switch to <code>Deny</code>/<code>enforce</code>. Fix the ones you can (add the missing <code>securityContext</code>), and for anything that genuinely can't run non-root yet, use a targeted <code>PolicyException</code> (or keep that one namespace at <code>baseline</code> instead of <code>restricted</code>) rather than holding the whole rollout hostage to one legacy workload. Only then flip <code>warn</code>/<code>audit</code> to <code>enforce</code> and <code>Audit</code> to <code>Deny</code>, namespace by namespace, watching the admission-rejection rate as you go — a spike means you missed a violator, and you can roll that one namespace back without touching the others. Once workloads are actually hardened, the next tightening step is a Kyverno <code>ImageValidatingPolicy</code> that requires a valid cosign signature before a pod's image is even accepted — pushing the check as far left as build time, which is exactly where the CI/CD pipeline in <a href="ch73-ci-cd-and-progressive-delivery.html">Chapter 73</a> is positioned to produce that signature in the first place.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · an over-broad RBAC grant</div>
+      <p><b>Symptom:</b> no outage at all — the danger is silent until something else goes wrong (a leaked token, a compromised app) and the blast radius turns out to be the whole cluster. <b>First cut:</b> audit every <code>ClusterRoleBinding</code> to <code>cluster-admin</code> or any wildcard-verb role, and every <code>RoleBinding</code> that references it. <b>Usual cause:</b> a grant made to "temporarily" unblock a pipeline or a debugging session that was never walked back, or the default ServiceAccount being used for a real workload instead of a scoped one. The fix is always the same shape: delete the broad binding, grant only the verbs actually called, and re-verify with <code>kubectl auth can-i --list</code>.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · a deploy blocked by policy</div>
+      <p><b>Symptom:</b> deploys that worked yesterday fail today, scoped to one or a few namespaces, with an admission-time error rather than a scheduling or runtime failure. <b>First cut:</b> read the rejection's shape — <code>violates PodSecurity</code> means Pod Security Admission, <code>admission webhook "&lt;name&gt;" denied</code> means a policy engine, and either way the message usually names the exact field or rule. <b>Usual cause:</b> a namespace label or a policy was changed without an audit period first, so previously-fine pod specs (or ones nobody had touched in months) suddenly fail the new bar. The fix is not to disable the policy — it's to fix the pod spec the message is pointing at, or grant a scoped, temporary exception if the workload genuinely can't comply yet.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · a workload breaks after a token rotation</div>
+      <p><b>Symptom:</b> an application that authenticated to the API server fine for weeks suddenly starts getting <code>401 Unauthorized</code>, with no RBAC or deploy change in sight. <b>First cut:</b> did the app read the ServiceAccount token once at startup and cache it, instead of re-reading the mounted file? <b>Usual cause:</b> bound, projected tokens are time-limited and the kubelet rotates the file on disk before expiry — client libraries that don't re-read the token path (most official Kubernetes client libraries do this correctly; hand-rolled HTTP clients often don't) keep presenting a token that's since expired. The fix is to use a maintained client library or explicitly re-read the token file on a schedule shorter than its lifetime, never to fall back to a long-lived legacy token to make the problem go away.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Least privilege is a discipline, not a setting.</b> Start every new Role empty and add exactly the verbs a real, observed failure demands — never start from <code>edit</code> or <code>cluster-admin</code> "to be safe," because that phrase is how every over-broad grant in Lab 3 gets written. Use aggregated ClusterRoles for genuinely common bundles (read-only dashboards, CI pipelines) so you're not hand-writing the same rules per team, but keep the bundle itself minimal and reviewed. And remember there's no RBAC deny: if a broad grant exists anywhere for an identity, a narrower one elsewhere does not claw it back — fix over-granting at its source, not by trying to out-scope it.</p>
+    <p><b>Admission policy rollout is an availability decision, not just a security one.</b> A webhook-backed policy engine (Kyverno, Gatekeeper) that fails closed on an outage can block every matching write cluster-wide — the same failure mode Chapter 32 describes for any admission webhook — so exclude the policy engine's own namespace from its rules, run it highly available, and give it a sane timeout. Stage every new deny rule through audit/warn first; Pod Security Admission's <code>warn</code>/<code>audit</code> only fire on new or updated objects, so pair it with a policy engine's background scan if you need to know what's already running out of compliance.</p>
+    <p><b><code>securityContext</code> matters even when RBAC and admission both already said yes.</b> It doesn't protect the API server — it bounds what a compromised <em>application</em> (a dependency vulnerability, an injected command) can do once code is already running inside the container. Dropping all capabilities and setting a seccomp profile doesn't stop a bad deploy; it stops a bad deploy from becoming a host compromise. <b>Common mistakes:</b> treating any single layer — RBAC, PSA, a policy engine — as "the" security boundary instead of one of three; binding <code>cluster-admin</code> to unblock automation and never revisiting it; using the namespace's default ServiceAccount for a workload that needs real permissions; and flipping a new policy straight to enforce without ever checking what's already running against it.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>Multi-tenancy in a shared cluster rests entirely on this chapter. The pod network trusts everything inside it by default (<a href="ch41-the-kubernetes-network-model-and-cni.html">Chapter 41</a>), so RBAC and admission policy are the identity and content boundaries that namespace isolation actually depends on — without them, "separate namespaces" is an organizational convention, not a security boundary. This is also where platform teams build "golden paths": a namespace template that pre-labels the Pod Security Standard, a Role template scoped to exactly what a typical service needs, and a CI pipeline (<a href="ch73-ci-cd-and-progressive-delivery.html">Chapter 73</a>) that signs what it builds — so an application team gets a compliant, least-privilege setup by default instead of hand-rolling one, which is where most of the over-broad grants in this chapter actually come from. For human access to the cluster and its infrastructure, rather than workload-to-API access, the same three-layer thinking reappears as identity-based access in <a href="ch72-teleport-and-identity-based-access.html">Chapter 72</a>.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first, then open it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's the difference between authentication, authorization, and admission in Kubernetes?</summary>
+        <div class="a"><p>Authentication figures out who's making the request — a certificate, a bearer token, or an OIDC identity resolved to a username and groups. Authorization, via RBAC, decides whether that identity is allowed to perform this verb on this resource — a check purely about who's asking. Admission is a separate stage that inspects the object itself, regardless of who submitted it — Pod Security Admission checking a pod's securityContext against a namespace standard, or a policy engine like Kyverno enforcing its own rules — and can reject an object that a perfectly authorized identity submitted. RBAC answers "who," admission answers "what," and passing one says nothing about the other.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through what happens from a ServiceAccount's <code>kubectl apply</code> to a running, hardened pod.</summary>
+        <div class="a"><p>The ServiceAccount presents its bound, projected token as a bearer credential; authentication resolves it to <code>system:serviceaccount:&lt;ns&gt;:&lt;name&gt;</code>. Authorization unions every Role and ClusterRole bound to that identity via RoleBindings or ClusterRoleBindings and checks whether any rule covers the requested verb and resource — RBAC has no deny rules, so this is purely "does any binding say yes." If authorized, mutating admission runs first — built-in defaulting plus any mutating webhook or Kyverno MutatingPolicy, which can inject defaults or sidecars. Then validating admission runs: Pod Security Admission checks the pod's securityContext against the namespace's Pod Security Standard, and any Gatekeeper constraint or Kyverno ValidatingPolicy runs its own checks — any one can reject with its own message. If everything passes, the object is persisted to etcd, a controller reconciles it into a Pod, and the kubelet creates the container with the pod's effective securityContext, which the runtime enforces via dropped capabilities, a loaded seccomp filter, and the requested non-root UID — the same mechanism as Chapter 27, just declaratively requested instead of hand-configured.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Why is there no "deny" rule in Kubernetes RBAC, and how do you actually restrict access given that?</summary>
+        <div class="a"><p>Core Kubernetes RBAC was designed as a purely additive allow model: the API server unions every rule from every Role and ClusterRole bound to an identity, and if any rule covers the requested verb and resource, the request is allowed. There's deliberately no rule type that overrides or narrows another rule's grant, because that would make the effective permission set depend on evaluation order and binding precedence — a much harder thing to reason about safely than "the union of everything granted, full stop." The practical consequence is that you cannot claw back a broad grant with a narrower one placed elsewhere; you have to fix over-granting at its source, by removing or narrowing the binding that grants too much. If you need something that behaves like a deny — "allowed to do X except in namespace Y," or "allowed unless this specific condition holds" — that has to happen at the admission layer instead, with a policy engine or a webhook that inspects the request and rejects it on its own terms, because that layer is a real second, independent veto rather than another RBAC rule competing with the first.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A policy change starts blocking deploys across several teams. How do you find the cause without just disabling the policy?</summary>
+        <div class="a"><p>First I read the actual rejection text, because its shape tells me which gate fired before I look at anything else: a 403 naming a verb and resource is RBAC; "violates PodSecurity" listing specific fields is Pod Security Admission; "admission webhook '&lt;name&gt;' denied the request" followed by a policy-specific message is a policy engine, and the webhook name tells me which one. Once I know the gate, I check what changed recently — a namespace label flipped to a stricter Pod Security Standard, or a new ValidatingPolicy or Gatekeeper constraint applied — against the timeline of when deploys started failing. Then I check breadth: is it every namespace or a subset, every pod or ones with a specific shape (missing securityContext fields, a disallowed image registry)? That tells me whether to fix the workloads that are genuinely out of compliance or roll the policy back to audit mode while I do it properly. I don't disable the policy outright unless it's actively causing a production outage, because the goal is to fix the gap the policy correctly found, not to remove the guardrail that found it.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>If RBAC and admission policy have already approved a pod, why isn't <code>securityContext</code> redundant?</summary>
+        <div class="a"><p>Because RBAC and admission police the Kubernetes API — who may submit what kind of object — and neither one polices what happens inside the container once it's running application code. A pod can pass every RBAC check and every admission policy and still run an application with a dependency vulnerability or an injected shell command; at that point, the only thing standing between that exploited process and the host is what the container is actually allowed to do — its capability set, whether a seccomp filter blocks dangerous syscalls, and whether it's even running as a privileged UID. securityContext is the layer that bounds the damage after everything upstream already said yes, which is exactly why admission policy exists to require it in the first place: PSA and Kyverno don't replace securityContext, they make sure workloads actually set it.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>Kubernetes security is three independent gates, not one. Authentication resolves an identity — a User or a ServiceAccount presenting a bearer token, ideally the modern audience-scoped, time-limited, projected kind rather than a legacy long-lived Secret. Authorization (RBAC) unions every Role/ClusterRole bound to that identity via RoleBindings/ClusterRoleBindings and allows the request if any rule covers it — there is no deny rule, only additive allow, so over-granting anywhere can never be clawed back by a narrower grant elsewhere. Admission control is a second, independent check on the object itself: Pod Security Admission enforces the Pod Security Standards (privileged/baseline/restricted) per namespace in enforce/audit/warn modes; Kyverno (now CEL-based ValidatingPolicy/MutatingPolicy/ImageValidatingPolicy — its old ClusterPolicy kind is deprecated) and Gatekeeper enforce their own rulebooks via admission webhooks. Each gate rejects with a distinctly-shaped error: 403 for RBAC, "violates PodSecurity" for PSA, "admission webhook denied" for a policy engine. securityContext (runAsNonRoot, dropped capabilities, seccompProfile) is the layer that bounds damage even after the first two approve, enforced by the runtime exactly as Chapter 27 described. Supply-chain scanning and signing push the check earlier still, before the image is ever offered to the cluster.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>RBAC answers "who may ask"; admission policy answers "what may exist"; securityContext bounds "what damage if both said yes."</li>
+      <li>RBAC has no explicit deny — only additive allow. Any bound rule that matches allows the request, no matter what else is bound.</li>
+      <li>A namespaced Role's grant never leaks into another namespace; a ClusterRole's grant is cluster-wide only if bound with a ClusterRoleBinding.</li>
+      <li>Modern ServiceAccount tokens are bound, audience-scoped, and time-limited (projected via TokenRequest); legacy Secret-backed tokens never expire.</li>
+      <li>Pod Security Admission enforces privileged/baseline/restricted per namespace, independently in enforce/audit/warn — warn and audit don't retroactively flag already-running pods.</li>
+      <li>Kyverno's current policy types are CEL-based (ValidatingPolicy, MutatingPolicy, ImageValidatingPolicy); its legacy ClusterPolicy kind is deprecated.</li>
+      <li>Read the rejection's shape to know the gate: 403 = RBAC; "violates PodSecurity ..." = PSA; "admission webhook '&lt;name&gt;' denied" = a policy engine.</li>
+      <li><code>kubectl auth can-i --list --as=&lt;identity&gt;</code> is the fastest way to see an identity's entire actual grant, unioned across every binding.</li>
+      <li>A webhook-backed policy engine that fails closed can block every matching write cluster-wide if it goes down — exclude its own namespace and run it HA.</li>
+      <li>Stage every new deny policy through audit/warn (and a background scan for what's already running) before flipping to enforce.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch27-container-security-and-process-to-container-to.html"><b>Ch 27</b> Capabilities &amp; seccomp mechanism</a>
+      <a href="ch32-api-machinery-apply-path-admission-crds-and.html"><b>Ch 32</b> The admission pipeline</a>
+      <a href="ch38-storage-volumes-pv-pvc-storageclass-csi.html"><b>Ch 38</b> fsGroup &amp; hostPath policy</a>
+      <a href="ch40-kubernetes-troubleshooting-methodology.html"><b>Ch 40</b> Troubleshooting methodology</a>
+      <a href="ch72-teleport-and-identity-based-access.html"><b>Ch 72</b> Identity-based access</a>
+      <a href="ch73-ci-cd-and-progressive-delivery.html"><b>Ch 73</b> CI/CD &amp; supply chain</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/reference/access-authn-authz/rbac/">Using RBAC Authorization</a>: Role, ClusterRole, bindings, and the aggregated-role mechanism, from the source.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/concepts/security/pod-security-admission/">Pod Security Admission</a> and <a href="https://kubernetes.io/docs/concepts/security/pod-security-standards/">Pod Security Standards</a>: the three levels and exactly what each one checks.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/">Configure Service Accounts</a>: bound, projected tokens versus the legacy long-lived Secret-backed token.</li>
+      <li>Kubernetes documentation — <a href="https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/">Dynamic Admission Control</a>: how mutating and validating webhooks — the mechanism Gatekeeper and Kyverno both run on — plug into the pipeline.</li>
+      <li>Kyverno documentation — <a href="https://kyverno.io/docs/policy-types/overview/">Policy Types Overview</a>: the current CEL-based policy types and the ClusterPolicy deprecation schedule.</li>
+      <li>Open Policy Agent — <a href="https://www.openpolicyagent.org/docs/latest/kubernetes-introduction/">OPA on Kubernetes</a>: how Gatekeeper runs OPA as a validating (and mutating) admission webhook.</li>
+      <li>Sigstore — <a href="https://docs.sigstore.dev/">Sigstore documentation</a>: <code>cosign</code> image signing and verification, the supply-chain half of this chapter.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch38-storage-volumes-pv-pvc-storageclass-csi.html"><span class="dir">← Prev</span><div class="ti">Ch 38 — Storage: volumes, PV, PVC, StorageClass, CSI</div></a>
+      <a class="nx" href="ch40-kubernetes-troubleshooting-methodology.html"><span class="dir">Next →</span><div class="ti">Ch 40 — Kubernetes troubleshooting methodology</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 39 of 121 · Part IV · Kubernetes — Architecture &amp; Internals. Read the shape of the rejection before you read anything else — it tells you which of the three gates just spoke.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Three gates</a>
+    <a href="#internals">Token to hardened container</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">Following a deploy</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

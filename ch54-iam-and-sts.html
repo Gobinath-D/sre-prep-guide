@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 54 — IAM and STS</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part VI · AWS &amp; EKS &nbsp;·&nbsp; Chapter 54</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part VI · AWS &amp; EKS for SREs · Chapter 54</div>
+      <h1>IAM and STS</h1>
+      <p class="tagline">Every AWS API call, no matter who makes it or from where, passes through exactly one gate before anything happens: prove who you are, then let a policy decide yes or no. "Access denied" is IAM's most common sentence, and almost nobody can explain why it said that instead of just trying random permissions until it stops.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~40 min read · AWS CLI / LocalStack</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Tell principals, identity-based policies, and resource-based policies apart, and state the exact rule AWS uses to turn several of them into one allow/deny answer.</li>
+          <li>Explain what an IAM role actually is — not "a user without a password" — and how <code>sts:AssumeRole</code> turns a trust policy into temporary credentials.</li>
+          <li>Walk the credential-provider chain in order and say which source wins when more than one is configured at once.</li>
+          <li>Perform the IMDSv2 token dance by hand with <code>curl</code>, and explain why AWS moved the whole platform off IMDSv1.</li>
+          <li>Debug an <code>AccessDenied</code> by reading the evaluation logic instead of guessing which permission is missing.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem IAM solves</h2>
+    <p>Every AWS account is born with one identity that can do absolutely anything to it: the root user. That's a problem the moment more than one person or one program needs to touch the account, which is to say, immediately. You can't hand out the root password to every engineer and every deployment pipeline — one leaked credential and the entire account is gone. You need a way to create many distinct identities, hand each one exactly the abilities it needs, and take those abilities away without touching anyone else's.</p>
+    <p>It gets harder than "create some users." An EC2 instance needs to read from S3 without a human ever typing a password into it. A CI pipeline needs to deploy infrastructure, then stop having that power the moment the job ends. A partner company's AWS account needs to write into one specific bucket of yours and nothing else. A Kubernetes pod needs to call AWS APIs with no credential file anywhere on disk for someone to steal. None of these are "a person logging in" — and <b>AWS Identity and Access Management</b> is the single system that answers all of them the same way: define who's asking (a <b>principal</b>), define what they're allowed to do (a <b>policy</b>), and make every single AWS API evaluate that pair before doing anything at all.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>IAM's decision procedure is the same for every API call on every AWS service, no exceptions: <b>deny by default; an explicit deny anywhere always wins; otherwise you need an explicit allow from somewhere that applies.</b> Nobody starts with any permissions. You never subtract access by writing less — you either grant it with an allow, or you actively block it with a deny that beats every allow in existence. That one sentence resolves most "why did this get denied" confusion before you even open a policy document.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a corporate badge office</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>Picture a company's <b>badge office</b> — that's IAM. Every employee gets a <b>permanent badge</b> — an <b>IAM user</b>, with credentials that don't expire on their own. But the office also runs a <b>temporary-badge desk</b> for contractors, visiting auditors, and anyone who shouldn't be carrying a permanent credential around: show valid ID, and if the desk's rulebook says you're allowed one, you walk away with a badge that expires at the end of the day. That temporary badge is an <b>IAM role</b>, and the desk's rulebook is the role's <b>trust policy</b> — it defines exactly who is allowed to ask for that badge, nothing about what the badge opens.</p>
+      <p>What the badge actually opens is a separate list, and it can live in two places. Sometimes the list is <b>clipped to the badge itself</b> — "this badge opens the server room and the mail room" — that's an <b>identity-based policy</b>. Sometimes the list is <b>taped to the door</b> instead — "this door opens for badge #4471, or for anyone from Acme Corp's badge office" — that's a <b>resource-based policy</b>. A door with a list taped to it can let in a badge from a completely different company's badge office; that's how cross-account access works. And somewhere in the security office there's a standing rule that says "no badge issued to this one employee, ever, under any circumstance, opens the vault" — a ceiling that no clipped-on list can override. That's a <b>permission boundary</b>.</p>
+      <p>Getting a temporary badge is exactly <code>sts:AssumeRole</code>: you walk up with your permanent badge (or another temporary one), the desk checks its rulebook, and if it trusts you, it hands back a badge with an expiry stamped on it — never the master keys, always a rented, time-limited credential.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In IAM</th></tr>
+      <tr><td>The badge office</td><td>AWS Identity and Access Management (IAM)</td></tr>
+      <tr><td>A permanent employee badge</td><td>An IAM user (long-lived credentials)</td></tr>
+      <tr><td>A temporary contractor badge, issued for a shift</td><td>An IAM role, used via temporary credentials</td></tr>
+      <tr><td>The list clipped to the badge</td><td>Identity-based policy (attached to the user/role)</td></tr>
+      <tr><td>The list taped to the door</td><td>Resource-based policy (attached to the resource, e.g. an S3 bucket policy)</td></tr>
+      <tr><td>The temp-badge desk's rulebook for who may ask</td><td>The role's trust policy</td></tr>
+      <tr><td>Walking up and getting a temp badge</td><td><code>sts:AssumeRole</code> (or the web-identity/SAML variants)</td></tr>
+      <tr><td>A standing rule capping what any badge issued to you can open</td><td>A permission boundary</td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>Principals, policies, and the assume-role flow</h2>
+    <p>A <b>principal</b> is anything IAM can identify as the caller of an API: the root user, an IAM user, an IAM role (almost always accessed as a temporary session rather than directly), or an AWS service acting on your behalf. A <b>policy</b> is a JSON document of allow/deny statements. Identity-based policies attach to a principal; resource-based policies attach to a resource like an S3 bucket or an SQS queue. Most of your day-to-day work is identity-based policies on roles — but the moment you're crossing an account boundary, the resource usually needs its own policy agreeing to let that principal in, because a principal's own policy can only grant permission over resources it's allowed to touch, and a resource owner has the final say over its own front door.</p>
+    <p>Roles are where this gets interesting, because a role has <em>two</em> separate policies doing two separate jobs, and conflating them is the single most common IAM misunderstanding. The <b>trust policy</b> (formally, the role's <code>AssumeRolePolicyDocument</code>) decides who is allowed to assume the role at all. The role's <b>permission policy</b> — an ordinary identity-based policy — decides what the resulting temporary credentials can actually do once someone's inside. Passing the trust policy gets you a badge; the permission policy decides what the badge opens. They're checked at completely different moments by completely different services: STS checks the trust policy when you call <code>AssumeRole</code>; the target service (S3, EC2, whatever you call next) checks the permission policy on every subsequent request.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 840 400" role="img" aria-label="A caller assumes a role by calling sts:AssumeRole, STS checks the role's trust policy and mints temporary credentials, and the caller then uses those credentials against a target AWS service, which checks the assumed role's own permission policy">
+        <defs>
+          <marker id="i1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+          <marker id="i2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+        </defs>
+        <rect x="14" y="150" width="140" height="76" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="84" y="176" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">CALLER</text>
+        <text x="84" y="194" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">IAM user "alice"</text>
+        <text x="84" y="210" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">has permission to AssumeRole</text>
+
+        <line x1="154" y1="180" x2="196" y2="140" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#i1)"/>
+        <text x="176" y="122" text-anchor="middle" style="fill:var(--accent2);font:600 9.5px sans-serif">sts:AssumeRole(RoleArn,</text>
+        <text x="176" y="134" text-anchor="middle" style="fill:var(--accent2);font:600 9.5px sans-serif">RoleSessionName)</text>
+
+        <rect x="200" y="20" width="230" height="230" rx="10" style="fill:var(--chip);stroke:var(--line)"/>
+        <text x="216" y="42" style="fill:var(--accent);font:700 11.5px sans-serif;letter-spacing:.04em">AWS STS</text>
+        <rect x="216" y="52" width="198" height="88" rx="7" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.4"/>
+        <text x="315" y="72" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">Checks the role's TRUST POLICY</text>
+        <text x="315" y="88" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">Is "alice" a listed Principal?</text>
+        <text x="315" y="102" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">(different document, different check)</text>
+        <line x1="315" y1="140" x2="315" y2="160" style="stroke:var(--line);stroke-width:1.5"/>
+        <rect x="216" y="164" width="198" height="72" rx="7" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.4"/>
+        <text x="315" y="184" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">Mints temporary credentials</text>
+        <text x="315" y="200" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">AccessKeyId · SecretAccessKey</text>
+        <text x="315" y="214" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">SessionToken · expires ≤ 12h</text>
+        <line x1="216" y1="200" x2="154" y2="226" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#i1)"/>
+        <text x="185" y="252" text-anchor="middle" style="fill:var(--accent2);font:600 9px sans-serif">returned to the caller</text>
+
+        <text x="315" y="272" text-anchor="middle" style="fill:var(--muted);font:10px sans-serif">new identity:</text>
+        <text x="315" y="288" text-anchor="middle" style="fill:var(--ink);font:600 9.5px sans-serif">arn:aws:sts::111122223333:assumed-role/</text>
+        <text x="315" y="302" text-anchor="middle" style="fill:var(--ink);font:600 9.5px sans-serif">ReportsRole/alice-session</text>
+
+        <line x1="84" y1="226" x2="84" y2="290" style="stroke:var(--line);stroke-width:1.5"/>
+        <line x1="84" y1="290" x2="470" y2="290" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#i1)"/>
+        <text x="280" y="280" text-anchor="middle" style="fill:var(--accent2);font:600 9.5px sans-serif">caller now signs API requests with the temp creds</text>
+
+        <rect x="474" y="40" width="220" height="80" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="584" y="64" text-anchor="middle" style="fill:var(--ink);font:600 12px sans-serif">Target AWS service</text>
+        <text x="584" y="82" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">e.g. S3 GetObject</text>
+        <text x="584" y="98" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">on s3://reports/q3.csv</text>
+        <line x1="584" y1="120" x2="584" y2="160" style="stroke:var(--accent);stroke-width:2" marker-end="url(#i2)"/>
+
+        <rect x="474" y="164" width="220" height="120" rx="8" style="fill:var(--panel);stroke:var(--deep);stroke-width:1.4"/>
+        <text x="584" y="186" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">Checks the ASSUMED ROLE'S</text>
+        <text x="584" y="202" text-anchor="middle" style="fill:var(--ink);font:600 11px sans-serif">PERMISSION POLICY</text>
+        <text x="584" y="220" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">— not alice's own identity policy</text>
+        <text x="584" y="238" text-anchor="middle" style="fill:var(--muted);font:9.5px sans-serif">Allow s3:GetObject on reports/*?</text>
+        <text x="584" y="258" text-anchor="middle" style="fill:var(--accent2);font:600 9.5px sans-serif">yes → object returned</text>
+        <text x="584" y="274" text-anchor="middle" style="fill:var(--deep);font:600 9.5px sans-serif">no → AccessDenied</text>
+      </svg>
+      <figcaption>Two policies, two moments: the trust policy gates who may become this role, checked once by STS at assume-time. The permission policy gates what the resulting session may do, checked fresh by every AWS service on every subsequent call.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>This exact flow — a caller presenting some proof of identity, a trust decision, temporary credentials handed back — is precisely what <a href="ch55-irsa-and-eks-pod-identity.html">Chapter 55</a> automates for Kubernetes pods, just with a Kubernetes-issued token standing in for the IAM user's own credentials as the "proof of identity" at the door. If this diagram makes sense, IRSA will look like a special case instead of new magic.</p>
+    </div>
+
+    <h2 id="internals"><span class="beat">Internal working</span>How one request actually gets decided, and how a role becomes credentials</h2>
+    <p>Two separate mechanisms are worth tracing in full: how AWS turns a pile of applicable policies into a single yes/no, and what actually happens during <code>AssumeRole</code>.</p>
+    <ol class="steps">
+      <li><b>Gather every policy that applies.</b> For a given call, that can include the caller's identity-based policies (managed and inline), a permission boundary if one is set, the resource's own policy if it has one, and organization-level service control policies if the account is in an AWS Organization. Not every call has all of these — most don't have a resource policy or an SCP at all.</li>
+      <li><b>Look for an explicit deny anywhere in that set.</b> If even one applicable statement says <code>"Effect": "Deny"</code> and matches the action/resource/condition, the request is denied immediately. Nothing else matters once this fires — no allow anywhere can override it.</li>
+      <li><b>If no explicit deny fired, look for an explicit allow.</b> The identity-based policy needs to allow the action. If a permission boundary is set, it must <em>also</em> allow it — the boundary and the identity policy are intersected, not added together, so the boundary can only shrink what the identity policy grants, never expand it. If the resource has its own policy, that resource policy generally needs to agree too, especially across accounts.</li>
+      <li><b>No matching allow anywhere means implicit deny.</b> This is the default state of everything in AWS: not denied on purpose, just never granted. It looks identical to an explicit deny from the caller's point of view — both produce <code>AccessDenied</code> — but they mean different things when you're debugging, which matters for one of this chapter's labs.</li>
+    </ol>
+    <p>Now the mechanics of turning a trust relationship into a usable credential:</p>
+    <ol class="steps">
+      <li><b>The caller calls <code>sts:AssumeRole</code></b> with the target role's ARN and a session name of their choosing. The caller needs their <em>own</em> identity-based policy to allow calling <code>sts:AssumeRole</code> on that specific role ARN — assuming a role is itself a permission that has to be granted.</li>
+      <li><b>STS evaluates the role's trust policy</b> — a resource-based policy attached to the role itself, listing which principals it trusts, sometimes narrowed with conditions (an external ID, a source ARN, an MFA requirement). This is a completely separate check from step 1; both have to pass.</li>
+      <li><b>STS mints temporary credentials</b>: an access key ID, a secret access key, and a session token, valid for a duration you can request between 15 minutes and the role's configured maximum (up to 12 hours), defaulting to one hour if you don't ask for a specific value.</li>
+      <li><b>The caller's effective identity is now the assumed role session</b>, with an ARN shaped like <code>arn:aws:sts::111122223333:assumed-role/ReportsRole/alice-session</code> — a new identity, distinct from both "alice" and the bare role, that shows up by that exact name in CloudTrail logs.</li>
+      <li><b>Every subsequent API call signed with those temporary credentials</b> is authorized against the <em>role's</em> permission policy, never against the original caller's. Alice's own policies are irrelevant from this point on — she borrowed the role's permissions, not the other way around.</li>
+    </ol>
+
+    <details class="recall"><summary>Think first: Alice's IAM user policy allows <code>s3:GetObject</code> on every bucket in the account. She assumes a role whose permission policy only allows <code>ec2:DescribeInstances</code>. Can she read S3 objects using that assumed-role session?</summary>
+      <div class="body">
+        <p>No. The moment she's operating as the assumed-role session, her own identity's policies stop applying entirely — the session's permissions come <em>only</em> from the role's own permission policy (intersected with any permission boundary or session policy she supplied). This is exactly the point of roles: you don't get to keep your existing permissions plus the role's; you temporarily trade your identity's permissions for the role's, for the life of that session. It's also why "least privilege roles for specific jobs" works as a pattern at all — the role's narrow permission policy is a hard ceiling, not a suggestion, regardless of how permissive the assuming principal's own policies happen to be.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>The pieces, and what each one owns</h2>
+    <ul>
+      <li><b>Principal.</b> Owns the "who." Root user, IAM user, IAM role, an AWS service principal (like <code>ec2.amazonaws.com</code>), or a federated/web-identity principal authenticated by an external IdP.</li>
+      <li><b>Identity-based policy.</b> Owns permissions attached directly to a user or role — managed (standalone, reusable, versioned) or inline (embedded in one specific identity, deleted with it).</li>
+      <li><b>Resource-based policy.</b> Owns permissions attached to the resource itself — an S3 bucket policy, an SNS topic policy — and is the only way to grant access to a principal in a different AWS account without that other account creating a role for you to assume.</li>
+      <li><b>Role + trust policy.</b> The role owns a permission policy like any identity; the trust policy owns a completely separate question — who may call <code>AssumeRole</code> on it at all.</li>
+      <li><b>Permission boundary.</b> Owns a ceiling, not a grant. Set on a user or role, it caps the maximum that identity's own policies can ever reach — the effective permission is the intersection, and a boundary with nothing else attached grants nothing by itself.</li>
+      <li><b>Instance profile.</b> Owns the container that lets an EC2 instance carry exactly one IAM role. The console creates one automatically with the same name as the role; the CLI and API treat the role and the instance profile as two separate objects you wire together yourself.</li>
+      <li><b>Instance Metadata Service (IMDS).</b> Owns the on-instance HTTP endpoint (<code>169.254.169.254</code>) that hands the instance's attached role's temporary credentials to anything running on that instance — no credential file, no secret ever written to disk by you.</li>
+    </ul>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one call from an EC2 instance to S3</h2>
+    <p>An application on an EC2 instance calls <code>s3:GetObject</code> using the AWS SDK, with no access key configured anywhere in its environment or code. The SDK walks its default credential-provider chain, finds nothing in environment variables or a local config file, and falls through to asking the Instance Metadata Service. IMDS, using the IMDSv2 token flow, hands back the temporary credentials for whatever IAM role is attached to the instance via its instance profile — the SDK caches these and refreshes them automatically before they expire. The SDK signs the S3 request with those temporary credentials. S3 evaluates the assumed role's permission policy (does it allow <code>s3:GetObject</code> on this object?) and, since the request crosses into a specific bucket, the bucket's own policy if one exists. Both checks pass, S3 streams the object back, and at no point did a human or a deployment script ever type or store a static credential.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>IAM and STS cost nothing to use directly — you only pay for whatever the resulting credentials go on to touch. Every lab notes a <b>no-cost local alternative</b>: <a href="https://www.localstack.aws/">LocalStack</a> emulates the core IAM and STS APIs (create-role, attach-policy, assume-role) in its free Community edition. Set up once:</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>aws sts get-caller-identity
+
+<span class="c"># No-cost local alt: LocalStack Community handles IAM/STS create+assume calls.</span>
+<span class="c"># docker run --rm -d -p 4566:4566 localstack/localstack</span>
+<span class="c"># add --endpoint-url http://localhost:4566 to every aws iam / aws sts command below.</span></code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — a role with a trust policy and a permission policy</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Create a role that trusts your own account's users to assume it, and give it a narrow, specific permission policy — not a managed AWS policy, so you can see exactly what you wrote.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># The trust policy: who may call AssumeRole on this role.</span>
+cat &gt; trust.json &lt;&lt;'EOF'
+{ "Version": "2012-10-17", "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "AWS": "arn:aws:iam::111122223333:root" },
+    "Action": "sts:AssumeRole"
+}]}
+EOF
+aws iam create-role --role-name ReportsRole --assume-role-policy-document file://trust.json
+
+<span class="c"># The permission policy: what the role may actually do once assumed.</span>
+cat &gt; perms.json &lt;&lt;'EOF'
+{ "Version": "2012-10-17", "Statement": [{
+    "Effect": "Allow", "Action": "s3:GetObject",
+    "Resource": "arn:aws:s3:::reports/*"
+}]}
+EOF
+aws iam put-role-policy --role-name ReportsRole --policy-name reports-read \
+  --policy-document file://perms.json</code></pre></div>
+        <div class="out"><span class="ol">Output (from get-role)</span>{ "Role": {
+  "RoleName": "ReportsRole",
+  "Arn": "arn:aws:iam::111122223333:role/ReportsRole",
+  "AssumeRolePolicyDocument": { "Statement": [{ "Effect": "Allow", "Action": "sts:AssumeRole", ... }] }
+}}</code></div>
+        <p>Two documents, two jobs: <code>trust.json</code> decided who may knock on this role's door (here, any principal in the same account with <code>sts:AssumeRole</code> permission themselves); <code>perms.json</code> decided what walking through that door actually gets you. Neither one does the other's job, and you'll feel that gap directly in Lab 3.</p>
+        <p class="small"><b>No-cost local alt:</b> identical calls against LocalStack with <code>--endpoint-url http://localhost:4566</code> — real ARNs, real policy JSON, $0.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — assume the role and inspect the new identity</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p>Actually become the role, and watch <code>get-caller-identity</code> report a completely different ARN shape than your own user.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>aws sts get-caller-identity      <span class="c"># before: you, as yourself</span>
+
+CREDS=$(aws sts assume-role --role-arn arn:aws:iam::111122223333:role/ReportsRole \
+  --role-session-name my-session --duration-seconds 900)
+export AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r .Credentials.AccessKeyId)
+export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r .Credentials.SecretAccessKey)
+export AWS_SESSION_TOKEN=$(echo $CREDS | jq -r .Credentials.SessionToken)
+
+aws sts get-caller-identity      <span class="c"># after: the assumed-role session</span></code></pre></div>
+        <div class="out"><span class="ol">Output</span>{ "Arn": "arn:aws:iam::111122223333:user/alice", ... }             <span class="c"># before</span>
+{ "Arn": "arn:aws:sts::111122223333:assumed-role/ReportsRole/my-session", ... }  <span class="c"># after</span></code></div>
+        <p>Notice the second ARN isn't the role's own ARN (<code>...:role/ReportsRole</code>) — it's a <em>session</em> ARN, unique to this specific assumption, carrying the session name you chose. That's the identity every subsequent call is authorized against, and it's what shows up in CloudTrail when you're reconstructing who did what. Unset the three environment variables when you're done, or every command in this shell keeps using the role.</p>
+        <p class="small"><b>No-cost local alt:</b> the same <code>assume-role</code> call against LocalStack returns the same JSON shape, including a session ARN, with no real AWS credentials ever needed.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — AccessDenied despite a policy that clearly allows it</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>Using the assumed-role session from Lab 2 — whose permission policy plainly allows <code>s3:GetObject</code> on <code>reports/*</code> — try to actually read an object in that bucket.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>aws s3api get-object --bucket reports --key q3.csv /tmp/q3.csv</code></pre></div>
+        <div class="out"><span class="ol">Output</span>An error occurred (AccessDenied) when calling the GetObject operation: Access Denied</code></div>
+        <p>The role's own permission policy says allow. Before opening the answer: what else gets consulted for a call against an S3 <em>bucket</em>, that isn't consulted for, say, an EC2 API call?</p>
+        <details class="recall"><summary>Reveal the cause</summary>
+          <div class="body">
+            <p><b>The bucket has its own resource-based policy, and it disagrees.</b> S3 buckets — unlike most EC2-style resources — can carry a bucket policy that is itself a full IAM policy document, and it's consulted alongside the caller's identity-based policy. If that bucket policy contains an explicit <code>Deny</code> (a common one: denying everything unless the request comes through a specific VPC endpoint, or requiring a specific encryption header), that deny wins over the role's allow, full stop — explicit deny anywhere beats any allow anywhere.</p>
+            <p>Confirm with <code>aws s3api get-bucket-policy --bucket reports</code> and read it line by line for a <code>Deny</code> statement whose condition your request doesn't satisfy. This is the exact gap people fall into: they debug by re-reading the identity-based policy over and over, when the actual blocker lives on the resource's side entirely. Whenever a resource can carry its own policy — S3 buckets, KMS keys, SQS queues, Secrets Manager secrets — checking only the caller's policy is checking half the evidence.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — the credentials that won't stop winning</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>A teammate swears they're using <code>--profile reporting-role</code>, which is configured to assume <code>ReportsRole</code>. Every call still runs as their personal admin user instead. Investigate before revealing.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>aws sts get-caller-identity --profile reporting-role
+<span class="c"># still returns arn:aws:iam::111122223333:user/admin-bob, not the role</span>
+
+<span class="c"># Ask the CLI directly where each setting is actually coming from:</span>
+aws configure list --profile reporting-role</code></pre></div>
+        <div class="out"><span class="ol">Output</span>      Name                    Value             Type    Location
+      ----                    -----             ----    ----------------
+   access_key     ****************ABCD          env    AWS_ACCESS_KEY_ID
+   secret_key     ****************WXYZ          env    AWS_SECRET_ACCESS_KEY
+       region                us-east-1      config-file    ~/.aws/config
+     profile          reporting-role   manual    --profile</code></div>
+        <p>The <code>Type</code> column for the access key says <code>env</code>, not <code>config-file</code>, even though <code>--profile</code> was passed correctly. Before opening the answer: what does that column tell you about precedence?</p>
+        <details class="recall"><summary>Reveal the cause</summary>
+          <div class="body">
+            <p><b>A stale <code>AWS_ACCESS_KEY_ID</code> / <code>AWS_SECRET_ACCESS_KEY</code> pair is sitting in the shell's environment from an old export, and environment variables outrank a named profile's configuration in the AWS CLI's credential-provider precedence</b> — command-line options first, environment variables second, and profile/config-file settings considerably later in the order. <code>--profile</code> was never wrong; it just never got a chance to matter, because the CLI found credentials at a higher-precedence source before it ever looked inside the profile.</p>
+            <p>The fix is <code>unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN</code>, then retry — now the CLI actually reads the named profile and performs the role assumption it was configured to do. The lesson generalizes past this one bug: whenever a credential seems to silently "win" despite your config looking correct, <code>aws configure list</code> is the fastest way to see exactly which source the CLI is actually reading, rather than assuming.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — do the IMDSv2 token dance by hand</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>SSH onto (or start) any EC2 instance with a role attached, and pull that role's temporary credentials the way the SDK does under the hood — by hand, with nothing but <code>curl</code>. Reason through why AWS requires two separate requests before opening the explanation.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Step 1: PUT a request to fetch a session token — this alone is the whole trick.</span>
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+
+<span class="c"># Step 2: use the token as a header on every subsequent GET.</span>
+curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/iam/security-credentials/
+
+<span class="c"># Add the role name from that response to fetch the actual temp credentials:</span>
+curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/iam/security-credentials/ReportsRole</code></pre></div>
+        <div class="out"><span class="ol">Output</span>{ "Code": "Success", "Type": "AWS-HMAC",
+  "AccessKeyId": "ASIA...", "SecretAccessKey": "...", "Token": "...",
+  "Expiration": "2026-09-21T18:00:00Z" }</code></div>
+        <p>Now the design question: why the extra <code>PUT</code>-for-a-token step at all? A plain <code>GET</code> would fetch the same data with one less round trip. Think about what kind of vulnerability that "one less round trip" opens up before opening the answer.</p>
+        <details class="recall"><summary>Reveal the reasoning</summary>
+          <div class="body">
+            <p><b>The PUT step exists specifically to defeat a whole class of SSRF (server-side request forgery) attack.</b> A common SSRF bug lets an attacker trick a vulnerable app into fetching an arbitrary URL and returning the response — usually only a plain <code>GET</code>, because that's what "fetch this URL for me" primitives typically issue. Under IMDSv1, that single forced GET to <code>169.254.169.254/latest/meta-data/iam/security-credentials/&lt;role&gt;</code> was enough to steal the instance's role credentials outright, remotely, through an application bug that had nothing to do with AWS at all. IMDSv2 requires a <code>PUT</code> with a custom header just to get a token, and most SSRF primitives can't forge an arbitrary HTTP method plus a custom header — only a GET with a URL. That single design change closed a large fraction of real-world instance-credential theft.</p>
+            <p>The other IMDSv2-relevant knob worth knowing: the <b>metadata response hop limit</b>, default 1, is the number of network hops the token response is allowed to survive. Containers add a hop between the host network namespace and the container's, so a hop limit of 1 can silently break metadata access inside a container on that instance — a genuinely common "why can't my container reach the role credentials" ticket, fixed by setting the hop limit to at least 2 on the instance's metadata options.</p>
+          </div>
+        </details>
+        <p class="small"><b>No-cost local alt:</b> this one only makes sense against a real running instance's link-local IMDS endpoint — there's no meaningful local emulation of it. Read the flow on the diagram instead: PUT for a token, GET with the token header, note where a plain GET-only SSRF primitive fails to reach the second step at all.</p>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · AccessDenied despite a policy that looks correct</div>
+      <p><b>Symptom:</b> the identity-based policy plainly allows the action, and it's still denied. <b>First cut:</b> does the resource being touched support its own resource-based policy (S3, KMS, SQS, Secrets Manager)? <b>Confirm:</b> read that resource's policy for an explicit <code>Deny</code> the request doesn't satisfy. <b>Usual cause:</b> explicit deny anywhere wins, and it's very often sitting on the resource, not the caller.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · the wrong credentials keep getting used</div>
+      <p><b>Symptom:</b> <code>--profile</code> or a config change is ignored; the CLI or SDK keeps authenticating as something else. <b>First cut:</b> <code>aws configure list</code> to see exactly which source (env / config-file / manual) supplied each credential field. <b>Usual cause:</b> a stale environment variable outranking the profile in the credential-provider chain.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · AssumeRole itself fails, before permissions are even relevant</div>
+      <p><b>Symptom:</b> the call to <code>sts:AssumeRole</code> fails outright with <code>AccessDenied</code>, before the role's permission policy ever enters the picture. <b>First cut:</b> is the caller listed as a trusted <code>Principal</code> in the role's trust policy, and does the caller's own identity policy allow calling <code>sts:AssumeRole</code> on that role ARN? <b>Usual cause:</b> a trust policy scoped to the wrong account or principal, or the caller simply never being granted <code>sts:AssumeRole</code> in their own policy — a completely different failure from a denied permission policy, and worth telling apart quickly.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>Prefer roles to long-lived users everywhere you can.</b> A static access key is a secret that has to be stored, rotated, and can be exfiltrated once and used forever until someone notices. A role's temporary credentials expire on their own, usually within hours, and never need to be typed into a config file by a human at all when the identity comes from an instance profile, IRSA, or federation. Reserve IAM users with long-lived keys for the narrow cases nothing else covers, and rotate what remains aggressively.</p>
+    <p><b>Use permission boundaries to delegate safely, not to grant.</b> A permission boundary caps what an identity's own policies can ever reach — pair it with letting a less-trusted team or automation create roles and policies for themselves, confident that whatever they write can never exceed the boundary. It's a ceiling on delegation, and by itself it grants nothing.</p>
+    <p><b>Remember IAM is eventually consistent.</b> A role or policy change can take a short but real amount of time to propagate globally, and AWS's own guidance is explicit: don't put IAM changes in the critical path of a high-availability workflow, and verify propagation before something downstream depends on it. A newly-created role that gets <code>AccessDenied</code> for its first few seconds of life is usually this, not a real misconfiguration.</p>
+    <p><b>Common mistakes:</b> assuming a permission boundary or an SCP grants access rather than just capping it; forgetting that crossing an account boundary needs the resource's own policy to agree, not just the caller's; wildcarding <code>Resource: "*"</code> out of impatience and never tightening it after the prototype ships; and treating IMDSv1-style unauthenticated metadata access as harmless because "it's internal" — it's exactly the kind of internal-only assumption that SSRF exploits.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>IAM is the trust fabric underneath every AWS system-design answer that involves more than one account, more than one service, or a human anywhere near production. Cross-account access, third-party integrations, CI/CD pipelines that deploy infrastructure, and "the app never sees a static secret" are all this chapter's mechanisms wearing different names. It's worth noticing the parallel with Kubernetes RBAC (<a href="ch39-security-rbac-admission-policy-securitycontext.html">Chapter 39</a>): RBAC decides who can do what against the cluster's own API, IAM decides who can do what against AWS's APIs, and EKS straddles both, which is exactly why <a href="ch57-eks-architecture.html">Chapter 57</a> needed the <code>aws-auth</code> ConfigMap and access entries to connect the two systems at all. And everything here — trust policies, temporary credentials, no static secrets on disk — is the direct setup for <a href="ch55-irsa-and-eks-pod-identity.html">Chapter 55</a>, where a Kubernetes pod gets exactly this treatment without ever running on an instance whose role it would otherwise inherit wholesale.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head before opening it.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's the difference between an IAM role and an IAM user?</summary>
+        <div class="a"><p>A user has long-lived credentials meant for one specific identity; a role has no credentials of its own at all and is instead <em>assumed</em> by some other principal, who receives short-lived temporary credentials in exchange. A role also carries a trust policy — a separate document deciding who's even allowed to assume it — which a user doesn't have, because nobody "assumes" a user. Roles are the right default for applications, cross-account access, and federated humans; users with static keys should be the exception, not the starting point.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through exactly how AWS decides allow or deny for one API call.</summary>
+        <div class="a"><p>AWS gathers every policy that could apply to the call: the caller's identity-based policies, a permission boundary if one is attached, the target resource's own policy if it has one, and any organization-level service control policies. It then looks for an explicit deny anywhere in that set — if one matches, the call is denied immediately and nothing else matters. If there's no explicit deny, it looks for an explicit allow; the identity-based policy has to allow it, a permission boundary (if present) also has to allow it since the boundary and the identity policy are intersected rather than combined additively, and a resource-based policy, when the resource has one, generally needs to agree as well, especially across account boundaries. If nothing anywhere grants an explicit allow, the request is denied by default — not because anything said no, but because nothing ever said yes. The two things I'd stress: deny is the starting state for everything, and an explicit deny always overrides every allow, no matter where either one is written.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Why does IMDSv2 require a PUT request for a token before you can GET credentials?</summary>
+        <div class="a"><p>It's a direct countermeasure to server-side request forgery. Under IMDSv1, fetching an instance's role credentials was a single unauthenticated GET to a fixed, well-known link-local address — which meant any application vulnerability that let an attacker induce the server to fetch an arbitrary URL and return the response (a classic SSRF bug, often nothing to do with AWS at all) was enough to steal that instance's IAM role credentials outright. Most SSRF primitives can only forge a GET with a URL; they can't easily also issue a PUT with a custom header. IMDSv2 requires exactly that — a PUT to a token endpoint with an <code>X-aws-ec2-metadata-token-ttl-seconds</code> header — before any metadata GET will even respond, which closes off a huge fraction of real-world SSRF-to-credential-theft chains without changing anything about how legitimate SDKs use the service, since they already do the token dance transparently. I'd also mention the metadata hop limit here: containers add a network hop, so a hop limit left at its default of 1 can break metadata access inside a container even when IMDSv2 itself is configured correctly — a different, and commonly confused, failure mode.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>A role's permission policy clearly allows the action being attempted, but the call still returns AccessDenied. How do you debug it?</summary>
+        <div class="a"><p>I stop trusting the identity-based policy as the whole story and ask what else IAM consults for this specific call. First: is the target a resource type that can carry its own resource-based policy — S3 bucket, KMS key, SQS queue, Secrets Manager secret, a role's own trust policy if the "action" is actually assuming something? If so, I pull that policy directly and read it for an explicit deny whose condition the request doesn't satisfy, because an explicit deny anywhere beats any allow anywhere, and it's very often sitting on the resource side while everyone keeps re-reading the caller's side. Second, if there's a permission boundary on the calling identity, I check that it isn't narrower than the identity policy — the effective permission is the intersection of the two, not just whatever the identity policy says. Third, if this crosses an AWS Organization boundary, I check for a service control policy doing the same thing at the org level. Only after ruling all of that out would I suspect a typo in the resource ARN or action name in the policy I already have open, because that's usually the first thing people re-check and the least likely actual cause once the policy has clearly been read correctly once already.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>How does the credential-provider chain matter in practice, beyond a CLI quirk?</summary>
+        <div class="a"><p>It matters because SDKs and the CLI silently pick whichever credential source ranks highest, without announcing which one they chose, and that ranking is fixed and specific: explicit code/CLI-flag credentials first, then environment variables, then role assumption configured via profiles, then a shared credentials or config file, and instance/container-role credentials from IMDS or ECS task metadata typically last, as the fallback of last resort. In practice this bites people two ways: a stale environment variable silently overriding a profile they just carefully configured (Lab 4's exact bug), and a CI system that "just works" locally with a developer's personal credentials in the environment but then fails in production because the environment variables aren't set there and the code was never actually exercising the IMDS/instance-role fallback path it's going to depend on. The practical habit this creates: whenever a credential seems to be coming from somewhere unexpected, check what's actually in the environment before you re-read any config file, because environment variables win against almost everything else.</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>IAM decides who's calling (a principal) and evaluates every policy that applies to decide allow or deny: default deny, an explicit deny anywhere always wins, otherwise you need an explicit allow from an identity-based policy — intersected with any permission boundary, and agreed to by the resource's own policy when one exists. A role is not a user without a password; it has no standing credentials at all, just a trust policy that gates who may call <code>sts:AssumeRole</code> and a separate permission policy that gates what the resulting temporary credentials, valid for up to 12 hours, can actually do. The credential-provider chain has a fixed precedence — explicit flags, then environment variables, then profile/role-assumption config, then instance or container role credentials last — and whichever source ranks highest wins silently. IMDS hands an EC2 instance's attached role credentials to anything running on it, and IMDSv2's PUT-for-a-token step exists specifically to block SSRF-based credential theft that plagued the old GET-only IMDSv1. Debugging AccessDenied means checking the resource's policy, not just the caller's, before you assume a typo.</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>Everything in AWS defaults to denied; you either grant an allow or actively block with a deny that beats every allow.</li>
+      <li>An explicit deny anywhere in the applicable policies always wins, no matter how many allows exist elsewhere.</li>
+      <li>A role has two separate documents: the trust policy (who may assume it) and the permission policy (what the session can do) — checked at different moments by different services.</li>
+      <li>Once you've assumed a role, your own identity's policies stop applying; only the role's permission policy governs the session.</li>
+      <li>A permission boundary caps what an identity's own policies can reach — it's an intersection, and it grants nothing by itself.</li>
+      <li>Resource-based policies (S3, KMS, SQS, Secrets Manager) are consulted alongside the caller's identity policy, and cross-account access needs both sides to agree.</li>
+      <li>The credential-provider chain has a fixed precedence; environment variables beat profile/config settings, which is a classic silent-override bug.</li>
+      <li>Temporary credentials from AssumeRole default to a 1-hour session and can go up to the role's configured maximum, up to 12 hours.</li>
+      <li>IMDSv2 requires a PUT-for-a-token step specifically to block SSRF-based theft of an instance's role credentials that IMDSv1's plain GET allowed.</li>
+      <li>IAM changes are eventually consistent globally — don't put them in a high-availability critical path, and don't assume a fresh AccessDenied is a real misconfiguration without checking propagation.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on &amp; toward:</span>
+      <a href="ch53-route-53-dns-and-routing-policies.html"><b>Ch 53</b> Route 53</a>
+      <a href="ch05-users-groups-permissions-capabilities.html"><b>Ch 5</b> Linux permissions</a>
+      <a href="ch39-security-rbac-admission-policy-securitycontext.html"><b>Ch 39</b> Kubernetes RBAC</a>
+      <a href="ch55-irsa-and-eks-pod-identity.html"><b>Ch 55</b> IRSA &amp; EKS Pod Identity</a>
+      <a href="ch57-eks-architecture.html"><b>Ch 57</b> EKS architecture</a>
+      <a href="ch72-teleport-and-identity-based-access.html"><b>Ch 72</b> Identity-based access</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/IAM/latest/UserGuide/introduction.html">What is IAM?</a>: principals, authentication vs authorization, and IAM's eventual-consistency behavior.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles.html">IAM roles</a>: trust policies, role chaining, delegation, and the terms this chapter builds on.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_boundaries.html">Permissions boundaries for IAM entities</a>: the intersection model, worked examples.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/STS/latest/APIReference/Welcome.html">AWS Security Token Service API Reference</a>: what STS is, session duration limits, and its relationship to IAM.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-metadata.html">Use instance metadata to manage your EC2 instance</a>: IMDS categories and how role credentials are exposed.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-options.html">Configure the Instance Metadata Service options</a>: the IMDSv1/IMDSv2 token model, hop limit, and enforcement settings.</li>
+      <li>AWS docs — <a href="https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-configure.html">Configuring settings for the AWS CLI</a>: the exact credential-and-configuration precedence order.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch53-route-53-dns-and-routing-policies.html"><span class="dir">← Prev</span><div class="ti">Ch 53 — Route 53: DNS and routing policies</div></a>
+      <a class="nx" href="ch55-irsa-and-eks-pod-identity.html"><span class="dir">Next →</span><div class="ti">Ch 55 — IRSA and EKS Pod Identity</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 54 of 121 · Part VI · AWS &amp; EKS for SREs. You can now read an AccessDenied like an investigator instead of a guesser. Next: give a single pod its own scoped identity, no static secret in sight.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">Principals &amp; assume-role</a>
+    <a href="#internals">Evaluation &amp; AssumeRole</a>
+    <a href="#components">The pieces</a>
+    <a href="#flow">EC2 to S3, end to end</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

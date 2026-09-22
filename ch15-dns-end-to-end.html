@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 15 — DNS, End to End</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <a class="home" href="../index.html">SRE / Platform Engineering</a>
+  <span class="crumb">&nbsp;· Part II · Networking &nbsp;·&nbsp; Chapter 15</span>
+  <span class="sp"></span>
+  <a class="tbtn" href="../index.html">Contents</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <main class="content">
+    <div class="hero">
+      <div class="kicker">Part II · Networking from First Principles · Chapter 15</div>
+      <h1>DNS, end to end</h1>
+      <p class="tagline">"It's always DNS" is a joke because it's usually true. DNS is the indirection layer under every hostname you type, a distributed database walked one delegation at a time, cached at every hop, and wired into your OS through a config file most engineers have never read. Learn the resolution path and the caching rules and you'll debug in minutes what teams lose afternoons to.</p>
+      <div class="levelbar">
+        <span class="lv">Start: Beginner</span><span class="arrow">→→→</span><span class="lv">End: Staff-level</span>
+        <span class="metaline" style="margin-left:auto">~48 min read · Linux lab (Docker)</span>
+      </div>
+      <div class="goal">
+        <h4>By the end of this chapter you can</h4>
+        <ul>
+          <li>Trace a name from stub resolver to root to TLD to authoritative, and prove it with <code>dig +trace</code>.</li>
+          <li>Read <code>/etc/resolv.conf</code> — nameservers, search domains, and <code>ndots</code> — and predict what a lookup will do.</li>
+          <li>Explain caching, TTL, and negative caching, and why a "fixed" record can take minutes to appear.</li>
+          <li>Diagnose the <code>ndots</code> latency trap that plagues Kubernetes and the musl surprises that plague Alpine.</li>
+          <li>Capture DNS on the wire with <code>tcpdump port 53</code> and read the query/response.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="why"><span class="beat">Why this exists · the problem</span>The problem DNS solves</h2>
+    <p>IP addresses are how machines talk, but they're hostile to humans and hostile to change. Nobody remembers <code>93.184.216.34</code>; everybody remembers <code>example.com</code>. Worse, addresses <em>move</em> — you re-deploy behind a new load balancer, fail over to another region, scale from one server to fifty — and if every client had hard-coded the old address, every one of them would break. You need a layer of indirection: a stable <b>name</b> that maps to whatever address is current, and a way to change that mapping without touching a single client.</p>
+    <p>That layer is DNS, the Domain Name System. At its simplest it answers one question — "what address is behind this name?" — but the way it answers is the interesting part. There is no single server holding all the names in the world; that would never scale and no one would agree to run it. Instead the namespace is a <b>tree</b>, and authority over each branch is <b>delegated</b> down: the root delegates <code>.com</code> to the registry that runs it, which delegates <code>example.com</code> to whoever owns that domain, who decides what <code>www.example.com</code> points to. To resolve a name you walk down that tree, asking each level "who handles the next part?" — and because the answers are cached aggressively at every step, the whole planet's lookups don't melt the root.</p>
+    <p>The indirection buys you everything: load balancing (one name, many A records), failover (change the record, clients follow), blue-green and canary routing, geo-routing (answer differently based on where the query came from), and clean service discovery inside a cluster. It also buys you a whole category of outages, because now a name that won't resolve looks exactly like a service that's down — and the two need completely different fixes.</p>
+    <div class="box keypoint"><div class="h">Key point</div>
+      <p>DNS is a <b>distributed, delegated, cached</b> database. No server knows everything; each knows its own zone and who to delegate the rest to. Resolution walks the tree top-down, and <b>caching with TTLs</b> is what makes it fast and what makes changes take time to propagate. Almost every DNS incident is really a question about one of those three words: which server is authoritative, what got delegated where, or what's stale in a cache.</p>
+    </div>
+
+    <h2 id="model"><span class="beat">Mental model · analogy</span>The mental model: a chain of librarians</h2>
+    <div class="box analogy"><div class="h">Real-world analogy</div>
+      <p>You walk up to the front-desk librarian (your <b>recursive resolver</b>) and ask, "where do I find <em>www.example.com</em>?" This librarian doesn't know — but that's fine, because their job isn't to know, it's to find out and remember. They keep a notepad of recent answers (the <b>cache</b>); if they looked this up two minutes ago and it hasn't expired, they just read it back to you instantly.</p>
+      <p>If it's not on the notepad, they start walking the directory, most general part first. They ask the <b>root</b> desk, "who handles <em>.com</em>?" The root doesn't know the address either — it only knows delegations — so it replies "go ask the <em>.com</em> desk, here's where it is." At the <b>.com</b> desk: "who handles <em>example.com</em>?" — "go ask example.com's own desk, here." Finally at <b>example.com's</b> desk (the <b>authoritative</b> server, the one that actually owns the answer): "<em>www</em> is at 93.184.216.34." The front-desk librarian writes that on the notepad with a use-by time (the <b>TTL</b>) and hands it to you. You never talked to the root or the TLD — your librarian did all the walking.</p>
+      <p>Two subtleties matter. If example.com's desk says "there's no such name," a good librarian writes <em>that</em> down too, for a while (<b>negative caching</b>), so they don't re-walk the whole tree every time you ask for something that doesn't exist. And if you ask for just "printer" with no domain, the librarian tries appending the office's known suffixes ("printer.eng.corp", "printer.corp") before giving up — that's the <b>search list</b>, and how eagerly they do it is <code>ndots</code>.</p>
+    </div>
+    <table class="t">
+      <tr><th>In the analogy</th><th>In DNS</th></tr>
+      <tr><td>You asking the front desk</td><td>The stub resolver (your app / OS) querying the recursive resolver</td></tr>
+      <tr><td>The front-desk librarian who finds out and remembers</td><td>The recursive resolver (8.8.8.8, your ISP, CoreDNS)</td></tr>
+      <tr><td>The notepad with use-by times</td><td>The cache, with TTLs</td></tr>
+      <tr><td>The root desk (only knows delegations)</td><td>The root servers (<code>.</code>)</td></tr>
+      <tr><td>The <code>.com</code> desk</td><td>The TLD authoritative servers</td></tr>
+      <tr><td>example.com's own desk (owns the answer)</td><td>The authoritative server for the zone</td></tr>
+      <tr><td>Writing down "no such name" for a while</td><td>Negative caching (RFC 2308)</td></tr>
+      <tr><td>Appending office suffixes to bare names</td><td>Search domains + <code>ndots</code></td></tr>
+    </table>
+
+    <h2 id="arch"><span class="beat">Architecture</span>The resolution path</h2>
+    <p>The figure traces one cold lookup — nothing cached — for <code>www.example.com</code>. Notice that your machine sends exactly <em>one</em> query (a recursive request to its resolver) and gets one answer. All the tree-walking (the <b>iterative</b> queries) is done by the recursive resolver on your behalf. That division of labour is the whole design.</p>
+
+    <figure class="fig">
+      <svg viewBox="0 0 720 500" role="img" aria-label="DNS resolution path: a stub resolver asks a recursive resolver, which iteratively queries the root, then the .com TLD, then the authoritative server, caches the answer, and returns it">
+        <defs>
+          <marker id="q" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent)"/></marker>
+          <marker id="a" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" style="fill:var(--accent2)"/></marker>
+        </defs>
+
+        <!-- stub -->
+        <rect x="18" y="196" width="186" height="96" rx="10" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+        <text x="111" y="222" text-anchor="middle" style="fill:var(--ink);font:600 13px sans-serif">Stub resolver</text>
+        <text x="111" y="242" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">your app / the OS</text>
+        <text x="111" y="266" text-anchor="middle" style="fill:var(--muted);font:11px ui-monospace,monospace">getaddrinfo()</text>
+        <text x="111" y="283" text-anchor="middle" style="fill:var(--muted);font:11px ui-monospace,monospace">reads resolv.conf</text>
+
+        <!-- recursive -->
+        <rect x="258" y="184" width="196" height="120" rx="10" style="fill:var(--chip);stroke:var(--accent2);stroke-width:2"/>
+        <text x="356" y="210" text-anchor="middle" style="fill:var(--ink);font:700 13px sans-serif">Recursive resolver</text>
+        <text x="356" y="229" text-anchor="middle" style="fill:var(--muted);font:11px sans-serif">8.8.8.8 · CoreDNS · ISP</text>
+        <rect x="278" y="244" width="156" height="44" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="356" y="263" text-anchor="middle" style="fill:var(--accent2);font:700 11px sans-serif">CACHE</text>
+        <text x="356" y="279" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">answers kept for their TTL</text>
+
+        <!-- tiers -->
+        <rect x="506" y="24" width="196" height="70" rx="9" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="604" y="48" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">Root servers ( . )</text>
+        <text x="604" y="68" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">"ask the .com servers"</text>
+        <text x="604" y="83" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">(referral, not the answer)</text>
+
+        <rect x="506" y="205" width="196" height="70" rx="9" style="fill:var(--panel);stroke:var(--line)"/>
+        <text x="604" y="229" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">.com TLD servers</text>
+        <text x="604" y="249" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">"ask example.com's</text>
+        <text x="604" y="264" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">name servers"</text>
+
+        <rect x="506" y="392" width="196" height="82" rx="9" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+        <text x="604" y="416" text-anchor="middle" style="fill:var(--ink);font:600 12.5px sans-serif">Authoritative</text>
+        <text x="604" y="435" text-anchor="middle" style="fill:var(--muted);font:10.5px sans-serif">example.com — owns the zone</text>
+        <text x="604" y="457" text-anchor="middle" style="fill:var(--ink);font:700 11px ui-monospace,monospace">www A 93.184.216.34</text>
+
+        <!-- step 1 / 8 stub<->recursive -->
+        <line x1="206" y1="228" x2="256" y2="228" style="stroke:var(--accent);stroke-width:2" marker-end="url(#q)"/>
+        <text x="230" y="220" text-anchor="middle" style="fill:var(--accent);font:700 10px sans-serif">1</text>
+        <line x1="256" y1="262" x2="206" y2="262" style="stroke:var(--accent2);stroke-width:2" marker-end="url(#a)"/>
+        <text x="230" y="277" text-anchor="middle" style="fill:var(--accent2);font:700 10px sans-serif">8</text>
+
+        <!-- to root 2/3 -->
+        <line x1="456" y1="210" x2="504" y2="70" style="stroke:var(--accent);stroke-width:2" marker-end="url(#q)"/>
+        <text x="470" y="150" style="fill:var(--accent);font:700 10px sans-serif">2 .com NS?</text>
+        <line x1="504" y1="90" x2="456" y2="226" style="stroke:var(--accent2);stroke-width:1.7;stroke-dasharray:5 3" marker-end="url(#a)"/>
+        <text x="486" y="175" style="fill:var(--accent2);font:700 10px sans-serif">3</text>
+
+        <!-- to tld 4/5 -->
+        <line x1="456" y1="244" x2="504" y2="240" style="stroke:var(--accent);stroke-width:2" marker-end="url(#q)"/>
+        <text x="470" y="235" style="fill:var(--accent);font:700 10px sans-serif">4 example.com NS?</text>
+        <line x1="504" y1="258" x2="456" y2="270" style="stroke:var(--accent2);stroke-width:1.7;stroke-dasharray:5 3" marker-end="url(#a)"/>
+        <text x="486" y="292" style="fill:var(--accent2);font:700 10px sans-serif">5</text>
+
+        <!-- to auth 6/7 -->
+        <line x1="456" y1="280" x2="504" y2="410" style="stroke:var(--accent);stroke-width:2" marker-end="url(#q)"/>
+        <text x="460" y="350" style="fill:var(--accent);font:700 10px sans-serif">6 www A?</text>
+        <line x1="504" y1="430" x2="456" y2="296" style="stroke:var(--accent2);stroke-width:1.7;stroke-dasharray:5 3" marker-end="url(#a)"/>
+        <text x="486" y="378" style="fill:var(--accent2);font:700 10px sans-serif">7 the A record</text>
+
+        <text x="360" y="330" text-anchor="middle" style="fill:var(--muted);font:italic 11px sans-serif">steps 2–7 are iterative queries; once cached, a repeat of step 1 skips them all</text>
+      </svg>
+      <figcaption>One recursive query in (step 1), one answer out (step 8). Between them the resolver walks root → TLD → authoritative iteratively (2–7), each upper tier handing back a referral rather than the answer. Every result is cached for its TTL, so the next identical lookup is a single hop.</figcaption>
+    </figure>
+
+    <div class="box realworld"><div class="h">Why an SRE cares</div>
+      <p>Inside Kubernetes this exact diagram runs constantly, with CoreDNS as the recursive resolver and a twist: pods are configured with <code>ndots:5</code> and a stack of search domains, so an innocent-looking external lookup can fan out into several failed queries first (<a href="ch45-coredns-and-service-discovery.html">Chapter 45</a>). Knowing the path and the caching rules is what lets you tell "the service is down" from "the name won't resolve" from "the resolver is slow" — three incidents that look identical from the app's error log and have nothing in common underneath.</p>
+    </div>
+
+    <h2 id="resolve"><span class="beat">Internal working</span>Recursion, iteration, caching, and negative caching</h2>
+    <p>Walk the cold lookup step by step, then see what caching changes.</p>
+    <ol class="steps">
+      <li><b>The stub resolver forms the query.</b> Your app calls <code>getaddrinfo("www.example.com")</code>; the OS resolver reads <code>/etc/resolv.conf</code>, applies the search/ndots rules to decide the exact name(s) to ask, and sends a UDP packet to port 53 of the first configured nameserver, with the "recursion desired" (RD) bit set — "please do the whole job for me."</li>
+      <li><b>The recursive resolver checks its cache.</b> If it has a fresh answer (TTL not expired), it returns it immediately and we're done. On a cold cache, it starts iterating.</li>
+      <li><b>It asks a root server "where is <code>.com</code>?"</b> The root doesn't resolve names — it only knows delegations — so it replies with a <em>referral</em>: the NS records for <code>.com</code> (and glue A records so you can reach them). The resolver knew where the roots are from its built-in root hints.</li>
+      <li><b>It asks a <code>.com</code> server "where is <code>example.com</code>?"</b> Another referral: the NS records for <code>example.com</code>'s authoritative servers.</li>
+      <li><b>It asks an authoritative server "what is <code>www.example.com</code>?"</b> This server owns the zone, so it answers <em>authoritatively</em> with the A record and a TTL.</li>
+      <li><b>It caches every step and returns the answer.</b> The resolver caches the A record, and often the intermediate NS records too, each for its own TTL. It sends one response back to your stub. Total: a handful of round trips on a cold cache, one hop on a warm one.</li>
+    </ol>
+    <p><b>Recursive vs iterative</b> is the distinction people muddle. Your stub asks for <em>recursion</em> — "give me the final answer." The recursive resolver satisfies that by making <em>iterative</em> queries up the tree, where each server it asks returns either the answer (if authoritative) or a referral to a more specific server. The root and TLD servers do <em>not</em> do recursion for you; they only ever refer. That's deliberate: it keeps the top of the tree stateless and fast, doing nothing but handing out delegations.</p>
+    <p><b>TTL and caching</b> are where operational reality lives. Each record carries a TTL in seconds; a resolver may serve it from cache until that expires. Low TTLs (30–60s) mean changes propagate fast but generate far more queries; high TTLs (hours) mean cheap and fast lookups but slow, painful changes. This is why you <em>lower a record's TTL well before</em> a planned migration — so that when you flip it, clients pick up the change quickly instead of clinging to a cached old address.</p>
+    <p><b>Negative caching</b> (RFC 2308) is the one people forget and get burned by. When a name doesn't exist (NXDOMAIN) or has no record of the requested type (NODATA), that <em>failure</em> is cached too, for a duration set by the zone's SOA record. The consequence: if you query a name a moment before it's created, the "doesn't exist" answer gets cached, and even after you create the record, lookups keep failing until the negative TTL expires. "I added the record but it's still not resolving" is, nine times out of ten, negative caching — not a mistake in the record.</p>
+
+    <details class="recall"><summary>Think first: you create a new DNS record, but clients still get "no such host" for several minutes even though a fresh <code>dig</code> against the authoritative server shows it. Why?</summary>
+      <div class="body">
+        <p>Negative caching. Something queried that name before it existed, so a resolver cached the NXDOMAIN/NODATA answer for the duration set by the zone's SOA negative TTL (often a few minutes to an hour). Your direct <code>dig @authoritative</code> bypasses that cache and sees the new record instantly, but clients going through the caching resolver keep getting the stale "doesn't exist" until the negative TTL expires. The fixes are patience (wait out the negative TTL), flushing the specific resolver's cache if you control it, or — for next time — keeping the SOA negative TTL modest so mistakes and new records don't get stuck for long. This is also why you should never query a name you're <em>about</em> to create.</p>
+      </div>
+    </details>
+
+    <h2 id="components"><span class="beat">Components</span>Record types, resolv.conf, and the resolver library</h2>
+    <h4>The record types you'll actually touch</h4>
+    <table class="t">
+      <tr><th>Type</th><th>Maps</th><th>What it's for</th></tr>
+      <tr><td><code>A</code></td><td>name → IPv4</td><td>The everyday address record.</td></tr>
+      <tr><td><code>AAAA</code></td><td>name → IPv6</td><td>The IPv6 address record ("quad-A").</td></tr>
+      <tr><td><code>CNAME</code></td><td>name → another name</td><td>An alias. Can't sit at a zone apex, and can't coexist with other records at the same name.</td></tr>
+      <tr><td><code>NS</code></td><td>zone → name server</td><td>Delegation — who's authoritative for a zone.</td></tr>
+      <tr><td><code>SOA</code></td><td>zone metadata</td><td>Serial, refresh/retry/expire, and the negative-caching TTL.</td></tr>
+      <tr><td><code>MX</code></td><td>domain → mail host + priority</td><td>Where email for the domain goes.</td></tr>
+      <tr><td><code>TXT</code></td><td>name → free text</td><td>SPF/DKIM, domain-ownership verification, ACME challenges.</td></tr>
+      <tr><td><code>PTR</code></td><td>IP → name</td><td>Reverse DNS, under <code>in-addr.arpa</code> / <code>ip6.arpa</code>.</td></tr>
+      <tr><td><code>SRV</code></td><td>service → host + port</td><td>Service discovery (SIP, LDAP, Kubernetes headless services).</td></tr>
+      <tr><td><code>CAA</code></td><td>domain → allowed CAs</td><td>Which certificate authorities may issue certs for the domain.</td></tr>
+    </table>
+    <h4>/etc/resolv.conf — three lines that decide everything</h4>
+    <p>The stub resolver's entire behaviour comes from this file. Three directives matter:</p>
+    <ul>
+      <li><b><code>nameserver &lt;ip&gt;</code></b> — up to three, tried in order. glibc moves to the next only when the first times out, so a dead first nameserver adds a full timeout to every lookup.</li>
+      <li><b><code>search a.corp b.corp</code></b> — suffixes to append to unqualified names. Ask for <code>web</code> and the resolver may try <code>web.a.corp</code>, then <code>web.b.corp</code>.</li>
+      <li><b><code>options ndots:N</code></b> — the threshold that decides whether to try search domains <em>first</em> or treat the name as absolute first. If the queried name has fewer than <code>N</code> dots, the search list is applied before trying the name as-is. Default is <code>ndots:1</code>.</li>
+    </ul>
+    <h4>The resolver library: glibc vs musl</h4>
+    <p>The code that reads <code>resolv.conf</code> and does all this is part of your libc, and the two common libcs behave differently — the source of a whole genre of "works on Ubuntu, breaks on Alpine" bugs. <b>glibc</b> (Debian, Ubuntu, most base images) reads <code>/etc/nsswitch.conf</code> to decide the lookup order (usually <code>files dns</code> — check <code>/etc/hosts</code> first, then DNS), queries nameservers <em>sequentially</em>, and fully implements search domains and <code>ndots</code>. <b>musl</b> (Alpine) has no <code>/etc/nsswitch.conf</code>, queries all configured nameservers <em>in parallel</em> and takes the first reply, and — famously — versions before 1.2.4 (2023) did <em>not</em> fall back to TCP for large responses, so a DNS answer over 512 bytes could simply fail on Alpine while working everywhere else. musl also historically handled search/ndots more conservatively. The upshot: Alpine's tiny image size comes with resolver behaviour you must test, not assume.</p>
+
+    <details class="recall"><summary>Think first: a service works perfectly on Ubuntu but intermittently fails DNS on Alpine, and the failures correlate with responses that have many records. What's the likely cause?</summary>
+      <div class="body">
+        <p>musl's lack of TCP fallback (in versions before 1.2.4). DNS starts over UDP, and a response too big for the UDP buffer comes back <em>truncated</em> with the TC bit set, which is the signal to retry over TCP. glibc does that retry automatically; older musl did not, so the truncated answer was effectively a failure. Large responses — a name with many A records, a big TXT/DKIM record, DNSSEC data — are exactly what triggers it. The fixes: upgrade to musl ≥ 1.2.4, or shrink the responses, or (in Kubernetes) make sure EDNS0 buffer sizes and CoreDNS are configured so answers fit. The tell is that the failures track response <em>size</em> and only happen on the Alpine-based images.</p>
+      </div>
+    </details>
+
+    <h2 id="flow"><span class="beat">Data flow</span>Following one lookup, search domains and all</h2>
+    <p>An app on a corporate host with <code>search eng.corp corp</code> and <code>options ndots:2</code> calls <code>getaddrinfo("api.internal")</code>. The name has one dot, which is fewer than <code>ndots:2</code>, so the resolver applies the search list <em>first</em>: it queries <code>api.internal.eng.corp</code> (NXDOMAIN, cached negatively), then <code>api.internal.corp</code> (NXDOMAIN), then finally the name as absolute, <code>api.internal.</code> — three queries for one lookup. Now the same app calls <code>getaddrinfo("www.example.com")</code>: two dots, which meets <code>ndots:2</code>, so the resolver tries it as absolute <em>first</em> — one query, straight to the recursive resolver, which returns the cached or freshly-walked A record. Same machine, same config, wildly different query counts depending only on how many dots the name has. That single fact — that dots decide whether you pay for the search list — is the seed of the Kubernetes latency problem in the failure section, and you can watch every one of these packets with <code>tcpdump port 53</code>.</p>
+
+    <h2 id="labs"><span class="beat">Hands-on</span>Labs — build, understand, break, troubleshoot</h2>
+    <p>All labs run in one throwaway container with outbound network. Open a second shell with <code>docker exec</code> for the captures.</p>
+    <div class="codewrap"><span class="lang">bash</span><pre><code>docker run --rm -it --name dns-lab ubuntu:24.04 bash
+
+<span class="c"># Inside:</span>
+apt-get update &amp;&amp; apt-get install -y dnsutils tcpdump iproute2 curl</code></pre></div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 1</span><span class="t">Build — read resolv.conf and a dig answer</span><span class="phase">Build</span></div>
+      <div class="lb">
+        <p>Start where every lookup starts — the config — then read a real answer.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>cat /etc/resolv.conf
+dig example.com A +noall +answer +stats</code></pre></div>
+        <div class="out"><span class="ol">Output (example)</span># resolv.conf
+nameserver 192.168.65.7
+options ndots:0
+
+# dig answer
+example.com.   240   IN   A   93.184.216.34
+;; Query time: 12 msec
+;; SERVER: 192.168.65.7#53(192.168.65.7) (UDP)</code></pre></div>
+        <p>Read the answer left to right: the name, the <b>TTL</b> (<code>240</code> seconds — how long this may be cached), the class <code>IN</code> (internet), the type <code>A</code>, and the address. The footer tells you which resolver answered, on port 53, over UDP. Run the same <code>dig</code> twice in a row and watch the TTL <em>count down</em> — that's the recursive resolver serving it from cache, decrementing the remaining lifetime on each hit. When it hits zero, the next query re-fetches.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 2</span><span class="t">Understand — walk the tree with dig +trace</span><span class="phase">Understand</span></div>
+      <div class="lb">
+        <p><code>dig +trace</code> does the iterative walk itself, from the root down, printing each referral — so you see the exact path the figure describes, live.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>dig +trace www.example.com A</code></pre></div>
+        <div class="out"><span class="ol">Output (heavily trimmed)</span>.            NS   a.root-servers.net.  ...        <span class="c"># the roots</span>
+com.         NS   a.gtld-servers.net.  ...        <span class="c"># root referred us to .com</span>
+example.com. NS   a.iana-servers.net.  ...        <span class="c"># .com referred us to example.com</span>
+www.example.com. 86400 IN A 93.184.216.34         <span class="c"># authoritative answer</span></code></pre></div>
+        <p>Four tiers, top to bottom: root gives you <code>.com</code>'s name servers, <code>.com</code> gives you <code>example.com</code>'s, and <code>example.com</code>'s server gives you the actual A record. Each upper level handed back a <em>referral</em> (NS records), never the answer — only the authoritative server at the bottom knows the address. This is the single best command for "is DNS itself broken, or just my resolver?": if <code>+trace</code> works but a normal <code>dig</code> doesn't, your configured resolver is the problem, not the domain.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 3</span><span class="t">Break — watch DNS on the wire with tcpdump</span><span class="phase">Break</span></div>
+      <div class="lb">
+        <p>See the actual UDP/53 packets, including a lookup for a name that doesn't exist so you can recognise NXDOMAIN.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># Shell A — capture DNS:</span>
+tcpdump -i any -n -s0 'port 53' -c 6
+
+<span class="c"># Shell B — one real name, one bogus name:</span>
+dig +short example.com A
+dig +short nope-nope-nope.example.com A</code></pre></div>
+        <div class="out"><span class="ol">Output</span>IP 10.0.0.2.51314 &gt; 192.168.65.7.53: A? example.com. (29)
+IP 192.168.65.7.53 &gt; 10.0.0.2.51314: 1/0/0 A 93.184.216.34 (45)
+IP 10.0.0.2.40122 &gt; 192.168.65.7.53: A? nope-nope-nope.example.com. (44)
+IP 192.168.65.7.53 &gt; 10.0.0.2.40122: 0/1/0 NXDOMAIN (100)</code></pre></div>
+        <p>The first pair is a clean question and answer — <code>A?</code> going out, <code>1/0/0</code> (one answer record) coming back. The second pair ends in <code>NXDOMAIN</code> with <code>0/1/0</code>: zero answers, one authority record (the SOA that carries the negative-cache TTL). Reading <code>tcpdump port 53</code> fluently is what separates "DNS is slow" hand-waving from "the query goes out but no response comes back for 5 seconds, so it's a resolver-reachability problem" precision.</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 4</span><span class="t">Troubleshoot — the ndots latency trap</span><span class="phase">Troubleshoot</span></div>
+      <div class="lb">
+        <p>Reproduce the Kubernetes-style problem: a high <code>ndots</code> plus search domains turns one external lookup into several failed ones. Rewrite <code>resolv.conf</code> the way a pod's looks, then capture. (If your <code>/etc/resolv.conf</code> is read-only, re-run <code>docker run</code> adding <code>--dns 1.1.1.1 --dns-search dev.svc.cluster.local --dns-search svc.cluster.local --dns-search cluster.local</code>.)</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code>cp /etc/resolv.conf /tmp/resolv.bak
+printf 'nameserver 1.1.1.1\nsearch dev.svc.cluster.local svc.cluster.local cluster.local\noptions ndots:5\n' &gt; /etc/resolv.conf
+
+<span class="c"># Shell A:</span>
+tcpdump -i any -n 'port 53' -c 8
+<span class="c"># Shell B — a 2-dot name, which is &lt; ndots:5, so search list runs first:</span>
+getent hosts api.github.com</code></pre></div>
+        <div class="out"><span class="ol">Output</span>A? api.github.com.dev.svc.cluster.local.   → NXDOMAIN
+A? api.github.com.svc.cluster.local.       → NXDOMAIN
+A? api.github.com.cluster.local.           → NXDOMAIN
+A? api.github.com.                         → 1/0/0  (finally!)</code></pre></div>
+        <p>Four lookups to resolve one name — three wasted round trips against the search domains before the real one, because <code>api.github.com</code> has two dots and <code>ndots:5</code> says "fewer than five dots? try the search list first." Why does this matter, and what's the fix?</p>
+        <details class="recall"><summary>Reveal the impact and the fixes</summary>
+          <div class="body">
+            <p>Each wasted query is a full round trip to the resolver — inside a cluster that's CoreDNS, and under load those extra queries multiply into real latency and real DNS server load. A service making thousands of external calls pays 3–4× the DNS traffic it should. The fixes, in order of preference: <b>fully-qualify</b> the name with a trailing dot (<code>api.github.com.</code>) so the resolver treats it as absolute and skips the search list entirely; lower <code>ndots</code> for workloads that mostly call external names; or use a <code>dnsConfig</code>/NodeLocal DNS cache to cut the cost. The reason Kubernetes ships <code>ndots:5</code> at all is so that <em>internal</em> short names like <code>service</code> or <code>service.namespace</code> resolve through the search domains — it helps intra-cluster names and hurts external ones, which is the trade-off you tune per workload (<a href="ch45-coredns-and-service-discovery.html">Chapter 45</a>). Restore: <code>cp /tmp/resolv.bak /etc/resolv.conf</code>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lh"><span class="n">Lab 5</span><span class="t">Production challenge — glibc vs musl, and TTL caching</span><span class="phase">Senior challenge</span></div>
+      <div class="lb">
+        <p>See the resolver-library difference directly. Run an Alpine (musl) box beside your Ubuntu (glibc) one and compare what each relies on.</p>
+        <div class="codewrap"><span class="lang">bash</span><pre><code><span class="c"># A separate Alpine container (musl):</span>
+docker run --rm -it alpine:3.20 sh
+apk add --no-cache bind-tools           <span class="c"># dig on Alpine</span>
+cat /etc/nsswitch.conf                   <span class="c"># ← no such file on musl!</span>
+cat /etc/resolv.conf
+dig +short example.com</code></pre></div>
+        <div class="out"><span class="ol">Output</span>cat: can't open '/etc/nsswitch.conf': No such file or directory
+nameserver 192.168.65.7
+93.184.216.34</code></pre></div>
+        <p>No <code>nsswitch.conf</code> — musl doesn't use one, so tricks that depend on it (custom lookup ordering, some <code>/etc/hosts</code> behaviours, certain NSS modules) simply don't apply on Alpine. Now the senior questions to reason through before opening the answer: <em>what else differs, and how would you prove a suspected musl DNS bug in production?</em></p>
+        <details class="recall"><summary>Reveal the senior view</summary>
+          <div class="body">
+            <p>The behavioural differences that bite: musl queries all nameservers in <b>parallel</b> and takes the first answer (glibc goes sequentially), so a fast-but-wrong resolver can win a race; musl before 1.2.4 had <b>no TCP fallback</b>, so responses over 512 bytes could fail silently; and musl applies search/ndots more conservatively. To prove a musl DNS bug I'd capture with <code>tcpdump port 53</code> inside the Alpine container and compare against the same lookup on glibc: if the Alpine capture shows a truncated (TC-bit) UDP response and no follow-up TCP query while glibc retries over TCP and succeeds, that's the smoking gun. The pragmatic fixes are to base images on glibc (Debian slim) for DNS-heavy or large-response workloads, upgrade musl to ≥ 1.2.4, or keep responses small. Separately, to <em>see</em> caching: run <code>dig example.com</code> twice quickly and watch the TTL count down between calls — that decrementing number is the resolver's cache clock, and when it reaches zero the next query goes back to the authoritative server. Understanding that counter is how you reason about propagation delay during a migration.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <h2 id="failure"><span class="beat">Failure &amp; troubleshooting</span>How this shows up in real incidents</h2>
+    <div class="box realworld"><div class="h">Incident pattern · intermittent DNS resolution failures</div>
+      <p><b>Symptom:</b> occasional "name or service not known" or slow lookups, not on every request. <b>First cut:</b> <code>dig</code> the name repeatedly and time it; check whether <code>resolv.conf</code> lists multiple nameservers. <b>Confirm:</b> failures/slowness align with one nameserver being unhealthy. <b>Cause is usually:</b> a dead or overloaded first nameserver — glibc waits for it to time out (default 5s) before trying the next, so every lookup that hits the bad one stalls. <b>Fix:</b> remove/replace the bad nameserver, tune <code>timeout</code>/<code>attempts</code>, or front pods with a local caching resolver.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · ndots latency in Kubernetes</div>
+      <p><b>Symptom:</b> external API calls from pods are slow and DNS query volume to CoreDNS is huge. <b>First cut:</b> <code>tcpdump port 53</code> in a pod during an external call. <b>Confirm:</b> each external lookup fans out into several NXDOMAINs against the cluster search domains first. <b>Cause is usually:</b> <code>ndots:5</code> plus a not-fully-qualified name. <b>Fix:</b> trailing-dot FQDNs for external names, per-workload <code>dnsConfig</code>, or a NodeLocal DNS cache. This is a preview of <a href="ch45-coredns-and-service-discovery.html">Chapter 45</a>.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · the change that won't propagate</div>
+      <p><b>Symptom:</b> you updated or created a record, but clients still see the old value (or "no such host"). <b>First cut:</b> <code>dig @&lt;authoritative&gt;</code> vs <code>dig</code> through the normal resolver. <b>Confirm:</b> the authoritative server is correct but the resolver serves stale/negative data. <b>Cause is usually:</b> TTL not yet expired, or negative caching of a name you queried before creating it. <b>Fix:</b> wait out the TTL/negative TTL; for planned changes, lower the TTL well in advance.</p>
+    </div>
+    <div class="box realworld"><div class="h">Incident pattern · Alpine/musl DNS surprises</div>
+      <p><b>Symptom:</b> a service works on Debian/Ubuntu images but fails DNS on Alpine, often tied to large responses or multiple resolvers. <b>First cut:</b> reproduce on Alpine with <code>tcpdump port 53</code>. <b>Confirm:</b> truncated responses with no TCP retry, or a parallel-query race. <b>Cause is usually:</b> musl's resolver behaviour (no TCP fallback pre-1.2.4, parallel nameserver queries). <b>Fix:</b> glibc base image for DNS-heavy work, upgrade musl, or shrink responses.</p>
+    </div>
+
+    <h2 id="prod"><span class="beat">Production · security · performance</span>What matters in production</h2>
+    <p><b>TTL is a planning tool, not an afterthought.</b> Before any migration or failover that relies on DNS, lower the record's TTL days ahead so clients aren't clinging to a cached old address when you flip it — then raise it back afterward to cut query load. Treat the negative TTL with the same respect: a long one turns a brief "record doesn't exist yet" window into a long outage.</p>
+    <p><b>Cache close to the workload.</b> The single biggest DNS reliability and latency win at scale is a local caching resolver near the client — <code>systemd-resolved</code> on a host, a NodeLocal DNS cache in Kubernetes, or a sidecar. It absorbs repeat lookups, survives brief upstream blips, and cuts round trips. Centralising all DNS on one distant resolver makes that resolver a latency tax and a single point of failure for everything.</p>
+    <p><b>Security touches DNS heavily.</b> Plain DNS is unauthenticated and unencrypted over UDP, so it's spoofable and observable; DNSSEC authenticates records, and DoT (port 853) / DoH (over 443) encrypt the query. DNS is also a favourite exfiltration and command-and-control channel precisely because it's usually allowed out of every network — which is why monitoring DNS query patterns is a real security control. And CAA records let you constrain which CAs may issue certificates for your domain, closing off mis-issuance.</p>
+    <p><b>Common mistakes:</b> hard-coding IPs to "avoid DNS" and then breaking on every failover; forgetting negative caching and thinking a new record is misconfigured; leaving a dead nameserver first in <code>resolv.conf</code> so every lookup eats a timeout; shipping DNS-heavy services on Alpine without testing musl's resolver; and setting TTLs so high that emergencies can't be routed around. Each is avoidable once you know the path and the caching rules.</p>
+
+    <h2 id="design"><span class="beat">System-design connection</span>Where this reaches into architecture</h2>
+    <p>DNS is the internet's primary indirection and load-distribution layer, so it shows up in almost every large design. Global traffic management — geo-routing users to the nearest region, weighted routing for canaries, latency- and health-based failover — is largely done in DNS by answering the same name differently depending on who's asking and what's healthy (Route 53's routing policies, <a href="ch53-route-53-dns-and-routing-policies.html">Chapter 53</a>). Service discovery inside clusters is DNS: a Kubernetes Service is a name that resolves to a stable virtual IP, and headless services return the pod addresses directly (<a href="ch45-coredns-and-service-discovery.html">Chapter 45</a>). The TTL choice is a genuine design trade-off between agility and load that you make per record. And the "is it down or is it just DNS?" ambiguity is why good architectures separate DNS health from service health in their monitoring and why clients should cache and fail over sensibly rather than treating a resolution failure as a hard, permanent error. Get DNS wrong at design time and you inherit slow failovers and mystery latency; get it right and it's the cheapest global routing you'll ever deploy.</p>
+
+    <h2 id="interview"><span class="beat">Interview</span>Interview questions &amp; answers</h2>
+    <p>Answer each in your head first.</p>
+    <div class="qa-wrap">
+      <details class="qa"><summary><span class="qtag s30">30-sec</span>What's the difference between a recursive resolver and an authoritative server?</summary>
+        <div class="a"><p>An authoritative server owns a zone's data and answers definitively for the names in it — it's the source of truth for, say, example.com. A recursive resolver owns no data; its job is to find the answer on a client's behalf by walking the tree from the root down, following referrals, and caching what it learns. Your device talks only to a recursive resolver; the recursive resolver talks to the authoritative servers. Root and TLD servers are authoritative for their level and only ever hand back referrals, never do recursion for you.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag s2m">2-min</span>Walk me through resolving <code>www.example.com</code> on a cold cache.</summary>
+        <div class="a"><p>My stub resolver reads <code>/etc/resolv.conf</code>, applies the search and ndots rules to settle on the exact name, and sends one UDP query to port 53 of its configured recursive resolver with the recursion-desired bit set. The resolver checks its cache; cold, so it iterates. It asks a root server "who handles .com?" and gets a referral — the NS records for .com — because the root only delegates. It asks a .com server "who handles example.com?" and gets another referral to example.com's authoritative name servers. It asks one of those "what is www.example.com?" and, because that server is authoritative, gets the actual A record with a TTL. The resolver caches the A record and the intermediate NS records, each for its own TTL, and returns a single answer to my stub. So my machine sent one recursive query and got one answer; the resolver did all the iterative walking. A warm cache collapses the whole thing to one round trip, which is the entire point of caching.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag deep">Deep</span>Explain TTL and negative caching, and how they affect a migration.</summary>
+        <div class="a"><p>Every DNS record carries a TTL in seconds, and a resolver may serve it from cache until that expires, decrementing the remaining time on each hit. Negative caching (RFC 2308) applies the same idea to failures: an NXDOMAIN or NODATA answer is cached for a duration set by the zone's SOA record, so resolvers don't re-walk the tree for names that don't exist. For a migration this is central. Because clients hold a cached address for up to the TTL, I lower the record's TTL well before the change — say from an hour to 60 seconds a day ahead — so that when I flip the record, clients pick up the new address within a minute instead of an hour, then I raise it back afterward to reduce query load. Negative caching is the trap people hit: if anything queries a name before I create it, the "doesn't exist" answer gets cached for the negative TTL, and even after I add the record, lookups through that resolver keep failing until it expires — which looks like a broken record but is stale cache. So my rules are: pre-lower TTLs before planned changes, keep the SOA negative TTL modest, and never query a name I'm about to create. A direct <code>dig</code> at the authoritative server bypasses caching and tells me the real current state.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag scn">Scenario</span>Pods make external API calls and they're slow; CoreDNS load is high. What's happening and how do you fix it?</summary>
+        <div class="a"><p>This is the ndots trap. Kubernetes configures pods with <code>ndots:5</code> and a stack of cluster search domains, and the rule is that a name with fewer dots than ndots gets the search list applied first. An external name like <code>api.vendor.com</code> has two dots, under five, so before the resolver ever tries it as an absolute name it appends each cluster search domain — <code>api.vendor.com.namespace.svc.cluster.local</code>, then <code>.svc.cluster.local</code>, then <code>.cluster.local</code> — and each of those is a failed round trip to CoreDNS before the real lookup succeeds. So one external call becomes four DNS queries, which is both the latency and the CoreDNS load. I'd confirm with <code>tcpdump port 53</code> in a pod and see the NXDOMAIN fan-out. The cleanest fix is to fully-qualify external names with a trailing dot so they're treated as absolute and skip the search list; beyond that, a per-workload <code>dnsConfig</code> to lower ndots for external-heavy services, and a NodeLocal DNS cache to absorb and speed up the rest. The reason ndots is 5 in the first place is to make internal short names resolve through the search domains, so it's a deliberate trade-off that helps internal names and hurts external ones.</p></div>
+      </details>
+      <details class="qa"><summary><span class="qtag fu">Follow-up</span>Why might a service resolve fine on Ubuntu but fail on Alpine?</summary>
+        <div class="a"><p>Because Alpine uses musl instead of glibc, and the two resolvers behave differently. The classic failure is that musl before version 1.2.4 didn't fall back to TCP when a DNS response came back truncated over UDP — DNS starts on UDP, and a response too large for the buffer returns with the truncation bit set as a signal to retry over TCP, which glibc does automatically and old musl did not, so large answers (a name with many records, big TXT/DKIM data, DNSSEC) could just fail on Alpine while working everywhere else. musl also queries all configured nameservers in parallel and takes the first response rather than trying them in order, so a fast-but-wrong resolver can win, and it has no <code>/etc/nsswitch.conf</code>, so anything depending on that doesn't apply. I'd prove it by capturing <code>tcpdump port 53</code> on both and comparing — a truncated UDP response with no TCP retry on Alpine is the tell. The fixes are a glibc base image for DNS-heavy or large-response workloads, upgrading musl to 1.2.4 or later, or keeping responses small. It's the archetype of "works on my image, breaks on the tiny one."</p></div>
+      </details>
+    </div>
+
+    <h2 id="revision"><span class="beat">Retain</span>Quick revision</h2>
+    <p>DNS is a distributed, delegated, cached database that maps names to addresses so machines can move without breaking clients. Your stub resolver sends one recursive query to a recursive resolver, which — on a cold cache — walks the tree iteratively: root refers it to the TLD, the TLD refers it to the authoritative server, and only the authoritative server returns the actual record. Every result is cached for its TTL, and even failures are cached (negative caching), which is why new records can take minutes to appear. <code>/etc/resolv.conf</code> controls everything through nameservers, search domains, and <code>ndots</code>; a high ndots plus search domains turns one lookup into several, which is the Kubernetes latency trap. glibc and musl resolve differently — musl queries nameservers in parallel and, before 1.2.4, didn't fall back to TCP — which breaks DNS-heavy services on Alpine. Debug with <code>dig +trace</code> (the whole path), <code>dig @authoritative</code> (bypass caches), and <code>tcpdump port 53</code> (ground truth on the wire).</p>
+
+    <h3>The 10 things to remember</h3>
+    <ol class="ten">
+      <li>DNS is distributed, delegated, and cached — no server knows everything; each knows its zone and its delegations.</li>
+      <li>Your stub asks for recursion; the recursive resolver does the iterative walk (root → TLD → authoritative).</li>
+      <li>Root and TLD servers only ever return referrals; only the authoritative server returns the actual record.</li>
+      <li>Every record has a TTL; lower it before a planned migration so clients follow the change quickly.</li>
+      <li>Negative caching means NXDOMAIN/NODATA is cached too — a "fixed" record can stay broken until the negative TTL expires.</li>
+      <li><code>resolv.conf</code> = nameservers (tried in order), search domains, and <code>ndots</code>; those three decide every lookup.</li>
+      <li><code>ndots:N</code> applies the search list first when a name has fewer than N dots — the Kubernetes latency trap; fix with FQDNs.</li>
+      <li>Record types to know: A/AAAA, CNAME, NS, SOA, MX, TXT, PTR, SRV, CAA.</li>
+      <li>glibc vs musl differ: musl queries nameservers in parallel and (pre-1.2.4) had no TCP fallback — Alpine surprises.</li>
+      <li><code>dig +trace</code> shows the path, <code>dig @authoritative</code> bypasses caches, <code>tcpdump port 53</code> is ground truth.</li>
+    </ol>
+
+    <div class="xref">
+      <span class="small" style="width:100%;color:var(--muted)">Builds on and toward:</span>
+      <a href="ch13-l4-tcp-deep-and-udp.html"><b>Ch 13</b> UDP &amp; TCP</a>
+      <a href="ch14-ports-sockets-ephemeral-ports-connection-lifecycle.html"><b>Ch 14</b> Ports &amp; sockets</a>
+      <a href="ch16-http-http-2-http-3-and-grpc.html"><b>Ch 16</b> HTTP &amp; gRPC</a>
+      <a href="ch45-coredns-and-service-discovery.html"><b>Ch 45</b> CoreDNS &amp; discovery</a>
+      <a href="ch53-route-53-dns-and-routing-policies.html"><b>Ch 53</b> Route 53 policies</a>
+      <a href="ch105-network-runbooks.html"><b>Ch 105</b> Network runbooks</a>
+    </div>
+
+    <h2 id="sources"><span class="beat">Go deeper</span>Sources &amp; further reading</h2>
+    <ul class="sources">
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc1034">RFC 1034: Domain Names — Concepts and Facilities</a> and <a href="https://www.rfc-editor.org/rfc/rfc1035">RFC 1035: Implementation and Specification</a>. The foundational pair.</li>
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc2308">RFC 2308: Negative Caching of DNS Queries</a>. How NXDOMAIN/NODATA caching and the SOA negative TTL work.</li>
+      <li>IETF — <a href="https://www.rfc-editor.org/rfc/rfc6891">RFC 6891: Extension Mechanisms for DNS (EDNS(0))</a>. Larger UDP responses and the fallback story.</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man5/resolv.conf.5.html">resolv.conf(5)</a>: nameserver, search, and the <code>ndots</code>/<code>timeout</code>/<code>attempts</code> options.</li>
+      <li>The Linux man-pages project — <a href="https://man7.org/linux/man-pages/man3/getaddrinfo.3.html">getaddrinfo(3)</a>: the stub-resolver entry point apps actually call.</li>
+      <li>IANA — <a href="https://www.iana.org/domains/root/servers">Root Servers</a>: the authoritative list of the root name servers.</li>
+    </ul>
+
+    <div class="prevnext">
+      <a href="ch14-ports-sockets-ephemeral-ports-connection-lifecycle.html"><span class="dir">← Prev</span><div class="ti">Ch 14 — Ports, sockets, ephemeral ports, connection lifecycle</div></a>
+      <a class="nx" href="ch16-http-http-2-http-3-and-grpc.html"><span class="dir">Next →</span><div class="ti">Ch 16 — HTTP, HTTP/2, HTTP/3, and gRPC</div></a>
+    </div>
+
+    <footer class="book">
+      Chapter 15 of 121 · Part II · Networking from First Principles. Next time someone says "it's probably DNS," you'll know how to prove it in three commands.
+    </footer>
+  </main>
+
+  <nav class="toc">
+    <div class="tt">On this page</div>
+    <a href="#why">The problem</a>
+    <a href="#model">Mental model</a>
+    <a href="#arch">The resolution path</a>
+    <a href="#resolve">Recursion &amp; caching</a>
+    <a href="#components">Records, resolv.conf, libc</a>
+    <a href="#flow">One lookup end to end</a>
+    <a href="#labs">Hands-on labs</a>
+    <a href="#failure">Real incidents</a>
+    <a href="#prod">In production</a>
+    <a href="#design">System-design link</a>
+    <a href="#interview">Interview Q&amp;A</a>
+    <a href="#revision">Quick revision</a>
+    <a href="#sources">Further reading</a>
+  </nav>
+</div>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

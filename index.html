@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SRE / Platform Engineering — Textbook &amp; Lab Program</title>
+<link rel="stylesheet" href="assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="home">SRE / Platform Engineering <small>· Textbook &amp; Lab</small></span>
+  <span class="sp"></span>
+  <a class="tbtn" href="00-Curriculum-Plan.html">Curriculum plan</a>
+  <button class="tbtn" data-theme-toggle>◐ Theme</button>
+</div>
+
+<div class="wrap">
+  <div class="content" style="grid-column:1 / -1;max-width:960px;margin:0 auto">
+    <div class="hero">
+      <div class="kicker">The book · home</div>
+      <h1>Understand it, build it, break it, fix it, design it, explain it.</h1>
+      <p class="tagline">A first-principles SRE and Platform Engineering course. Every chapter opens at true beginner level and ends at the depth a Staff SRE carries in their head — with real production stories so the ideas stick.</p>
+      <div class="levelbar">
+        <span class="lv">Beginner</span><span class="arrow">→</span>
+        <span class="lv">Intermediate</span><span class="arrow">→</span>
+        <span class="lv">Advanced</span><span class="arrow">→</span>
+        <span class="lv">Senior</span><span class="arrow">→</span>
+        <span class="lv">Lead / Staff</span>
+      </div>
+    </div>
+
+    <div class="goal">
+      <h4>How to use this book</h4>
+      <ul>
+        <li>Read a chapter top to bottom once. It starts gentle, so don't skip the analogy — it's the hook the internals hang on.</li>
+        <li>Actually run the labs. Reading about a TCP handshake and watching one in <code>tcpdump</code> are different skills, and only one gets you hired.</li>
+        <li>Hit a <b>Think first</b> box? Stop and answer it in your head before you click. That reflex is the whole point.</li>
+        <li>Work in order — chapters lean on earlier ones — but the distributed-systems track (Part IX) is a fine detour any time after networking.</li>
+      </ul>
+    </div>
+
+    <div class="progress">
+      <div style="display:flex;justify-content:space-between;align-items:baseline">
+        <b>Progress</b><span class="small" id="progtext">—</span>
+      </div>
+      <div class="bar"><i id="progbar" style="width:0%"></i></div>
+      <p class="small" style="margin:10px 0 0">Start here → <a href="chapters/ch01-kernel-and-system-calls.html"><b>Chapter 1 — The kernel, user space &amp; system calls</b></a>. New chapters are added part by part; anything marked <span class="badge soon" style="padding:1px 7px">Planned</span> is written and ready in the plan, not yet built as a page.</p>
+    </div>
+
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:18px 0 6px">
+      <input id="q" type="search" placeholder="Search 121 chapters — TCP, kube-proxy, IRSA, Envoy, sharding…"
+        style="flex:1;min-width:240px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--panel);color:var(--ink);font-size:14px">
+      <button class="tbtn" data-expand-all>Collapse all</button>
+    </div>
+
+    <div id="parts"></div>
+    <p class="small" id="noresults" style="display:none">No chapters match. Clear the search.</p>
+
+    <footer class="book">
+      14 parts · 121 chapters · local-first labs · built to open offline, months from now.<br>
+      This folder is the book. Keep <code>index.html</code>, <code>00-Curriculum-Plan.html</code>, the <code>assets/</code> and <code>chapters/</code> folders together.
+    </footer>
+  </div>
+</div>
+
+<script src="assets/book.js"></script>
+<script>
+(function(){
+  "use strict";
+  var DONE={1:"chapters/ch01-kernel-and-system-calls.html"};
+  var parts=[
+    {n:"I",title:"Linux &amp; Operating-System Foundations",ch:[
+      [1,"The kernel, user space, and system calls"],[2,"Processes, threads, scheduling, signals"],
+      [3,"Memory: virtual memory, page cache, swap, OOM"],[4,"Filesystems, inodes, file descriptors, disk I/O"],
+      [5,"Users, groups, permissions, capabilities"],[6,"systemd, journald, cron, service lifecycle"],
+      [7,"The SRE Linux toolkit as a diagnostic system"],[8,"Bash &amp; shell scripting for automation"],
+      [9,"Python for SRE automation"]]},
+    {n:"II",title:"Networking from First Principles",ch:[
+      [10,"OSI vs TCP/IP, encapsulation, the layered model"],[11,"L2 — Ethernet, MAC, ARP, switching"],
+      [12,"L3 — IP, CIDR, subnetting, routing, NAT"],[13,"L4 — TCP deep, and UDP"],
+      [14,"Ports, sockets, ephemeral ports, connection lifecycle"],[15,"DNS, end to end"],
+      [16,"HTTP / HTTP&#8202;2 / HTTP&#8202;3, and gRPC"],[17,"TLS &amp; PKI"],
+      [18,"The Linux network stack internals"],[19,"Capstone trace — curl https://example.com"],
+      [20,"The network troubleshooting toolkit"]]},
+    {n:"III",title:"Containers &amp; Container Internals",ch:[
+      [21,"What a container really is"],[22,"Linux namespaces"],[23,"cgroups v2 — CPU, memory, I/O limits"],
+      [24,"Container filesystems — overlayfs &amp; image layers"],[25,"Container networking"],
+      [26,"Docker, containerd, runc, and the OCI model"],[27,"Container security &amp; Process→Container→Pod→VM"]]},
+    {n:"IV",title:"Kubernetes — Architecture &amp; Internals",ch:[
+      [28,"Why Kubernetes — the declarative, reconciled model"],[29,"Control plane — API server, etcd, scheduler, CM"],
+      [30,"The node — kubelet, kube-proxy, runtime, CRI"],[31,"The reconciliation loop, controllers, informers"],
+      [32,"API machinery — apply path, admission, CRDs &amp; operators"],[33,"Workloads I — Pod, ReplicaSet, Deployment"],
+      [34,"Workloads II — StatefulSet, DaemonSet, Job, CronJob"],[35,"Config &amp; identity — ConfigMap, Secret, SA, Namespace"],
+      [36,"Scheduling deep"],[37,"Autoscaling &amp; governance — HPA, VPA, CA/Karpenter"],
+      [38,"Storage — volumes, PV, PVC, StorageClass, CSI"],[39,"Security — RBAC, admission policy, securityContext"],
+      [40,"Kubernetes troubleshooting methodology"]]},
+    {n:"V",title:"Kubernetes Networking at Packet Level",ch:[
+      [41,"The Kubernetes network model &amp; CNI"],[42,"Pod networking internals — Pod → Pod"],
+      [43,"Services &amp; the datapath — Pod → Service"],[44,"NodePort, LoadBalancer — Internet → Pod"],
+      [45,"CoreDNS &amp; service discovery"],[46,"Ingress &amp; the Gateway API"],
+      [47,"NetworkPolicy deep"],[48,"Pod → Internet, and the full synthesis"]]},
+    {n:"VI",title:"AWS &amp; EKS for SREs",ch:[
+      [49,"The AWS mental model — regions, AZs, failure domains"],[50,"VPC foundations — CIDR, subnets, routes, IGW, NAT"],
+      [51,"VPC security — Security Groups vs NACLs"],[52,"Load balancing — ALB, NLB, target groups, health checks"],
+      [53,"Route 53 — DNS &amp; routing policies"],[54,"IAM &amp; STS"],[55,"IRSA &amp; EKS Pod Identity"],
+      [56,"Compute &amp; data services for SREs"],[57,"EKS architecture"],[58,"VPC CNI — the deep one"],
+      [59,"AWS integrations"],[60,"End-to-end synthesis — Internet → ALB → Service → Pod"]]},
+    {n:"VII",title:"Platform Engineering — Packaging, IaC, GitOps, Mesh, Access",ch:[
+      [61,"Helm"],[62,"Terraform I — model, state, the dependency graph"],[63,"Terraform II — modules, state at scale, drift"],
+      [64,"GitOps principles"],[65,"Argo CD"],[66,"Service-mesh foundations"],[67,"Envoy &amp; Istiod internals"],
+      [68,"Istio traffic management"],[69,"Istio security"],[70,"Istio resilience &amp; onboarding a new service"],
+      [71,"Istio troubleshooting — the deep one"],[72,"Teleport &amp; identity-based access"],[73,"CI/CD &amp; progressive delivery"]]},
+    {n:"VIII",title:"Observability",ch:[
+      [74,"Observability foundations"],[75,"Prometheus"],[76,"Grafana &amp; dashboard design"],
+      [77,"Alerting &amp; on-call health"],[78,"Logging"],[79,"Distributed tracing &amp; OpenTelemetry"],
+      [80,"SLI / SLO / SLA &amp; error budgets"]]},
+    {n:"IX",title:"Distributed Systems, Data &amp; Reliability",ch:[
+      [81,"Distributed-systems fundamentals"],[82,"Consistency, replication, partitioning"],
+      [83,"Coordination — leader election, consensus, locks, clocks"],[84,"Async &amp; flow control"],
+      [85,"Caching"],[86,"The data layer — MySQL &amp; PostgreSQL"],[87,"Redis &amp; in-memory data"],
+      [88,"Reliability engineering"],[89,"Capacity planning &amp; performance"],[90,"Disaster recovery"],
+      [91,"Chaos engineering"],[92,"Incident management, postmortems &amp; the SRE operating model"]]},
+    {n:"X",title:"System Design",ch:[
+      [93,"The system-design method"],[94,"Building blocks"],[95,"Scaling patterns"],
+      [96,"Project — URL shortener"],[97,"Project — Distributed rate limiter"],
+      [98,"Project — Distributed job/queue processing"],[99,"Project — Notification system"],
+      [100,"Project — Metrics/monitoring platform"],[101,"Project — CI/CD + Kubernetes platform"],
+      [102,"Project — Highly available multi-region SaaS"]]},
+    {n:"XI",title:"SRE Problem-Solving &amp; Production Troubleshooting",ch:[
+      [103,"The universal troubleshooting framework"],[104,"Compute &amp; memory runbooks"],
+      [105,"Network runbooks"],[106,"HTTP status-code runbooks"],[107,"Kubernetes runbooks"],
+      [108,"Platform &amp; distributed runbooks"]]},
+    {n:"XII",title:"Interview Mastery &amp; Mock Interviews",ch:[
+      [109,"Interview strategy — how levels are scored"],[110,"Topic interview banks"],
+      [111,"Distributed-systems &amp; system-design interviews"],[112,"Production-troubleshooting &amp; incident interviews"],
+      [113,"Behavioral &amp; leadership (lead/staff)"],[114,"Mock-interview mode"]]},
+    {n:"XIII",title:"Capstone",ch:[
+      [115,"The capstone platform"],[116,"The incident gauntlet"]]},
+    {n:"XIV",title:"Interview Coding &amp; SRE Career &nbsp;<span class='small'>(added after the mxssl-guide review)</span>",ch:[
+      [117,"Coding, algorithms &amp; data structures for SRE interviews"],
+      [118,"Timed scripting &amp; log-wrangling (“SRE coding”) + SadServers drills"],
+      [119,"The SRE interview process, levels &amp; what each round scores"],
+      [120,"Resume, portfolio &amp; salary negotiation"],
+      [121,"Go for SRE — optional language track"]]}
+  ];
+
+  var total=0, done=0;
+  var host=document.getElementById('parts');
+  parts.forEach(function(p,idx){
+    var card=document.createElement('div'); card.className='partcard'+(idx>0?' collapsed':'');
+    var doneN=0; p.ch.forEach(function(c){ if(DONE[c[0]]) doneN++; });
+    var head=document.createElement('div'); head.className='ph';
+    head.innerHTML='<span class="pn">'+p.n+'</span><h3>'+p.title+'</h3><span class="st">'+doneN+' / '+p.ch.length+'</span>';
+    card.appendChild(head);
+    var body=document.createElement('div'); body.className='pb';
+    p.ch.forEach(function(c){
+      total++;
+      var row=document.createElement('div'); row.className='crow';
+      var slug=DONE[c[0]];
+      var title=slug?('<a href="'+slug+'">'+c[1]+'</a>'):c[1];
+      var badge=slug?'<span class="badge ready">Ready</span>':'<span class="badge soon">Planned</span>';
+      if(slug){ row.classList.add('done'); done++; }
+      row.innerHTML='<span class="cn">'+c[0]+'</span><span class="ct">'+title+'</span>'+badge;
+      body.appendChild(row);
+    });
+    card.appendChild(body);
+    host.appendChild(card);
+  });
+
+  var pct=Math.round(done/total*100);
+  document.getElementById('progbar').style.width=pct+'%';
+  document.getElementById('progtext').textContent=done+' of '+total+' chapters built ('+pct+'%)';
+
+  // search
+  var q=document.getElementById('q');
+  q.addEventListener('input',function(){
+    var term=q.value.trim().toLowerCase(); var any=false;
+    document.querySelectorAll('.partcard').forEach(function(card){
+      var vis=0;
+      card.querySelectorAll('.crow').forEach(function(r){
+        var ok=!term||r.textContent.toLowerCase().indexOf(term)>-1;
+        r.style.display=ok?'':'none'; if(ok)vis++;
+      });
+      card.style.display=vis>0?'':'none';
+      if(vis>0){ any=true; if(term) card.classList.remove('collapsed'); }
+    });
+    document.getElementById('noresults').style.display=any?'none':'';
+  });
+})();
+</script>
+</body>
+</html>

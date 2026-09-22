@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SRE / Platform Engineering — Curriculum & Training Plan</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --panel:#ffffff; --ink:#12161c; --muted:#5a6472; --line:#e4e8ee;
+    --accent:#0f6fb8; --accent2:#0b8f6a; --deep:#c23b3b; --applied:#b06f00;
+    --code-bg:#0f141a; --code-ink:#d6e2f0; --shadow:0 1px 2px rgba(16,24,40,.06),0 6px 20px rgba(16,24,40,.06);
+    --chip:#eef2f7;
+  }
+  html[data-theme="dark"]{
+    --bg:#0c1016; --panel:#141a22; --ink:#e6ebf2; --muted:#9aa6b6; --line:#232c38;
+    --accent:#4ca8e6; --accent2:#38c496; --deep:#ff7676; --applied:#e6a638;
+    --code-bg:#0a0e13; --code-ink:#cfe0f2; --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35);
+    --chip:#1c242e;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  a{color:var(--accent); text-decoration:none}
+  a:hover{text-decoration:underline}
+  code,kbd{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.9em}
+  .layout{display:grid; grid-template-columns:290px 1fr; min-height:100vh}
+  /* Sidebar */
+  aside{
+    position:sticky; top:0; align-self:start; height:100vh; overflow:auto;
+    background:var(--panel); border-right:1px solid var(--line); padding:20px 16px;
+  }
+  aside .brand{font-weight:700; font-size:15px; letter-spacing:.2px}
+  aside .brand small{display:block; color:var(--muted); font-weight:500; font-size:12px; margin-top:2px}
+  nav{margin-top:16px}
+  nav a{display:block; color:var(--muted); padding:6px 10px; border-radius:8px; font-size:13.5px; margin:1px 0}
+  nav a:hover{background:var(--chip); text-decoration:none; color:var(--ink)}
+  nav a.active{background:var(--chip); color:var(--ink); font-weight:600; box-shadow:inset 3px 0 0 var(--accent)}
+  nav .grp{font-size:11px; text-transform:uppercase; letter-spacing:.09em; color:var(--muted); margin:14px 10px 4px; opacity:.8}
+  .toolbar{display:flex; gap:8px; margin-top:14px; flex-wrap:wrap}
+  .btn{cursor:pointer; border:1px solid var(--line); background:var(--panel); color:var(--ink);
+       padding:6px 10px; border-radius:8px; font-size:12.5px}
+  .btn:hover{border-color:var(--accent)}
+  /* Main */
+  main{padding:0 min(6vw,64px) 120px; max-width:1080px}
+  .hero{padding:56px 0 20px; border-bottom:1px solid var(--line)}
+  .kicker{color:var(--accent); font-weight:700; letter-spacing:.14em; text-transform:uppercase; font-size:12px}
+  h1{font-size:40px; line-height:1.12; margin:12px 0 8px; letter-spacing:-.02em}
+  .sub{color:var(--muted); font-size:18px; max-width:70ch}
+  .meta{display:flex; gap:22px; flex-wrap:wrap; margin-top:22px}
+  .meta .m{background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px 16px; box-shadow:var(--shadow)}
+  .meta .m b{display:block; font-size:22px}
+  .meta .m span{color:var(--muted); font-size:12.5px}
+  section.block{padding:40px 0; border-bottom:1px solid var(--line)}
+  h2{font-size:26px; letter-spacing:-.01em; margin:0 0 6px}
+  h2 .n{color:var(--accent); font-weight:800; margin-right:10px}
+  .lead{color:var(--muted); max-width:76ch; margin:0 0 18px}
+  h3{font-size:18px; margin:26px 0 8px}
+  p{max-width:78ch}
+  .card{background:var(--panel); border:1px solid var(--line); border-radius:14px; box-shadow:var(--shadow); overflow:hidden; margin:16px 0}
+  .part-head{display:flex; align-items:center; gap:12px; padding:16px 18px; cursor:pointer; user-select:none}
+  .part-head:hover{background:var(--chip)}
+  .part-head .pn{font-size:12px; font-weight:800; color:#fff; background:var(--accent); border-radius:7px; padding:4px 8px; letter-spacing:.04em}
+  .part-head h3{margin:0; font-size:17px}
+  .part-head .desc{color:var(--muted); font-size:13px; margin-left:auto; text-align:right; max-width:44ch}
+  .part-head .caret{transition:transform .18s; color:var(--muted)}
+  .card.collapsed .part-body{display:none}
+  .card.collapsed .caret{transform:rotate(-90deg)}
+  .part-body{border-top:1px solid var(--line)}
+  .ch{display:grid; grid-template-columns:52px 1fr auto; gap:12px; padding:12px 18px; border-top:1px solid var(--line)}
+  .ch:first-child{border-top:none}
+  .ch .cn{color:var(--muted); font-variant-numeric:tabular-nums; font-size:13px; padding-top:2px}
+  .ch .ct{font-weight:600}
+  .ch .cf{color:var(--muted); font-size:13.5px; margin-top:2px}
+  .tags{display:flex; gap:6px; flex-wrap:wrap; align-items:flex-start}
+  .tag{font-size:10.5px; font-weight:700; letter-spacing:.03em; padding:3px 7px; border-radius:999px; white-space:nowrap; text-transform:uppercase}
+  .t-deep{background:rgba(194,59,59,.12); color:var(--deep); border:1px solid rgba(194,59,59,.28)}
+  .t-core{background:var(--chip); color:var(--muted); border:1px solid var(--line)}
+  .t-applied{background:rgba(176,111,0,.12); color:var(--applied); border:1px solid rgba(176,111,0,.28)}
+  .t-lab{background:rgba(11,143,106,.12); color:var(--accent2); border:1px solid rgba(11,143,106,.28)}
+  .t-design{background:rgba(15,111,184,.12); color:var(--accent); border:1px solid rgba(15,111,184,.28)}
+  .t-mock{background:rgba(120,80,200,.14); color:#7a52c8; border:1px solid rgba(120,80,200,.3)}
+  html[data-theme="dark"] .t-mock{color:#b79bec}
+  .searchrow{display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:6px 0 4px}
+  .searchrow input{flex:1; min-width:220px; padding:10px 12px; border:1px solid var(--line); border-radius:10px; background:var(--panel); color:var(--ink); font-size:14px}
+  .filters{display:flex; gap:6px; flex-wrap:wrap}
+  .filters .btn.on{background:var(--accent); color:#fff; border-color:var(--accent)}
+  .legend{display:flex; gap:14px; flex-wrap:wrap; color:var(--muted); font-size:12.5px; margin-top:10px}
+  .legend span b{color:var(--ink)}
+  /* generic boxes */
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:16px}
+  .grid3{display:grid; grid-template-columns:repeat(3,1fr); gap:14px}
+  .box{background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px 18px; box-shadow:var(--shadow)}
+  .box h4{margin:0 0 8px; font-size:15px}
+  .box.accent{border-left:4px solid var(--accent)}
+  .box.deep{border-left:4px solid var(--deep)}
+  .box.warn{border-left:4px solid var(--applied)}
+  ol.steps{counter-reset:s; list-style:none; padding:0; margin:0}
+  ol.steps li{counter-increment:s; position:relative; padding:8px 0 8px 40px; border-top:1px dashed var(--line)}
+  ol.steps li:first-child{border-top:none}
+  ol.steps li::before{content:counter(s); position:absolute; left:0; top:8px; width:26px; height:26px; border-radius:50%;
+    background:var(--chip); color:var(--ink); font-weight:700; font-size:12px; display:grid; place-items:center; border:1px solid var(--line)}
+  ol.steps li b{display:block}
+  ol.steps li span{color:var(--muted); font-size:13.5px}
+  /* phase ladder */
+  .ladder{display:flex; flex-direction:column; gap:0; margin-top:8px}
+  .phase{display:grid; grid-template-columns:120px 1fr; gap:0; align-items:stretch}
+  .phase .pl{padding:16px; font-weight:700; color:#fff; display:flex; align-items:center; justify-content:center; text-align:center; font-size:13px}
+  .phase .pc{background:var(--panel); border:1px solid var(--line); border-left:none; padding:14px 16px}
+  .phase .pc .doms{display:flex; gap:8px; flex-wrap:wrap; margin-top:6px}
+  .dom{font-size:12.5px; background:var(--chip); border:1px solid var(--line); border-radius:8px; padding:4px 9px}
+  .phase .pc small{color:var(--muted)}
+  .arrowdown{height:18px; display:grid; place-items:center; color:var(--muted)}
+  /* skill ladder */
+  .rung{display:grid; grid-template-columns:150px 1fr; gap:14px; padding:14px 0; border-top:1px solid var(--line)}
+  .rung:first-child{border-top:none}
+  .rung .lvl{font-weight:800}
+  .rung .lvl small{display:block; color:var(--muted); font-weight:500; font-size:12px; margin-top:2px}
+  table.dep{width:100%; border-collapse:collapse; margin-top:6px; font-size:14px}
+  table.dep th,table.dep td{border:1px solid var(--line); padding:9px 12px; text-align:left; vertical-align:top}
+  table.dep th{background:var(--chip); font-size:12.5px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted)}
+  .pill{display:inline-block; font-size:12px; background:var(--chip); border:1px solid var(--line); border-radius:999px; padding:2px 9px; margin:2px 3px 0 0}
+  .callout{background:linear-gradient(0deg,var(--panel),var(--panel)) padding-box; border:1px solid var(--line); border-left:4px solid var(--accent2);
+    border-radius:12px; padding:16px 18px; margin:16px 0}
+  footer{color:var(--muted); font-size:13px; padding:30px 0 0}
+  .note{font-size:13px; color:var(--muted)}
+  @media (max-width:960px){
+    .layout{grid-template-columns:1fr}
+    aside{position:static; height:auto; border-right:none; border-bottom:1px solid var(--line)}
+    .grid2,.grid3{grid-template-columns:1fr}
+    .part-head .desc{display:none}
+    h1{font-size:32px}
+  }
+  @media print{
+    aside{display:none} .layout{grid-template-columns:1fr} .card.collapsed .part-body{display:block}
+    .btn,.toolbar,.searchrow{display:none}
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+<aside>
+  <div class="brand">SRE / Platform Engineering<small>Textbook &amp; Lab Program — Master Plan</small></div>
+  <div class="toolbar">
+    <button class="btn" id="themeBtn">◐ Theme</button>
+    <button class="btn" id="expandBtn">Expand all</button>
+    <button class="btn" id="printBtn">Print</button>
+  </div>
+  <nav id="toc">
+    <div class="grp">Orientation</div>
+    <a href="#orientation">How this book works</a>
+    <a href="#template">The chapter template</a>
+    <a href="#frameworks">Core frameworks</a>
+    <div class="grp">Curriculum</div>
+    <a href="#curriculum">All 14 parts &middot; 121 chapters</a>
+    <a href="#deepest">Deepest-treatment topics</a>
+    <div class="grp">Progressions</div>
+    <a href="#deps">Dependency map</a>
+    <a href="#labs">Lab progression</a>
+    <a href="#design">System-design progression</a>
+    <a href="#trouble">Troubleshooting progression</a>
+    <a href="#skill">Beginner → Staff ladder</a>
+    <div class="grp">Endgame</div>
+    <a href="#capstone">Capstone platform</a>
+    <a href="#additions">What I added to your brief</a>
+    <a href="#sources">Sources &amp; the repo review</a>
+    <a href="#next">How we proceed</a>
+  </nav>
+</aside>
+
+<main>
+  <div class="hero" id="top">
+    <div class="kicker">Master Plan · v1 · for review</div>
+    <h1>From "I use these tools" to "I understand, build, break, fix, design, and explain the systems underneath."</h1>
+    <p class="sub">A first-principles SRE and Platform Engineering textbook plus a build-break-fix laboratory manual, sequenced for someone who already ships on AWS/EKS, Kubernetes, Helm, Argo CD, Istio, and Prometheus, and now wants the internals, the packet-level reasoning, and Senior/Lead/Staff interview command.</p>
+    <div class="meta">
+      <div class="m"><b>14</b><span>parts, dependency-ordered</span></div>
+      <div class="m"><b>121</b><span>chapters, one template</span></div>
+      <div class="m"><b>5-lab</b><span>arc per major topic</span></div>
+      <div class="m"><b>Local-first</b><span>Docker · kind · EKS where it earns it</span></div>
+      <div class="m"><b>Interactive</b><span>self-contained HTML, opens offline</span></div>
+    </div>
+    <p class="note" style="margin-top:20px">This page is the plan only — not the textbook. Review it, tell me what to change, and I write the book one part at a time (starting with Linux), keeping this structure and cross-references intact.</p>
+  </div>
+
+  <!-- ORIENTATION -->
+  <section class="block" id="orientation">
+    <h2><span class="n">0</span>How this book works</h2>
+    <p class="lead">Your learning loop drives every chapter: <b>Understand → Build → Observe → Break → Troubleshoot → Fix → Explain → Design → Interview</b>. Nothing is presented as a definition to memorize. Every concept starts from the problem it solves, then earns its complexity one layer at a time.</p>
+    <div class="grid3">
+      <div class="box accent"><h4>Textbook half</h4><p class="note">Prose that teaches the "why" and the internals — the reasoning a Staff SRE carries in their head. You can read a chapter cold, months from now, and rebuild the mental model.</p></div>
+      <div class="box accent"><h4>Lab-manual half</h4><p class="note">Every major topic ships a five-lab arc. You build the smallest real thing, inspect what actually got created, break it on purpose, and investigate before any root cause is revealed.</p></div>
+      <div class="box accent"><h4>Interview half</h4><p class="note">Each topic closes with a 30-second answer, a 2-minute answer, deep-dive and scenario questions, and the follow-ups an interviewer throws after your first answer.</p></div>
+    </div>
+    <div class="callout">
+      <b>Active recall is built in, not bolted on.</b> Chapters stop and ask you: <i>what happens next? which layer is failing? what command would you run? what evidence confirms it?</i> — then give progressive hints, not the answer. The point is to grow the reflex, so an unfamiliar incident in an interview or at 3 a.m. is still solvable.
+    </div>
+    <h3>Who this assumes you are</h3>
+    <p>You already deploy to EKS, write Helm charts, run Argo CD syncs, and read Grafana. So chapters skip the "what is a container" tour and go straight for the parts that experienced engineers usually hold as folklore: what a namespace actually is, why <code>TIME_WAIT</code> exists, what kube-proxy writes into iptables, how a pod gets AWS credentials without a secret. Where a fundamental gap would block the internals, the book fills it fast and moves on.</p>
+  </section>
+
+  <!-- TEMPLATE -->
+  <section class="block" id="template">
+    <h2><span class="n">0.1</span>The chapter template</h2>
+    <p class="lead">Every chapter follows the same 27-beat structure you specified, so the book is navigable and you always know where the lab or the interview section lives. Short topics compress beats; deep topics expand them — the order never changes.</p>
+    <div class="card"><div class="part-body">
+      <div class="ch"><div class="cn">1–4</div><div><div class="ct">Framing</div><div class="cf">Why it exists · the problem it solves · mental model · real-world analogy</div></div><div class="tags"><span class="tag t-core">Understand</span></div></div>
+      <div class="ch"><div class="cn">5–8</div><div><div class="ct">How it is built</div><div class="cf">Architecture · internal working · components · request/data flow</div></div><div class="tags"><span class="tag t-core">Internals</span></div></div>
+      <div class="ch"><div class="cn">9–12</div><div><div class="ct">Hands-on</div><div class="cf">Implementation · commands (with intent, not just syntax) · configuration · verification</div></div><div class="tags"><span class="tag t-lab">Build</span></div></div>
+      <div class="ch"><div class="cn">13–15</div><div><div class="ct">When it goes wrong</div><div class="cf">Failure scenarios · troubleshooting reasoning · production considerations</div></div><div class="tags"><span class="tag t-deep">Break/Fix</span></div></div>
+      <div class="ch"><div class="cn">16–19</div><div><div class="ct">Operating it</div><div class="cf">Security · performance · scalability · common mistakes</div></div><div class="tags"><span class="tag t-core">Operate</span></div></div>
+      <div class="ch"><div class="cn">20</div><div><div class="ct">System-design connection</div><div class="cf">Where this shows up when you architect at scale</div></div><div class="tags"><span class="tag t-design">Design</span></div></div>
+      <div class="ch"><div class="cn">21–22</div><div><div class="ct">Interview</div><div class="cf">Questions + interview-ready answers with the reasoning behind them</div></div><div class="tags"><span class="tag t-mock">Interview</span></div></div>
+      <div class="ch"><div class="cn">23–25</div><div><div class="ct">Practice</div><div class="cf">Hands-on lab · failure-injection exercise · senior-level challenge</div></div><div class="tags"><span class="tag t-lab">Lab</span></div></div>
+      <div class="ch"><div class="cn">26–27</div><div><div class="ct">Retain</div><div class="cf">Quick revision · the 10 things you must remember</div></div><div class="tags"><span class="tag t-core">Recall</span></div></div>
+    </div></div>
+  </section>
+
+  <!-- FRAMEWORKS -->
+  <section class="block" id="frameworks">
+    <h2><span class="n">0.2</span>Two frameworks used everywhere</h2>
+    <p class="lead">These repeat so often that they get taught once, early, then referenced by name for the rest of the book. Learning them as reflexes is half of what separates a senior SRE from a mid-level one.</p>
+    <div class="grid2">
+      <div class="box deep">
+        <h4>The troubleshooting loop</h4>
+        <ol class="steps">
+          <li><b>Symptom</b><span>State it precisely and measurably. "Slow" is not a symptom; "p99 doubled at 14:02 for /checkout" is.</span></li>
+          <li><b>Hypotheses</b><span>List several plausible causes across layers before touching anything.</span></li>
+          <li><b>Evidence &amp; investigation</b><span>Cheapest, most decisive check first. Let data kill hypotheses.</span></li>
+          <li><b>Isolation</b><span>Bisect the request path until the failing component is cornered.</span></li>
+          <li><b>Root cause → fix → validation</b><span>Prove the cause, apply the smallest safe fix, confirm the symptom is gone.</span></li>
+          <li><b>Prevention</b><span>What guardrail, alert, or design change stops the rerun.</span></li>
+        </ol>
+      </div>
+      <div class="box accent">
+        <h4>The system-design method</h4>
+        <p class="note" style="margin-top:0">Never jump to a diagram. Every design in Part X walks the same 21 steps:</p>
+        <p style="margin:6px 0">
+          <span class="pill">1 Clarify</span><span class="pill">2 Functional</span><span class="pill">3 Non-functional</span><span class="pill">4 Scale est.</span><span class="pill">5 Traffic</span><span class="pill">6 Storage</span><span class="pill">7 API</span><span class="pill">8 High-level</span><span class="pill">9 Data model</span><span class="pill">10 DB choice</span><span class="pill">11 Cache</span><span class="pill">12 Queue</span><span class="pill">13 Network</span><span class="pill">14 Security</span><span class="pill">15 Observability</span><span class="pill">16 Failure</span><span class="pill">17 Scale</span><span class="pill">18 Availability</span><span class="pill">19 DR</span><span class="pill">20 Cost</span><span class="pill">21 Trade-offs</span>
+        </p>
+        <p class="note">Each component gets a written justification: why it is here, and what breaks without it.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- CURRICULUM -->
+  <section class="block" id="curriculum">
+    <h2><span class="n">1</span>The curriculum</h2>
+    <p class="lead">Fourteen parts in dependency order. Filter or search to focus. <span class="t-deep tag">Deep dive</span> marks the topics that get the most pages and the hardest labs; <span class="t-lab tag">Lab</span> marks a full build-break-fix arc; <span class="t-design tag">Design</span> marks a system-design project; <span class="t-mock tag">Interview</span> marks a dedicated interview part.</p>
+    <div class="searchrow">
+      <input id="q" type="search" placeholder="Search chapters — e.g. TCP, kube-proxy, IRSA, Envoy, sharding…" autocomplete="off">
+      <div class="filters">
+        <button class="btn on" data-f="all">All</button>
+        <button class="btn" data-f="deep">Deep only</button>
+        <button class="btn" data-f="lab">Labs</button>
+        <button class="btn" data-f="design">Design</button>
+      </div>
+    </div>
+    <div class="legend">
+      <span><b>Tags:</b></span>
+      <span class="tag t-deep">Deep dive</span>
+      <span class="tag t-core">Core</span>
+      <span class="tag t-applied">Applied</span>
+      <span class="tag t-lab">Lab arc</span>
+      <span class="tag t-design">Design project</span>
+      <span class="tag t-mock">Interview</span>
+    </div>
+    <div id="parts">
+
+    <!-- PART I -->
+    <div class="card" data-part>
+      <div class="part-head"><span class="pn">I</span><h3>Linux &amp; Operating-System Foundations</h3><span class="caret">▾</span><span class="desc">The machine everything else runs on. Read as an SRE, not a sysadmin.</span></div>
+      <div class="part-body">
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">1</div><div><div class="ct">The kernel, user space, and system calls</div><div class="cf">Boot, ring 0 vs ring 3, the syscall boundary, how a program actually asks the OS for anything.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">2</div><div><div class="ct">Processes, threads, scheduling, signals</div><div class="cf">fork/exec, process states, the run queue, context switches, signals and zombies — read via <code>ps</code>, <code>/proc</code>.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">3</div><div><div class="ct">Memory: virtual memory, page cache, swap, OOM</div><div class="cf">Address spaces, paging, RSS vs cache, why "free" memory looks scary, and exactly when the OOM killer fires.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">4</div><div><div class="ct">Filesystems, inodes, file descriptors, disk I/O</div><div class="cf">What an FD really is, inode vs name, buffered vs direct I/O, iowait, "disk full but df says free".</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core"><div class="cn">5</div><div><div class="ct">Users, groups, permissions, capabilities</div><div class="cf">uid/gid, setuid, the permission check path, Linux capabilities — the basis for container security later.</div></div><div class="tags"><span class="tag t-core">Core</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">6</div><div><div class="ct">systemd, journald, cron, service lifecycle</div><div class="cf">Units, dependencies, cgroup-backed services, reading <code>journalctl</code>, why a service won't start.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">7</div><div><div class="ct">The SRE Linux toolkit as a diagnostic system</div><div class="cf"><code>top/htop vmstat iostat sar free lsof strace ss</code> — not a command list, but "which one answers which question," plus a USE-method sweep. eBPF/<code>bpftrace</code> introduced here.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">8</div><div><div class="ct">Bash &amp; shell scripting for automation</div><div class="cf">Pipelines, <code>grep/awk/sed/xargs/cut/sort/uniq</code>, exit codes, safe scripting, when to stop using bash.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">9</div><div><div class="ct">Python for SRE automation</div><div class="cf">Structure, stdlib for ops, calling APIs, writing a small operator-style tool, testing and packaging.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+      </div>
+    </div>
+
+    <!-- PART II -->
+    <div class="card" data-part>
+      <div class="part-head"><span class="pn">II</span><h3>Networking from First Principles</h3><span class="caret">▾</span><span class="desc">Your highest priority. Taught to packet level, ending in the full <code>curl</code> trace.</span></div>
+      <div class="part-body">
+        <div class="ch" data-depth="core"><div class="cn">10</div><div><div class="ct">OSI vs TCP/IP, encapsulation, the layered mental model</div><div class="cf">Why layers exist, what each header adds, how to reason about "which layer owns this problem."</div></div><div class="tags"><span class="tag t-core">Core</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">11</div><div><div class="ct">L2 — Ethernet, MAC, ARP, switching</div><div class="cf">Frames, the ARP cache, how a host finds its neighbor, broadcast domains — watched live with <code>tcpdump</code>.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">12</div><div><div class="ct">L3 — IP, CIDR, subnetting, routing, NAT</div><div class="cf">Addressing math you can do in your head, the routing table, default gateway decisions, source vs destination NAT.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">13</div><div><div class="ct">L4 — TCP deep, and UDP</div><div class="cf">Three-way handshake, the full state machine, <code>TIME_WAIT</code> and why it protects you, retransmission, flow vs congestion control, head-of-line blocking.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">14</div><div><div class="ct">Ports, sockets, ephemeral ports, connection lifecycle</div><div class="cf">The 4-tuple, socket states in <code>ss</code>, ephemeral-port exhaustion, connection reuse and keep-alive.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">15</div><div><div class="ct">DNS, end to end</div><div class="cf">Recursive vs authoritative, record types, the resolver path, TTL and caching, negative caching, the failures that masquerade as app bugs.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core"><div class="cn">16</div><div><div class="ct">HTTP / HTTP/2 / HTTP/3, and gRPC</div><div class="cf">Methods, status classes, headers, keep-alive, multiplexing, QUIC, and why gRPC changes load-balancing assumptions.</div></div><div class="tags"><span class="tag t-core">Core</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">17</div><div><div class="ct">TLS &amp; PKI</div><div class="cf">Handshake step by step, certificate chains, SNI, session resumption, mTLS, and the anatomy of an expiry incident.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">18</div><div><div class="ct">The Linux network stack internals</div><div class="cf">Network namespaces, veth pairs, bridges, <code>iptables</code>/<code>nftables</code>, conntrack, and packet traversal through the kernel — the foundation for all container networking.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">19</div><div><div class="ct">Capstone trace — what happens when you run <code>curl https://example.com</code></div><div class="cf">The full path: process → resolver → socket → routing → ARP → TCP → TLS → HTTP → server → response, each step with the packet and the command that reveals it. This chapter is the spine of the whole networking part.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">20</div><div><div class="ct">The network troubleshooting toolkit</div><div class="cf"><code>ip ss tcpdump dig curl ping traceroute nc mtr conntrack</code> — each mapped to the question it answers, then a set of packet-capture investigations you have to solve.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+      </div>
+    </div>
+
+    <!-- PART III -->
+    <div class="card" data-part>
+      <div class="part-head"><span class="pn">III</span><h3>Containers &amp; Container Internals</h3><span class="caret">▾</span><span class="desc">A container is a process in a costume. This part removes the magic.</span></div>
+      <div class="part-body">
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">21</div><div><div class="ct">What a container really is</div><div class="cf">Build one by hand from namespaces + cgroups + a chroot, so "it's just a Linux process, isolated" stops being a slogan.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">22</div><div><div class="ct">Linux namespaces</div><div class="cf">pid, net, mnt, uts, ipc, user, cgroup — what each hides, inspected through <code>/proc/&lt;pid&gt;/ns</code> and <code>nsenter</code>.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">23</div><div><div class="ct">cgroups v2 — CPU, memory, I/O limits</div><div class="cf">How limits are enforced, CPU throttling vs shares, memory limits and OOM-kill mechanics, the numbers behind "the pod got throttled."</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">24</div><div><div class="ct">Container filesystems — overlayfs &amp; image layers</div><div class="cf">Copy-on-write, layer caching, why image order matters, ephemeral vs persistent writes.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">25</div><div><div class="ct">Container networking</div><div class="cf">The bridge + veth + NAT model, port mapping, container-to-container and container-to-host — the direct ancestor of the CNI model.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">26</div><div><div class="ct">Docker, containerd, runc, and the OCI model</div><div class="cf">What the daemon does vs the runtime, image build internals, registries, and where Kubernetes plugs in via the CRI.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core"><div class="cn">27</div><div><div class="ct">Container security &amp; Process → Container → Pod → VM</div><div class="cf">Capabilities, seccomp, rootless, the isolation spectrum, and a clear-eyed comparison of the four units of compute.</div></div><div class="tags"><span class="tag t-core">Core</span></div></div>
+      </div>
+    </div>
+
+    <!-- PART IV -->
+    <div class="card" data-part>
+      <div class="part-head"><span class="pn">IV</span><h3>Kubernetes — Architecture &amp; Internals</h3><span class="caret">▾</span><span class="desc">Control loops, not YAML. Why the cluster does what it does.</span></div>
+      <div class="part-body">
+        <div class="ch" data-depth="core"><div class="cn">28</div><div><div class="ct">Why Kubernetes — the declarative, reconciled model</div><div class="cf">The orchestration problem, desired vs actual state, level-triggered control — the idea the rest of the part elaborates.</div></div><div class="tags"><span class="tag t-core">Core</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">29</div><div><div class="ct">The control plane — API server, etcd, scheduler, controller manager</div><div class="cf">Request path through the API server, etcd as the source of truth (and its backup/quorum concerns), how scheduling decisions are made.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">30</div><div><div class="ct">The node — kubelet, kube-proxy, runtime, CRI</div><div class="cf">How a pod actually starts on a node, the PLEG, eviction, node conditions and what "NotReady" means underneath.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep"><div class="cn">31</div><div><div class="ct">The reconciliation loop, controllers, informers</div><div class="cf">Watch/list, the informer cache, work queues, edge vs level triggering — the pattern behind every controller and operator.</div></div><div class="tags"><span class="tag t-deep">Deep</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">32</div><div><div class="ct">API machinery — objects, the apply path, admission, CRDs &amp; operators</div><div class="cf">What happens between <code>kubectl apply</code> and etcd, validating vs mutating admission webhooks, and writing a minimal operator.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">33</div><div><div class="ct">Workloads I — Pod, ReplicaSet, Deployment</div><div class="cf">Pod lifecycle, init and sidecar containers, probes, rolling updates and rollbacks, and what the Deployment controller does step by step.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">34</div><div><div class="ct">Workloads II — StatefulSet, DaemonSet, Job, CronJob</div><div class="cf">Stable identity and ordering, per-node daemons, run-to-completion semantics, and the failure modes unique to each.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">35</div><div><div class="ct">Config &amp; identity — ConfigMap, Secret, ServiceAccount, Namespace</div><div class="cf">Injection mechanics, the downward API, why Secrets aren't secret by default, and secret-management options (External Secrets, SOPS, sealed-secrets, Vault).</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">36</div><div><div class="ct">Scheduling deep</div><div class="cf">Requests vs limits, the three QoS classes, node selection, taints/tolerations, affinity/anti-affinity, topology spread, PDBs — and how they interact under pressure.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">37</div><div><div class="ct">Autoscaling &amp; governance — HPA, VPA, Cluster Autoscaler/Karpenter</div><div class="cf">Metrics-driven scaling, node autoscaling, ResourceQuota and LimitRange, and a first look at right-sizing and cost.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">38</div><div><div class="ct">Storage — volumes, PV, PVC, StorageClass, CSI</div><div class="cf">Static vs dynamic provisioning, access modes, the CSI attach/mount flow, and StatefulSet storage in practice.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">39</div><div><div class="ct">Security — RBAC, admission policy, securityContext</div><div class="cf">RBAC that actually maps to teams, Pod Security Admission, OPA/Gatekeeper and Kyverno, and supply-chain basics (scanning, signing, SBOM).</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">40</div><div><div class="ct">Kubernetes troubleshooting methodology</div><div class="cf">A reasoning framework for CrashLoopBackOff, ImagePullBackOff, Pending, NotReady, OOMKilled — read as symptoms of the internals in Ch 28–39.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+      </div>
+    </div>
+
+    <!-- PART V -->
+    <div class="card" data-part>
+      <div class="part-head"><span class="pn">V</span><h3>Kubernetes Networking at Packet Level</h3><span class="caret">▾</span><span class="desc">Where Part II meets Part IV. Every arrow is a real packet.</span></div>
+      <div class="part-body">
+        <div class="ch" data-depth="deep"><div class="cn">41</div><div><div class="ct">The Kubernetes network model &amp; CNI</div><div class="cf">The flat-pod-network promise, what the CNI plugin is responsible for, and how it plugs into the kubelet.</div></div><div class="tags"><span class="tag t-deep">Deep</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">42</div><div><div class="ct">Pod networking internals — Pod → Pod</div><div class="cf">Pod netns, veth to the node, same-node bridging vs cross-node routing, traced with real captures.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">43</div><div><div class="ct">Services &amp; the datapath — Pod → Service</div><div class="cf">ClusterIP, EndpointSlices, kube-proxy in iptables vs IPVS mode, and exactly which rule rewrites the packet.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">44</div><div><div class="ct">NodePort, LoadBalancer — Internet → Pod</div><div class="cf">The full external path, externalTrafficPolicy and source-IP preservation, and where cloud load balancers hook in.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">45</div><div><div class="ct">CoreDNS &amp; service discovery</div><div class="cf">The in-cluster resolution path, <code>ndots</code> and search domains, DNS caching, and the classic "intermittent DNS" incident.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">46</div><div><div class="ct">Ingress &amp; the Gateway API</div><div class="cf">L7 routing, ingress controllers, and the current Gateway API model that supersedes Ingress for new designs.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">47</div><div><div class="ct">NetworkPolicy deep</div><div class="cf">Default-deny, ingress/egress rules, how the CNI enforces them, and why a policy "silently" broke a service.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">48</div><div><div class="ct">Pod → Internet, and the full synthesis</div><div class="cf">Egress SNAT, and one diagram that stitches Ch 41–47 into a single labeled packet journey.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+      </div>
+    </div>
+
+    <!-- PART VI -->
+    <div class="card" data-part>
+      <div class="part-head"><span class="pn">VI</span><h3>AWS &amp; EKS for SREs</h3><span class="caret">▾</span><span class="desc">Cloud through a networking and identity lens, wired straight back to Kubernetes.</span></div>
+      <div class="part-body">
+        <div class="ch" data-depth="core"><div class="cn">49</div><div><div class="ct">The AWS mental model — regions, AZs, failure domains</div><div class="cf">What an AZ guarantees, the shared-responsibility line, and how to think about blast radius before drawing anything.</div></div><div class="tags"><span class="tag t-core">Core</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">50</div><div><div class="ct">VPC foundations — CIDR, subnets, route tables, IGW, NAT GW</div><div class="cf">Public vs private subnets defined by routes, the internet and NAT gateways, and the packet's path out of the VPC.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">51</div><div><div class="ct">VPC security — Security Groups vs NACLs</div><div class="cf">Stateful vs stateless, evaluation order, and a packet traced through both on the way to an instance.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">52</div><div><div class="ct">Load balancing — ALB, NLB, target groups, health checks</div><div class="cf">L7 vs L4 choice, target types, cross-zone behavior, and how health checks decide who gets traffic.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core"><div class="cn">53</div><div><div class="ct">Route 53 — DNS &amp; routing policies</div><div class="cf">Hosted zones, weighted/latency/failover routing, health checks, and DNS as a global availability tool.</div></div><div class="tags"><span class="tag t-core">Core</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">54</div><div><div class="ct">IAM &amp; STS</div><div class="cf">Identities, policies, roles, trust policies, assume-role, and the credential-resolution chain that trips everyone up.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">55</div><div><div class="ct">IRSA &amp; EKS Pod Identity</div><div class="cf">OIDC federation, projected service-account tokens, and precisely how a pod gets scoped AWS credentials with no static secret.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core"><div class="cn">56</div><div><div class="ct">Compute &amp; data services for SREs</div><div class="cf">EC2, Auto Scaling, ECR, S3, RDS, ElastiCache, SQS — the operational edges that matter, not the marketing.</div></div><div class="tags"><span class="tag t-core">Core</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">57</div><div><div class="ct">EKS architecture</div><div class="cf">Managed control plane, node groups vs Fargate, and cluster authentication (aws-auth and the access-entries model).</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">58</div><div><div class="ct">VPC CNI — the deep one</div><div class="cf">ENIs and secondary IPs, prefix delegation, IP exhaustion, and the line from pod netns → ENI → VPC route → Security Group. Where Part V and Part VI fuse.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">59</div><div><div class="ct">AWS integrations</div><div class="cf">AWS Load Balancer Controller, ExternalDNS, EBS/EFS CSI, Karpenter, CloudWatch — how the cluster reaches into AWS.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep"><div class="cn">60</div><div><div class="ct">End-to-end synthesis — Internet → Route 53 → ALB → Ingress → Service → Pod</div><div class="cf">One request, every hop, with IAM, Security Groups, and the CNI annotated. The chapter that makes EKS stop feeling like a black box.</div></div><div class="tags"><span class="tag t-deep">Deep</span></div></div>
+      </div>
+    </div>
+
+    <!-- PART VII -->
+    <div class="card" data-part>
+      <div class="part-head"><span class="pn">VII</span><h3>Platform Engineering — Packaging, IaC, GitOps, Mesh, Access</h3><span class="caret">▾</span><span class="desc">The tools you use daily, taught from their internals and their failure modes.</span></div>
+      <div class="part-body">
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">61</div><div><div class="ct">Helm</div><div class="cf">Templating and release model, values layering, dependencies, hooks. Build a production chart, feed it a bad value, break the release, roll back, harden it.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">62</div><div><div class="ct">Terraform I — model, resources, state, the dependency graph</div><div class="cf">Providers, resources, variables/outputs/locals, and how Terraform builds and walks its dependency graph internally.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">63</div><div><div class="ct">Terraform II — modules, state at scale, drift</div><div class="cf">Remote state and locking, reusable modules, count/for_each, dynamic blocks, lifecycle, import. Inject real drift and reconcile it.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core"><div class="cn">64</div><div><div class="ct">GitOps principles</div><div class="cf">Git as the source of truth, pull vs push delivery, and continuous reconciliation as an operating model.</div></div><div class="tags"><span class="tag t-core">Core</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">65</div><div><div class="ct">Argo CD</div><div class="cf">Architecture, Application/AppProject/ApplicationSet, sync waves, self-heal, prune, health, app-of-apps. Deploy, mutate the cluster by hand, watch drift, break it, roll back. Progressive delivery (Argo Rollouts) introduced.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core"><div class="cn">66</div><div><div class="ct">Service-mesh foundations</div><div class="cf">The problem a mesh solves, sidecar vs ambient, and the data-plane / control-plane split — before any YAML.</div></div><div class="tags"><span class="tag t-core">Core</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">67</div><div><div class="ct">Envoy &amp; Istiod internals</div><div class="cf">xDS, listeners/routes/clusters/endpoints, and how traffic is transparently intercepted into the sidecar.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">68</div><div><div class="ct">Istio traffic management</div><div class="cf">Gateway, VirtualService, DestinationRule, ServiceEntry — mapped back onto the Envoy config they generate.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">69</div><div><div class="ct">Istio security</div><div class="cf">mTLS modes, PeerAuthentication, RequestAuthentication (JWT), AuthorizationPolicy — and how to prove mTLS is actually on.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">70</div><div><div class="ct">Istio resilience &amp; onboarding a new service</div><div class="cf">Retries, timeouts, circuit breaking, traffic splitting and canary — then onboard a brand-new service into the mesh from scratch.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">71</div><div><div class="ct">Istio troubleshooting — the deep one</div><div class="cf">503/404/401/403, mTLS failures, missing sidecar, bad routes, empty endpoints, connection resets, latency, cardinality — each solved with <code>istioctl proxy-status</code> and <code>proxy-config cluster/listener/route/endpoint</code>, explaining exactly what each reveals.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">72</div><div><div class="ct">Teleport &amp; identity-based access</div><div class="cf">Why it exists, SSH/K8s/DB access through short-lived certificates, RBAC, audit logs — contrasted with the bastion model.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">73</div><div><div class="ct">CI/CD &amp; progressive delivery</div><div class="cf">Pipelines, GitHub Actions and Jenkins, build → test → scan → sign → publish → deploy, DORA metrics, and where GitOps takes over from the pipeline.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+      </div>
+    </div>
+
+    <!-- PART VIII -->
+    <div class="card" data-part>
+      <div class="part-head"><span class="pn">VIII</span><h3>Observability</h3><span class="caret">▾</span><span class="desc">Metrics, logs, traces — and the SLO discipline that turns them into decisions.</span></div>
+      <div class="part-body">
+        <div class="ch" data-depth="core"><div class="cn">74</div><div><div class="ct">Observability foundations</div><div class="cf">Metrics vs logs vs traces, and the RED / USE / Golden-Signals lenses for choosing what to measure.</div></div><div class="tags"><span class="tag t-core">Core</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">75</div><div><div class="ct">Prometheus</div><div class="cf">Architecture and TSDB, the scrape model, PromQL, recording rules, exporters, and the cardinality trap that quietly kills clusters.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">76</div><div><div class="ct">Grafana &amp; dashboard design</div><div class="cf">Dashboards people actually use, template variables, and correlating a metric spike with logs and traces.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">77</div><div><div class="ct">Alerting &amp; on-call health</div><div class="cf">Alertmanager, routing and grouping, alerting on symptoms not causes, burn-rate alerts, and killing alert fatigue.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">78</div><div><div class="ct">Logging</div><div class="cf">Structured logging, aggregation pipelines, indexing vs cost, retention, and correlation IDs that tie logs to a request.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">79</div><div><div class="ct">Distributed tracing &amp; OpenTelemetry</div><div class="cf">Spans and context propagation, sampling strategies, the collector, and joining traces to metrics and logs.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">80</div><div><div class="ct">SLI / SLO / SLA &amp; error budgets</div><div class="cf">Choosing good SLIs, setting SLOs, the error-budget policy, burn-rate alerting, and how budgets change what a team ships. The bridge into reliability.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+      </div>
+    </div>
+
+    <!-- PART IX -->
+    <div class="card" data-part>
+      <div class="part-head"><span class="pn">IX</span><h3>Distributed Systems, Data &amp; Reliability</h3><span class="caret">▾</span><span class="desc">Theory tied to real infrastructure, then the discipline of keeping it up.</span></div>
+      <div class="part-body">
+        <div class="ch" data-depth="core"><div class="cn">81</div><div><div class="ct">Distributed-systems fundamentals</div><div class="cf">Latency, throughput, availability, the fallacies of distributed computing, and the failure modes you design against.</div></div><div class="tags"><span class="tag t-core">Core</span></div></div>
+        <div class="ch" data-depth="deep"><div class="cn">82</div><div><div class="ct">Consistency, replication, partitioning</div><div class="cf">CAP and PACELC used correctly, replication models, sharding, quorum reads/writes, and consistency you can reason about.</div></div><div class="tags"><span class="tag t-deep">Deep</span></div></div>
+        <div class="ch" data-depth="core"><div class="cn">83</div><div><div class="ct">Coordination — leader election, consensus, locks, clocks</div><div class="cf">Raft at an operator's level, distributed locks and their traps, clock skew, and why "just use a lock" is dangerous.</div></div><div class="tags"><span class="tag t-core">Core</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">84</div><div><div class="ct">Async &amp; flow control</div><div class="cf">Queues (SQS/Kafka/RabbitMQ trade-offs), backpressure, rate limiting, idempotency, and retries with jitter that don't cause a storm.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">85</div><div><div class="ct">Caching</div><div class="cf">Cache-aside vs write-through, invalidation, eviction, stampede protection, hot keys, and cache as a failure amplifier.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">86</div><div><div class="ct">The data layer for SREs — MySQL &amp; PostgreSQL</div><div class="cf">Indexes, transactions, isolation, locks and deadlocks, MVCC, connection pooling and limits, slow queries, replication and failover — and how each looks from the app and the cluster. Safe schema changes (expand/contract).</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">87</div><div><div class="ct">Redis &amp; in-memory data</div><div class="cf">Data structures, persistence trade-offs, latency sources, clustering, and the failure patterns behind "Redis got slow."</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep"><div class="cn">88</div><div><div class="ct">Reliability engineering</div><div class="cf">HA and redundancy, fault tolerance, graceful degradation, bulkheads, circuit breakers, timeouts — "what happens when this component fails?" as a habit.</div></div><div class="tags"><span class="tag t-deep">Deep</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">89</div><div><div class="ct">Capacity planning &amp; performance</div><div class="cf">Utilization vs saturation, the USE method at scale, load testing (k6/vegeta/fortio), headroom, and reading a saturation curve.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="core"><div class="cn">90</div><div><div class="ct">Disaster recovery</div><div class="cf">RPO/RTO defined by the business, backup/restore you have actually tested, multi-AZ vs multi-region strategies and their costs.</div></div><div class="tags"><span class="tag t-core">Core</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">91</div><div><div class="ct">Chaos engineering</div><div class="cf">Steady-state hypotheses, blast-radius control, game days, and running your first safe experiment.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep"><div class="cn">92</div><div><div class="ct">Incident management, postmortems &amp; the SRE operating model</div><div class="cf">Incident command roles, communication, timelines, blameless postmortems, RCA techniques that find causes not culprits — plus toil reduction, on-call practice, and the resiliency-pyramid view of SRE as a discipline.</div></div><div class="tags"><span class="tag t-deep">Deep</span></div></div>
+      </div>
+    </div>
+
+    <!-- PART X -->
+    <div class="card" data-part>
+      <div class="part-head"><span class="pn">X</span><h3>System Design</h3><span class="caret">▾</span><span class="desc">A real engineering skill first, an interview skill second. Architectures that evolve with scale.</span></div>
+      <div class="part-body">
+        <div class="ch" data-depth="deep"><div class="cn">93</div><div><div class="ct">The system-design method</div><div class="cf">The 21-step process from the frameworks section, back-of-envelope estimation you can do out loud, and how to reason about trade-offs instead of naming components.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-design">Design</span></div></div>
+        <div class="ch" data-depth="core"><div class="cn">94</div><div><div class="ct">Building blocks</div><div class="cf">Load balancers, caches, queues, DB families, API design, data modeling, service discovery, CDNs, API gateways — each with "when, and when not."</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-design">Design</span></div></div>
+        <div class="ch" data-depth="core"><div class="cn">95</div><div><div class="ct">Scaling patterns</div><div class="cf">Statelessness, horizontal vs vertical, sharding and replication, multi-AZ/region, cell-based architecture, and graceful degradation under load.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-design">Design</span></div></div>
+        <div class="ch" data-depth="applied" data-lab="1" data-design="1"><div class="cn">96</div><div><div class="ct">Project — URL shortener</div><div class="cf">Design → build a small version → load-test → break → observe → fix → scale → redesign. Introduces read-heavy scaling and hashing.</div></div><div class="tags"><span class="tag t-applied">Project</span><span class="tag t-lab">Lab</span><span class="tag t-design">Design</span></div></div>
+        <div class="ch" data-depth="applied" data-lab="1" data-design="1"><div class="cn">97</div><div><div class="ct">Project — Distributed rate limiter</div><div class="cf">Token bucket vs sliding window, shared state in Redis, and behavior under partition. Ties back to Ch 84–85.</div></div><div class="tags"><span class="tag t-applied">Project</span><span class="tag t-lab">Lab</span><span class="tag t-design">Design</span></div></div>
+        <div class="ch" data-depth="applied" data-lab="1" data-design="1"><div class="cn">98</div><div><div class="ct">Project — Distributed job/queue processing</div><div class="cf">At-least-once delivery, idempotent workers, backpressure, and a poison-message failure to debug.</div></div><div class="tags"><span class="tag t-applied">Project</span><span class="tag t-lab">Lab</span><span class="tag t-design">Design</span></div></div>
+        <div class="ch" data-depth="applied" data-lab="1" data-design="1"><div class="cn">99</div><div><div class="ct">Project — Notification system</div><div class="cf">Fan-out, provider failure, retries and dedup, and delivery guarantees under load.</div></div><div class="tags"><span class="tag t-applied">Project</span><span class="tag t-lab">Lab</span><span class="tag t-design">Design</span></div></div>
+        <div class="ch" data-depth="applied" data-design="1"><div class="cn">100</div><div><div class="ct">Project — Metrics/monitoring platform</div><div class="cf">Design the thing you operate: ingestion, TSDB, cardinality, query, and cost. Reuses Part VIII directly.</div></div><div class="tags"><span class="tag t-applied">Project</span><span class="tag t-design">Design</span></div></div>
+        <div class="ch" data-depth="applied" data-design="1"><div class="cn">101</div><div><div class="ct">Project — CI/CD + Kubernetes deployment platform</div><div class="cf">An internal developer platform: golden paths, multi-tenancy, safe rollouts — the platform-engineering interview centerpiece.</div></div><div class="tags"><span class="tag t-applied">Project</span><span class="tag t-design">Design</span></div></div>
+        <div class="ch" data-depth="applied" data-design="1"><div class="cn">102</div><div><div class="ct">Project — Highly available multi-region SaaS</div><div class="cf">Active-active vs active-passive, data replication and conflict, failover, and the cost/latency trade-offs. Extended projects (video streaming, logging platform, distributed cache) sketched here.</div></div><div class="tags"><span class="tag t-applied">Project</span><span class="tag t-design">Design</span></div></div>
+      </div>
+    </div>
+
+    <!-- PART XI -->
+    <div class="card" data-part>
+      <div class="part-head"><span class="pn">XI</span><h3>SRE Problem-Solving &amp; Production Troubleshooting</h3><span class="caret">▾</span><span class="desc">Reasoning, not command lists. Symptom → prevention, every time.</span></div>
+      <div class="part-body">
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">103</div><div><div class="ct">The universal troubleshooting framework</div><div class="cf">The troubleshooting loop turned into decision trees, with the discipline of forming hypotheses before touching anything.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">104</div><div><div class="ct">Compute &amp; memory runbooks</div><div class="cf">High CPU, high memory, OOMKilled, disk full — traced from symptom to the Part I/III internals that cause them.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">105</div><div><div class="ct">Network runbooks</div><div class="cf">Latency, packet loss, connection refused vs timeout, DNS failure — each mapped to a layer from Part II and Part V.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">106</div><div><div class="ct">HTTP status-code runbooks</div><div class="cf">404/401/403/429/500/502/503/504 — and the skill of knowing which hop in the path emitted it (client, LB, mesh, app, upstream).</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">107</div><div><div class="ct">Kubernetes runbooks</div><div class="cf">CrashLoopBackOff, ImagePullBackOff, Pending, NotReady, in-cluster DNS, "Service unavailable" — investigations you have to work, not read.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">108</div><div><div class="ct">Platform &amp; distributed runbooks</div><div class="cf">DB connection exhaustion, queue backlog, deployment failure, Argo CD drift, Istio 503, cert expiry, high-cardinality blowups, high latency, resource exhaustion.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+      </div>
+    </div>
+
+    <!-- PART XII -->
+    <div class="card" data-part>
+      <div class="part-head"><span class="pn">XII</span><h3>Interview Mastery &amp; Mock Interviews</h3><span class="caret">▾</span><span class="desc">How senior/lead/staff loops are actually scored — and repeated live practice.</span></div>
+      <div class="part-body">
+        <div class="ch" data-depth="core" data-mock="1"><div class="cn">109</div><div><div class="ct">Interview strategy</div><div class="cf">What each level is graded on, structuring an answer under pressure, STAR for experience, and framing trade-offs instead of reciting facts.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-mock">Interview</span></div></div>
+        <div class="ch" data-depth="core" data-mock="1"><div class="cn">110</div><div><div class="ct">Topic interview banks</div><div class="cf">Linux, networking, K8s, AWS, Terraform, Helm, Argo CD, Istio, observability — each with 30-second, 2-minute, deep-dive, scenario, and follow-up questions, plus the reasoning behind strong answers.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-mock">Interview</span></div></div>
+        <div class="ch" data-depth="core" data-mock="1"><div class="cn">111</div><div><div class="ct">Distributed-systems &amp; system-design interviews</div><div class="cf">Driving the 21-step method live, handling "now 10× the traffic," and defending your trade-offs.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-mock">Interview</span></div></div>
+        <div class="ch" data-depth="core" data-mock="1"><div class="cn">112</div><div><div class="ct">Production-troubleshooting &amp; incident interviews</div><div class="cf">Thinking out loud through an incident, showing methodology, and turning a real outage you handled into a strong story.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-mock">Interview</span></div></div>
+        <div class="ch" data-depth="core" data-mock="1"><div class="cn">113</div><div><div class="ct">Behavioral &amp; leadership (lead/staff)</div><div class="cf">Influence without authority, incident command, mentoring, driving decisions and writing them down — what tips a loop from senior to lead.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-mock">Interview</span></div></div>
+        <div class="ch" data-depth="deep" data-mock="1"><div class="cn">114</div><div><div class="ct">Mock-interview mode</div><div class="cf">I switch to interviewer: one question at a time, no answer up front, scored on correctness/depth/clarity/methodology/trade-offs, then a follow-up. Progresses Junior → Mid → Senior → Lead → Staff.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-mock">Interview</span></div></div>
+      </div>
+    </div>
+
+    <!-- PART XIII -->
+    <div class="card" data-part>
+      <div class="part-head"><span class="pn">XIII</span><h3>Capstone</h3><span class="caret">▾</span><span class="desc">Everything, wired into one platform — then broken on purpose.</span></div>
+      <div class="part-body">
+        <div class="ch" data-depth="applied" data-lab="1" data-design="1"><div class="cn">115</div><div><div class="ct">The capstone platform</div><div class="cf">GitHub → Actions → ECR → Argo CD → EKS → Istio → services → Redis → RDS → Prometheus/Grafana → logging → alerting. Terraform-provisioned, Helm-packaged, GitOps-delivered, mesh-secured, observable, access-controlled. Built local-first on kind, with an EKS variant.</div></div><div class="tags"><span class="tag t-applied">Project</span><span class="tag t-lab">Lab</span><span class="tag t-design">Design</span></div></div>
+        <div class="ch" data-depth="deep" data-lab="1"><div class="cn">116</div><div><div class="ct">The incident gauntlet</div><div class="cf">DNS failure, wrong Service selector, broken NetworkPolicy, Istio 503, mTLS break, bad deploy, pod OOM, node failure, DB connection exhaustion, Redis latency, queue backlog, cert expiry, Argo drift, Terraform drift, cardinality blowup, latency, resource exhaustion — run as timed exercises with the framework.</div></div><div class="tags"><span class="tag t-deep">Deep</span><span class="tag t-lab">Lab</span></div></div>
+      </div>
+    </div>
+
+    <!-- PART XIV (added after the mxssl-guide review) -->
+    <div class="card" data-part>
+      <div class="part-head"><span class="pn">XIV</span><h3>Interview Coding &amp; SRE Career</h3><span class="caret">▾</span><span class="desc">Added after reviewing the mxssl SRE guide — the coding, algorithms, and career prep big-tech loops expect.</span></div>
+      <div class="part-body">
+        <div class="ch" data-depth="applied" data-lab="1" data-mock="1"><div class="cn">117</div><div><div class="ct">Coding, algorithms &amp; data structures for SRE interviews</div><div class="cf">The subset that actually comes up: arrays/strings/hashmaps, big-O reasoning, and solving a clean problem out loud. Not a LeetCode grind — the level SRE loops probe.</div></div><div class="tags"><span class="tag t-applied">Project</span><span class="tag t-lab">Lab</span><span class="tag t-mock">Interview</span></div></div>
+        <div class="ch" data-depth="applied" data-lab="1" data-mock="1"><div class="cn">118</div><div><div class="ct">Timed scripting &amp; log-wrangling — "SRE coding"</div><div class="cf">The practical coding round: parse a log, aggregate with awk/Python, script a fix under time pressure. Drilled against SadServers-style scenarios.</div></div><div class="tags"><span class="tag t-applied">Project</span><span class="tag t-lab">Lab</span><span class="tag t-mock">Interview</span></div></div>
+        <div class="ch" data-depth="core" data-mock="1"><div class="cn">119</div><div><div class="ct">The SRE interview process &amp; levels</div><div class="cf">How loops are structured at large companies, what each round scores, and how Junior/Mid/Senior/Lead/Staff expectations actually differ.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-mock">Interview</span></div></div>
+        <div class="ch" data-depth="core" data-mock="1"><div class="cn">120</div><div><div class="ct">Resume, portfolio &amp; salary negotiation</div><div class="cf">Turning this program's projects and the capstone into a resume and portfolio that reads as senior scope, and negotiating the offer.</div></div><div class="tags"><span class="tag t-core">Core</span><span class="tag t-mock">Interview</span></div></div>
+        <div class="ch" data-depth="core" data-lab="1"><div class="cn">121</div><div><div class="ct">Go for SRE — optional language track</div><div class="cf">Optional. The language of Kubernetes, Terraform, and most infra tooling: enough Go to read the code you operate and write small tools and a basic controller.</div></div><div class="tags"><span class="tag t-core">Optional</span><span class="tag t-lab">Lab</span></div></div>
+      </div>
+    </div>
+
+    </div><!-- /parts -->
+    <p class="note" id="noresults" style="display:none">No chapters match that filter. Clear the search or switch back to "All".</p>
+  </section>
+
+  <!-- DEEPEST -->
+  <section class="block" id="deepest">
+    <h2><span class="n">2</span>Where the book goes deepest</h2>
+    <p class="lead">Depth over breadth was the instruction, so these get the most pages, the hardest labs, and the fullest packet or control-flow diagrams. If time is ever short, these are the chapters worth slowing down on.</p>
+    <table class="dep">
+      <tr><th>Rank</th><th>Topic</th><th>Chapters</th><th>Why it earns the depth</th></tr>
+      <tr><td>1</td><td>Linux networking to packet level + the <code>curl</code> trace</td><td>13, 15, 17, 18, 19, 20</td><td>Your stated top priority, and the substrate every later networking topic reduces to.</td></tr>
+      <tr><td>2</td><td>Kubernetes networking datapath</td><td>42, 43, 44, 47</td><td>Services and kube-proxy are where most K8s incidents live and where most engineers wave their hands.</td></tr>
+      <tr><td>3</td><td>Kubernetes control plane &amp; reconciliation</td><td>29, 30, 31, 32</td><td>Understanding the loop turns every K8s behavior from surprising to predictable.</td></tr>
+      <tr><td>4</td><td>Container internals — namespaces &amp; cgroups</td><td>21, 22, 23</td><td>Removes the magic; makes container security, limits, and OOM obvious.</td></tr>
+      <tr><td>5</td><td>EKS networking — VPC CNI + IRSA</td><td>55, 58, 60</td><td>The exact seam between AWS and Kubernetes, and a frequent senior interview probe.</td></tr>
+      <tr><td>6</td><td>Istio data plane &amp; troubleshooting</td><td>67, 71</td><td>Envoy/xDS plus the <code>istioctl</code> workflow is what separates "we run Istio" from "I can debug Istio."</td></tr>
+      <tr><td>7</td><td>TCP / TLS / DNS</td><td>13, 15, 17</td><td>The three protocols behind the majority of "it's slow / it's flaky" incidents.</td></tr>
+      <tr><td>8</td><td>Troubleshooting framework + runbooks</td><td>103–108, 116</td><td>The reasoning habit that makes unfamiliar incidents solvable — the core senior differentiator.</td></tr>
+      <tr><td>9</td><td>System-design method + projects</td><td>93, 96–102</td><td>Where fundamentals become architecture and interview performance.</td></tr>
+      <tr><td>10</td><td>Prometheus/PromQL/cardinality + SLOs</td><td>75, 80</td><td>Observability done wrong is its own outage; SLOs are the SRE operating language.</td></tr>
+      <tr><td>11</td><td>The data layer (MySQL/Postgres/Redis)</td><td>86, 87</td><td>The most common hidden cause behind application and cluster symptoms.</td></tr>
+    </table>
+  </section>
+
+  <!-- DEPENDENCY MAP -->
+  <section class="block" id="deps">
+    <h2><span class="n">3</span>Dependency map — what unlocks what</h2>
+    <p class="lead">The book is sequenced so nothing depends on something you haven't met. Two tracks run in parallel: the infrastructure track (Linux up through the platform) and a distributed-systems track that can start early and merges into reliability and system design. Read top to bottom; the phase labels are where each domain becomes learnable.</p>
+    <div class="ladder">
+      <div class="phase"><div class="pl" style="background:#3b6fb0">Phase 1<br>Foundations</div><div class="pc"><b>The machine and the wire</b><small> — no dependencies; everything above rests here.</small><div class="doms"><span class="dom">I · Linux &amp; OS</span><span class="dom">II · Networking first principles</span></div></div></div>
+      <div class="arrowdown">▼</div>
+      <div class="phase"><div class="pl" style="background:#3b7fa0">Phase 2<br>Isolation</div><div class="pc"><b>Containers</b><small> — needs Linux namespaces/cgroups (I) and the network stack (II).</small><div class="doms"><span class="dom">III · Containers &amp; internals</span></div></div></div>
+      <div class="arrowdown">▼</div>
+      <div class="phase"><div class="pl" style="background:#3b8f90">Phase 3<br>Orchestration</div><div class="pc"><b>Kubernetes internals</b><small> — needs containers (III); the control loop needs the process/IO model (I).</small><div class="doms"><span class="dom">IV · Kubernetes internals</span></div></div></div>
+      <div class="arrowdown">▼</div>
+      <div class="phase"><div class="pl" style="background:#3b9f7d">Phase 4<br>Wiring the cluster</div><div class="pc"><b>Kubernetes networking + AWS/EKS</b><small> — fuses Part II with Part IV; EKS networking needs both.</small><div class="doms"><span class="dom">V · K8s networking</span><span class="dom">VI · AWS &amp; EKS</span></div></div></div>
+      <div class="arrowdown">▼</div>
+      <div class="phase"><div class="pl" style="background:#3ba968">Phase 5<br>The platform</div><div class="pc"><b>Helm · Terraform · GitOps/Argo · Istio · Teleport · CI/CD</b><small> — needs the cluster (IV/V) and cloud (VI). Istio needs networking (II) and mesh foundations.</small><div class="doms"><span class="dom">VII · Platform engineering</span></div></div></div>
+      <div class="arrowdown">▼</div>
+      <div class="phase"><div class="pl" style="background:#5ba24e">Phase 6<br>Seeing &amp; surviving</div><div class="pc"><b>Observability, then distributed systems &amp; reliability</b><small> — observability needs something running to watch; reliability needs the dist-sys track below.</small><div class="doms"><span class="dom">VIII · Observability</span><span class="dom">IX · Dist-sys · Data · Reliability</span></div></div></div>
+      <div class="arrowdown">▼</div>
+      <div class="phase"><div class="pl" style="background:#7a9b3f">Phase 7<br>Designing</div><div class="pc"><b>System design</b><small> — pulls together dist-sys (IX), the building blocks (LB/cache/queue/DB), and reliability.</small><div class="doms"><span class="dom">X · System design + projects</span></div></div></div>
+      <div class="arrowdown">▼</div>
+      <div class="phase"><div class="pl" style="background:#9a8f38">Phase 8<br>Under fire</div><div class="pc"><b>Production troubleshooting</b><small> — draws evidence from every prior part; taught as reasoning over that whole stack.</small><div class="doms"><span class="dom">XI · Troubleshooting &amp; runbooks</span></div></div></div>
+      <div class="arrowdown">▼</div>
+      <div class="phase"><div class="pl" style="background:#b07a30">Phase 9<br>Proving it</div><div class="pc"><b>Interview mastery + the capstone</b><small> — the capstone assembles Parts IV–IX; interviews convert all of it into stories and whiteboards.</small><div class="doms"><span class="dom">XII · Interview &amp; mock</span><span class="dom">XIII · Capstone + gauntlet</span></div></div></div>
+    </div>
+    <div class="callout">
+      <b>Parallel track.</b> Part IX's distributed-systems and data chapters (81–87) don't depend on Kubernetes — you can read them any time after Part II. I place them in Phase 6 so the reliability chapters (88–92) can lean on both them and observability, but if you want variety while grinding through the cluster parts, they're a safe detour.
+    </div>
+  </section>
+
+  <!-- LABS -->
+  <section class="block" id="labs">
+    <h2><span class="n">4</span>Lab progression</h2>
+    <p class="lead">Local-first, as you chose. Every major topic runs the same five-lab arc, and the tooling you install grows exactly in step with the curriculum — nothing before you need it.</p>
+    <div class="grid2">
+      <div class="box accent">
+        <h4>The five-lab arc (every major topic)</h4>
+        <ol class="steps">
+          <li><b>Build</b><span>The smallest working example. Not a toy — a real, minimal instance of the thing.</span></li>
+          <li><b>Understand</b><span>Inspect what actually got created. Read the state, the process, the packet, the config.</span></li>
+          <li><b>Break</b><span>Introduce one specific failure on purpose.</span></li>
+          <li><b>Troubleshoot</b><span>The root cause is <i>not</i> revealed. You investigate with hints, then confirm.</span></li>
+          <li><b>Production challenge</b><span>Realistic constraints, and you design the fix or the guardrail.</span></li>
+        </ol>
+      </div>
+      <div class="box accent">
+        <h4>Toolchain, introduced in order</h4>
+        <p style="margin:0 0 8px">
+          <span class="pill">Linux in a container / VM</span><span class="pill">tcpdump · ss · dig</span><span class="pill">Docker</span><span class="pill">kind (+ minikube)</span><span class="pill">kubectl</span><span class="pill">Helm</span><span class="pill">Argo CD</span><span class="pill">Istio + istioctl</span><span class="pill">Terraform (+ LocalStack)</span><span class="pill">Prometheus · Grafana</span><span class="pill">k6 · fortio</span>
+        </p>
+        <p class="note">Everything runs on your laptop. AWS/EKS appears only where the cloud behavior <i>is</i> the lesson — VPC CNI IP exhaustion, IRSA, ALB target groups, Route 53 failover — and each of those chapters also ships a local stand-in (kind + a mock or a diagram-driven walkthrough) so you're never blocked on an account or a bill.</p>
+      </div>
+    </div>
+    <h3>How labs escalate across the book</h3>
+    <p>Early labs are single-machine and fast: break a process, watch a TCP handshake, exhaust file descriptors. By Part IV they're cluster-scale on kind. By Part VII you're breaking a Helm release and recovering it through Argo CD. The capstone gauntlet (Ch 116) is the final form — multi-component failures where the symptom is three layers away from the cause, exactly like production.</p>
+  </section>
+
+  <!-- SYSTEM DESIGN PROGRESSION -->
+  <section class="block" id="design">
+    <h2><span class="n">5</span>System-design progression</h2>
+    <p class="lead">Architecture is taught as something that <i>grows</i>, never as a finished diagram handed down. Each project starts at the simplest correct design and is forced to evolve as requirements and scale increase — so you learn <i>why</i> each component appears, not just that it does.</p>
+    <div class="ladder">
+      <div class="phase"><div class="pl" style="background:#3b6fb0">Base</div><div class="pc"><b>Client → Load balancer → App → Database</b><small> — the four-box design every system starts as.</small></div></div>
+      <div class="arrowdown">▼ traffic grows, reads dominate</div>
+      <div class="phase"><div class="pl" style="background:#3b8f90">+ Cache</div><div class="pc"><b>Add caching</b><small> — cache-aside, invalidation, stampede. Now failure modes multiply (Ch 85).</small></div></div>
+      <div class="arrowdown">▼ writes spike, work gets slow</div>
+      <div class="phase"><div class="pl" style="background:#3ba968">+ Async</div><div class="pc"><b>Add queues &amp; workers</b><small> — decouple, backpressure, idempotency, retries with jitter (Ch 84, 98).</small></div></div>
+      <div class="arrowdown">▼ one DB can't hold it</div>
+      <div class="phase"><div class="pl" style="background:#7a9b3f">+ Scale data</div><div class="pc"><b>Replication &amp; sharding</b><small> — read replicas, partitioning, quorum, consistency trade-offs (Ch 82, 86).</small></div></div>
+      <div class="arrowdown">▼ one AZ / region isn't enough</div>
+      <div class="phase"><div class="pl" style="background:#b07a30">+ Geo &amp; DR</div><div class="pc"><b>Multi-AZ → multi-region, CDN, DR</b><small> — active-active vs active-passive, RPO/RTO, cost and latency (Ch 90, 95, 102).</small></div></div>
+    </div>
+    <p class="note" style="margin-top:14px">The seven projects (Ch 96–102) are ordered by how much of this ladder they force you to climb: the URL shortener stops at caching and read-scaling; the multi-region SaaS climbs the whole thing. Each ends with a redesign pass where you critique your own architecture at the next order of magnitude.</p>
+  </section>
+
+  <!-- TROUBLESHOOTING PROGRESSION -->
+  <section class="block" id="trouble">
+    <h2><span class="n">6</span>Troubleshooting progression</h2>
+    <p class="lead">Troubleshooting is never taught as a list of commands. It's taught as reasoning, layered from a single box outward, so by the capstone you can localize a failure across the whole stack from one symptom.</p>
+    <table class="dep">
+      <tr><th>Stage</th><th>Scope</th><th>Example incidents</th><th>Leans on</th></tr>
+      <tr><td>1 · Framework</td><td>The reasoning loop itself</td><td>Forming hypotheses before acting; bisecting a request path</td><td>Ch 103</td></tr>
+      <tr><td>2 · Single box</td><td>One host</td><td>High CPU, memory pressure, OOMKilled, disk full, iowait</td><td>Parts I, III · Ch 104</td></tr>
+      <tr><td>3 · The wire</td><td>Host-to-host</td><td>Latency, packet loss, refused vs timeout, DNS failure</td><td>Part II · Ch 105</td></tr>
+      <tr><td>4 · The request</td><td>L7 / HTTP path</td><td>404/401/403/429/5xx — and which hop emitted it</td><td>Ch 16, 17 · Ch 106</td></tr>
+      <tr><td>5 · The cluster</td><td>Kubernetes</td><td>CrashLoop, ImagePull, Pending, NotReady, in-cluster DNS</td><td>Parts IV, V · Ch 107</td></tr>
+      <tr><td>6 · The platform</td><td>Mesh, GitOps, data, IaC</td><td>Istio 503, Argo/Terraform drift, DB exhaustion, queue backlog, cert expiry, cardinality</td><td>Parts VII–IX · Ch 108</td></tr>
+      <tr><td>7 · Everything at once</td><td>The full platform</td><td>Multi-layer incidents where the symptom is far from the cause</td><td>Capstone · Ch 116</td></tr>
+    </table>
+  </section>
+
+  <!-- SKILL LADDER -->
+  <section class="block" id="skill">
+    <h2><span class="n">7</span>Beginner → Staff — the skill ladder</h2>
+    <p class="lead">Where each part lands you, framed as what you can <i>do</i> and how you'd <i>interview</i> at that level. You're entering around the Intermediate rung with real gaps below and above it; the book closes both directions.</p>
+    <div class="rung"><div class="lvl">Foundational<small>Parts I–III</small></div><div><b>Can:</b> reason about processes, memory, files, and packets on a single machine; explain what a container is from the kernel up. <b>Interview:</b> answers Linux and networking fundamentals without hand-waving.</div></div>
+    <div class="rung"><div class="lvl">Intermediate<small>Parts IV–VI</small></div><div><b>Can:</b> operate Kubernetes and EKS with an understanding of the control loop and the packet path; explain how a pod gets an IP and AWS credentials. <b>Interview:</b> handles "walk me through what happens when…" for the cluster and the cloud.</div></div>
+    <div class="rung"><div class="lvl">Advanced<small>Parts VII–IX</small></div><div><b>Can:</b> build and run the platform — GitOps, mesh, IaC, observability — and reason about distributed-systems and data trade-offs. <b>Interview:</b> defends design and reliability choices with evidence.</div></div>
+    <div class="rung"><div class="lvl">Senior<small>Parts X–XI</small></div><div><b>Can:</b> design systems that evolve with scale, and localize any production failure systematically. <b>Interview:</b> drives a system-design round and thinks out loud through an incident with a clear method.</div></div>
+    <div class="rung"><div class="lvl">Lead / Staff<small>Parts XII–XIII</small></div><div><b>Can:</b> own an end-to-end platform, run incidents, and make + document architecture decisions; mentor and influence. <b>Interview:</b> passes the behavioral/leadership bar and turns the capstone into credible senior-scope stories.</div></div>
+  </section>
+
+  <!-- ADDITIONS -->
+  <section class="block" id="additions">
+    <h2><span class="n">8</span>What I added beyond your brief</h2>
+    <p class="lead">You asked me to add anything genuinely useful. These are the topics a current Senior/Lead SRE or Platform Engineer is expected to know that weren't explicit in your list. I've folded each into the chapter shown rather than bolting on a loose appendix.</p>
+    <div class="grid2">
+      <div class="box"><h4>Kernel-level observability</h4><p class="note">eBPF and <code>bpftrace</code>, <code>perf</code>, flame graphs — the modern way to see what a running system is doing. → Ch 7, 89.</p></div>
+      <div class="box"><h4>Platform engineering as a discipline</h4><p class="note">Internal developer platforms, golden paths, platform-as-product, self-service — central to the exact roles you're targeting. → Ch 64, 101.</p></div>
+      <div class="box"><h4>Secrets management</h4><p class="note">External Secrets, SOPS, sealed-secrets, Vault, and rotation — because "Secrets aren't secret" needs an answer. → Ch 35.</p></div>
+      <div class="box"><h4>Supply-chain security</h4><p class="note">Image scanning, SBOMs, signing (cosign), and admission policy that enforces it. → Ch 39, 73.</p></div>
+      <div class="box"><h4>Policy as code</h4><p class="note">OPA/Gatekeeper and Kyverno for guardrails that scale past manual review. → Ch 39.</p></div>
+      <div class="box"><h4>Progressive delivery</h4><p class="note">Argo Rollouts / canary and blue-green as first-class deploy strategies. → Ch 65, 70, 73.</p></div>
+      <div class="box"><h4>Cost engineering / FinOps</h4><p class="note">Right-sizing, Karpenter economics, and cost as a design constraint, not an afterthought. → Ch 37, 89, and every design project.</p></div>
+      <div class="box"><h4>gRPC, HTTP/2 &amp; HTTP/3</h4><p class="note">Modern protocols and why they change load-balancing and mesh behavior. → Ch 16.</p></div>
+      <div class="box"><h4>Certificate automation</h4><p class="note">cert-manager and ACME — turning the TLS-expiry incident into a non-event. → Ch 17, 69.</p></div>
+      <div class="box"><h4>Safe schema changes &amp; migrations</h4><p class="note">Expand/contract, online DDL, backward-compatible rollouts. → Ch 86.</p></div>
+      <div class="box"><h4>Load testing as a habit</h4><p class="note">k6, vegeta, fortio — used in every design project's "load-test → break" step. → Ch 89, 96–102.</p></div>
+      <div class="box"><h4>etcd operations &amp; DR game days</h4><p class="note">Backup/restore of cluster state, and rehearsed failure drills. → Ch 29, 90, 91.</p></div>
+      <div class="box"><h4>Toil, error-budget policy &amp; the SRE operating model</h4><p class="note">The cultural machinery — how budgets change what teams ship, and how to reduce toil deliberately. → Ch 80, 92.</p></div>
+      <div class="box"><h4>Multi-cluster / fleet basics</h4><p class="note">A pragmatic look at running more than one cluster before it's forced on you. → Ch 57, 102.</p></div>
+    </div>
+  </section>
+
+  <!-- SOURCES -->
+  <section class="block" id="sources">
+    <h2><span class="n">10</span>Sources &amp; the repo review</h2>
+    <p class="lead">You pointed me at <a href="https://github.com/mxssl/sre-interview-prep-guide">mxssl/sre-interview-prep-guide</a> (9.1k stars). I read it end to end. It's a curated list of the best <em>reading</em> on each SRE topic — and our curriculum already covers its technical ground, then goes past it by teaching and labbing rather than linking. What it changed here: it prompted Part XIV (interview coding + career), the expanded Chapter 92, and the source map below, which pins the canonical references to the parts that use them. Chapters cite these inline.</p>
+    <table class="dep">
+      <tr><th>Canonical source</th><th>Used in</th></tr>
+      <tr><td>Google — <i>Site Reliability Engineering</i>, <i>The SRE Workbook</i>, <i>Implementing SLOs</i></td><td>Parts VIII–IX (SLOs, error budgets, incidents, operating model)</td></tr>
+      <tr><td>Brendan Gregg — <i>Systems Performance</i> (2nd ed.) + linuxperf</td><td>Parts I &amp; XI (performance, the toolkit, troubleshooting)</td></tr>
+      <tr><td>Stevens — <i>TCP/IP Illustrated, Vol 1</i></td><td>Part II (networking from first principles)</td></tr>
+      <tr><td>The Kubernetes Networking Guide (tkng.io) + "what happens when… k8s"</td><td>Parts IV–V (K8s internals &amp; packet-level networking)</td></tr>
+      <tr><td>biriukov.dev SRE Linux internals (page cache, file descriptors, resolvers)</td><td>Part I &amp; Ch 15 (DNS/resolvers)</td></tr>
+      <tr><td>linux-insides (0xax) &amp; man7.org man-pages</td><td>Part I (kernel internals, syscall reference)</td></tr>
+      <tr><td>ByteByteGo — System Design 101 &amp; the System Design Primer</td><td>Part X (system design + projects)</td></tr>
+      <tr><td>SadServers (hands-on Linux scenarios)</td><td>Parts I, XI, XIV (troubleshooting &amp; timed-scripting drills)</td></tr>
+      <tr><td>LinkedIn — School of SRE</td><td>Parts VIII–IX &amp; XII (foundations, culture, interviews)</td></tr>
+      <tr><td>PagerDuty incident-response &amp; postmortem guides; open-guides/og-aws</td><td>Ch 92 (incidents) &amp; Part VI (AWS)</td></tr>
+    </table>
+    <p class="note">Every chapter also leans on the official docs first — Kubernetes, CNCF, AWS, Istio, Helm, Argo CD, Terraform, Prometheus, Grafana, OpenTelemetry — and flags where a widely-repeated practice is outdated.</p>
+  </section>
+
+  <!-- NEXT -->
+  <section class="block" id="next">
+    <h2><span class="n">9</span>How we proceed</h2>
+    <p class="lead">The book is now underway. This plan stays as the map; the writing follows it part by part.</p>
+    <ol class="steps">
+      <li><b>You review this page</b><span>Tell me what to cut, add, reorder, or go deeper on. The dependency order and the added topics are the main things worth a second look.</span></li>
+      <li><b>I write Part I, chapter by chapter</b><span>Each chapter is its own interactive HTML page in this folder, following the 27-beat template, with diagrams, labs, and interview sections. I'll deliver a chapter (or a small batch) at a time so you can actually work through them, not drown.</span></li>
+      <li><b>We keep an index page</b><span>A home page links every chapter, tracks what's done, and holds the cross-references so the book stays navigable as it grows to 121 chapters.</span></li>
+      <li><b>Labs stay local</b><span>Every lab is runnable on your laptop; I'll note the exact tools per chapter so you install them just in time.</span></li>
+    </ol>
+    <div class="callout">
+      <b>We've started.</b> The book now has a home page (<code>index.html</code>) and <b>Chapter 1 — the kernel &amp; system calls</b> written in full as a per-chapter page: beginner on-ramp, real-world analogy, first-principles internals, five local labs, production incident patterns, and interview Q&amp;A. Open Chapter 1, and if the depth and tone are right I'll continue straight through Part I (Chapter 2 next) and keep going part by part. Tell me any time to go deeper, lighter, faster, or slower.
+    </div>
+  </section>
+
+  <footer>
+    SRE / Platform Engineering Textbook &amp; Lab Program · Master Plan v1 · built to be read offline, months from now.<br>
+    This file lives in your <code>SRE-Platform-Textbook</code> folder. Reopen it any time — it needs no internet and no server.
+  </footer>
+</main>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  var root=document.documentElement;
+  // theme
+  try{ var t=localStorage.getItem('sre_theme'); if(t) root.setAttribute('data-theme',t); }catch(e){}
+  document.getElementById('themeBtn').addEventListener('click',function(){
+    var next=root.getAttribute('data-theme')==='dark'?'light':'dark';
+    root.setAttribute('data-theme',next);
+    try{localStorage.setItem('sre_theme',next);}catch(e){}
+  });
+  // collapse parts
+  document.querySelectorAll('.part-head').forEach(function(h){
+    h.addEventListener('click',function(){ h.parentElement.classList.toggle('collapsed'); });
+  });
+  var allExpanded=true;
+  document.getElementById('expandBtn').addEventListener('click',function(){
+    allExpanded=!allExpanded;
+    document.querySelectorAll('#parts .card').forEach(function(c){ c.classList.toggle('collapsed',!allExpanded); });
+    this.textContent=allExpanded?'Collapse all':'Expand all';
+  });
+  // print
+  document.getElementById('printBtn').addEventListener('click',function(){ window.print(); });
+  // search + filter
+  var q=document.getElementById('q'), filter='all';
+  var chapters=[].slice.call(document.querySelectorAll('#parts .ch'));
+  var parts=[].slice.call(document.querySelectorAll('#parts .card[data-part]'));
+  function apply(){
+    var term=(q.value||'').trim().toLowerCase();
+    chapters.forEach(function(ch){
+      var text=ch.textContent.toLowerCase();
+      var okText=!term||text.indexOf(term)>-1;
+      var okFilter=true;
+      if(filter==='deep') okFilter=ch.getAttribute('data-depth')==='deep';
+      else if(filter==='lab') okFilter=ch.getAttribute('data-lab')==='1';
+      else if(filter==='design') okFilter=ch.getAttribute('data-design')==='1';
+      ch.style.display=(okText&&okFilter)?'':'none';
+    });
+    var anyVisible=false;
+    parts.forEach(function(p){
+      var vis=p.querySelectorAll('.ch:not([style*="display: none"])').length;
+      // recount robustly
+      var count=0; p.querySelectorAll('.ch').forEach(function(c){ if(c.style.display!=='none') count++; });
+      p.style.display=count>0?'':'none';
+      if(count>0){ anyVisible=true; if(term||filter!=='all') p.classList.remove('collapsed'); }
+    });
+    document.getElementById('noresults').style.display=anyVisible?'none':'';
+  }
+  q.addEventListener('input',apply);
+  document.querySelectorAll('.filters .btn').forEach(function(b){
+    b.addEventListener('click',function(){
+      document.querySelectorAll('.filters .btn').forEach(function(x){x.classList.remove('on');});
+      b.classList.add('on'); filter=b.getAttribute('data-f'); apply();
+    });
+  });
+  // scrollspy
+  var links=[].slice.call(document.querySelectorAll('#toc a'));
+  var map={};
+  links.forEach(function(a){ var id=a.getAttribute('href').slice(1); var el=document.getElementById(id); if(el) map[id]=a; });
+  var obs=new IntersectionObserver(function(entries){
+    entries.forEach(function(en){
+      if(en.isIntersecting){
+        links.forEach(function(a){a.classList.remove('active');});
+        var a=map[en.target.id]; if(a) a.classList.add('active');
+      }
+    });
+  },{rootMargin:'-45% 0px -50% 0px'});
+  Object.keys(map).forEach(function(id){ var el=document.getElementById(id); if(el) obs.observe(el); });
+})();
+</script>
+</body>
+</html>
